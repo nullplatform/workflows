@@ -158,6 +158,18 @@ steps:
     type: module
     plugin_type: claude-code-agent
     name: "AI Thread Answer"
+    # DECLARED inputs, mandatory: steps.* templates inside this plugin's
+    # config resolve activity-side WITHOUT step state (arrive as the string
+    # "undefined") — the prompt below references inputs.* only. Same fix as
+    # wf2b's ai_analysis.
+    inputs:
+      item_title: "${{ inputs.item_title }}"
+      item_description: "${{ inputs.item_description }}"
+      metadata: "${{ inputs.metadata }}"
+      matchers: "${{ inputs.matchers }}"
+      thread: "${{ inputs.thread }}"
+      question_author: "${{ inputs.question_author }}"
+      question: "${{ inputs.question }}"
     config:
       model: claude-opus-4-8
       maxIterations: 8
@@ -201,23 +213,23 @@ steps:
           few supporting bullets with the key numbers in bold. No headings,
           no sign-off.
       userPrompt: |
-        Action item: ${{ steps.guard.outputs.item_title }}
+        Action item: ${{ inputs.item_title }}
 
         Item analysis (as posted):
-        ${{ steps.guard.outputs.item_description }}
+        ${{ inputs.item_description }}
 
         Item metrics metadata (recorded by the scanner at analysis time):
-        ${{ steps.guard.outputs.metadata }}
+        ${{ inputs.metadata }}
 
         Prometheus pod matchers for query_metrics — copy VERBATIM into your
-        PromQL selectors: ${{ steps.guard.outputs.matchers }}
+        PromQL selectors: ${{ inputs.matchers }}
 
         Recent thread (oldest → newest):
-        ${{ steps.guard.outputs.thread }}
+        ${{ inputs.thread }}
 
-        LAST comment (by ${{ steps.guard.outputs.question_author }} — decide
+        LAST comment (by ${{ inputs.question_author }} — decide
         whether to answer this):
-        ${{ steps.guard.outputs.question }}
+        ${{ inputs.question }}
       outputSchema:
         type: object
         required: [should_reply, reply]
