@@ -34,6 +34,10 @@ inputs:
     type: string
     required: false
     description: "Optional NRN prefix filter — only scopes under this NRN are analyzed (empty = whole organization)"
+  force:
+    type: boolean
+    required: false
+    description: "Bypass every per-scope prefilter (rescan window, tracker-healthy skip) and run the full analysis on all scopes — for recalibrations."
 
 steps:
   - id: start_manual
@@ -48,6 +52,10 @@ steps:
           required: false
           description: "Only analyze scopes under this NRN (prefix match)"
           placeholder: "organization=…:account=…"
+        force:
+          type: boolean
+          required: false
+          description: "Bypass prefilters (rescan window, healthy-skip) — full re-analysis"
 
   - id: start_cron
     type: trigger
@@ -114,6 +122,8 @@ steps:
       itemVariable: scope
       parallel: true
       maxConcurrency: 3
+    inputs:
+      force: "${{ workflow.inputs.force }}"
     config:
       # PER-ORG id of "Right Sizing — Analyze Scope"; patched by
       # setup/04-upload-workflows.mjs on upload.
@@ -179,7 +189,7 @@ steps:
 
   # ── Portfolio item: the sub-ticket long tail ──────────────────────────
   # Opportunities below the per-environment ticket floor are invisible one
-  # by one but real money in aggregate.
+  # by one but real money in aggregate (~$40/month on the nullplatform org).
   # ONE org-level item accumulates them: entries are upserted when a scan
   # concludes below_min_savings, removed when the scope resolves any other
   # way (real item, healthy, discarded), and kept while skipped/prefiltered.

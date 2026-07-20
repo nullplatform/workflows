@@ -105,7 +105,7 @@ steps:
       agent_selector:
         nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
         tags:
-          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'runtime' }}"
       # Placeholder so validateConfig() passes; inputs.cmdline overrides.
       cmdline: "/bin/true"
 
@@ -117,6 +117,7 @@ steps:
       stdout: "${{ steps.run_costing.outputs.stdout }}"
       cur_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0' }}"
       cur_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0' }}"
+      loading_factor: "${{ vars.CLUSTER_COST_LOADING_FACTOR || '1' }}"
     config:
       code: |
         // A cron calibration must REPORT problems, never crash: every exit
@@ -131,6 +132,21 @@ steps:
         if (c.error) return reject('costing failed: ' + c.error);
         var pc = Number(c.price_per_millicore_hour), pm = Number(c.price_per_mb_ram_hour);
         if (!(pc > 0) || !(pm > 0)) return reject('derived prices are not positive: ' + JSON.stringify(c).slice(0, 200));
+        // Fully-loaded pricing: the costing script measures RAW EC2-Compute
+        // (CE AmortizedCost); the loading factor bills the cluster costs that
+        // filter misses (EBS, NAT + regional data transfer, ELB, EKS control
+        // plane, prorated Support/CloudTrail/GuardDuty). Derived from the real
+        // bill (see docs/architecture.md § Money flow); the POLICY value lives
+        // in the CLUSTER_COST_LOADING_FACTOR config entry, never hardcoded.
+        var lf = Number(inputs.loading_factor);
+        if (!(lf >= 1 && lf <= 3)) return reject('CLUSTER_COST_LOADING_FACTOR out of sane range [1,3]: ' + String(inputs.loading_factor));
+        pc = Math.round(pc * lf * 10000000) / 10000000;
+        pm = Math.round(pm * lf * 100000000) / 100000000;
+        c.price_per_millicore_hour = pc;
+        c.price_per_mb_ram_hour = pm;
+        c.loading_factor = lf;
+        c.monthly_loaded_cost = Math.round(Number(c.monthly_compute_cost) * lf * 100) / 100;
+        c.method = String(c.method || '') + ' x loading_factor ' + lf;
         // Guardrail: a derived price outside [1/3x, 3x] of the current one is
         // treated as suspect data — report, do not silently reprice the org.
         function inBounds(now, prev) {
@@ -204,6 +220,8 @@ steps:
         price_per_mb_ram_hour: "${{ steps.validate.outputs.costing.price_per_mb_ram_hour }}"
         currency: "USD"
         monthly_compute_cost: "${{ steps.validate.outputs.costing.monthly_compute_cost }}"
+        monthly_loaded_cost: "${{ steps.validate.outputs.costing.monthly_loaded_cost }}"
+        loading_factor: "${{ steps.validate.outputs.costing.loading_factor }}"
         nodes: "${{ steps.validate.outputs.costing.nodes }}"
         vcpu_total: "${{ steps.validate.outputs.costing.vcpu_total }}"
         gb_total: "${{ steps.validate.outputs.costing.gb_total }}"
