@@ -117,7 +117,7 @@ steps:
       agent_selector:
         nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
         tags:
-          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'runtime' }}"
       # Placeholder so validateConfig() (config-only, pre-execute) passes;
       # inputs.cmdline (whitelisted override) replaces it at run time.
       cmdline: "/bin/true"
@@ -136,6 +136,25 @@ steps:
       # 404 = first run for this scope (no instance yet) — not an error.
       failOnHttpError: false
 
+  # The DEV-CONFIGURED request lives on the scope, not in the cluster:
+  # platform tunes the actual K8s request/limit for bin-packing, but the
+  # scope pays what its owner CONFIGURED (× real pods) — that keeps the
+  # incentive on configuring well, independent of platform tuning.
+  # inputs shield (scope_id): np-api-call merges inherited passthrough over
+  # config — declared inputs prevent it (see CLAUDE.md).
+  - id: fetch_scope
+    type: module
+    plugin_type: np-api-call
+    name: "Read Scope Config"
+    inputs:
+      scope_id: "${{ workflow.inputs.scope.scope_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/scope/${{ workflow.inputs.scope.scope_id }}"
+      # A failed fetch only means "no config basis" → KSM request fallback.
+      failOnHttpError: false
+
   - id: price_and_merge
     type: module
     plugin_type: code-exec
@@ -144,6 +163,8 @@ steps:
       stdout:   "${{ steps.run_collector.outputs.stdout }}"
       existing_status: "${{ steps.fetch_instance.outputs.status }}"
       existing: "${{ steps.fetch_instance.outputs.body }}"
+      scope_status: "${{ steps.fetch_scope.outputs.status }}"
+      scope_body:   "${{ steps.fetch_scope.outputs.body }}"
       date:     "${{ workflow.inputs.date }}"
       price_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }}"
       price_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }}"
@@ -166,30 +187,60 @@ steps:
         var noData = !parsed.samples;
         var samples = Number(parsed.samples) || 0;
 
-        // CHARGEBACK basis (headline cost): a scope pays for what it RESERVED
-        // — requests bind cluster nodes whether used or not — or for usage
-        // when it bursts above its request: max(usage, request) per hour.
+        // BILLING basis: the DEV-CONFIGURED per-pod request from the scope,
+        // not the request the cluster runs — platform tunes actual K8s
+        // requests (bin-packing, overhead sidecars) and that game must not
+        // leak into what the owner pays. Config sources by scope type:
+        //   custom:              capabilities.cpu_millicores / ram_memory (MB)
+        //   web_pool[_k8s]:      memory from capabilities.memory.memory_in_gb
+        //                        (or requested_spec.memory_in_gb); CPU is
+        //                        PROFILE-DERIVED (kubernetes_processor
+        //                        millicores:-1) → not dev intent → KSM basis.
+        // Missing config → KSM request fallback (never bill zero).
+        var sc = (Number(inputs.scope_status) === 200 && inputs.scope_body) ? inputs.scope_body : null;
+        var caps = (sc && sc.capabilities) || {};
+        var rspec = (sc && sc.requested_spec) || {};
+        var kproc = caps.kubernetes_processor || {};
+        var cfgCpu = Number(caps.cpu_millicores) > 0 ? Number(caps.cpu_millicores)
+          : Number(kproc.millicores) > 0 ? Number(kproc.millicores) : 0;
+        var capMem = caps.memory || {};
+        var cfgMem = Number(caps.ram_memory) > 0 ? Number(caps.ram_memory)
+          : Number(capMem.memory_in_gb) > 0 ? Number(capMem.memory_in_gb) * 1024
+          : Number(rspec.memory_in_gb) > 0 ? Number(rspec.memory_in_gb) * 1024 : 0;
+
+        // CHARGEBACK (headline cost): a scope pays for what it RESERVED
+        // — configured request × that hour's real pod count — or for usage
+        // when it bursts above the reservation: max(usage, reserved)/hour.
         // USAGE basis is kept alongside; the difference is the scope's waste.
         var hrs = parsed.hours || [];
         var billCpuH = 0, billMemH = 0;
+        var podsHSum = 0, podsHN = 0;
         if (hrs.length > 0) {
           for (var hi = 0; hi < hrs.length; hi++) {
             var hh = hrs[hi] || {};
             var hc = Number(hh.cpu_mc) || 0, hm = Number(hh.mem_mb) || 0;
             if (hc <= 0 && hm <= 0) continue; // hour without data: not billed
-            // THAT hour's request when the collector provides it (replica
-            // scaling within the day is real: 100 pods at 10:00, 2 at 11:00);
-            // daily average only as fallback for older collectors / KSM gaps.
+            // KSM request of THAT hour (replica scaling within the day is
+            // real); daily average as fallback for older collectors.
             var hcr = Number(hh.cpu_req_mc) || 0;
             var hmr = Number(hh.mem_req_mb) || 0;
-            billCpuH += Math.max(hc, hcr > 0 ? hcr : cpuReq);
-            billMemH += Math.max(hm, hmr > 0 ? hmr : memReq);
+            var hp = Number(hh.pods) || 0;
+            if (hp > 0) { podsHSum += hp; podsHN++; }
+            var resCpu = (cfgCpu > 0 && hp > 0) ? cfgCpu * hp : (hcr > 0 ? hcr : cpuReq);
+            var resMem = (cfgMem > 0 && hp > 0) ? cfgMem * hp : (hmr > 0 ? hmr : memReq);
+            billCpuH += Math.max(hc, resCpu);
+            billMemH += Math.max(hm, resMem);
           }
         } else {
           // Aggregate-only payloads (no hourly detail): coarse fallback.
           billCpuH = Math.max(cpuMcH, cpuReq * samples);
           billMemH = Math.max(memMbH, memReq * samples);
         }
+        var podsAvgH = podsHN > 0 ? podsHSum / podsHN : 0;
+        var billingBasis = {
+          cpu: (cfgCpu > 0 && podsHN > 0) ? 'scope-config' : 'cluster',
+          mem: (cfgMem > 0 && podsHN > 0) ? 'scope-config' : 'cluster'
+        };
         var billCpuCost = billCpuH * pCpu;
         var billMemCost = billMemH * pMem;
         var billCost = billCpuCost + billMemCost;   // what the scope COSTS
@@ -276,6 +327,11 @@ steps:
           },
           cpu_request_mc: r2(cpuReq),
           mem_request_mb: r2(memReq),
+          // Dev-configured per-pod request (billing basis) — null when the
+          // scope type has no comparable config for that dimension.
+          cfg_cpu_request_mc: cfgCpu > 0 ? r2(cfgCpu) : null,
+          cfg_mem_request_mb: cfgMem > 0 ? r2(cfgMem) : null,
+          billing_basis: 'cpu:' + billingBasis.cpu + ',mem:' + billingBasis.mem,
           cpu_avg_usage_mc: r2(cpuAvg),
           mem_avg_usage_mb: r2(memAvg),
           // Usage/requested as raw daily data — readable straight from the
@@ -377,9 +433,11 @@ steps:
 
 connections:
   - { id: c1, from: start,           to: build_command }
+  - { id: c1b, from: start,          to: fetch_scope }
   - { id: c2, from: build_command,   to: run_collector }
   - { id: c3, from: run_collector,   to: fetch_instance }
   - { id: c4, from: fetch_instance,  to: price_and_merge }
+  - { id: c4b, from: fetch_scope,    to: price_and_merge }
   - { id: c5, from: price_and_merge, to: has_data }
   - { id: c5b, from: has_data,       to: create_instance, source_port: "true" }
   - { id: c5c, from: has_data,       to: stash_no_data,   source_port: "false" }

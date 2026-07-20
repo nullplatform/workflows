@@ -152,9 +152,18 @@ steps:
           var series = inst.daily_series || [];
           var pts = series.slice(-7);
           var cpuU = [], memU = [];
+          // Utilization vs the BILLING basis: the dev-configured request
+          // (cfg_* headline fields, written by the tracker) × that day's
+          // pods when available — a scope can look "healthy" against the
+          // platform-tuned KSM request while being over-provisioned against
+          // what its owner configured and pays. KSM fleet request fallback.
+          var cfgC = Number(inst.cfg_cpu_request_mc) || 0;
+          var cfgM = Number(inst.cfg_mem_request_mb) || 0;
           for (var i = 0; i < pts.length; i++) {
             var p = pts[i] || {};
-            var cReq = Number(p.cpu_req_mc) || 0, mReq = Number(p.mem_req_mb) || 0;
+            var podsD = Number(p.pods_avg) || 0;
+            var cReq = (cfgC > 0 && podsD > 0) ? cfgC * podsD : (Number(p.cpu_req_mc) || 0);
+            var mReq = (cfgM > 0 && podsD > 0) ? cfgM * podsD : (Number(p.mem_req_mb) || 0);
             if (!(cReq > 0) || !(mReq > 0)) continue;
             cpuU.push(((Number(p.cpu_mc_h) || 0) / 24 / cReq) * 100);
             memU.push(((Number(p.mem_mb_h) || 0) / 24 / mReq) * 100);
@@ -381,7 +390,7 @@ steps:
       agent_selector:
         nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
         tags:
-          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'runtime' }}"
       # Placeholder so validateConfig() (config-only, pre-execute) passes;
       # inputs.cmdline (whitelisted override) replaces it at run time.
       cmdline: "/bin/true"
@@ -489,12 +498,33 @@ steps:
         var podsAvg = Number(pp.pod_count_avg) > 0 ? Number(pp.pod_count_avg) : 1;
         var ppc = pp.cpu || {};
         var ppm = pp.mem || {};
-        // Current per-pod requests: KSM per-pod value (collector v4);
-        // fall back to fleet/pods for older collectors.
-        var ppReqC = Number(pp.req_cpu_mc) > 0 ? Number(pp.req_cpu_mc)
+        // TWO current per-pod requests, on purpose:
+        //   KSM (what the cluster actually runs) — platform-tuned; stays the
+        //     basis for under-provision checks and the closer's observed_*
+        //     change-detection baseline.
+        //   SCOPE CONFIG (what the dev asked for) — the BILLING basis since
+        //     the tracker bills config × pods; candidacy, savings and the
+        //     item's "current" work from THIS one so the item reflects what
+        //     the owner actually pays and what an accepted change patches.
+        // Config missing for a dimension (e.g. profile-derived CPU on
+        // web_pool_k8s) → KSM fallback for that dimension.
+        var ksmReqC = Number(pp.req_cpu_mc) > 0 ? Number(pp.req_cpu_mc)
           : (Number(cpu.request_now_mc) || Number(cpu.avg_request_mc) || 0) / podsAvg;
-        var ppReqM = Number(pp.req_mem_mb) > 0 ? Number(pp.req_mem_mb)
+        var ksmReqM = Number(pp.req_mem_mb) > 0 ? Number(pp.req_mem_mb)
           : (Number(mem.request_now_mb) || Number(mem.avg_request_mb) || 0) / podsAvg;
+        var scDet = inputs.scope_detail || {};
+        var scCaps = scDet.capabilities || {};
+        var scKproc = scCaps.kubernetes_processor || {};
+        var scMemCap = scCaps.memory || {};
+        var scSpec = scDet.requested_spec || {};
+        var cfgReqC = Number(scCaps.cpu_millicores) > 0 ? Number(scCaps.cpu_millicores)
+          : Number(scKproc.millicores) > 0 ? Number(scKproc.millicores) : 0;
+        var cfgReqM = Number(scCaps.ram_memory) > 0 ? Number(scCaps.ram_memory)
+          : Number(scMemCap.memory_in_gb) > 0 ? Number(scMemCap.memory_in_gb) * 1024
+          : Number(scSpec.memory_in_gb) > 0 ? Number(scSpec.memory_in_gb) * 1024 : 0;
+        var ppReqC = cfgReqC > 0 ? cfgReqC : ksmReqC;
+        var ppReqM = cfgReqM > 0 ? cfgReqM : ksmReqM;
+        var requestSource = { cpu: cfgReqC > 0 ? 'scope-config' : 'ksm', mem: cfgReqM > 0 ? 'scope-config' : 'ksm' };
         // Hottest-pod load profile (fallbacks: fleet metric / pods).
         var cpuPeak = Number(ppc.hot_peak10m_mc) > 0 ? Number(ppc.hot_peak10m_mc)
           : (Number(cpu.peak10m_mc) > 0 ? Number(cpu.peak10m_mc) : Number(cpu.p95_usage_mc) || 0) / podsAvg;
@@ -543,8 +573,10 @@ steps:
         // Under-provisioning: the hottest pod's peak sits at/above 90% of
         // its request on either dimension — throttling / OOM risk. Reported
         // on the catalog flag even when there is nothing to reclaim.
-        var underProv = (ppReqC > 0 && cpuPeak >= ppReqC * 0.9) ||
-                        (ppReqM > 0 && memPeak >= ppReqM * 0.9);
+        // Measured against the KSM request: throttling/OOM happen against
+        // what the cluster actually enforces, not the scope config.
+        var underProv = (ksmReqC > 0 && cpuPeak >= ksmReqC * 0.9) ||
+                        (ksmReqM > 0 && memPeak >= ksmReqM * 0.9);
 
         // A change too small to bother: below N% of the configured request
         // AND below 100 mc / 100 MB absolute — applying it costs more
@@ -628,7 +660,11 @@ steps:
           stats: sum,
           per_pod: parsed.per_pod || {},
           // The sizing ground truth: per-pod current request + fleet size.
+          // per_pod_request = BILLING basis (scope config, KSM fallback);
+          // per_pod_request_ksm = what the cluster runs (closer baseline).
           per_pod_request: { cpu_mc: r2(ppReqC), mem_mb: r2(ppReqM) },
+          per_pod_request_ksm: { cpu_mc: r2(ksmReqC), mem_mb: r2(ksmReqM) },
+          request_source: requestSource,
           pods_avg: r2(podsAvg),
           under_provisioned: underProv,
           health: parsed.health || {},
@@ -966,6 +1002,8 @@ steps:
       autoscaling: "${{ steps.evaluate.outputs.autoscaling }}"
       targets:  "${{ steps.evaluate.outputs.targets }}"
       per_pod_request: "${{ steps.evaluate.outputs.per_pod_request }}"
+      per_pod_request_ksm: "${{ steps.evaluate.outputs.per_pod_request_ksm }}"
+      request_source: "${{ steps.evaluate.outputs.request_source }}"
       pods_avg: "${{ steps.evaluate.outputs.pods_avg }}"
       matchers: "${{ steps.build_command.outputs.matchers }}"
       days:     "${{ steps.build_command.outputs.days }}"
@@ -1001,6 +1039,7 @@ steps:
         // Current PER-POD requests (requests are per-pod config; fleet sums
         // move with the autoscaler). Recommendations are per pod too.
         var ppr = inputs.per_pod_request || {};
+        var ksm = inputs.per_pod_request_ksm || {};
         var pods = Number(inputs.pods_avg) > 0 ? Number(inputs.pods_avg) : 1;
         var curCpu = Number(ppr.cpu_mc) || 0;
         var curMem = Number(ppr.mem_mb) || 0;
@@ -1128,8 +1167,13 @@ steps:
             avg_mem_request_mb: mem.avg_request_mb || 0,
             // PER-POD request AT ANALYSIS TIME: the closer (wf7) compares
             // per-pod requests (fleet sums move with autoscaling).
-            observed_cpu_request_mc: curCpu,
-            observed_mem_request_mb: curMem,
+            // observed_* = KSM (what the cluster RUNS): the closer detects
+            // applied changes against live cluster requests, so its baseline
+            // must be the same currency — never the scope-config billing
+            // basis (config 500mc vs KSM 300mc would read as "changed").
+            observed_cpu_request_mc: Number(ksm.cpu_mc) || curCpu,
+            observed_mem_request_mb: Number(ksm.mem_mb) || curMem,
+            request_source: String(((inputs.request_source || {}).cpu) || 'ksm') + '/' + String(((inputs.request_source || {}).mem) || 'ksm'),
             pods_avg: r2(pods),
             cpu_peak10m_mc: Number(cpu.peak10m_mc) || 0,
             mem_peak_mb: Number(mem.peak_mb) || 0,
@@ -1268,6 +1312,8 @@ steps:
       autoscaling: "${{ steps.evaluate.outputs.autoscaling }}"
       targets:  "${{ steps.evaluate.outputs.targets }}"
       per_pod_request: "${{ steps.evaluate.outputs.per_pod_request }}"
+      per_pod_request_ksm: "${{ steps.evaluate.outputs.per_pod_request_ksm }}"
+      request_source: "${{ steps.evaluate.outputs.request_source }}"
       pods_avg: "${{ steps.evaluate.outputs.pods_avg }}"
       matchers: "${{ steps.build_command.outputs.matchers }}"
       days:     "${{ steps.build_command.outputs.days }}"
@@ -1288,6 +1334,7 @@ steps:
         var recCpu = Number(a.recommended_cpu_request_mc) || 0;
         var recMem = Number(a.recommended_mem_request_mb) || 0;
         var ppr = inputs.per_pod_request || {};
+        var ksm = inputs.per_pod_request_ksm || {};
         var pods = Number(inputs.pods_avg) > 0 ? Number(inputs.pods_avg) : 1;
         var curCpu = Number(ppr.cpu_mc) || 0;
         var curMem = Number(ppr.mem_mb) || 0;
@@ -1310,8 +1357,13 @@ steps:
             avg_cpu_request_mc: cpu.avg_request_mc || 0,
             avg_mem_usage_mb: mem.avg_usage_mb || 0,
             avg_mem_request_mb: mem.avg_request_mb || 0,
-            observed_cpu_request_mc: curCpu,
-            observed_mem_request_mb: curMem,
+            // observed_* = KSM (what the cluster RUNS): the closer detects
+            // applied changes against live cluster requests, so its baseline
+            // must be the same currency — never the scope-config billing
+            // basis (config 500mc vs KSM 300mc would read as "changed").
+            observed_cpu_request_mc: Number(ksm.cpu_mc) || curCpu,
+            observed_mem_request_mb: Number(ksm.mem_mb) || curMem,
+            request_source: String(((inputs.request_source || {}).cpu) || 'ksm') + '/' + String(((inputs.request_source || {}).mem) || 'ksm'),
             pods_avg: r2(pods),
             cpu_peak10m_mc: Number(cpu.peak10m_mc) || 0,
             mem_peak_mb: Number(mem.peak_mb) || 0,
