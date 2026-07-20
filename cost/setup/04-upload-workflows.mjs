@@ -93,6 +93,34 @@ function patchReferences(def, idByKey) {
   }
 }
 
+/**
+ * Resolves `${{ vars.NP_ORGANIZATION_ID }}` inside TRIGGER configs to the
+ * uploading org's literal id. Trigger ACTIVATION does not run the template
+ * resolver: the engine sent `nrn: "organization=${{ vars.… }}"` verbatim to
+ * POST /notification/channel and NP's NRN-based authz rejected it with 401
+ * (verified live 2026-07-20 — the same request with the literal nrn is a
+ * 200). Runtime step configs still resolve vars normally; only activation
+ * needs the literal.
+ */
+function patchTriggerOrg(def, orgId) {
+  const needle = '${{ vars.NP_ORGANIZATION_ID }}';
+  const patch = (cfg) => {
+    if (!cfg || typeof cfg !== 'object') return;
+    for (const [k, v] of Object.entries(cfg)) {
+      if (typeof v === 'string' && v.includes(needle)) {
+        cfg[k] = v.split(needle).join(orgId);
+      } else if (v && typeof v === 'object') {
+        patch(v);
+      }
+    }
+  };
+  for (const trg of def.triggers ?? []) patch(trg.config);
+  const steps = Array.isArray(def.steps) ? def.steps : Object.values(def.steps ?? {});
+  for (const step of steps) {
+    if (step?.type === 'trigger') patch(step.config);
+  }
+}
+
 async function main() {
   const apiKey = process.env.NP_API_KEY;
   if (!apiKey) throw new Error('export NP_API_KEY first');
@@ -114,6 +142,7 @@ async function main() {
   for (const { file, key } of PLAN) {
     const def = await loadDefinition(file);
     patchReferences(def, idByKey);
+    patchTriggerOrg(def, orgId);
 
     const existing = orgState[key];
     const url = existing
