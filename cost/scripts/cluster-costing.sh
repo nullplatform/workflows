@@ -48,14 +48,17 @@ done
 
 fail() { echo "{\"error\":\"$1\"}"; exit 3; }
 
-# Default month: the last FULL month (GNU date with BSD fallback).
+# Default month: the last FULL month. Pure-shell month arithmetic — the
+# agent host is BusyBox (no GNU `date -d`, no BSD `date -v`).
 if [[ -z "$MONTH" ]]; then
-  MONTH=$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m 2>/dev/null \
-        || date -u -v-1m +%Y-%m)
+  Y=$(date -u +%Y); M=$((10#$(date -u +%m) - 1))
+  if [ "$M" -eq 0 ]; then M=12; Y=$((Y - 1)); fi
+  MONTH=$(printf '%04d-%02d' "$Y" "$M")
 fi
 START="$MONTH-01"
-END=$(date -u -d "$START +1 month" +%Y-%m-%d 2>/dev/null \
-    || date -u -j -f %Y-%m-%d -v+1m "$START" +%Y-%m-%d)
+NY=${MONTH%-*}; NM=$((10#${MONTH#*-} + 1))
+if [ "$NM" -eq 13 ]; then NM=1; NY=$((NY + 1)); fi
+END=$(printf '%04d-%02d-01' "$NY" "$NM")
 
 # ── Monthly compute cost (Cost Explorer, amortized) ─────────────────────
 if [[ -n "$COST_OVERRIDE" ]]; then
