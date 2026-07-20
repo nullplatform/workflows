@@ -1,0 +1,80 @@
+# AI-deploy tool: move blue-green traffic to a percentage.
+#
+# Verified mechanism: PATCH /deployment/:id {"strategy_data":
+# {"desired_switched_traffic": N}} → HTTP 204; the provider reconciles
+# `switched_traffic` asynchronously (confirm with deploy_status).
+id: deploy_switch_traffic
+name: "Deploy Tool — Switch Traffic"
+description: >
+  Requests a blue-green traffic move. Inputs: deployment_id (string,
+  required), percentage (number 0-100, required). Returns {ok, http_status}.
+  The switch is asynchronous — confirm switched_traffic with deploy_status.
+  Note: lowering below the already-switched value does NOT revert traffic
+  (use deploy_finish action=cancel to roll back).
+path: "/deploy"
+semantic_version: 1.0.0
+
+inputs:
+  deployment_id:
+    type: string
+    required: true
+  percentage:
+    type: number
+    required: true
+    description: "Desired switched traffic 0-100"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Requests a traffic move (AI-deploy tool)."
+      inputs:
+        deployment_id: { type: string, required: true }
+        percentage: { type: number, required: true }
+
+  - id: clamp
+    type: module
+    plugin_type: code-exec
+    name: "Validate Percentage"
+    inputs:
+      pct: "${{ workflow.inputs.percentage }}"
+    config:
+      code: |
+        var p = Math.round(Number(inputs.pct));
+        if (!isFinite(p) || p < 0 || p > 100) throw new Error('percentage must be 0-100, got: ' + inputs.pct);
+        return { pct: p };
+
+  - id: patch
+    type: module
+    plugin_type: np-api-call
+    name: "Switch Traffic"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/deployment/${{ workflow.inputs.deployment_id }}"
+      failOnHttpError: false
+      body:
+        strategy_data:
+          desired_switched_traffic: "${{ steps.clamp.outputs.pct }}"
+
+  - id: shape
+    type: module
+    plugin_type: code-exec
+    name: "Shape Result"
+    inputs:
+      status: "${{ steps.patch.outputs.status }}"
+    config:
+      code: |
+        var st = Number(inputs.status) || 0;
+        return { ok: st >= 200 && st < 300, http_status: st };
+
+connections:
+  - { id: c1, from: start, to: clamp }
+  - { id: c2, from: clamp, to: patch }
+  - { id: c3, from: patch, to: shape }
+
+outputs:
+  ok:          "${{ steps.shape.outputs.ok }}"
+  http_status: "${{ steps.shape.outputs.http_status }}"

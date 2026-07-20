@@ -1,0 +1,73 @@
+# AI-deploy tool: read a deployment's live state.
+id: deploy_status
+name: "Deploy Tool — Status"
+description: >
+  Reads a deployment's current state. Inputs: deployment_id (string,
+  required). Returns {status, switched_traffic, desired_switched_traffic,
+  healthy_instances, launched_instances, expected_instances, now} where
+  `now` is the server-side unix time in seconds (use it to measure elapsed
+  time between calls).
+path: "/deploy"
+semantic_version: 1.0.0
+
+inputs:
+  deployment_id:
+    type: string
+    required: true
+    description: "Deployment to inspect"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Reads a deployment's state (AI-deploy tool)."
+      inputs:
+        deployment_id: { type: string, required: true }
+
+  - id: fetch
+    type: module
+    plugin_type: np-api-call
+    name: "Get Deployment"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/deployment/${{ workflow.inputs.deployment_id }}"
+      failOnHttpError: false
+
+  - id: shape
+    type: module
+    plugin_type: code-exec
+    name: "Shape Result"
+    inputs:
+      status: "${{ steps.fetch.outputs.status }}"
+      body:   "${{ steps.fetch.outputs.body }}"
+    config:
+      code: |
+        var st = Number(inputs.status) || 0;
+        var d = inputs.body || {};
+        if (st < 200 || st >= 300) throw new Error('GET /deployment failed: HTTP ' + st);
+        var sd = d.strategy_data || {};
+        return {
+          status: String(d.status || 'unknown'),
+          switched_traffic: Number(sd.switched_traffic) || 0,
+          desired_switched_traffic: Number(sd.desired_switched_traffic) || 0,
+          healthy_instances: Number(sd.healthy_instances) || 0,
+          launched_instances: Number(sd.launched_instances) || 0,
+          expected_instances: Number(sd.amount_instances_to_wait) || 0,
+          now: Math.floor(new Date().getTime() / 1000)
+        };
+
+connections:
+  - { id: c1, from: start, to: fetch }
+  - { id: c2, from: fetch, to: shape }
+
+outputs:
+  status:                   "${{ steps.shape.outputs.status }}"
+  switched_traffic:         "${{ steps.shape.outputs.switched_traffic }}"
+  desired_switched_traffic: "${{ steps.shape.outputs.desired_switched_traffic }}"
+  healthy_instances:        "${{ steps.shape.outputs.healthy_instances }}"
+  launched_instances:       "${{ steps.shape.outputs.launched_instances }}"
+  expected_instances:       "${{ steps.shape.outputs.expected_instances }}"
+  now:                      "${{ steps.shape.outputs.now }}"

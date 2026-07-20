@@ -1,0 +1,379 @@
+# Sub-workflow: closer verification for ONE scope.
+#
+# Called by wf7-rightsizing-closer once per scope (forEach fan-out). Checks
+# whether the scope's live right-sizing item was ACTED ON — the requested
+# resources changed (applied via the suggestion's apply-only mode, or by
+# hand) — and whether the change actually improved efficiency:
+#   - request changed + ≥3 days of post-change tracker data + utilization
+#     healthy → comment the realized before/after numbers and CLOSE the item.
+#   - request changed but the scope now runs hot (>90% on a dimension, or
+#     above the environment ceiling) → close with a WARNING comment and flag
+#     the scope under_provisioned so it surfaces on the catalog.
+#   - request changed but not enough post-change days yet → wait for the
+#     next weekly run (silent).
+#   - request unchanged → nothing to do (the scanner's stale-close handles
+#     the case where the load itself changed).
+# All decisions run on tracker metadata only — no Prometheus, no AI.
+id: right_sizing_verify_scope
+name: "Right Sizing — Verify Scope (closer)"
+description: >
+  Verifies whether a scope's live right-sizing item was acted on (request
+  changed) and whether the change improved efficiency; closes the item with
+  realized before/after numbers, or flags a regression.
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  scope:
+    type: object
+    required: true
+    description: "Scope row: {scope_id, scope_name, scope_slug, scope_nrn, app_name}"
+
+variables:
+  result: { initialValue: { status: "no_item", action_item_id: null, realized_savings_usd_month: 0 } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Verifies one scope's right-sizing item outcome (normally invoked by the closer)."
+      inputs:
+        scope:
+          type: object
+          required: true
+          description: "Scope row (see workflow description)"
+
+  - id: fetch_tracker
+    type: module
+    plugin_type: np-api-call
+    name: "Read Tracker Metadata"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      # 404 = tracker never saw this scope — nothing to verify.
+      failOnHttpError: false
+
+  # The item pointer lives on the tracker instance (scanner-owned). No
+  # pointer → nothing to verify for this scope.
+  - id: has_item
+    type: decider
+    plugin_type: conditional
+    name: "Live Item Pointer?"
+    config:
+      expression: "steps.fetch_tracker.outputs.status == 200 && steps.fetch_tracker.outputs.body.rightsizing_item_id != null"
+
+  - id: stash_no_item
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: no item"
+    config:
+      path: result
+      value:
+        status: "no_item"
+        action_item_id: null
+        realized_savings_usd_month: 0
+
+  - id: fetch_item
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Action Item"
+    # SHIELD: without declared inputs the conditional's passthrough (the
+    # tracker GET's status/body/headers) merges over this plugin's config —
+    # `body`/`headers` ARE np-api-call config keys. See wf2b get_flag_inst.
+    inputs:
+      item_pointer: "${{ steps.fetch_tracker.outputs.body.rightsizing_item_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/governance/action_item/${{ steps.fetch_tracker.outputs.body.rightsizing_item_id }}"
+      # 404/410 = the item is gone — clean the stale pointer.
+      failOnHttpError: false
+
+  - id: verify
+    type: module
+    plugin_type: code-exec
+    name: "Verify Outcome"
+    inputs:
+      scope: "${{ workflow.inputs.scope }}"
+      item_status: "${{ steps.fetch_item.outputs.status }}"
+      item: "${{ steps.fetch_item.outputs.body }}"
+      instance: "${{ steps.fetch_tracker.outputs.body }}"
+      target_util_map: "${{ vars.RIGHTSIZING_TARGET_UTIL_BY_ENV || '' }}"
+      price_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }}"
+      price_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }}"
+    config:
+      code: |
+        function r2(x) { return Math.round(x * 100) / 100; }
+        var inst = inputs.instance || {};
+        var itemId = String(inst.rightsizing_item_id || '');
+        var item = (Number(inputs.item_status) === 200 && inputs.item) ? inputs.item : null;
+        // Item gone or already closed elsewhere (wf4 deploy path, by hand):
+        // the tracker pointer is stale — clean it, don't guess a status.
+        var CLOSED = { closed: 1, resolved: 1, done: 1, cancelled: 1, dismissed: 1 };
+        if (!item || CLOSED[String(item.status || '').toLowerCase()]) {
+          return { verdict: 'stale_pointer', item_id: itemId };
+        }
+        var md = item.metadata || {};
+        var series = inst.daily_series || [];
+        // Change detection works on PER-POD requests: requests are per-pod
+        // CONFIG, so only a spec change moves them. Fleet totals
+        // (Σ across pods) move with autoscaling replica counts — comparing
+        // those closed items on scale-ups (observed live 2026-07-19:
+        // "1024MB → 1280MB" was 4→5 replicas of 256MB, not a change).
+        function ppd(p) {
+          p = p || {};
+          var pods = Number(p.pods_avg) || 0;
+          var r = Number(p.cpu_req_mc) || 0;
+          var m = Number(p.mem_req_mb) || 0;
+          if (!(pods > 0) || !(r > 0)) return null;
+          return { d: p.d, cpu: r / pods, mem: m / pods, raw: p };
+        }
+        var pp = [];
+        for (var i = 0; i < series.length; i++) { var x = ppd(series[i]); if (x) pp.push(x); }
+        if (pp.length === 0) {
+          return { verdict: 'unchanged', item_id: itemId, note: 'no per-pod request series to compare' };
+        }
+        // Baseline = the last day at or before the item's detection date
+        // (fallback: the first usable day).
+        var det = String(md.detected_at || '').slice(0, 10);
+        var base = pp[0];
+        for (var b = 0; b < pp.length; b++) {
+          if (det && pp[b].d <= det) base = pp[b];
+        }
+        function changed(a, c) { return a > 0 && c > 0 && Math.abs(a - c) / a > 0.05; }
+        // Change day: first day AFTER the baseline whose per-pod request
+        // deviates >5% on either dimension.
+        var changeIdx = -1;
+        for (var j = 0; j < pp.length; j++) {
+          if (pp[j].d <= base.d) continue;
+          if (changed(base.cpu, pp[j].cpu) || changed(base.mem, pp[j].mem)) { changeIdx = j; break; }
+        }
+        if (changeIdx < 0) {
+          return { verdict: 'unchanged', item_id: itemId };
+        }
+        var post = [];
+        for (var k = changeIdx; k < pp.length; k++) post.push(pp[k].raw);
+        if (post.length < 3) {
+          return { verdict: 'awaiting_data', item_id: itemId, post_days: post.length };
+        }
+        var curPP = pp[pp.length - 1];
+        var podsNow = Number(curPP.raw.pods_avg) || 1;
+        var obsCpu = base.cpu * podsNow, obsMem = base.mem * podsNow;
+        var curCpu = curPP.cpu * podsNow, curMem = curPP.mem * podsNow;
+        // Post-change utilization (avg + peak when the series has the v3
+        // peak profile).
+        var cu = 0, mu = 0, pk = 0, pkn = 0;
+        for (var m = 0; m < post.length; m++) {
+          var e = post[m];
+          cu += ((Number(e.cpu_mc_h) || 0) / 24) / Number(e.cpu_req_mc) * 100;
+          mu += ((Number(e.mem_mb_h) || 0) / 24) / (Number(e.mem_req_mb) || 1) * 100;
+          if ((Number(e.cpu_mc_pk10m) || 0) > 0) { pk += Number(e.cpu_mc_pk10m) / Number(e.cpu_req_mc) * 100; pkn++; }
+        }
+        cu = cu / post.length; mu = mu / post.length;
+        var peakUtil = pkn > 0 ? pk / pkn : null;
+        var env = String(md.environment || 'unknown').toLowerCase();
+        var tuMap = {};
+        try { tuMap = JSON.parse(String(inputs.target_util_map || '')) || {}; } catch (e2) { tuMap = {}; }
+        var tu = tuMap[env] || tuMap['default'] || {};
+        var ceilCpu = Number(tu.cpu) > 0 ? Number(tu.cpu) : 70;
+        var ceilMem = Number(tu.mem) > 0 ? Number(tu.mem) : 85;
+        var basis = String(tu.basis || 'avg');
+        var cpuCheck = basis === 'peak10m' && peakUtil !== null ? peakUtil : cu;
+        var hot = cpuCheck > Math.max(ceilCpu, 90) || mu > Math.max(ceilMem, 90) || cu > 90 || mu > 90;
+        var HOURS_MONTH = 730;
+        var realized = r2(Math.max(0, obsCpu - curCpu) * (Number(inputs.price_cpu) || 0) * HOURS_MONTH +
+                          Math.max(0, obsMem - curMem) * (Number(inputs.price_mem) || 0) * HOURS_MONTH);
+        var before = 'CPU ' + r2(base.cpu) + 'mc / mem ' + r2(base.mem) + 'MB per pod';
+        var after = 'CPU ' + r2(curPP.cpu) + 'mc / mem ' + r2(curPP.mem) + 'MB per pod (~' + r2(podsNow) + ' pods)';
+        var utilLine = 'post-change utilization over ' + post.length + ' days: cpu avg ' + r2(cu) + '%' +
+          (peakUtil !== null ? ' (peak10m ' + r2(peakUtil) + '%)' : '') + ', mem avg ' + r2(mu) + '%';
+        if (hot) {
+          return {
+            verdict: 'verified_warning', item_id: itemId,
+            realized_savings_usd_month: realized,
+            comment: 'Right-sizing verified by the closer: the requested resources changed (' + before + ' → ' + after +
+              ', realized saving ~' + realized + ' USD/month) — but the scope now runs HOT: ' + utilLine +
+              '. Consider raising the requests again or reviewing the change; the catalog flags this scope as under-provisioned.',
+            close_reason: 'Change applied but post-change utilization is above the safe band — closed with a warning by the right-sizing closer.'
+          };
+        }
+        return {
+          verdict: 'verified', item_id: itemId,
+          realized_savings_usd_month: realized,
+          comment: 'Right-sizing verified by the closer: requested resources changed (' + before + ' → ' + after +
+            ') and the scope runs healthy — ' + utilLine + '. Realized saving ~' + realized + ' USD/month.',
+          close_reason: 'Change applied and verified healthy by the right-sizing closer (realized saving ~' + realized + ' USD/month).'
+        };
+
+  - id: route
+    type: decider
+    plugin_type: case
+    name: "Route Verdict"
+    config:
+      # RAW expression (no ${{ }}) — see wf2b scan_route. The two closing
+      # verdicts (verified / verified_warning) CONVERGE on the default port:
+      # two edges from the same decider into one any-join target would run
+      # the target once per edge.
+      expression: "steps.verify.outputs.verdict"
+      cases:
+        - { match: "stale_pointer", port: "cleanup" }
+        - { match: "unchanged", port: "noop" }
+        - { match: "awaiting_data", port: "waiting" }
+      default: "closeable"
+
+  # ── verified / warning: comment + close + flag ────────────────────────
+  - id: post_comment
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment Outcome"
+    inputs:
+      text: "${{ steps.verify.outputs.comment }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ steps.verify.outputs.item_id }}"
+      author: "agent:rightsizing-closer"
+      content: "${{ inputs.text }}"
+
+  - id: close_item
+    type: module
+    plugin_type: np-action-item-update
+    name: "Close Item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      reason: "${{ steps.verify.outputs.close_reason }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ steps.verify.outputs.item_id }}"
+      action: close
+      # Lifecycle transitions require an actor.
+      actor: "agent:rightsizing-closer"
+      reason: "${{ inputs.reason }}"
+
+  - id: stash_closed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: closed"
+    inputs:
+      verdict: "${{ steps.verify.outputs.verdict }}"
+      item: "${{ steps.verify.outputs.item_id }}"
+      realized: "${{ steps.verify.outputs.realized_savings_usd_month }}"
+    config:
+      path: result
+      value:
+        status: "${{ inputs.verdict }}"
+        action_item_id: "${{ inputs.item }}"
+        realized_savings_usd_month: "${{ inputs.realized }}"
+
+  # ── flag sync (closed or stale pointer) ───────────────────────────────
+  - id: build_flag
+    type: module
+    plugin_type: code-exec
+    name: "Build Flag Payload"
+    # Converges the closed and the stale-pointer paths — only one fires.
+    join_strategy: any
+    inputs:
+      body: "${{ steps.fetch_tracker.outputs.body }}"
+      verdict: "${{ steps.verify.outputs.verdict }}"
+    config:
+      code: |
+        // inputs are frozen in the sandbox — build a shallow copy to modify.
+        var inst = {};
+        for (var k in (inputs.body || {})) inst[k] = inputs.body[k];
+        var v = String(inputs.verdict || '');
+        // verified → the change landed and looks healthy; warning → the
+        // scope now runs hot; stale pointer → the item vanished, back to
+        // unknown until the scanner rules again.
+        inst.provisioning_status = v === 'verified' ? 'optimal'
+          : v === 'verified_warning' ? 'under_provisioned'
+          : 'unknown';
+        inst.rightsizing_item_id = null;
+        inst.last_scan_note = v === 'verified'
+          ? 'Right-sizing applied and verified healthy by the closer'
+          : v === 'verified_warning'
+          ? 'Right-sizing applied but the scope now runs HOT — review the requests'
+          : 'Stale item pointer cleaned by the closer';
+        return { payload: inst };
+
+  - id: put_flag
+    type: module
+    plugin_type: np-api-call
+    name: "Write Provisioning Flag"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      payload: "${{ steps.build_flag.outputs.payload }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      body: "${{ inputs.payload }}"
+
+  - id: stash_cleaned
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: stale pointer cleaned"
+    config:
+      path: result
+      value:
+        status: "stale_pointer"
+        action_item_id: "${{ steps.verify.outputs.item_id }}"
+        realized_savings_usd_month: 0
+
+  # ── silent outcomes ───────────────────────────────────────────────────
+  - id: stash_noop
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: unchanged"
+    config:
+      path: result
+      value:
+        status: "unchanged"
+        action_item_id: "${{ steps.verify.outputs.item_id }}"
+        realized_savings_usd_month: 0
+
+  - id: stash_waiting
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: awaiting data"
+    config:
+      path: result
+      value:
+        status: "awaiting_data"
+        action_item_id: "${{ steps.verify.outputs.item_id }}"
+        realized_savings_usd_month: 0
+
+connections:
+  - { id: c1, from: start,         to: fetch_tracker }
+  - { id: c2, from: fetch_tracker, to: has_item }
+  - { id: c3, from: has_item,      to: fetch_item,    source_port: "true" }
+  - { id: c4, from: has_item,      to: stash_no_item, source_port: "false" }
+  - { id: c5, from: fetch_item,    to: verify }
+  - { id: c6, from: verify,        to: route }
+  - { id: c7, from: route,         to: post_comment,  source_port: "closeable" }
+  - { id: c9, from: post_comment,  to: close_item }
+  - { id: c10, from: close_item,   to: stash_closed }
+  - { id: c11, from: stash_closed, to: build_flag }
+  - { id: c12, from: route,        to: stash_cleaned, source_port: "cleanup" }
+  - { id: c13, from: stash_cleaned, to: build_flag }
+  - { id: c14, from: build_flag,   to: put_flag }
+  - { id: c15, from: route,        to: stash_noop,    source_port: "noop" }
+  - { id: c16, from: route,        to: stash_waiting, source_port: "waiting" }
+
+outputs:
+  status:                       "${{ variables.result.status }}"
+  action_item_id:               "${{ variables.result.action_item_id }}"
+  realized_savings_usd_month:   "${{ variables.result.realized_savings_usd_month }}"
+  scope_id:                     "${{ workflow.inputs.scope.scope_id }}"
+  scope_name:                   "${{ workflow.inputs.scope.scope_name }}"

@@ -1,0 +1,87 @@
+# AI-deploy tool: finalize or cancel (rollback) a blue-green deployment.
+#
+# Verified mechanism on the k8s-agent provider (audit-checked): the UI
+# finalizes with PATCH {"status":"finalizing"} and cancels with
+# PATCH {"status":"cancelling"}; the provider job drives the deployment to
+# the terminal state (finalized / rolled_back). Confirm with deploy_status.
+id: deploy_finish
+name: "Deploy Tool — Finalize / Cancel"
+description: >
+  Ends a blue-green deployment. Inputs: deployment_id (string, required),
+  action (string, required: "finalize" locks in the new version and removes
+  the old one; "cancel" rolls back to the previous version). Returns
+  {ok, http_status, blocked_reason}. The transition is asynchronous —
+  confirm the terminal status (finalized / rolled_back) with deploy_status.
+path: "/deploy"
+semantic_version: 1.0.0
+
+inputs:
+  deployment_id:
+    type: string
+    required: true
+  action:
+    type: string
+    required: true
+    description: "finalize | cancel"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Finalizes or cancels a deployment (AI-deploy tool)."
+      inputs:
+        deployment_id: { type: string, required: true }
+        action: { type: string, required: true }
+
+  - id: map_action
+    type: module
+    plugin_type: code-exec
+    name: "Map Action to Status"
+    inputs:
+      action: "${{ workflow.inputs.action }}"
+    config:
+      code: |
+        var a = String(inputs.action || '').trim().toLowerCase();
+        if (a === 'finalize') return { status: 'finalizing' };
+        if (a === 'cancel' || a === 'rollback') return { status: 'cancelling' };
+        throw new Error('action must be finalize or cancel, got: ' + inputs.action);
+
+  - id: patch
+    type: module
+    plugin_type: np-api-call
+    name: "Transition Deployment"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/deployment/${{ workflow.inputs.deployment_id }}"
+      failOnHttpError: false
+      body:
+        status: "${{ steps.map_action.outputs.status }}"
+
+  - id: shape
+    type: module
+    plugin_type: code-exec
+    name: "Shape Result"
+    inputs:
+      status: "${{ steps.patch.outputs.status }}"
+      body:   "${{ steps.patch.outputs.body }}"
+    config:
+      code: |
+        var st = Number(inputs.status) || 0;
+        if (st >= 200 && st < 300) return { ok: true, http_status: st, blocked_reason: '' };
+        var msg = String(((inputs.body || {}).message) || JSON.stringify(inputs.body || {})).slice(0, 300);
+        var kind = /approval|policy|checklist|not allowed|forbidden|denied/i.test(msg) || st === 403
+          ? 'blocked by an approval/policy/checklist gate' : 'rejected by the platform';
+        return { ok: false, http_status: st, blocked_reason: kind + ' — HTTP ' + st + ': ' + msg };
+
+connections:
+  - { id: c1, from: start,      to: map_action }
+  - { id: c2, from: map_action, to: patch }
+  - { id: c3, from: patch,      to: shape }
+
+outputs:
+  ok:             "${{ steps.shape.outputs.ok }}"
+  http_status:    "${{ steps.shape.outputs.http_status }}"
+  blocked_reason: "${{ steps.shape.outputs.blocked_reason }}"

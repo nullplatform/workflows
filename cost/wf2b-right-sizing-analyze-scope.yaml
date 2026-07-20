@@ -1,0 +1,1658 @@
+# Sub-workflow: right-sizing analysis for ONE K8s scope.
+#
+# Called by wf2-right-sizing-scanner once per scope (forEach fan-out).
+# Two phases on one canvas:
+#   1. Deterministic: 14-day hourly usage vs requests (np agent → Prometheus)
+#      → over-provision filter (avg request ≥ usage × (1 + PCT/100), request
+#      above the platform floors, naive saving above the per-environment
+#      minimum from RIGHTSIZING_MIN_SAVINGS_BY_ENV). Not a candidate → stop.
+#   2. AI deep-dive: claude-code-agent with a metrics zoom-in tool
+#      (cost_metrics_tool) confirms the opportunity is genuine, recommends new
+#      requests, estimates the saving and picks the apply mode. Not genuine
+#      (or AI-estimated saving below the minimum) → stop.
+# Genuine → idempotent action item (metadata.rightsizing_key) + ONE
+# suggestion whose metadata.mode is the AI-chosen apply mode
+# (nocturnal-deploy | apply-only), executed by wf4-apply-rightsizing when
+# accepted (routed by wf3).
+id: right_sizing_analyze_scope
+name: "Right Sizing — Analyze Scope"
+description: >
+  Analyzes one K8s scope for over-provisioned CPU/memory (deterministic
+  filter + AI validation with metric zoom-in) and ensures an action item with
+  applyable suggestions when a genuine opportunity exists.
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  scope:
+    type: object
+    required: true
+    description: "Scope row: {scope_id, scope_name, scope_slug, scope_nrn, app_name}"
+  min_savings_by_env:
+    type: string
+    required: false
+    description: >
+      JSON object mapping environment (lowercase) → minimum estimated monthly
+      saving (USD) required to open an action item, e.g.
+      {"default":1,"production":5}. Overrides the
+      RIGHTSIZING_MIN_SAVINGS_BY_ENV config entry (normally left empty).
+  min_change_pct_by_env:
+    type: string
+    required: false
+    description: >
+      JSON object mapping environment (lowercase) → minimum change (% of the
+      configured request) worth acting on, e.g. {"default":10,
+      "production":25}. Overrides RIGHTSIZING_MIN_CHANGE_PCT_BY_ENV
+      (normally left empty).
+  target_util_by_env:
+    type: string
+    required: false
+    description: >
+      JSON object mapping environment → utilization ceiling + per-dimension
+      basis, e.g. {"production":{"cpu":50,"mem":70,"cpu_basis":"p95_10m",
+      "mem_basis":"peak10m"}}. Overrides RIGHTSIZING_TARGET_UTIL_BY_ENV
+      (normally left empty).
+  floors_by_env:
+    type: string
+    required: false
+    description: >
+      JSON object mapping environment → platform floors, e.g.
+      {"default":{"cpu":50,"mem":64},"production":{"cpu":100,"mem":128}}.
+      Overrides RIGHTSIZING_FLOORS_BY_ENV (normally left empty).
+  matchers_template:
+    type: string
+    required: false
+    description: >
+      Override for COST_POD_MATCHERS_TEMPLATE ('scope' delegates the pod
+      mapping to the collector script; normally left empty).
+  force:
+    type: boolean
+    required: false
+    description: >
+      Bypass the tracker-data prefilter and always run the full Prometheus
+      analysis (default false).
+
+variables:
+  result: { initialValue: { status: "other", action_item_id: null, estimated_savings_usd_month: 0 } }
+  created_item: { initialValue: { id: null } }
+  found: { initialValue: { count: 0, items: [], firstMatch: null } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Analyzes one scope for right-sizing (normally invoked by the scanner)."
+      inputs:
+        scope:
+          type: object
+          required: true
+          description: "Scope row (see workflow description)"
+
+  # ── Phase 0: cheap prefilter on tracker data ──────────────────────────
+  # Two NP API calls route the scope WITHOUT touching Prometheus or the AI:
+  #   - live item + tracker says the scope is now healthy → close it cheaply
+  #     (the item is stale) — the item lifecycle never needs the full
+  #     analysis, only the tracker's daily history.
+  #   - live item still backed by the data → skip (the item already reports
+  #     the opportunity; nothing new to say).
+  #   - no item, scanned within the rescan window (RIGHTSIZING_RESCAN_DAYS,
+  #     default 15) → skip: a scope's usage profile doesn't change weekly,
+  #     and every full analysis costs an AI run.
+  #   - no item, tracker 7d history clearly healthy → skip.
+  #   - everything else (no data, stale scan, headroom showing) → full
+  #     analysis. When in doubt, analyze.
+  - id: fetch_tracker
+    type: module
+    plugin_type: np-api-call
+    name: "Read Tracker Metadata"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      # 404 = tracker hasn't seen this scope — analyze fully.
+      failOnHttpError: false
+
+  - id: find_live
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Live Item (prefilter)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      metadataKey: rightsizing_key
+      metadataValue: "rightsizing:${{ workflow.inputs.scope.scope_id }}"
+
+  - id: prefilter
+    type: module
+    plugin_type: code-exec
+    name: "Tracker-Data Prefilter"
+    inputs:
+      force: "${{ workflow.inputs.force }}"
+      live_count: "${{ steps.find_live.outputs.count }}"
+      got_status: "${{ steps.fetch_tracker.outputs.status }}"
+      instance: "${{ steps.fetch_tracker.outputs.body }}"
+      pct: "${{ vars.RIGHTSIZING_DEVIATION_PCT || '50' }}"
+      rescan_days: "${{ vars.RIGHTSIZING_RESCAN_DAYS || '15' }}"
+    config:
+      code: |
+        function r2(x) { return Math.round(x * 100) / 100; }
+        var live = Number(inputs.live_count) > 0;
+        if (inputs.force === true || String(inputs.force) === 'true') {
+          return { route: 'analyze', reason: 'forced' };
+        }
+        var inst = (Number(inputs.got_status) === 200 && inputs.instance) ? inputs.instance : null;
+
+        // Tracker 7d utilization (both dims). /24 (not hours-with-data)
+        // biases utilization DOWN on partial days → toward analyzing /
+        // keeping items open. Conservative by construction.
+        var ca = null, ma = null, usable = 0;
+        if (inst) {
+          var series = inst.daily_series || [];
+          var pts = series.slice(-7);
+          var cpuU = [], memU = [];
+          for (var i = 0; i < pts.length; i++) {
+            var p = pts[i] || {};
+            var cReq = Number(p.cpu_req_mc) || 0, mReq = Number(p.mem_req_mb) || 0;
+            if (!(cReq > 0) || !(mReq > 0)) continue;
+            cpuU.push(((Number(p.cpu_mc_h) || 0) / 24 / cReq) * 100);
+            memU.push(((Number(p.mem_mb_h) || 0) / 24 / mReq) * 100);
+          }
+          usable = cpuU.length;
+          function avg(a) { var s = 0; for (var j = 0; j < a.length; j++) s += a[j]; return s / a.length; }
+          if (usable >= 3) { ca = avg(cpuU); ma = avg(memU); }
+        }
+        var pct = Number(inputs.pct) > 0 ? Number(inputs.pct) : 50;
+        var thr = 100 / (1 + pct / 100);
+        var healthy = ca !== null && ca >= thr && ma >= thr;
+
+        if (live) {
+          // Item lifecycle runs on tracker data alone — no Prometheus, no AI.
+          if (healthy) {
+            return {
+              route: 'close',
+              reason: 'live item but the tracker 7d avg is healthy: cpu ' + r2(ca) + '%, mem ' + r2(ma) + '% (threshold ' + r2(thr) + '%) — the opportunity no longer exists',
+              cpu_util_7d: r2(ca), mem_util_7d: r2(ma), threshold_pct: r2(thr)
+            };
+          }
+          return {
+            route: 'skip_active',
+            reason: ca === null
+              ? 'live item; tracker history too thin to re-validate (' + usable + ' usable days) — keeping it open'
+              : 'live item still backed by the data: cpu ' + r2(ca) + '%, mem ' + r2(ma) + '% (threshold ' + r2(thr) + '%)',
+            cpu_util_7d: ca === null ? null : r2(ca), mem_util_7d: ma === null ? null : r2(ma)
+          };
+        }
+
+        // No live item: honor the rescan window first — a scope analyzed
+        // recently (any conclusive verdict) is not re-analyzed; profiles
+        // don't change weekly and each full analysis costs an AI run.
+        var rescanDays = Number(inputs.rescan_days) > 0 ? Number(inputs.rescan_days) : 15;
+        var lastScan = inst && inst.last_scan_at ? Date.parse(String(inst.last_scan_at)) : NaN;
+        var lastStatus = inst ? String(inst.last_scan_status || '') : '';
+        if (isFinite(lastScan) && lastStatus && lastStatus !== 'no_data') {
+          var ageDays = (Date.now() - lastScan) / 86400000;
+          if (ageDays < rescanDays) {
+            return {
+              route: 'skip',
+              reason: 'scanned ' + r2(ageDays) + ' days ago (' + lastStatus + '); rescan window is ' + rescanDays + ' days',
+              last_scan_age_days: r2(ageDays)
+            };
+          }
+        }
+        if (!inst) {
+          return { route: 'analyze', reason: 'no tracker data for this scope yet' };
+        }
+        if (usable < 3) {
+          return { route: 'analyze', reason: 'insufficient tracker history (' + usable + ' usable days)' };
+        }
+        if (healthy) {
+          return {
+            route: 'skip',
+            reason: 'healthy per tracker 7d avg: cpu ' + r2(ca) + '%, mem ' + r2(ma) + '% (threshold ' + r2(thr) + '%)',
+            cpu_util_7d: r2(ca), mem_util_7d: r2(ma)
+          };
+        }
+        return {
+          route: 'analyze',
+          reason: 'tracker 7d avg suggests headroom: cpu ' + r2(ca) + '%, mem ' + r2(ma) + '% (threshold ' + r2(thr) + '%)',
+          cpu_util_7d: r2(ca), mem_util_7d: r2(ma)
+        };
+
+  # Deciders run in-sandbox (ports always known) — safe to wire all four.
+  - id: scan_route
+    type: decider
+    plugin_type: case
+    name: "Route Scan"
+    config:
+      # RAW expression (no ${{ }}): like `conditional`, the case decider
+      # evaluates the expression itself — template delimiters would be
+      # resolved by the engine BEFORE the plugin sees them.
+      expression: "steps.prefilter.outputs.route"
+      cases:
+        - { match: "analyze", port: "analyze" }
+        - { match: "skip", port: "skip" }
+        - { match: "skip_active", port: "skip_active" }
+        - { match: "close", port: "close" }
+
+  - id: stash_prefiltered
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: prefiltered"
+    inputs:
+      why: "${{ steps.prefilter.outputs.reason }}"
+    config:
+      path: result
+      value:
+        status: "prefiltered"
+        action_item_id: null
+        estimated_savings_usd_month: 0
+        reason: "${{ inputs.why }}"
+
+  # Live item still backed by the tracker data: leave it as-is. The item
+  # already reports the opportunity — re-running the AI would only reshuffle
+  # the same numbers.
+  - id: stash_active_valid
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: active item valid"
+    inputs:
+      why:  "${{ steps.prefilter.outputs.reason }}"
+      item: "${{ steps.find_live.outputs.firstMatch.id }}"
+    config:
+      path: result
+      value:
+        status: "active_valid"
+        action_item_id: "${{ inputs.item }}"
+        estimated_savings_usd_month: 0
+        reason: "${{ inputs.why }}"
+
+  # ── cheap stale close (tracker data said the item no longer applies) ──
+  - id: build_close_cheap
+    type: module
+    plugin_type: code-exec
+    name: "Build Close Reason (tracker)"
+    inputs:
+      pf: "${{ steps.prefilter.outputs }}"
+    config:
+      code: |
+        var pf = inputs.pf || {};
+        return {
+          reason: 'Auto-closed by the right-sizing scanner: the scope no longer qualifies — ' +
+            'the cost tracker 7-day average shows healthy utilization (cpu ' + pf.cpu_util_7d +
+            '%, mem ' + pf.mem_util_7d + '%, over-provisioning threshold ' + pf.threshold_pct +
+            '%). The change may have been applied manually or the load grew.'
+        };
+
+  - id: close_cheap
+    type: module
+    plugin_type: np-action-item-update
+    name: "Close Stale Item (tracker)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      reason: "${{ steps.build_close_cheap.outputs.reason }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ steps.find_live.outputs.firstMatch.id }}"
+      action: close
+      # Lifecycle transitions require an actor (same as wf4's close_item).
+      actor: "agent:rightsizing-scanner"
+      reason: "${{ inputs.reason }}"
+
+  - id: stash_closed_cheap
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: closed (tracker)"
+    config:
+      path: result
+      value:
+        status: "closed_stale"
+        action_item_id: "${{ steps.find_live.outputs.firstMatch.id }}"
+        estimated_savings_usd_month: 0
+
+  # ── Phase 1: deterministic usage-vs-request filter ────────────────────
+  - id: build_command
+    type: module
+    plugin_type: code-exec
+    name: "Build Collector Command"
+    inputs:
+      scope: "${{ workflow.inputs.scope }}"
+      base:     "${{ vars.COST_AGENT_CMDLINE || '/opt/nullplatform/cost/collect-metrics.sh' }}"
+      template: "${{ workflow.inputs.matchers_template || vars.COST_POD_MATCHERS_TEMPLATE || 'namespace=\"{app_name}\",pod=~\"{scope_slug}.*\"' }}"
+      days:     "${{ vars.RIGHTSIZING_LOOKBACK_DAYS || '14' }}"
+      k8s_namespace: "${{ vars.COST_K8S_NAMESPACE || 'nullplatform' }}"
+    config:
+      code: |
+        var s = inputs.scope || {};
+        var tpl = String(inputs.template || '');
+        var days = Number(inputs.days) > 0 ? Number(inputs.days) : 14;
+        // 'scope' template: the script resolves the null->k8s mapping itself
+        // (both pod naming styles, dead pods included) — see wf1b for why.
+        if (tpl === 'scope') {
+          if (!s.scope_id) throw new Error('scope.scope_id is required for the scope template');
+          var cmdline = String(inputs.base) +
+            " --mode range --days " + days +
+            " --scope " + String(s.scope_id);
+          // The AI's zoom-in queries go through wf2c (base64 PromQL), so it
+          // CAN use real matchers even though the agent command line cannot —
+          // emit the same regex the script builds so the prompt stays honest.
+          var ns = String(inputs.k8s_namespace || 'nullplatform');
+          var promMatchers = 'namespace="' + ns + '",pod=~"(d-' + String(s.scope_id) +
+            '-|.*-' + String(s.scope_id) + '-d-).*"';
+          return { cmdline: cmdline, matchers: promMatchers, days: days };
+        }
+        var matchers = tpl
+          .split('{scope_id}').join(String(s.scope_id || ''))
+          .split('{scope_slug}').join(String(s.scope_slug || ''))
+          .split('{scope_name}').join(String(s.scope_name || ''))
+          .split('{app_name}').join(String(s.app_name || ''));
+        if (matchers.indexOf("'") !== -1) {
+          throw new Error('COST_POD_MATCHERS_TEMPLATE must not contain single quotes');
+        }
+        var cmdline = String(inputs.base) +
+          " --mode range --days " + days +
+          " --matchers '" + matchers + "'";
+        return { cmdline: cmdline, matchers: matchers, days: days };
+
+  - id: collect_usage
+    type: module
+    plugin_type: np-agent-command
+    name: "Collect 14d Usage (np agent)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "5s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      cmdline: "${{ steps.build_command.outputs.cmdline }}"
+    config:
+      command_type: exec
+      apikey: "${{ secrets.NP_API_KEY }}"
+      timeout_seconds: 180
+      # Control plane rejects `data.env` on exec — see wf1b run_collector.
+      inject_workflow_env: false
+      agent_selector:
+        nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
+        tags:
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+      # Placeholder so validateConfig() (config-only, pre-execute) passes;
+      # inputs.cmdline (whitelisted override) replaces it at run time.
+      cmdline: "/bin/true"
+
+  # The scope's environment dimension (dev/prod/…) lives on the scope API
+  # entity, not in the lake row the scanner passes in — fetch it to resolve
+  # the per-environment minimum-saving cap.
+  - id: fetch_scope
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Scope (environment)"
+    inputs:
+      collector_status: "${{ steps.collect_usage.outputs.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/scope/${{ workflow.inputs.scope.scope_id }}"
+      # A failed fetch only means "environment unknown" → default cap applies.
+      failOnHttpError: false
+
+  - id: evaluate
+    type: module
+    plugin_type: code-exec
+    name: "Over-provision Filter"
+    inputs:
+      stdout: "${{ steps.collect_usage.outputs.stdout }}"
+      scope:  "${{ workflow.inputs.scope }}"
+      scope_detail: "${{ steps.fetch_scope.outputs.body }}"
+      min_savings_map: "${{ workflow.inputs.min_savings_by_env || vars.RIGHTSIZING_MIN_SAVINGS_BY_ENV || '' }}"
+      min_change_map:  "${{ workflow.inputs.min_change_pct_by_env || vars.RIGHTSIZING_MIN_CHANGE_PCT_BY_ENV || '' }}"
+      target_util_map: "${{ workflow.inputs.target_util_by_env || vars.RIGHTSIZING_TARGET_UTIL_BY_ENV || '' }}"
+      min_replicas_map: "${{ vars.RIGHTSIZING_MIN_REPLICAS_BY_ENV || '' }}"
+      pct:       "${{ vars.RIGHTSIZING_DEVIATION_PCT || '50' }}"
+      cpu_min:   "${{ vars.CPU_MIN_MILLICORES || '100' }}"
+      mem_min:   "${{ vars.MEM_MIN_MB || '128' }}"
+      floors_map: "${{ workflow.inputs.floors_by_env || vars.RIGHTSIZING_FLOORS_BY_ENV || '' }}"
+      price_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }}"
+      price_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }}"
+    config:
+      code: |
+        var parsed;
+        try { parsed = JSON.parse(String(inputs.stdout || '')); }
+        catch (e) { throw new Error('Collector stdout is not JSON: ' + String(inputs.stdout).slice(0, 200)); }
+        if (parsed.error) throw new Error('Collector failed: ' + parsed.error);
+
+        var sum = parsed.summary || {};
+        var cpu = sum.cpu || {};
+        var mem = sum.mem || {};
+        var points = parsed.points || [];
+        if (points.length === 0) {
+          return { candidate: false, status: 'no_data', stats: sum };
+        }
+
+        var pct = Number(inputs.pct) > 0 ? Number(inputs.pct) : 50;
+        var factor = 1 + pct / 100;
+        var cpuMin = Number(inputs.cpu_min) || 100;
+        var memMin = Number(inputs.mem_min) || 128;
+        var pCpu = Number(inputs.price_cpu) || 0;
+        var pMem = Number(inputs.price_mem) || 0;
+        var HOURS_MONTH = 730;
+
+        function r2(x) { return Math.round(x * 100) / 100; }
+
+        // Per-environment minimum saving: an opportunity below this floor is
+        // not worth an action item (a ticket costs human attention). Keys are
+        // lowercase environment names + "default"; missing/unparseable → 0.
+        var capMap = {};
+        try { capMap = JSON.parse(String(inputs.min_savings_map || '')) || {}; } catch (e) { capMap = {}; }
+        var env = String((((inputs.scope_detail || {}).dimensions) || {}).environment || 'unknown').toLowerCase();
+        var cap = Number(capMap[env] !== undefined ? capMap[env] : capMap['default']) || 0;
+
+        // Utilization ceilings + replica floor per environment (policy):
+        // post-change utilization must stay AT OR BELOW these targets. The
+        // BASIS the ceiling applies to is per-environment AND per-dimension:
+        //   cpu_basis: "p95_10m" (default for production via config) — CPU
+        //     is compressible; sizing to the p95 of 10-minute windows keeps
+        //     real traffic peaks inside the ceiling while IGNORING one-off
+        //     deployment/startup bursts (observed live: a 10-min startup
+        //     burst under basis peak10m inflated the requirement past the
+        //     configured request and KILLED genuine candidates).
+        //   mem_basis: "peak10m" — memory is not compressible; the observed
+        //     maximum working set is the safety line.
+        //   "avg" (default) measures on window averages (dev tolerates
+        //     transient saturation).
+        // Back-compat: a single `basis` key applies to both dimensions.
+        var tuMap = {};
+        try { tuMap = JSON.parse(String(inputs.target_util_map || '')) || {}; } catch (e) { tuMap = {}; }
+        var tu = tuMap[env] || tuMap['default'] || {};
+        var targetCpuPct = Number(tu.cpu) > 0 ? Number(tu.cpu) : 70;
+        var targetMemPct = Number(tu.mem) > 0 ? Number(tu.mem) : 85;
+        var VALID_BASIS = { avg: 1, peak10m: 1, p95_10m: 1 };
+        function pickBasis(specific, fallback) {
+          var b = String(specific || fallback || 'avg');
+          return VALID_BASIS[b] ? b : 'avg';
+        }
+        var cpuBasis = pickBasis(tu.cpu_basis, tu.basis);
+        var memBasis = pickBasis(tu.mem_basis, tu.basis) === 'p95_10m' ? 'peak10m' : pickBasis(tu.mem_basis, tu.basis);
+        // ALL sizing math runs PER POD: requests are per-pod config, and
+        // fleet sums move with the autoscaler's replica count (observed
+        // live: a scope scaling 2→9 pods made its fleet peaks track replica
+        // count, the naive rec matched the fleet request, and a genuine
+        // candidate was rejected AND its item closed). Fleet stats stay in
+        // the outputs for cost context only.
+        var pp = parsed.per_pod || {};
+        var podsAvg = Number(pp.pod_count_avg) > 0 ? Number(pp.pod_count_avg) : 1;
+        var ppc = pp.cpu || {};
+        var ppm = pp.mem || {};
+        // Current per-pod requests: KSM per-pod value (collector v4);
+        // fall back to fleet/pods for older collectors.
+        var ppReqC = Number(pp.req_cpu_mc) > 0 ? Number(pp.req_cpu_mc)
+          : (Number(cpu.request_now_mc) || Number(cpu.avg_request_mc) || 0) / podsAvg;
+        var ppReqM = Number(pp.req_mem_mb) > 0 ? Number(pp.req_mem_mb)
+          : (Number(mem.request_now_mb) || Number(mem.avg_request_mb) || 0) / podsAvg;
+        // Hottest-pod load profile (fallbacks: fleet metric / pods).
+        var cpuPeak = Number(ppc.hot_peak10m_mc) > 0 ? Number(ppc.hot_peak10m_mc)
+          : (Number(cpu.peak10m_mc) > 0 ? Number(cpu.peak10m_mc) : Number(cpu.p95_usage_mc) || 0) / podsAvg;
+        var cpuP9510 = Number(ppc.hot_p95_10m_mc) > 0 ? Number(ppc.hot_p95_10m_mc)
+          : Number(ppc.hot_p95_mc) > 0 ? Number(ppc.hot_p95_mc)
+          : (Number(cpu.p95_10m_mc) > 0 ? Number(cpu.p95_10m_mc) : Number(cpu.p95_usage_mc) || 0) / podsAvg;
+        var memPeak = Number(ppm.hot_peak_mb) > 0 ? Number(ppm.hot_peak_mb)
+          : (Number(mem.peak_mb) > 0 ? Number(mem.peak_mb) : Number(mem.p95_usage_mb) || 0) / podsAvg;
+        var cpuAvgPP = Number(ppc.hot_avg_mc) > 0 ? Number(ppc.hot_avg_mc) : (Number(cpu.avg_usage_mc) || 0) / podsAvg;
+        var memAvgPP = Number(ppm.hot_avg_mb) > 0 ? Number(ppm.hot_avg_mb) : (Number(mem.avg_usage_mb) || 0) / podsAvg;
+
+        // Per-environment platform floors: production keeps the classic
+        // 100mc/128MB; non-prod can go lower (50mc/64MB) — dozens of tiny
+        // idle scopes pinned at an oversized floor are real money.
+        var flMap = {};
+        try { flMap = JSON.parse(String(inputs.floors_map || '')) || {}; } catch (e) { flMap = {}; }
+        var fl = flMap[env] || flMap['default'] || {};
+        cpuMin = Number(fl.cpu) > 0 ? Number(fl.cpu) : cpuMin;
+        memMin = Number(fl.mem) > 0 ? Number(fl.mem) : memMin;
+        var repMap = {};
+        try { repMap = JSON.parse(String(inputs.min_replicas_map || '')) || {}; } catch (e) { repMap = {}; }
+        var minReplicas = Number(repMap[env] !== undefined ? repMap[env] : repMap['default']) || 1;
+
+        // A dimension is over-provisioned when the PER-POD request exceeds
+        // per-pod usage by more than PCT% AND sits above the platform floor
+        // (nothing to reclaim from a scope already at the minimum).
+        var cpuOver = ppReqC > 0 && ppReqC >= cpuAvgPP * factor && ppReqC > cpuMin;
+        var memOver = ppReqM > 0 && ppReqM >= memAvgPP * factor && ppReqM > memMin;
+
+        // Naive PER-POD recommendation for the AI to challenge: the larger
+        // of p95 + 20% headroom and the utilization-ceiling floor, quantized
+        // UP (multiples of 50 below 1000, of 100 above — a 50mc floor is
+        // unreachable with 100-quantization), never below the platform
+        // floor. The ceiling floor works from each dimension's basis, on
+        // the HOTTEST pod's profile.
+        function q(v) { var step = v < 1000 ? 50 : 100; return Math.ceil(v / step) * step; }
+        var cpuBasisVal = cpuBasis === 'peak10m' ? cpuPeak : cpuBasis === 'p95_10m' ? cpuP9510 : cpuAvgPP;
+        var memBasisVal = memBasis === 'peak10m' ? memPeak : memAvgPP;
+        var cpuFromTarget = (cpuBasisVal * 100) / targetCpuPct;
+        var memFromTarget = (memBasisVal * 100) / targetMemPct;
+        var cpuP95Comp = cpuP9510 * 1.2;
+        var memP95Comp = (Number(ppm.hot_p95_mb) > 0 ? Number(ppm.hot_p95_mb) : memAvgPP) * 1.2;
+        var recCpu = Math.max(q(Math.max(cpuP95Comp, cpuFromTarget)), cpuMin);
+        var recMem = Math.max(q(Math.max(memP95Comp, memFromTarget)), memMin);
+
+        // Under-provisioning: the hottest pod's peak sits at/above 90% of
+        // its request on either dimension — throttling / OOM risk. Reported
+        // on the catalog flag even when there is nothing to reclaim.
+        var underProv = (ppReqC > 0 && cpuPeak >= ppReqC * 0.9) ||
+                        (ppReqM > 0 && memPeak >= ppReqM * 0.9);
+
+        // A change too small to bother: below N% of the configured request
+        // AND below 100 mc / 100 MB absolute — applying it costs more
+        // attention than it saves. N is per-environment
+        // (RIGHTSIZING_MIN_CHANGE_PCT_BY_ENV, e.g. {"default":10,
+        // "production":25} — production only acts on big wins).
+        var changeMap = {};
+        try { changeMap = JSON.parse(String(inputs.min_change_map || '')) || {}; } catch (e) { changeMap = {}; }
+        var changePct = Number(changeMap[env] !== undefined ? changeMap[env] : changeMap['default']);
+        if (!isFinite(changePct) || changePct <= 0) changePct = 10;
+        function worthChanging(current, rec) {
+          var delta = (Number(current) || 0) - rec;
+          if (delta <= 0) return false;
+          return delta >= ((Number(current) || 0) * changePct) / 100 || delta >= 100;
+        }
+        cpuOver = cpuOver && worthChanging(ppReqC, recCpu);
+        memOver = memOver && worthChanging(ppReqM, recMem);
+
+        // Monthly saving = per-pod reclaim × average replica count.
+        var saving = 0;
+        if (cpuOver) saving += Math.max(0, ppReqC - recCpu) * podsAvg * pCpu * HOURS_MONTH;
+        if (memOver) saving += Math.max(0, ppReqM - recMem) * podsAvg * pMem * HOURS_MONTH;
+
+        // Per-day digest of the hourly points — the AI's starting picture
+        // (avg vs max per day exposes spikes/trends without extra queries).
+        var byDay = {};
+        for (var i = 0; i < points.length; i++) {
+          var p = points[i] || {};
+          var d = new Date((Number(p.t) || 0) * 1000).toISOString().slice(0, 10);
+          var b = byDay[d] || (byDay[d] = { n: 0, cpuSum: 0, cpuMax: 0, memSum: 0, memMax: 0 });
+          b.n++;
+          b.cpuSum += Number(p.cpu_mc) || 0;
+          b.memSum += Number(p.mem_mb) || 0;
+          if ((Number(p.cpu_mc) || 0) > b.cpuMax) b.cpuMax = Number(p.cpu_mc) || 0;
+          if ((Number(p.mem_mb) || 0) > b.memMax) b.memMax = Number(p.mem_mb) || 0;
+        }
+        var digest = [];
+        var days = Object.keys(byDay).sort();
+        for (var j = 0; j < days.length; j++) {
+          var v = byDay[days[j]];
+          digest.push({ d: days[j], hours: v.n, cpu_avg_mc: r2(v.cpuSum / v.n), cpu_max_mc: r2(v.cpuMax), mem_avg_mb: r2(v.memSum / v.n), mem_max_mb: r2(v.memMax) });
+        }
+
+        // Descale check: replicas that never move while the load clearly
+        // does (per-pod peak-to-average ≥ 2×) mean the scope is not
+        // autoscaling — in the low-traffic valleys it burns the full fleet.
+        // Reported as a finding on the item (HPA review); right-sizing
+        // never changes replica counts itself.
+        var podsMin = Number(pp.pod_count_min) || 0;
+        var podsMax = Number(pp.pod_count_max) || 0;
+        var peakToAvg = cpuAvgPP > 0 ? cpuPeak / cpuAvgPP : 0;
+        var flatReplicas = podsMax > 0 && podsMin === podsMax && peakToAvg >= 2;
+        var autoscaling = {
+          flat_replicas: flatReplicas,
+          pods_min: podsMin,
+          pods_max: podsMax,
+          peak_to_avg_ratio: r2(peakToAvg)
+        };
+
+        var candidate = cpuOver || memOver;
+        var status = candidate ? 'candidate' : 'not_candidate';
+        if (candidate && r2(saving) < cap) {
+          candidate = false;
+          status = 'below_min_savings';
+        }
+        log.info('Right-sizing filter', {
+          scope: (inputs.scope || {}).scope_name,
+          environment: env, min_savings_usd_month: cap, min_change_pct: changePct,
+          candidate: candidate, status: status,
+          cpu_over: cpuOver, mem_over: memOver,
+          naive_saving_month: r2(saving)
+        });
+        return {
+          candidate: candidate,
+          status: status,
+          environment: env,
+          min_savings_usd_month: cap,
+          min_change_pct: changePct,
+          cpu_over: cpuOver,
+          mem_over: memOver,
+          stats: sum,
+          per_pod: parsed.per_pod || {},
+          // The sizing ground truth: per-pod current request + fleet size.
+          per_pod_request: { cpu_mc: r2(ppReqC), mem_mb: r2(ppReqM) },
+          pods_avg: r2(podsAvg),
+          under_provisioned: underProv,
+          health: parsed.health || {},
+          coverage: parsed.coverage || {},
+          autoscaling: autoscaling,
+          targets: { cpu_util_pct: targetCpuPct, mem_util_pct: targetMemPct, min_replicas: minReplicas, cpu_basis: cpuBasis, mem_basis: memBasis },
+          floors: { cpu_mc: cpuMin, mem_mb: memMin },
+          series_digest: digest,
+          naive_recommendation: { cpu_request_mc: recCpu, mem_request_mb: recMem },
+          naive_savings_usd_month: r2(saving)
+        };
+
+  - id: is_candidate
+    type: decider
+    plugin_type: conditional
+    name: "Over-provisioned?"
+    config:
+      expression: "steps.evaluate.outputs.candidate == true"
+
+  - id: stash_skipped
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: skipped"
+    inputs:
+      skip_status: "${{ steps.evaluate.outputs.status }}"
+      naive: "${{ steps.evaluate.outputs.naive_savings_usd_month }}"
+      naive_rec: "${{ steps.evaluate.outputs.naive_recommendation }}"
+      env: "${{ steps.evaluate.outputs.environment }}"
+      stats: "${{ steps.evaluate.outputs.stats }}"
+      under: "${{ steps.evaluate.outputs.under_provisioned }}"
+    config:
+      path: result
+      value:
+        status: "${{ inputs.skip_status }}"
+        action_item_id: null
+        estimated_savings_usd_month: 0
+        # Sub-ticket opportunities feed the scanner's PORTFOLIO item: too
+        # small for a ticket each, real money in aggregate.
+        naive_savings_usd_month: "${{ inputs.naive }}"
+        naive_recommendation: "${{ inputs.naive_rec }}"
+        environment: "${{ inputs.env }}"
+        stats: "${{ inputs.stats }}"
+        under_provisioned: "${{ inputs.under }}"
+        min_savings_usd_month: "${{ steps.evaluate.outputs.min_savings_usd_month }}"
+
+  # ── Phase 2: AI deep-dive with metric zoom-in ─────────────────────────
+  - id: ai_analysis
+    type: module
+    plugin_type: claude-code-agent
+    name: "AI Opportunity Analysis"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 15
+      tools:
+        # PER-ORG id of "Right Sizing — Metrics Tool"; patched by
+        # setup/04-upload-workflows.mjs on upload.
+        - type: workflow
+          workflow: cost_metrics_tool
+          name: query_metrics
+          description: >
+            Runs a PromQL query_range against the cluster's Prometheus. Inputs:
+            promql (string, required), start (unix seconds or relative like
+            -14d/-6h, default -24h), end (unix seconds or 'now'), step
+            (seconds, default 3600). Returns the raw Prometheus series. Keep
+            results small: prefer aggregations (sum/avg/quantile) and coarse
+            steps over raw per-pod series.
+      systemPrompt: |
+        You are a Kubernetes right-sizing specialist. You receive a scope that
+        a deterministic filter flagged as over-provisioned (average resource
+        REQUESTS exceed average real USAGE by a configured threshold over the
+        lookback window). Your job is to decide whether this is a GENUINE
+        right-sizing opportunity or a false positive, and if genuine, to
+        recommend new request values.
+
+        Work from the metadata outward: the prompt gives you the scope's
+        collected stats and a per-day usage digest (avg vs max per day) from
+        the cost-metadata pipeline — read those FIRST to spot spikes, trends
+        or odd patterns, then use query_metrics to zoom into anything the
+        digest cannot resolve (sub-hourly peaks, throttling, restarts).
+
+        MANDATORY verification protocol — you MUST run AT LEAST these
+        query_metrics calls (using the exact pod matchers given in the
+        prompt) before returning a verdict:
+        1. Peaks: max_over_time on rate(container_cpu_usage_seconds_total[5m])
+           over the FULL lookback window with a short step (≤ 300s), and the
+           same for container_memory_working_set_bytes. Hourly averages hide
+           spikes — this is the check that catches them.
+        2. Data coverage: how much history actually exists (e.g.
+           count_over_time over the lookback, or query the earliest samples).
+           Retention shorter than the lookback MUST be reported.
+        3. Risk signals: container_cpu_cfs_throttled_periods_total and
+           kube_pod_container_status_restarts_total (if absent, say so).
+        Also look at trends (usage growing?) and weekly patterns when the
+        history allows it.
+
+        Evidence rules (hard):
+        - EVERY number you cite must come from a query_metrics result or from
+          the deterministic stats in the prompt — never invent or extrapolate
+          values. In each reason bullet, name the query that produced it.
+        - If a query returns empty, fix the query (check the matchers/metric
+          name) or report the gap. An empty result is NEVER evidence of
+          "flat usage".
+        - Report data_sufficiency honestly: "sufficient" only when the
+          history covers most of the lookback window; "partial" when it
+          covers at least half; otherwise "insufficient". When insufficient,
+          return genuine=false and say in the reason that more history is
+          needed before right-sizing.
+
+        Rules for recommendations:
+        - Requests are PER INSTANCE (the scope's requested_spec applies to
+          each pod). Size from the per-pod stats given in the prompt — the
+          hottest pod's p95/avg — never from fleet-wide sums.
+        - Utilization ceilings (policy, given per environment in the
+          prompt): the recommendation must keep projected utilization AT OR
+          BELOW the target, measured on each dimension's BASIS (given in
+          the prompt). cpu basis "p95_10m": the ceiling applies to the p95
+          of 10-minute windows — CPU is compressible, so one-off
+          deployment/startup bursts above p95 are acceptable brief
+          throttling, NOT capacity; do not size CPU for them. cpu basis
+          "peak10m": the absolute highest 10-minute average must fit. mem
+          basis "peak10m": memory is NOT compressible — the observed
+          maximum working set is the safety line, always. Basis "avg":
+          window averages (transient saturation tolerated). If honoring
+          the ceilings erases the saving, return genuine=false.
+        - Replicas: you never change replica counts. But if the per-pod
+          stats show the scope running fewer pods than the minimum-replicas
+          policy for its environment, add a reason bullet flagging it as a
+          reliability note (single instance in production = availability
+          risk).
+        - Autoscaling: the prompt tells you whether the replica count stayed
+          FLAT while the load clearly varied (peak-to-avg ratio). When it
+          did, fill autoscaling_note with a short recommendation to review
+          HPA min/max for this scope (the valleys pay for peak capacity);
+          leave it empty otherwise. This never blocks the request
+          recommendation.
+        - CPU request: never below the platform floor given in the prompt;
+          keep ≥ 20% headroom over sustained p95; round UP to a multiple of
+          50m below 1000m, of 100m above.
+        - Memory request: never below the platform floor; memory is not
+          compressible — keep ≥ 30% headroom over the observed maximum working
+          set; round UP to a multiple of 50MB below 1000MB, of 100MB above.
+        - Not worth a change: if for a dimension the reduction is below the
+          minimum-change percentage given in the prompt (per environment)
+          AND below 100m / 100MB absolute, keep that dimension at its
+          current value; if that leaves nothing to change, return
+          genuine=false (the ticket costs more attention than it saves).
+        - When in doubt, be conservative: recommend genuine=false or higher
+          values. A too-aggressive recommendation that causes throttling or
+          OOM kills destroys trust in the whole system.
+        - Estimate monthly savings using the prices given in the prompt
+          (730 hours/month × reclaimed millicores/MB).
+
+        Apply mode (recommended_mode): pick exactly one.
+        - "apply-only": the new requests are written to the scope
+          configuration and ship with the next regular deployment. Prefer it
+          for low-risk changes on non-production scopes, or when the saving
+          is modest and can wait for the normal release cadence.
+        - "nocturnal-deploy": additionally runs a controlled deploy in the
+          night window so the saving is realized immediately. Prefer it for
+          larger savings, production scopes, or scopes that rarely deploy.
+
+        Format `reason` as Markdown (it is rendered in the action item):
+        a one-line verdict, then a bullet list where each bullet is
+        `- **<what you checked>**: <finding with the key numbers in bold>`,
+        and a final bullet explaining the chosen apply mode. No headings.
+      userPrompt: |
+        Scope under analysis:
+        - name: ${{ workflow.inputs.scope.scope_name }} (app ${{ workflow.inputs.scope.app_name }}, scope_id ${{ workflow.inputs.scope.scope_id }})
+        - Prometheus pod matchers — copy them VERBATIM into your PromQL selectors: ${{ steps.build_command.outputs.matchers }}
+        - Lookback window: ${{ steps.build_command.outputs.days }} days
+        - Available metrics (cAdvisor + kube-state-metrics; labels namespace/pod/container):
+          container_cpu_usage_seconds_total, container_memory_working_set_bytes,
+          kube_pod_container_resource_requests, container_cpu_cfs_throttled_periods_total,
+          kube_pod_container_status_restarts_total
+
+        Environment: ${{ steps.evaluate.outputs.environment }}
+        Policy for this environment — max post-change utilization:
+        cpu ${{ steps.evaluate.outputs.targets.cpu_util_pct }}%,
+        mem ${{ steps.evaluate.outputs.targets.mem_util_pct }}%,
+        cpu measured on basis "${{ steps.evaluate.outputs.targets.cpu_basis }}",
+        memory on basis "${{ steps.evaluate.outputs.targets.mem_basis }}"
+        (p95_10m = p95 of 10-minute windows, deployment bursts excluded;
+        peak10m = absolute highest 10-minute average);
+        minimum replicas: ${{ steps.evaluate.outputs.targets.min_replicas }}
+
+        Replica behavior over the window (flat replicas + varying load =
+        the scope never scales down; if flat_replicas is true, fill
+        autoscaling_note):
+        ${{ steps.evaluate.outputs.autoscaling }}
+
+        Deterministic filter findings (hourly averages over the window, from
+        the scope's cost-metadata pipeline — these are FLEET sums across all
+        pods):
+        ${{ steps.evaluate.outputs.stats }}
+
+        Current PER-POD request (the sizing ground truth — recommendations
+        replace THESE values) and average replica count:
+        request ${{ steps.evaluate.outputs.per_pod_request }} × ${{ steps.evaluate.outputs.pods_avg }} pods
+
+        Per-pod stats over the window (requests are per instance — size from
+        these; pod_count_avg vs the minimum-replicas policy is your
+        reliability check; fleet sums move with the autoscaler, NEVER size
+        from them):
+        ${{ steps.evaluate.outputs.per_pod }}
+
+        Health (cpu throttling ratio, restarts in window):
+        ${{ steps.evaluate.outputs.health }}
+
+        Collector data coverage (trust the averages only when coverage is
+        high; low coverage → report data_sufficiency accordingly):
+        ${{ steps.evaluate.outputs.coverage }}
+
+        Daily usage digest (per-day avg/max from the same collector — START
+        from this, then zoom in with queries on anything that looks spiky,
+        trending or odd):
+        ${{ steps.evaluate.outputs.series_digest }}
+
+        Over-provisioned dimensions: cpu=${{ steps.evaluate.outputs.cpu_over }}, memory=${{ steps.evaluate.outputs.mem_over }}
+        Naive recommendation (p95 + 20%): ${{ steps.evaluate.outputs.naive_recommendation }}
+        Naive monthly saving estimate: ${{ steps.evaluate.outputs.naive_savings_usd_month }} USD
+
+        Platform floors for THIS environment: CPU ${{ steps.evaluate.outputs.floors.cpu_mc }} millicores, memory ${{ steps.evaluate.outputs.floors.mem_mb }} MB. Round recommendations UP to a multiple of 50 below 1000, of 100 above.
+        Prices: ${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }} USD per millicore-hour, ${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }} USD per MB-hour.
+        Scope environment: ${{ steps.evaluate.outputs.environment }}. Minimum saving to open an item in this environment: ${{ steps.evaluate.outputs.min_savings_usd_month }} USD/month (below that, report genuine=false).
+        Minimum meaningful change in this environment: ${{ steps.evaluate.outputs.min_change_pct }}% of the current request (or ≥100 units absolute).
+
+        Zoom into the metrics with query_metrics (use the matchers above in
+        your PromQL) and decide.
+      outputSchema:
+        type: object
+        required: [genuine, reason, recommended_cpu_request_mc, recommended_mem_request_mb, recommended_mode, confidence, estimated_savings_usd_month, risk_level, data_sufficiency]
+        properties:
+          genuine:
+            type: boolean
+            description: "true only when this is a real, safe right-sizing opportunity backed by tool-verified evidence (always false when data_sufficiency is insufficient)"
+          reason:
+            type: string
+            description: "Markdown, evidence-based explanation of the verdict: one-line verdict + bullets citing the metrics checked (key numbers in bold, each bullet naming the query that produced it) + a bullet for the chosen apply mode"
+          data_sufficiency:
+            type: string
+            enum: [sufficient, partial, insufficient]
+            description: "How much of the lookback window the actual metric history covers: sufficient (most), partial (≥ half), insufficient (less — do not right-size yet)"
+          data_notes:
+            type: string
+            description: "What limits the data (short retention, missing metrics, gaps) — empty when sufficient"
+          autoscaling_note:
+            type: string
+            description: "Short HPA review recommendation when the replica count stayed flat while the load varied (see the replica-behavior block) — empty otherwise"
+          recommended_mode:
+            type: string
+            enum: [nocturnal-deploy, apply-only]
+            description: "How to apply the change: controlled deploy tonight, or config-only riding the next deployment"
+          recommended_cpu_request_mc:
+            type: number
+            description: "Recommended CPU request in millicores (current value if cpu should not change)"
+          recommended_mem_request_mb:
+            type: number
+            description: "Recommended memory request in MB (current value if memory should not change)"
+          confidence:
+            type: number
+            description: "0..1"
+          estimated_savings_usd_month:
+            type: number
+          risk_level:
+            type: string
+            enum: [low, medium, high]
+
+  # The AI verdict AND its refined saving estimate must clear the same
+  # per-environment floor the naive estimate already passed.
+  - id: is_genuine
+    type: decider
+    plugin_type: conditional
+    name: "Genuine Opportunity?"
+    config:
+      expression: "steps.ai_analysis.outputs.genuine == true && steps.ai_analysis.outputs.estimated_savings_usd_month >= steps.evaluate.outputs.min_savings_usd_month"
+
+  - id: stash_not_genuine
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: not genuine"
+    inputs:
+      ai_usage: "${{ steps.ai_analysis.outputs.usage }}"
+      under: "${{ steps.evaluate.outputs.under_provisioned }}"
+      ai_sufficiency: "${{ steps.ai_analysis.outputs.data_sufficiency }}"
+      ai_notes: "${{ steps.ai_analysis.outputs.data_notes }}"
+    config:
+      path: result
+      value:
+        status: "not_genuine"
+        action_item_id: null
+        estimated_savings_usd_month: 0
+        ai_usage: "${{ inputs.ai_usage }}"
+        under_provisioned: "${{ inputs.under }}"
+        ai_sufficiency: "${{ inputs.ai_sufficiency }}"
+        ai_notes: "${{ inputs.ai_notes }}"
+
+  # ── Ensure the action item (idempotent by rightsizing_key) ────────────
+  - id: find_existing
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Existing Item"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      metadataKey: rightsizing_key
+      metadataValue: "rightsizing:${{ workflow.inputs.scope.scope_id }}"
+
+  - id: stash_found
+    type: module
+    plugin_type: set-variable
+    name: "Stash Find Result"
+    inputs:
+      raw: "${{ steps.find_existing.outputs }}"
+    config:
+      path: found
+      value: "${{ inputs.raw }}"
+
+  - id: missing
+    type: decider
+    plugin_type: conditional
+    name: "No Live Item Yet?"
+    config:
+      expression: "variables.found.count == 0"
+
+  # ── create path ───────────────────────────────────────────────────────
+  - id: build_item
+    type: module
+    plugin_type: code-exec
+    name: "Build Item Payload"
+    inputs:
+      scope:    "${{ workflow.inputs.scope }}"
+      stats:    "${{ steps.evaluate.outputs.stats }}"
+      analysis: "${{ steps.ai_analysis.outputs }}"
+      environment: "${{ steps.evaluate.outputs.environment }}"
+      autoscaling: "${{ steps.evaluate.outputs.autoscaling }}"
+      targets:  "${{ steps.evaluate.outputs.targets }}"
+      per_pod_request: "${{ steps.evaluate.outputs.per_pod_request }}"
+      pods_avg: "${{ steps.evaluate.outputs.pods_avg }}"
+      matchers: "${{ steps.build_command.outputs.matchers }}"
+      days:     "${{ steps.build_command.outputs.days }}"
+      price_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }}"
+      price_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }}"
+      window_start: "${{ vars.DEPLOY_WINDOW_START || '01:00' }}"
+      window_end:   "${{ vars.DEPLOY_WINDOW_END || '05:00' }}"
+      tz_offset:    "${{ vars.DEPLOY_WINDOW_TZ_OFFSET || '-03:00' }}"
+    config:
+      code: |
+        var s = inputs.scope || {};
+        var a = inputs.analysis || {};
+        // Production policy: report the opportunity, but NEVER attach an
+        // auto-apply suggestion — production changes go through the normal
+        // change process.
+        var isProd = String(inputs.environment || '').toLowerCase() === 'production';
+        // Auto-apply patches the scope's requested_spec — only the standard
+        // k8s scope type has that shape. Other k8s-backed types (custom,
+        // web_pool) get the ITEM (report + numbers) but no apply suggestion.
+        // Rows without scope_type (older callers) keep the old behavior.
+        var stype = String(s.scope_type || 'web_pool_k8s');
+        var applyable = stype === 'web_pool_k8s';
+        var autoApply = !isProd && applyable;
+        var st = inputs.stats || {};
+        var cpu = st.cpu || {};
+        var mem = st.mem || {};
+        var saving = Math.round((Number(a.estimated_savings_usd_month) || 0) * 100) / 100;
+        var priority = saving >= 50 ? 'high' : saving >= 10 ? 'medium' : 'low';
+        var scopeNrn = String(s.scope_nrn || '') + ':scope=' + String(s.scope_id);
+        var detectedAt = new Date().toISOString();
+        var recCpu = Number(a.recommended_cpu_request_mc) || 0;
+        var recMem = Number(a.recommended_mem_request_mb) || 0;
+        // Current PER-POD requests (requests are per-pod config; fleet sums
+        // move with the autoscaler). Recommendations are per pod too.
+        var ppr = inputs.per_pod_request || {};
+        var pods = Number(inputs.pods_avg) > 0 ? Number(inputs.pods_avg) : 1;
+        var curCpu = Number(ppr.cpu_mc) || 0;
+        var curMem = Number(ppr.mem_mb) || 0;
+
+        // Per-dimension opportunity, in BOTH currencies — reclaimable
+        // per-pod mc/MB and fleet USD/month (per-pod delta × avg replicas ×
+        // price). Computed deterministically here; the AI's
+        // estimated_savings_usd_month stays as the headline.
+        var HOURS_MONTH = 730;
+        function r2(x) { return Math.round(x * 100) / 100; }
+        var cpuReclaimMc = Math.max(0, curCpu - recCpu);
+        var memReclaimMb = Math.max(0, curMem - recMem);
+        var cpuSavings = r2(cpuReclaimMc * pods * (Number(inputs.price_cpu) || 0) * HOURS_MONTH);
+        var memSavings = r2(memReclaimMb * pods * (Number(inputs.price_mem) || 0) * HOURS_MONTH);
+        var windowLabel = String(inputs.window_start) + '-' + String(inputs.window_end) + ' (' + String(inputs.tz_offset) + ')';
+
+        // Apply mode chosen by the AI; "apply-only" (no deploy) is the safe
+        // default should the model ever return something unexpected. It is
+        // only the DEFAULT of the accept form below — the user has the final
+        // word via deploy_timing/deploy_at when accepting.
+        var mode = a.recommended_mode === 'nocturnal-deploy' ? 'nocturnal-deploy' : 'apply-only';
+
+        // Suggestion description = the exact execution plan (what + how).
+        var planHead = 'Right-size ' + s.scope_name + ': patch the scope requested spec — CPU ' +
+          curCpu + 'm → ' + recCpu + 'm, memory ' + curMem + 'MB → ' + recMem + 'MB (estimated saving ~' + saving + ' USD/month).';
+        var planSteps = mode === 'nocturnal-deploy'
+          ? 'Execution: 1) PATCH the scope configuration via the platform API. 2) Trigger a controlled ' +
+            'deployment in the nocturnal window ' + windowLabel + ' and poll it to completion, posting ' +
+            'progress as comments (while scheduled, comment \'deploy now\' or \'abort\'). 3) On a ' +
+            'finalized deployment the suggestion is marked applied and the item is CLOSED; on failure ' +
+            'the item stays open.'
+          : 'Execution: 1) PATCH the scope configuration via the platform API — no deployment is ' +
+            'triggered. 2) The change ships with your next regular deployment; the suggestion is ' +
+            'marked applied and the item STAYS OPEN until the change is live.';
+        var planChoices = 'On accept you choose: apply only (next deploy), deploy now, or schedule ' +
+          'the deploy at a specific time.';
+        var suggestionDescription = planHead + ' ' + planSteps + ' ' + planChoices;
+
+        var howLine = isProd
+          ? 'Production policy: no auto-apply suggestion is attached. Review the analysis and ' +
+            'apply the recommended requests through your normal change process; the item stays ' +
+            'open until the change is live.'
+          : mode === 'nocturnal-deploy'
+          ? 'Accepting it applies the change and runs a controlled deploy in the nocturnal window ' +
+            windowLabel + ' (closes this item on success) — on accept you can instead deploy ' +
+            '**immediately**, pick a **specific time**, or just update the config and ship with the ' +
+            '**next deploy**. While a deploy is scheduled you can comment `deploy now` or `abort`.'
+          : 'Accepting it applies the change **without deploying** — it ships with your next ' +
+            'deployment and this item stays open until the change is live. On accept you can instead ' +
+            'run a controlled deploy **now** or **schedule it** at a specific time (either closes ' +
+            'the item on success).';
+
+        // Accept form (rendered by the UI from user_metadata_config.schema;
+        // the answers land in the suggestion's user_metadata, read by wf4).
+        var userMetadataConfig = {
+          schema: {
+            type: 'object',
+            properties: {
+              deploy_timing: {
+                type: 'string',
+                title: 'How to apply',
+                description: 'next-deploy: config only, ships with your next deployment (item stays open). scheduled: controlled deploy at the scheduled time below. now: deploy immediately.',
+                enum: ['next-deploy', 'scheduled', 'now'],
+                default: mode === 'nocturnal-deploy' ? 'scheduled' : 'next-deploy'
+              },
+              deploy_at: {
+                type: 'string',
+                title: 'Scheduled deploy time (HH:MM ' + String(inputs.tz_offset) + ')',
+                description: 'Only used when "How to apply" is scheduled. Empty = tonight\'s window start (' + String(inputs.window_start) + ').',
+                pattern: '^([01]?\\d|2[0-3]):[0-5]\\d$'
+              }
+            }
+          }
+        };
+
+        var au = inputs.autoscaling || {};
+        var tg = inputs.targets || {};
+        var lines = [
+          '## Right-sizing opportunity',
+          '',
+          'Scope **' + s.scope_name + '** (application **' + s.app_name + '**) is over-provisioned:',
+          '',
+          '| dimension (per pod, ~' + r2(pods) + ' pods) | current request | avg usage (fleet) | peak 10m (fleet) | recommended request |',
+          '|---|---|---|---|---|',
+          '| CPU (millicores) | ' + curCpu + ' | ' + (cpu.avg_usage_mc || 0) + ' | ' + (cpu.peak10m_mc || 0) + ' | ' + recCpu + ' |',
+          '| Memory (MB) | ' + curMem + ' | ' + (mem.avg_usage_mb || 0) + ' | ' + (mem.peak_mb || 0) + ' | ' + recMem + ' |',
+          '',
+          '**Estimated saving**: ' + saving + ' USD/month · **Risk**: ' + (a.risk_level || 'n/a') + ' · **Confidence**: ' + (a.confidence || 0) + ' · **Data**: ' + (a.data_sufficiency || 'n/a') + (a.data_notes ? ' (' + a.data_notes + ')' : '') + ' · **Sizing basis**: cpu ' + (tg.cpu_basis || 'avg') + ' / mem ' + (tg.mem_basis || 'avg'),
+          '',
+          '### AI analysis (' + inputs.days + '-day window)',
+          '',
+          String(a.reason || '')
+        ];
+        if (au.flat_replicas) {
+          lines.push('');
+          lines.push('### Autoscaling');
+          lines.push('');
+          lines.push('Replicas stayed flat at **' + au.pods_max + '** the whole window while the load varied **' +
+            au.peak_to_avg_ratio + '×** between peak and average — the scope never scales down, so the quiet ' +
+            'hours pay for peak capacity.' + (a.autoscaling_note ? ' ' + String(a.autoscaling_note) : ''));
+        }
+        lines.push('');
+        lines.push(howLine);
+
+        return {
+          mode: mode,
+          auto_apply: autoApply,
+          suggestion_description: suggestionDescription,
+          user_metadata_config: userMetadataConfig,
+          title: 'Right-sizing: ' + s.scope_name + ' (' + s.app_name + ') — save ~' + saving + ' USD/month',
+          description: lines.join('\n'),
+          priority: priority,
+          value: saving,
+          scope_nrn: scopeNrn,
+          metadata: {
+            rightsizing_key: 'rightsizing:' + String(s.scope_id),
+            scope_id: String(s.scope_id),
+            scope_name: s.scope_name || '',
+            app_name: s.app_name || '',
+            matchers: inputs.matchers || '',
+            lookback_days: inputs.days,
+            avg_cpu_usage_mc: cpu.avg_usage_mc || 0,
+            avg_cpu_request_mc: cpu.avg_request_mc || 0,
+            avg_mem_usage_mb: mem.avg_usage_mb || 0,
+            avg_mem_request_mb: mem.avg_request_mb || 0,
+            // PER-POD request AT ANALYSIS TIME: the closer (wf7) compares
+            // per-pod requests (fleet sums move with autoscaling).
+            observed_cpu_request_mc: curCpu,
+            observed_mem_request_mb: curMem,
+            pods_avg: r2(pods),
+            cpu_peak10m_mc: Number(cpu.peak10m_mc) || 0,
+            mem_peak_mb: Number(mem.peak_mb) || 0,
+            sizing_basis: String((inputs.targets || {}).cpu_basis || 'avg') + '/' + String((inputs.targets || {}).mem_basis || 'avg'),
+            flat_replicas: (inputs.autoscaling || {}).flat_replicas === true,
+            peak_to_avg_ratio: Number((inputs.autoscaling || {}).peak_to_avg_ratio) || 0,
+            recommended_cpu_request_mc: Number(a.recommended_cpu_request_mc) || 0,
+            recommended_mem_request_mb: Number(a.recommended_mem_request_mb) || 0,
+            estimated_savings_usd_month: saving,
+            cpu_reclaim_mc: cpuReclaimMc,
+            mem_reclaim_mb: memReclaimMb,
+            cpu_savings_usd_month: cpuSavings,
+            mem_savings_usd_month: memSavings,
+            risk_level: a.risk_level || '',
+            confidence: Number(a.confidence) || 0,
+            data_sufficiency: a.data_sufficiency || '',
+            data_notes: a.data_notes || '',
+            environment: String(inputs.environment || ''),
+            scope_type: stype,
+            auto_apply: autoApply,
+            detected_at: detectedAt
+          },
+          saving: saving
+        };
+
+  - id: create_item
+    type: module
+    plugin_type: np-action-item-create
+    name: "Create Action Item"
+    # observed_metadata: observation input for the E2E harness (stubs cannot
+    # see config); not a plugin config key, so the merge is inert.
+    inputs:
+      observed_metadata: "${{ steps.build_item.outputs.metadata }}"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      categorySlug: "${{ vars.RIGHTSIZING_CATEGORY_SLUG || 'finops' }}"
+      createdBy: "agent:right-sizing-scanner"
+      # Single-hop passthrough from build_item ($item = its outputs).
+      nrn: "${{ $item.scope_nrn }}"
+      title: "${{ $item.title }}"
+      description: "${{ $item.description }}"
+      priority: "${{ $item.priority }}"
+      value: "${{ $item.saving }}"
+      labels:
+        workflow_type: "rightsizing"
+        auto_detected: "true"
+      metadata: "${{ $item.metadata }}"
+
+  - id: stash_item_id
+    type: module
+    plugin_type: set-variable
+    name: "Stash Created Item Id"
+    inputs:
+      id: "${{ steps.create_item.outputs.actionItemId }}"
+    config:
+      path: created_item
+      value:
+        id: "${{ inputs.id }}"
+
+  # Production items get NO auto-apply suggestion (policy) — the item alone
+  # reports the opportunity.
+  - id: should_suggest
+    type: decider
+    plugin_type: conditional
+    name: "Attach Auto-apply Suggestion?"
+    config:
+      expression: "steps.build_item.outputs.auto_apply == true"
+
+  # ONE suggestion; the apply mode was chosen by the AI (build_item validated
+  # it). wf3 routes an accept to wf4, which reads metadata.mode.
+  - id: suggest_apply
+    type: module
+    plugin_type: np-action-item-suggestion-create
+    name: "Suggestion: Apply Right-sizing"
+    # observed_item_id / observed_mode: observation inputs for the E2E
+    # harness (stubs cannot see config); not plugin config keys, so the
+    # merge is inert.
+    inputs:
+      observed_item_id: "${{ variables.created_item.id }}"
+      observed_mode: "${{ steps.build_item.outputs.mode }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ variables.created_item.id }}"
+      createdBy: "agent:right-sizing-scanner"
+      owner: "executor:rightsizing-applier"
+      confidence: "${{ steps.ai_analysis.outputs.confidence }}"
+      description: "${{ steps.build_item.outputs.suggestion_description }}"
+      # Accept form: the UI renders this schema when the user accepts; the
+      # answers land in the suggestion's user_metadata (read by wf4).
+      userMetadataConfig: "${{ steps.build_item.outputs.user_metadata_config }}"
+      metadata:
+        mode: "${{ steps.build_item.outputs.mode }}"
+        recommended_cpu_request_mc: "${{ steps.ai_analysis.outputs.recommended_cpu_request_mc }}"
+        recommended_mem_request_mb: "${{ steps.ai_analysis.outputs.recommended_mem_request_mb }}"
+
+  - id: stash_created
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: created"
+    # Reached with the suggestion (non-prod) or directly (production) —
+    # exactly one path fires.
+    join_strategy: any
+    inputs:
+      saving: "${{ steps.ai_analysis.outputs.estimated_savings_usd_month }}"
+    config:
+      path: result
+      value:
+        status: "created"
+        ai_usage: "${{ inputs.ai_usage }}"
+        action_item_id: "${{ variables.created_item.id }}"
+        estimated_savings_usd_month: "${{ inputs.saving }}"
+
+  # ── existing-item path ────────────────────────────────────────────────
+  - id: changed
+    type: decider
+    plugin_type: conditional
+    name: "Recommendation Changed?"
+    config:
+      expression: "variables.found.firstMatch.metadata.recommended_cpu_request_mc != steps.ai_analysis.outputs.recommended_cpu_request_mc || variables.found.firstMatch.metadata.recommended_mem_request_mb != steps.ai_analysis.outputs.recommended_mem_request_mb"
+
+  - id: build_refresh
+    type: module
+    plugin_type: code-exec
+    name: "Build Refreshed Metadata"
+    inputs:
+      scope:    "${{ workflow.inputs.scope }}"
+      stats:    "${{ steps.evaluate.outputs.stats }}"
+      analysis: "${{ steps.ai_analysis.outputs }}"
+      environment: "${{ steps.evaluate.outputs.environment }}"
+      autoscaling: "${{ steps.evaluate.outputs.autoscaling }}"
+      targets:  "${{ steps.evaluate.outputs.targets }}"
+      per_pod_request: "${{ steps.evaluate.outputs.per_pod_request }}"
+      pods_avg: "${{ steps.evaluate.outputs.pods_avg }}"
+      matchers: "${{ steps.build_command.outputs.matchers }}"
+      days:     "${{ steps.build_command.outputs.days }}"
+      price_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }}"
+      price_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }}"
+    config:
+      code: |
+        var s = inputs.scope || {};
+        var a = inputs.analysis || {};
+        var st = inputs.stats || {};
+        var cpu = st.cpu || {};
+        var mem = st.mem || {};
+        var saving = Math.round((Number(a.estimated_savings_usd_month) || 0) * 100) / 100;
+        // Same per-dimension opportunity breakdown as build_item (dashboards
+        // aggregate cpu vs memory in both resources and USD).
+        var HOURS_MONTH = 730;
+        function r2(x) { return Math.round(x * 100) / 100; }
+        var recCpu = Number(a.recommended_cpu_request_mc) || 0;
+        var recMem = Number(a.recommended_mem_request_mb) || 0;
+        var ppr = inputs.per_pod_request || {};
+        var pods = Number(inputs.pods_avg) > 0 ? Number(inputs.pods_avg) : 1;
+        var curCpu = Number(ppr.cpu_mc) || 0;
+        var curMem = Number(ppr.mem_mb) || 0;
+        var cpuReclaimMc = Math.max(0, curCpu - recCpu);
+        var memReclaimMb = Math.max(0, curMem - recMem);
+        var cpuSavings = r2(cpuReclaimMc * pods * (Number(inputs.price_cpu) || 0) * HOURS_MONTH);
+        var memSavings = r2(memReclaimMb * pods * (Number(inputs.price_mem) || 0) * HOURS_MONTH);
+        var isProd = String(inputs.environment || '').toLowerCase() === 'production';
+        var stype = String((inputs.scope || {}).scope_type || 'web_pool_k8s');
+        var autoApply = !isProd && stype === 'web_pool_k8s';
+        return {
+          metadata: {
+            rightsizing_key: 'rightsizing:' + String(s.scope_id),
+            scope_id: String(s.scope_id),
+            scope_name: s.scope_name || '',
+            app_name: s.app_name || '',
+            matchers: inputs.matchers || '',
+            lookback_days: inputs.days,
+            avg_cpu_usage_mc: cpu.avg_usage_mc || 0,
+            avg_cpu_request_mc: cpu.avg_request_mc || 0,
+            avg_mem_usage_mb: mem.avg_usage_mb || 0,
+            avg_mem_request_mb: mem.avg_request_mb || 0,
+            observed_cpu_request_mc: curCpu,
+            observed_mem_request_mb: curMem,
+            pods_avg: r2(pods),
+            cpu_peak10m_mc: Number(cpu.peak10m_mc) || 0,
+            mem_peak_mb: Number(mem.peak_mb) || 0,
+            sizing_basis: String((inputs.targets || {}).cpu_basis || 'avg') + '/' + String((inputs.targets || {}).mem_basis || 'avg'),
+            flat_replicas: (inputs.autoscaling || {}).flat_replicas === true,
+            peak_to_avg_ratio: Number((inputs.autoscaling || {}).peak_to_avg_ratio) || 0,
+            recommended_cpu_request_mc: recCpu,
+            recommended_mem_request_mb: recMem,
+            estimated_savings_usd_month: saving,
+            cpu_reclaim_mc: cpuReclaimMc,
+            mem_reclaim_mb: memReclaimMb,
+            cpu_savings_usd_month: cpuSavings,
+            mem_savings_usd_month: memSavings,
+            risk_level: a.risk_level || '',
+            confidence: Number(a.confidence) || 0,
+            data_sufficiency: a.data_sufficiency || '',
+            data_notes: a.data_notes || '',
+            environment: String(inputs.environment || ''),
+            auto_apply: autoApply,
+            detected_at: new Date().toISOString()
+          },
+          saving: saving
+        };
+
+  - id: update_item
+    type: module
+    plugin_type: np-action-item-update
+    name: "Refresh Item Metadata"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ variables.found.firstMatch.id }}"
+      # Single-hop passthrough from build_refresh.
+      metadata: "${{ $item.metadata }}"
+
+  - id: stash_updated
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: updated"
+    inputs:
+      saving: "${{ steps.ai_analysis.outputs.estimated_savings_usd_month }}"
+      ai_usage: "${{ steps.ai_analysis.outputs.usage }}"
+    config:
+      path: result
+      value:
+        status: "updated"
+        ai_usage: "${{ inputs.ai_usage }}"
+        action_item_id: "${{ variables.found.firstMatch.id }}"
+        estimated_savings_usd_month: "${{ inputs.saving }}"
+
+  - id: stash_unchanged
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: unchanged"
+    inputs:
+      saving: "${{ steps.ai_analysis.outputs.estimated_savings_usd_month }}"
+      ai_usage: "${{ steps.ai_analysis.outputs.usage }}"
+    config:
+      path: result
+      value:
+        status: "unchanged"
+        ai_usage: "${{ inputs.ai_usage }}"
+        action_item_id: "${{ variables.found.firstMatch.id }}"
+        estimated_savings_usd_month: "${{ inputs.saving }}"
+
+  # ── stale-item close path ─────────────────────────────────────────────
+  # The scope no longer qualifies (deterministic filter or AI said no). If a
+  # live item exists from a previous scan it is STALE — the scope was fixed
+  # (manual right-size, traffic grew, spec changed). Close it with the
+  # current numbers so it doesn't linger open forever.
+  - id: find_stale
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Stale Item"
+    # Reached from the skipped OR the not-genuine path — only one fires.
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      metadataKey: rightsizing_key
+      metadataValue: "rightsizing:${{ workflow.inputs.scope.scope_id }}"
+
+  - id: has_stale
+    type: decider
+    plugin_type: conditional
+    name: "Stale Item To Close?"
+    config:
+      # no_data is NOT evidence the scope was fixed (pods unmonitored, agent
+      # down) — never close on it.
+      expression: "steps.find_stale.outputs.count > 0 && steps.evaluate.outputs.status != 'no_data'"
+
+  - id: build_close_reason
+    type: module
+    plugin_type: code-exec
+    name: "Build Close Reason"
+    inputs:
+      ev: "${{ steps.evaluate.outputs }}"
+      result: "${{ variables.result }}"
+      ai_reason: "${{ steps.ai_analysis.outputs.reason }}"
+    config:
+      code: |
+        var ev = inputs.ev || {};
+        var st = String((inputs.result || {}).status || '');
+        var s = ev.stats || {}; var c = s.cpu || {}; var m = s.mem || {};
+        var why;
+        if (st === 'not_genuine') {
+          why = 'the AI validation no longer considers the opportunity genuine';
+        } else if (ev.status === 'below_min_savings') {
+          why = 'the estimated saving fell below the minimum (' +
+            ev.min_savings_usd_month + ' USD/month for ' + ev.environment + ')';
+        } else {
+          why = 'current usage no longer exceeds the over-provisioning threshold';
+        }
+        var reason = 'Auto-closed by the right-sizing scanner: the scope no longer qualifies — ' + why +
+          '. Analysis window: CPU avg usage ' + (c.avg_usage_mc || 0) + 'mc vs ' + (c.avg_request_mc || 0) +
+          'mc requested; memory avg ' + (m.avg_usage_mb || 0) + 'MB vs ' + (m.avg_request_mb || 0) + 'MB requested.' +
+          (inputs.ai_reason ? ' AI note: ' + String(inputs.ai_reason).slice(0, 300) : '');
+        return { reason: reason };
+
+  - id: close_stale
+    type: module
+    plugin_type: np-action-item-update
+    name: "Close Stale Item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      reason: "${{ steps.build_close_reason.outputs.reason }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ steps.find_stale.outputs.firstMatch.id }}"
+      action: close
+      # Lifecycle transitions require an actor (same as wf4's close_item).
+      actor: "agent:rightsizing-scanner"
+      reason: "${{ inputs.reason }}"
+
+  - id: stash_closed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: closed_stale"
+    config:
+      path: result
+      value:
+        status: "closed_stale"
+        action_item_id: "${{ steps.find_stale.outputs.firstMatch.id }}"
+        estimated_savings_usd_month: 0
+
+  # ── catalog flag sync + last-scan stamp ───────────────────────────────
+  # provisioning_status on the cost_tracking instance is a CONSEQUENCE of the
+  # item lifecycle (the scanner's analysis is the authority, not a daily
+  # average): live item → over_provisioned; closed / no finding → optimal.
+  # Every conclusive verdict also stamps last_scan_at/last_scan_status,
+  # which drives the RIGHTSIZING_RESCAN_DAYS skip window in the prefilter.
+  # The tracker (wf1b) only preserves these fields.
+  - id: get_flag_inst
+    type: module
+    plugin_type: np-api-call
+    name: "Read Catalog Instance (flag)"
+    # Converges the created / updated / unchanged / closed paths — one fires.
+    join_strategy: any
+    # SHIELD (do not remove): a step with NO declared inputs receives the
+    # upstream passthrough as ctx.inputs, and np-api-call merges inputs OVER
+    # config — the preceding set-variable's `path` output ("result") would
+    # override the request path (observed live: GET /result → 404, the flag
+    # sync silently never ran). Declaring any input replaces that.
+    inputs:
+      verdict: "${{ variables.result.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      # 404 = tracker hasn't seen this scope yet — nothing to flag.
+      failOnHttpError: false
+
+  - id: build_flag
+    type: module
+    plugin_type: code-exec
+    name: "Build Flag Payload"
+    inputs:
+      got_status: "${{ steps.get_flag_inst.outputs.status }}"
+      body: "${{ steps.get_flag_inst.outputs.body }}"
+      result: "${{ variables.result }}"
+    config:
+      code: |
+        if (Number(inputs.got_status) !== 200 || !inputs.body) {
+          return { do: false, note: 'no cost_tracking instance yet (tracker has not run for this scope)' };
+        }
+        var st = String((inputs.result || {}).status || '');
+        // no_data is not a verdict (pods unmonitored, agent down): don't
+        // stamp last_scan (the scope must be re-analyzed next run) and don't
+        // touch the flag.
+        if (st === 'no_data') {
+          return { do: false, note: 'no_data is not a verdict — nothing to stamp' };
+        }
+        // inputs are frozen in the sandbox — build a shallow copy to modify.
+        var inst = {};
+        for (var k in inputs.body) inst[k] = inputs.body[k];
+        if (st === 'created' || st === 'updated' || st === 'unchanged' || st === 'active_valid') {
+          // active_valid included: it HEALS the catalog pointer for items
+          // created before the flag-sync existed (the closer finds its work
+          // through rightsizing_item_id).
+          inst.provisioning_status = 'over_provisioned';
+          inst.rightsizing_item_id = (inputs.result || {}).action_item_id || null;
+        } else {
+          // closed_stale / not_candidate / not_genuine / below_min_savings:
+          // nothing to RECLAIM — but the hottest pod running at ≥90% of its
+          // request is a throttling/OOM risk worth surfacing on the catalog.
+          inst.provisioning_status = (inputs.result || {}).under_provisioned === true
+            ? 'under_provisioned' : 'optimal';
+          inst.rightsizing_item_id = null;
+        }
+        inst.last_scan_at = new Date().toISOString();
+        inst.last_scan_status = st;
+        // Human-readable one-liner: WHY the scanner concluded what it did —
+        // readable straight off the scope page, no digging through items.
+        var res = inputs.result || {};
+        var save = Number(res.estimated_savings_usd_month) || 0;
+        var naive = Number(res.naive_savings_usd_month) || 0;
+        var note;
+        if (st === 'created' || st === 'updated') {
+          note = 'Right-sizing opportunity ~$' + save + '/month — see action item ' + (res.action_item_id || '');
+        } else if (st === 'unchanged') {
+          note = 'Opportunity still open (~$' + save + '/month), recommendation unchanged — item ' + (res.action_item_id || '');
+        } else if (st === 'active_valid') {
+          note = 'Open item still backed by the tracker data — item ' + (res.action_item_id || '');
+        } else if (st === 'closed_stale') {
+          note = 'Previous opportunity no longer applies — item auto-closed';
+        } else if (st === 'below_min_savings') {
+          note = 'Small opportunity (~$' + naive + '/month) below the $' + (Number(res.min_savings_usd_month) || 0) + ' ticket floor — tracked in the portfolio item';
+        } else if (st === 'not_genuine') {
+          var why = String(res.ai_sufficiency || '') === 'insufficient'
+            ? 'insufficient metric history (' + String(res.ai_notes || '').slice(0, 120) + ')'
+            : String(res.ai_notes || 'AI review found no safe reduction').slice(0, 140);
+          note = 'AI discarded the candidate: ' + why;
+        } else {
+          note = res.under_provisioned === true
+            ? 'No reclaimable headroom — hottest pod runs at ≥90% of its request (throttling/OOM risk)'
+            : 'Correctly sized at current policy';
+        }
+        inst.last_scan_savings_usd_month = save > 0 ? save : naive;
+        inst.last_scan_note = note;
+        return { do: true, payload: inst };
+
+  - id: flag_needed
+    type: decider
+    plugin_type: conditional
+    name: "Instance Exists?"
+    config:
+      expression: "steps.build_flag.outputs.do == true"
+
+  - id: put_flag
+    type: module
+    plugin_type: np-api-call
+    name: "Write Provisioning Flag"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      payload: "${{ steps.build_flag.outputs.payload }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      body: "${{ inputs.payload }}"
+
+connections:
+  - { id: c1,  from: start,             to: fetch_tracker }
+  - { id: c1b, from: fetch_tracker,     to: find_live }
+  - { id: c1c, from: find_live,         to: prefilter }
+  - { id: c1d, from: prefilter,         to: scan_route }
+  - { id: c1e, from: scan_route,        to: build_command,     source_port: "analyze" }
+  - { id: c1f, from: scan_route,        to: stash_prefiltered, source_port: "skip" }
+  - { id: c1g, from: scan_route,        to: stash_active_valid, source_port: "skip_active" }
+  - { id: c1h, from: scan_route,        to: build_close_cheap, source_port: "close" }
+  - { id: c1i, from: build_close_cheap, to: close_cheap }
+  - { id: c1j, from: close_cheap,       to: stash_closed_cheap }
+  - { id: c2,  from: build_command,     to: collect_usage }
+  - { id: c2b, from: collect_usage,     to: fetch_scope }
+  - { id: c3,  from: fetch_scope,       to: evaluate }
+  - { id: c4,  from: evaluate,          to: is_candidate }
+  - { id: c5,  from: is_candidate,      to: stash_skipped,     source_port: "false" }
+  - { id: c6,  from: is_candidate,      to: ai_analysis,       source_port: "true" }
+  - { id: c7,  from: ai_analysis,       to: is_genuine }
+  - { id: c8,  from: is_genuine,        to: stash_not_genuine, source_port: "false" }
+  - { id: c9,  from: is_genuine,        to: find_existing,     source_port: "true" }
+  - { id: c10, from: find_existing,     to: stash_found }
+  - { id: c11, from: stash_found,       to: missing }
+  - { id: c12, from: missing,           to: build_item,        source_port: "true" }
+  - { id: c13, from: build_item,        to: create_item }
+  - { id: c14, from: create_item,       to: stash_item_id }
+  - { id: c15, from: stash_item_id,     to: should_suggest }
+  - { id: c15b, from: should_suggest,   to: suggest_apply, source_port: "true" }
+  - { id: c16, from: suggest_apply,     to: stash_created }
+  - { id: c16b, from: should_suggest,   to: stash_created, source_port: "false" }
+  - { id: c18, from: missing,           to: changed,           source_port: "false" }
+  - { id: c19, from: changed,           to: build_refresh,     source_port: "true" }
+  - { id: c20, from: build_refresh,     to: update_item }
+  - { id: c21, from: update_item,       to: stash_updated }
+  - { id: c22, from: changed,           to: stash_unchanged,   source_port: "false" }
+  # stale-item close path (skipped/not-genuine but a live item exists)
+  - { id: c23, from: stash_skipped,     to: find_stale }
+  - { id: c24, from: stash_not_genuine, to: find_stale }
+  - { id: c25, from: find_stale,        to: has_stale }
+  - { id: c26, from: has_stale,         to: build_close_reason, source_port: "true" }
+  - { id: c27, from: build_close_reason, to: close_stale }
+  - { id: c28, from: close_stale,       to: stash_closed }
+  # catalog flag sync (item lifecycle → provisioning_status + last-scan stamp)
+  - { id: c29, from: stash_created,     to: get_flag_inst }
+  - { id: c30, from: stash_updated,     to: get_flag_inst }
+  - { id: c31, from: stash_unchanged,   to: get_flag_inst }
+  - { id: c32, from: stash_closed,      to: get_flag_inst }
+  - { id: c36, from: stash_closed_cheap, to: get_flag_inst }
+  # Live item kept: heal/refresh the catalog pointer + stamp the verdict.
+  - { id: c38, from: stash_active_valid, to: get_flag_inst }
+  # No stale item to close: still stamp last_scan_at/status (drives the
+  # rescan window) — build_flag skips the write for no_data.
+  - { id: c37, from: has_stale,         to: get_flag_inst, source_port: "false" }
+  - { id: c33, from: get_flag_inst,     to: build_flag }
+  - { id: c34, from: build_flag,        to: flag_needed }
+  - { id: c35, from: flag_needed,       to: put_flag,           source_port: "true" }
+
+outputs:
+  status:                      "${{ variables.result.status }}"
+  action_item_id:              "${{ variables.result.action_item_id }}"
+  estimated_savings_usd_month: "${{ variables.result.estimated_savings_usd_month }}"
+  ai_usage:                    "${{ variables.result.ai_usage }}"
+  # Sub-ticket detail (below_min_savings only) — feeds the scanner portfolio.
+  naive_savings_usd_month:     "${{ variables.result.naive_savings_usd_month }}"
+  naive_recommendation:        "${{ variables.result.naive_recommendation }}"
+  environment:                 "${{ variables.result.environment }}"
+  stats:                       "${{ variables.result.stats }}"
+  scope_id:                    "${{ workflow.inputs.scope.scope_id }}"
+  scope_name:                  "${{ workflow.inputs.scope.scope_name }}"

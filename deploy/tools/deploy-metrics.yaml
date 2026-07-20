@@ -1,0 +1,189 @@
+# AI-deploy tool: scope telemetry snapshot with a DETERMINISTIC degradation
+# verdict.
+#
+# The comparison against the baseline runs here, in plain code, not in the
+# model: the agent narrates and decides WHEN to check, but whether the step
+# is degraded is computed from the platform telemetry with the thresholds
+# passed in — an auditable boolean, not a judgment call.
+id: deploy_metrics
+name: "Deploy Tool — Metrics Check"
+description: >
+  Reads a scope's traffic telemetry (http.rpm / http.error_rate /
+  http.response_time averages over the window). Inputs: scope_id (string,
+  required), minutes (number, default 5), baseline_err / baseline_rt /
+  baseline_has_data (optional — pass the values from your FIRST call),
+  max_err_increase (pct points, default 1), max_rt_ratio (default 1.5).
+  Returns {rpm, error_rate, response_time, has_data, degraded, problems}.
+  degraded is computed deterministically: error_rate exceeding baseline_err
+  by more than max_err_increase, or response_time above baseline_rt ×
+  max_rt_ratio (only when the baseline had real traffic). Without baselines
+  it returns degraded=false — use the first call as the baseline.
+path: "/deploy"
+semantic_version: 1.0.0
+
+inputs:
+  scope_id:
+    type: string
+    required: true
+  minutes:
+    type: number
+    required: false
+  baseline_err:
+    type: number
+    required: false
+  baseline_rt:
+    type: number
+    required: false
+  baseline_has_data:
+    type: boolean
+    required: false
+  max_err_increase:
+    type: number
+    required: false
+  max_rt_ratio:
+    type: number
+    required: false
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Scope telemetry + deterministic degradation verdict (AI-deploy tool)."
+      inputs:
+        scope_id: { type: string, required: true }
+        minutes: { type: number, required: false }
+        baseline_err: { type: number, required: false }
+        baseline_rt: { type: number, required: false }
+        baseline_has_data: { type: boolean, required: false }
+        max_err_increase: { type: number, required: false }
+        max_rt_ratio: { type: number, required: false }
+
+  - id: fetch_scope
+    type: module
+    plugin_type: np-api-call
+    name: "Get Scope (application id)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/scope/${{ workflow.inputs.scope_id }}"
+
+  - id: window
+    type: module
+    plugin_type: code-exec
+    name: "Resolve Window"
+    inputs:
+      minutes: "${{ workflow.inputs.minutes }}"
+      app: "${{ steps.fetch_scope.outputs.body.application_id }}"
+    config:
+      code: |
+        var m = Math.round(Number(inputs.minutes));
+        if (!isFinite(m) || m < 1 || m > 60) m = 5;
+        if (!inputs.app) throw new Error('Scope has no application_id');
+        return { minutes: m, app: inputs.app };
+
+  - id: get_rpm
+    type: module
+    plugin_type: np-api-call
+    name: "Telemetry: rpm"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/telemetry/application/${{ steps.window.outputs.app }}/metric/http.rpm?scope_id=${{ workflow.inputs.scope_id }}&minutes=${{ steps.window.outputs.minutes }}&period=60"
+      failOnHttpError: false
+
+  - id: get_err
+    type: module
+    plugin_type: np-api-call
+    name: "Telemetry: error rate"
+    inputs:
+      prev: "${{ steps.get_rpm.outputs.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/telemetry/application/${{ steps.window.outputs.app }}/metric/http.error_rate?scope_id=${{ workflow.inputs.scope_id }}&minutes=${{ steps.window.outputs.minutes }}&period=60"
+      failOnHttpError: false
+
+  - id: get_rt
+    type: module
+    plugin_type: np-api-call
+    name: "Telemetry: response time"
+    inputs:
+      prev: "${{ steps.get_err.outputs.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/telemetry/application/${{ steps.window.outputs.app }}/metric/http.response_time?scope_id=${{ workflow.inputs.scope_id }}&minutes=${{ steps.window.outputs.minutes }}&period=60"
+      failOnHttpError: false
+
+  - id: verdict
+    type: module
+    plugin_type: code-exec
+    name: "Deterministic Verdict"
+    inputs:
+      rpm: "${{ steps.get_rpm.outputs.body }}"
+      err: "${{ steps.get_err.outputs.body }}"
+      rt:  "${{ steps.get_rt.outputs.body }}"
+      baseline_err: "${{ workflow.inputs.baseline_err }}"
+      baseline_rt:  "${{ workflow.inputs.baseline_rt }}"
+      baseline_has_data: "${{ workflow.inputs.baseline_has_data }}"
+      max_err_increase: "${{ workflow.inputs.max_err_increase }}"
+      max_rt_ratio: "${{ workflow.inputs.max_rt_ratio }}"
+    config:
+      code: |
+        function avg(body) {
+          var results = (body || {}).results || [];
+          var sum = 0, n = 0;
+          for (var i = 0; i < results.length; i++) {
+            var data = (results[i] || {}).data || [];
+            for (var j = 0; j < data.length; j++) {
+              var v = Number((data[j] || {}).value);
+              if (isFinite(v)) { sum += v; n++; }
+            }
+          }
+          return n > 0 ? sum / n : null;
+        }
+        function r2(x) { return Math.round(x * 100) / 100; }
+        var rpm = avg(inputs.rpm), err = avg(inputs.err), rt = avg(inputs.rt);
+        var hasData = rpm !== null && rpm > 0;
+
+        var problems = [];
+        var maxErrInc = Number(inputs.max_err_increase);
+        if (!isFinite(maxErrInc)) maxErrInc = 1;
+        var maxRtRatio = Number(inputs.max_rt_ratio);
+        if (!isFinite(maxRtRatio) || maxRtRatio <= 0) maxRtRatio = 1.5;
+        var baseErr = Number(inputs.baseline_err);
+        var baseRt = Number(inputs.baseline_rt);
+        var baseHasData = inputs.baseline_has_data === true || inputs.baseline_has_data === 'true';
+
+        if (isFinite(baseErr) && err !== null && err - baseErr > maxErrInc) {
+          problems.push('error rate ' + r2(err) + '% vs baseline ' + r2(baseErr) + '% (max increase ' + maxErrInc + 'pp)');
+        }
+        if (baseHasData && isFinite(baseRt) && baseRt > 0 && rt !== null && rt > baseRt * maxRtRatio) {
+          problems.push('response time ' + r2(rt) + 'ms vs baseline ' + r2(baseRt) + 'ms (max ratio ' + maxRtRatio + 'x)');
+        }
+        return {
+          rpm: rpm === null ? null : r2(rpm),
+          error_rate: err === null ? null : r2(err),
+          response_time: rt === null ? null : r2(rt),
+          has_data: hasData,
+          degraded: problems.length > 0,
+          problems: problems
+        };
+
+connections:
+  - { id: c1, from: start,       to: fetch_scope }
+  - { id: c2, from: fetch_scope, to: window }
+  - { id: c3, from: window,      to: get_rpm }
+  - { id: c4, from: get_rpm,     to: get_err }
+  - { id: c5, from: get_err,     to: get_rt }
+  - { id: c6, from: get_rt,      to: verdict }
+
+outputs:
+  rpm:           "${{ steps.verdict.outputs.rpm }}"
+  error_rate:    "${{ steps.verdict.outputs.error_rate }}"
+  response_time: "${{ steps.verdict.outputs.response_time }}"
+  has_data:      "${{ steps.verdict.outputs.has_data }}"
+  degraded:      "${{ steps.verdict.outputs.degraded }}"
+  problems:      "${{ steps.verdict.outputs.problems }}"

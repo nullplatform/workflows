@@ -1,0 +1,160 @@
+# Validate Jira Epic — checklist external item resolver.
+#
+# Pairs with checklist external items of `kind: validate-jira-epic`. The
+# `np-checklist-trigger` step auto-registers a notification_channel in NP
+# at activation and emits parsed dispatch payloads (with `callbackUrl`,
+# `callbackToken`, and the `inputs.jira_epic` key). The Jira issue is
+# fetched, validated, and the item is resolved via
+# `np-checklist-item-resolve` — no raw HTTP, no token plumbing in YAML.
+#
+# Workflow-level `secrets:` are NP secret bindings: each `key:` is the
+# secret name as stored in NP, NOT an env var. The workflow-system
+# resolves them at run time and substitutes the value into `${{ secrets.* }}`.
+id: validate_jira_epic
+name: "Validate Jira Epic"
+description: >
+  Validates that the Jira epic referenced in deployment metadata exists,
+  is of type Epic, and sits in a permissible status. Resolves the
+  checklist item with the validation outcome.
+path: "/governance/validate-jira-epic"
+semantic_version: 1.0.0
+
+# NP and Jira credentials are supplied as config entries (secrets/vars)
+# scoped to this workflow or its folder, referenced as `${{ secrets.* }}` /
+# `${{ vars.* }}` on the steps below — never inlined.
+secrets: {}
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-checklist-trigger
+    name: "On checklist dispatch (validate-jira-epic)"
+    config:
+      pathPrefix: /np/checklist/validate-jira-epic
+      mode: start
+      kind: validate-jira-epic
+      # The org NRN the checklist trigger registers its notification_channel
+      # under. Set NP_ORGANIZATION_ID as a config entry on this workflow/folder.
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      # NP API key comes from a config entry (write-only secret), never inline.
+      npApiKey: "${{ secrets.NP_API_KEY }}"
+
+  # Heartbeat the checklist item BEFORE we kick off the Jira lookup so
+  # the deployer sees "running" + a textual breadcrumb in the UI
+  # instead of staring at a static `pending`. Failures here are
+  # non-fatal (the resolve at the end is the source of truth), but we
+  # let them surface so retries get a chance.
+  - id: progress_looking_up
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: looking up Jira epic"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Looking up Jira epic ${{ steps.trigger.outputs.inputs.jira_epic }} in Atlassian…"
+
+  - id: get_epic
+    type: module
+    plugin_type: jira-get-issue
+    name: "Fetch Jira epic"
+    config:
+      # Jira credentials come from config entries (secret token, plain vars).
+      baseUrl:  "${{ vars.JIRA_BASE_URL }}"
+      email:    "${{ vars.JIRA_EMAIL }}"
+      apiToken: "${{ secrets.JIRA_API_TOKEN }}"
+    inputs:
+      # Read from the trigger explicitly because `$item` is the
+      # upstream step's item — and after inserting a progress
+      # heartbeat the upstream is no longer the trigger.
+      issueKey: "${{ steps.trigger.outputs.inputs.jira_epic }}"
+    # Lookup failure (404/401/etc.) is itself a meaningful validation outcome:
+    # the epic could not be verified. Route to `resolve_failure` so the
+    # checklist item gets marked `failed` with the Jira error message
+    # instead of leaving it pending until timeout.
+    error_handling:
+      fallback_step: resolve_failure
+
+  - id: validate
+    type: module
+    plugin_type: code-exec
+    name: "Validate epic shape + status"
+    config:
+      code: |
+        // $item is the upstream Jira issue (jira-get-issue outputs).
+        // Failure paths come from get_epic with status='failure', but
+        // code-exec only runs when upstream succeeded so we focus on
+        // domain validation.
+        var issue = $item;
+        if (issue.issuetype !== 'Epic') {
+          return {
+            status: 'failed',
+            message: 'Issue ' + (issue.key || '<unknown>') + ' is not an Epic (got "' + issue.issuetype + '").',
+            details: { jira_key: issue.key, issuetype: issue.issuetype },
+          };
+        }
+        var allowed = ['In Progress', 'In Development'];
+        if (allowed.indexOf(issue.status) === -1) {
+          return {
+            status: 'failed',
+            message: 'Epic ' + issue.key + ' is in status "' + issue.status + '"; expected one of ' + allowed.join(', ') + '.',
+            details: { jira_key: issue.key, status: issue.status },
+          };
+        }
+        return {
+          status: 'passed',
+          message: 'Epic ' + issue.key + ' OK (status="' + issue.status + '").',
+          details: { jira_key: issue.key, status: issue.status, summary: issue.summary || null },
+        };
+
+  - id: resolve
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        "${{ steps.validate.outputs.status }}"
+      message:       "${{ steps.validate.outputs.message }}"
+      details:       "${{ steps.validate.outputs.details }}"
+
+  # Reached only when `get_epic` fails terminally (Jira 404, 401, network
+  # error, etc.). We surface the Jira error verbatim as the checklist item
+  # failure message so the deployer sees what went wrong without having to
+  # open workflow logs. NOT connected via a normal edge — the engine routes
+  # to this step via `error_handling.fallback_step` on `get_epic`.
+  - id: resolve_failure
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item (lookup failed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Could not validate Jira epic: ${{ steps.get_epic.error.message }}"
+      details:
+        jira_key:      "${{ steps.trigger.outputs.inputs.jira_epic }}"
+        error_code:    "${{ steps.get_epic.error.code }}"
+        error_message: "${{ steps.get_epic.error.message }}"
+
+connections:
+  - { id: c1,  from: trigger,             to: progress_looking_up }
+  - { id: c1b, from: progress_looking_up, to: get_epic }
+  - { id: c2,  from: get_epic,            to: validate }
+  - { id: c3,  from: validate,            to: resolve }
+  # Edge from get_epic to resolve_failure declared so the graph
+  # knows resolve_failure is NOT a workflow entry point. The
+  # `condition` is permanently false so the success path never
+  # traverses this edge. On terminal failure the engine bypasses
+  # port routing entirely and reaches resolve_failure via
+  # `error_handling.fallback_step` above.
+  - { id: c4, from: get_epic, to: resolve_failure, condition: "false" }
+
+outputs:
+  resolved_status:  "${{ steps.validate.outputs.status }}"
+  resolved_message: "${{ steps.validate.outputs.message }}"
+  callback_ok:      "${{ steps.resolve.outputs.ok }}"

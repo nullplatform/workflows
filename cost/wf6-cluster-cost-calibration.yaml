@@ -1,0 +1,255 @@
+# Monthly cluster-cost calibration.
+#
+# Derives the unit prices the cost tracker bills scopes with from REALITY:
+# last month's amortized EC2-Compute cost (AWS Cost Explorer — Savings
+# Plans included) split over the fleet Prometheus reports (allocatable
+# vCPU/RAM), CPU:RAM ratio configurable. Then it:
+#   1. upserts COST_PER_MILLICORE_HOUR / COST_PER_MB_RAM_HOUR config
+#      entries (what wf1b prices with from the next run on), and
+#   2. records the calibration on the account's `cost_pricing` catalog
+#      metadata (auditable, lake-visible history).
+#
+# Guardrail: if a derived price lands outside [1/3×, 3×] of the current
+# entry, nothing is written — the run reports out_of_bounds instead
+# (a fat-finger in CE data must not silently reprice the whole org).
+#
+# AWS credentials live on the AGENT (--command-executor-env), never in the
+# workflow. Required IAM: ce:GetCostAndUsage. See scripts/cluster-costing.sh.
+id: cluster_cost_calibration
+name: "Cost Tracker — Cluster Cost Calibration"
+description: >
+  Monthly: derives $/millicore-hour and $/MB-hour from the cluster's real
+  bill (CE amortized) + fleet size (Prometheus), updates the pricing config
+  entries and the account-level cost_pricing metadata.
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  month:
+    type: string
+    required: false
+    description: "Month to calibrate (YYYY-MM). Default: last full month."
+  monthly_cost_override:
+    type: number
+    required: false
+    description: "Skip Cost Explorer and use this monthly compute cost (USD)."
+
+variables:
+  result: { initialValue: { status: "failed" } }
+
+steps:
+  - id: cron
+    type: trigger
+    plugin_type: cron
+    name: "Monthly"
+    config:
+      # Day 2, 07:00 UTC — CE has the full previous month consolidated.
+      schedule: "0 7 2 * *"
+
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Run Calibration"
+    config:
+      description: "Recalibrates the tracker's unit prices from the cluster's real bill."
+      inputs:
+        month:
+          type: string
+          required: false
+          description: "YYYY-MM (default: last full month)"
+        monthly_cost_override:
+          type: number
+          required: false
+          description: "Use this USD amount instead of querying Cost Explorer"
+
+  - id: build_command
+    type: module
+    plugin_type: code-exec
+    name: "Build Costing Command"
+    # Reached from either trigger.
+    join_strategy: any
+    inputs:
+      base:  "${{ vars.CLUSTER_COSTING_CMDLINE || '/opt/nullplatform/cost/cluster-costing.sh' }}"
+      ratio: "${{ vars.CLUSTER_COST_CPU_RAM_RATIO || '7.2' }}"
+      month: "${{ workflow.inputs.month }}"
+      cost_override: "${{ workflow.inputs.monthly_cost_override }}"
+    config:
+      code: |
+        var cmdline = String(inputs.base) + " --ratio " + String(Number(inputs.ratio) || 7.2);
+        var month = String(inputs.month || '').trim();
+        if (month) {
+          if (!/^\d{4}-\d{2}$/.test(month)) throw new Error('month must be YYYY-MM');
+          cmdline += " --month " + month;
+        }
+        var override = Number(inputs.cost_override);
+        if (override > 0) cmdline += " --monthly-cost " + override;
+        return { cmdline: cmdline };
+
+  - id: run_costing
+    type: module
+    plugin_type: np-agent-command
+    name: "Derive Prices (np agent)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "10s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      cmdline: "${{ steps.build_command.outputs.cmdline }}"
+    config:
+      command_type: exec
+      apikey: "${{ secrets.NP_API_KEY }}"
+      timeout_seconds: 180
+      inject_workflow_env: false
+      agent_selector:
+        nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
+        tags:
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+      # Placeholder so validateConfig() passes; inputs.cmdline overrides.
+      cmdline: "/bin/true"
+
+  - id: validate
+    type: module
+    plugin_type: code-exec
+    name: "Validate Against Current Prices"
+    inputs:
+      stdout: "${{ steps.run_costing.outputs.stdout }}"
+      cur_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0' }}"
+      cur_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0' }}"
+    config:
+      code: |
+        // A cron calibration must REPORT problems, never crash: every exit
+        // of this step is a structured verdict routed by the decider.
+        function reject(note) {
+          return { apply: false, status_out: 'invalid_data', note: note, costing: null,
+                   calibrated_at: new Date().toISOString() };
+        }
+        var c;
+        try { c = JSON.parse(String(inputs.stdout || '')); }
+        catch (e) { return reject('costing stdout is not JSON: ' + String(inputs.stdout).slice(0, 200)); }
+        if (c.error) return reject('costing failed: ' + c.error);
+        var pc = Number(c.price_per_millicore_hour), pm = Number(c.price_per_mb_ram_hour);
+        if (!(pc > 0) || !(pm > 0)) return reject('derived prices are not positive: ' + JSON.stringify(c).slice(0, 200));
+        // Guardrail: a derived price outside [1/3x, 3x] of the current one is
+        // treated as suspect data — report, do not silently reprice the org.
+        function inBounds(now, prev) {
+          if (!(prev > 0)) return true; // first calibration: nothing to compare
+          return now >= prev / 3 && now <= prev * 3;
+        }
+        var okCpu = inBounds(pc, Number(inputs.cur_cpu));
+        var okMem = inBounds(pm, Number(inputs.cur_mem));
+        return {
+          apply: okCpu && okMem,
+          status_out: (okCpu && okMem) ? 'applied' : 'out_of_bounds',
+          calibrated_at: new Date().toISOString(),
+          costing: c,
+          price_cpu: String(pc),
+          price_mem: String(pm),
+          note: (okCpu && okMem) ? 'within bounds'
+            : 'derived prices out of [1/3x,3x] bounds vs current (cpu ok=' + okCpu + ', mem ok=' + okMem + ') — NOT applied'
+        };
+
+  - id: should_apply
+    type: decider
+    plugin_type: conditional
+    name: "Apply?"
+    config:
+      expression: "steps.validate.outputs.apply == true"
+
+  - id: write_cpu_price
+    type: module
+    plugin_type: np-api-call
+    name: "Upsert CPU Price Entry"
+    inputs:
+      value: "${{ steps.validate.outputs.price_cpu }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: POST
+      path: "/workflows/config"
+      body:
+        name: COST_PER_MILLICORE_HOUR
+        value: "${{ inputs.value }}"
+        secret: false
+        path: "/cost"
+
+  - id: write_mem_price
+    type: module
+    plugin_type: np-api-call
+    name: "Upsert Memory Price Entry"
+    inputs:
+      value: "${{ steps.validate.outputs.price_mem }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: POST
+      path: "/workflows/config"
+      body:
+        name: COST_PER_MB_RAM_HOUR
+        value: "${{ inputs.value }}"
+        secret: false
+        path: "/cost"
+
+  - id: write_metadata
+    type: module
+    plugin_type: np-api-call
+    name: "Record Calibration (account metadata)"
+    inputs:
+      costing: "${{ steps.validate.outputs.costing }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/metadata/account/${{ vars.COST_ACCOUNT_ID }}/cost_pricing"
+      body:
+        price_per_millicore_hour: "${{ steps.validate.outputs.costing.price_per_millicore_hour }}"
+        price_per_mb_ram_hour: "${{ steps.validate.outputs.costing.price_per_mb_ram_hour }}"
+        currency: "USD"
+        monthly_compute_cost: "${{ steps.validate.outputs.costing.monthly_compute_cost }}"
+        nodes: "${{ steps.validate.outputs.costing.nodes }}"
+        vcpu_total: "${{ steps.validate.outputs.costing.vcpu_total }}"
+        gb_total: "${{ steps.validate.outputs.costing.gb_total }}"
+        method: "${{ steps.validate.outputs.costing.method }}"
+        calibrated_at: "${{ steps.validate.outputs.calibrated_at }}"
+
+  - id: stash_applied
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: applied"
+    inputs:
+      costing: "${{ steps.validate.outputs.costing }}"
+    config:
+      path: result
+      value:
+        status: "applied"
+        costing: "${{ inputs.costing }}"
+
+  - id: stash_not_applied
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: not applied"
+    inputs:
+      status_out: "${{ steps.validate.outputs.status_out }}"
+      note: "${{ steps.validate.outputs.note }}"
+      costing: "${{ steps.validate.outputs.costing }}"
+    config:
+      path: result
+      value:
+        status: "${{ inputs.status_out }}"
+        note: "${{ inputs.note }}"
+        costing: "${{ inputs.costing }}"
+
+connections:
+  - { id: c1,  from: cron,           to: build_command }
+  - { id: c2,  from: start,          to: build_command }
+  - { id: c3,  from: build_command,  to: run_costing }
+  - { id: c4,  from: run_costing,    to: validate }
+  - { id: c5,  from: validate,       to: should_apply }
+  - { id: c6,  from: should_apply,   to: write_cpu_price,     source_port: "true" }
+  - { id: c7,  from: write_cpu_price, to: write_mem_price }
+  - { id: c8,  from: write_mem_price, to: write_metadata }
+  - { id: c9,  from: write_metadata,  to: stash_applied }
+  - { id: c10, from: should_apply,   to: stash_not_applied,    source_port: "false" }
+
+outputs:
+  status: "${{ variables.result.status }}"
+  costing: "${{ variables.result.costing }}"
+  note: "${{ variables.result.note }}"

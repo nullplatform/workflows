@@ -1,0 +1,470 @@
+# AMI Drift Scanner — detects EC2 scopes whose active deployment runs an AMI
+# different from the one their applicable PROVIDER configures, and ensures
+# one open action item per drifted scope.
+#
+# Configured AMIs (baseline): EC2 PROVIDERS — the operator-managed source of
+# truth. `GET /provider?nrn=organization={org}&specification_id={ec2_spec}
+# &show_descendants=true` lists every entry; each `data_source.key` points at
+# the runtime_configuration holding the values (`values.aws.amiId`). The
+# /nrn tree is NEVER consulted: it carries legacy values with the same key
+# names that are NOT provider config (reading it hid real drift, 2026-07-16).
+# Matching (per scope): a provider applies when its nrn is the scope's nrn
+# or an ancestor AND all its dimensions match the scope's dimensions;
+# specificity = deeper nrn wins, then more matching dimensions. No
+# applicable provider → counted as `skipped_unconfigured`, never drift.
+# Deployed AMIs: datalake — deployment infrastructure_configuration metadata
+# (data.ec2.ami_id) of active deployments on active EC2 scopes; scope
+# dimensions joined from core_entities_scope_dimension.
+#
+# Data flows step→step through declared `inputs:`/forEach expressions — no
+# set-variable hops (snapshot shared-ref hazard + np-* plugins merge
+# `{...config, ...ctx.inputs}`, so upstream output fields named like config
+# keys hijack the plugin config).
+#
+# Per-org configuration (config entries on folder /action-items/ami-drift):
+#   NP_API_KEY (secret)          — NP API key (exchanged+cached by the plugins)
+#   NP_ORGANIZATION_ID (var)     — organization id
+#   AMI_DRIFT_CATEGORY_SLUG (var) — action item category slug (e.g. engineering)
+#   AMI_DRIFT_DUE_DAYS (var)     — due-date offset in days (e.g. 14)
+id: ami_drift_scanner
+name: "AMI Drift Scanner"
+description: >
+  Daily scan (03:00, also manual) that compares the AMI each active EC2
+  deployment runs against the AMI its applicable EC2 provider configures
+  (nrn + dimensions matching, most-specific wins), and ensures an idempotent
+  action item (category from config, priority medium, value 200) per
+  drifted scope.
+path: "/action-items/ami-drift"
+semantic_version: 2.0.0
+
+inputs:
+  due_days:
+    type: number
+    required: false
+    description: "Override for the action item due date offset in days (default: AMI_DRIFT_DUE_DAYS var)"
+  nrn:
+    type: string
+    required: false
+    description: "Optional NRN prefix filter — only scopes under this NRN are scanned (empty = whole organization)"
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Scan Now"
+    config:
+      description: "Runs the AMI drift scan immediately."
+      inputs:
+        due_days:
+          type: number
+          required: false
+          description: "Due date offset in days for created action items"
+          placeholder: "14"
+        nrn:
+          type: string
+          required: false
+          description: "Only scan scopes under this NRN (prefix match; empty = whole organization)"
+          placeholder: "organization=…:account=…:namespace=…:application=…"
+
+  - id: start_cron
+    type: trigger
+    plugin_type: cron
+    name: "Nightly Scan"
+    config:
+      schedule: "0 3 * * *"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  # ── Current state: active EC2 deployments + their AMI ────────────────
+  - id: lake_deployments
+    type: module
+    plugin_type: np-lake-query
+    name: "Active EC2 Deployments (lake)"
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      # scope_dimensions: map {dimension_slug: value_slug} joined from
+      # core_entities_scope_dimension — provider matching contrasts these
+      # against each provider's `dimensions`. Validated live 2026-07-16.
+      sql: |
+        SELECT d.id AS deployment_id, d.scope_id AS scope_id, s.name AS scope_name, s.nrn AS scope_nrn,
+               a.app_name AS application,
+               JSONExtractString(m.data, 'ec2', 'ami_id') AS deployed_ami,
+               toString(d.created_at) AS deployed_at,
+               dims.dimensions AS scope_dimensions
+        FROM core_entities_deployment AS d FINAL
+        JOIN core_entities_scope AS s FINAL ON d.scope_id = s.id AND s._deleted = 0
+        JOIN core_entities_application AS a FINAL ON s.application_id = a.app_id AND a._deleted = 0
+        LEFT JOIN core_entities_metadata AS m FINAL
+          ON m.entity = 'deployment' AND m.metadata_type = 'infrastructure_configuration'
+          AND m.id = toString(d.id) AND m._deleted = 0
+        LEFT JOIN (
+          SELECT scope_id, mapFromArrays(groupArray(dimension_slug), groupArray(value_slug)) AS dimensions
+          FROM core_entities_scope_dimension FINAL
+          WHERE _deleted = 0
+          GROUP BY scope_id
+        ) AS dims ON dims.scope_id = d.scope_id
+        WHERE d._deleted = 0
+          AND d.status_in_scope = 'active'
+          AND s.type = 'web_pool'
+          AND s.provider = 'AWS:WEB_POOL:EC2INSTANCES'
+          AND s.status = 'active'
+        LIMIT 5000
+
+  # ── Optional scope filter: workflow input `nrn` (manual runs) ────────
+  # Prefix match on the scope's application NRN: `nrn` equal to or an
+  # ancestor of scope_nrn keeps the row. Empty/absent input (cron runs)
+  # passes everything through. Filtering HERE also shrinks the NRN
+  # resolution fan-out below to just the filtered applications.
+  - id: filter_rows
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Filter by NRN"
+    inputs:
+      rows: "${{ steps.lake_deployments.outputs.rows }}"
+      nrn:  "${{ workflow.inputs.nrn }}"
+    config:
+      code: |
+        var rows = inputs.rows || [];
+        var nrn = String(inputs.nrn || '').trim();
+        if (!nrn) {
+          log.info('No NRN filter — scanning the whole organization', { rows: rows.length });
+          return { rows: rows, nrn_filter: null, total: rows.length };
+        }
+        var out = [];
+        for (var i = 0; i < rows.length; i++) {
+          var s = (rows[i] || {}).scope_nrn || '';
+          if (s === nrn || s.indexOf(nrn + ':') === 0) out.push(rows[i]);
+        }
+        log.info('NRN filter applied', { filter: nrn, matched: out.length, of: rows.length });
+        return { rows: out, nrn_filter: nrn, total: out.length };
+
+  # ── Baseline: configured AMIs from EC2 PROVIDERS ─────────────────────
+  # The ec2-configuration specification is platform-global (same id in
+  # every org). Each provider entry's data_source.key points at the
+  # runtime_configuration that holds the actual values.
+  - id: fetch_providers
+    type: module
+    plugin_type: np-api-call
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "List EC2 Providers"
+    inputs:
+      upstream_count: "${{ steps.filter_rows.outputs.total }}"
+    output_projection:
+      - status
+      - body.results[].id
+      - body.results[].nrn
+      - body.results[].dimensions
+      - body.results[].data_source
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/provider?nrn=organization=${{ vars.NP_ORGANIZATION_ID }}&specification_id=f784061e-5b6d-4a0d-a19b-754e7f4ef72c&show_descendants=true&limit=200"
+
+  - id: build_rc_paths
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Build Provider Detail Paths"
+    inputs:
+      providers: "${{ steps.fetch_providers.outputs.body.results }}"
+    config:
+      code: |
+        // v1.5: fetch each provider BY ID — the detail endpoint returns the
+        // provider's RESOLVED attributes (attributes.ami.id) regardless of
+        // whether the org stores values inline or behind a data_source →
+        // runtime_configuration pointer, and it resolves fine even when the
+        // pointer references a deleted application (orphan rc entries 401).
+        var provs = inputs.providers || [];
+        if (provs.length >= 200) {
+          log.warn('Provider list hit the page limit — results may be incomplete', { count: provs.length });
+        }
+        var paths = [];
+        for (var i = 0; i < provs.length; i++) {
+          var id = (provs[i] || {}).id;
+          if (id === undefined || id === null || id === '') continue;
+          paths.push('/provider/' + encodeURIComponent(String(id)));
+        }
+        log.info('EC2 providers', { providers: provs.length, detail_fetches: paths.length });
+        return { paths: paths, providers_total: provs.length };
+
+  - id: fetch_runtime_configs
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Runtime Configurations"
+    forEach:
+      expression: "${{ steps.build_rc_paths.outputs.paths }}"
+      itemVariable: path
+    # Source-side trim: build_provider_index only reads these paths.
+    output_projection:
+      - status
+      - body.id
+      - body.nrn
+      - body.dimensions
+      - body.attributes.ami.id
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      # Providers can point at runtime configs of DELETED applications
+      # (orphan entries — seen live: the NP API answers 401 for them). A
+      # single dead pointer must not kill the whole scan: with
+      # failOnHttpError off, the 4xx response has no body.id, so
+      # build_provider_index skips it and the affected scopes count as
+      # skipped_unconfigured. The empty-baseline guard still aborts if
+      # NOTHING resolves.
+      failOnHttpError: false
+      # Placeholder so validateConfig() (config-only, pre-execute) passes;
+      # forEach injects inputs.path per iteration (merged over config).
+      path: "/__foreach_placeholder__"
+
+  - id: build_provider_index
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Build Provider Baseline"
+    # Joins the provider entries (nrn + dimensions) with their runtime
+    # configuration values (aws.amiId) into the matchable baseline:
+    # [{nrn, dimensions, ami}]. Only ACTIVE runtime configs with an amiId
+    # participate.
+    inputs:
+      providers: "${{ steps.fetch_providers.outputs.body.results }}"
+      configs:   "${{ steps.fetch_runtime_configs.outputs.items }}"
+    config:
+      code: |
+        // v1.5: each detail row IS the provider with resolved attributes —
+        // no runtime_configuration join needed. Details that failed to fetch
+        // (failOnHttpError: false → 4xx body without attributes) or lack an
+        // AMI are skipped; their scopes count as skipped_unconfigured.
+        var rcs = inputs.configs || [];
+        var providers = [];
+        for (var i = 0; i < rcs.length; i++) {
+          var body = (rcs[i] || {}).body || rcs[i] || {};
+          var ami = (((body.attributes || {}).ami) || {}).id;
+          if (!ami) continue;
+          providers.push({ nrn: body.nrn || '', dimensions: body.dimensions || {}, ami: ami });
+        }
+        if (providers.length === 0) {
+          // Guard: never evaluate drift against an empty baseline — with no
+          // providers there is no configured truth to compare against, and
+          // proceeding would either flag everything or silently no-op.
+          throw new Error('No active EC2 provider AMIs configured for the organization — aborting drift evaluation');
+        }
+        log.info('EC2 provider baseline', { providers: providers.length });
+        return { providers: providers };
+
+  - id: detect_drift
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Detect Drift"
+    inputs:
+      rows:      "${{ steps.filter_rows.outputs.rows }}"
+      providers: "${{ steps.build_provider_index.outputs.providers }}"
+      due_days:  "${{ workflow.inputs.due_days || vars.AMI_DRIFT_DUE_DAYS }}"
+    config:
+      code: |
+        var rows = inputs.rows || [];
+        var providers = inputs.providers || [];
+        var dueDaysRaw = Number(inputs.due_days);
+        var dueDays = dueDaysRaw > 0 ? dueDaysRaw : 14;
+        var now = new Date();
+        var due = new Date(now.getTime() + dueDays * 86400000).toISOString().slice(0, 10);
+        var detectedAt = now.toISOString();
+        // Per-scope applicable provider: its nrn is the scope's nrn or an
+        // ancestor AND every provider dimension matches the scope's.
+        // Specificity: deeper nrn wins, then more matching dimensions.
+        // (Validated live against org data 2026-07-16.)
+        function expectedFor(r) {
+          var scopeNrn = r.scope_nrn || '';
+          var dims = r.scope_dimensions || {};
+          var best = null;
+          var bestScore = -1;
+          for (var i = 0; i < providers.length; i++) {
+            var p = providers[i];
+            if (!(scopeNrn === p.nrn || scopeNrn.indexOf(p.nrn + ':') === 0)) continue;
+            var pd = p.dimensions || {};
+            var dimKeys = Object.keys(pd);
+            var ok = true;
+            for (var j = 0; j < dimKeys.length; j++) {
+              if (String(dims[dimKeys[j]]) !== String(pd[dimKeys[j]])) { ok = false; break; }
+            }
+            if (!ok) continue;
+            var score = p.nrn.split(':').length * 100 + dimKeys.length;
+            if (score > bestScore) { bestScore = score; best = p; }
+          }
+          return best ? best.ami : null;
+        }
+        // ONE finding per scope (drift_key = scope). A scope with several
+        // active drifted deployments used to emit one finding EACH — same
+        // drift_key raced in the parallel ensure fan-out (both children
+        // find nothing → both create → duplicate items). Keep the most
+        // recent deployment as the representative.
+        var byKey = {};
+        var keyOrder = [];
+        var skipped = 0;
+        var unconfigured = 0;
+        for (var i = 0; i < rows.length; i++) {
+          var r = rows[i] || {};
+          var ami = r.deployed_ami || '';
+          // Old deployments predate infrastructure_configuration metadata —
+          // no AMI evidence, so no drift claim. Counted for the summary.
+          if (!ami) { skipped++; continue; }
+          var expected = expectedFor(r);
+          // No resolvable expected AMI for this scope → nothing to compare
+          // against; counted separately (config gap, not drift).
+          if (!expected) { unconfigured++; continue; }
+          if (ami === expected) continue;
+          var scopeId = String(r.scope_id);
+          var prior = byKey[scopeId];
+          if (prior && String(prior.deployed_at || '') >= String(r.deployed_at || '')) continue;
+          if (!prior) keyOrder.push(scopeId);
+          // Findings stay SLIM (no per-finding arrays): with thousands of
+          // scopes these travel through snapshots, reports and sub-workflow
+          // inputs — every repeated byte multiplies.
+          byKey[scopeId] = ({
+            drift_key: 'ami-drift:' + scopeId,
+            scope_id: scopeId,
+            scope_name: r.scope_name || ('scope-' + scopeId),
+            scope_nrn: (r.scope_nrn || '') + ':scope=' + scopeId,
+            application: r.application || '',
+            deployment_id: String(r.deployment_id),
+            deployed_ami: ami,
+            expected_ami: expected,
+            deployed_at: r.deployed_at || null,
+            due_date: due,
+            metadata: {
+              drift_key: 'ami-drift:' + scopeId,
+              scope_id: scopeId,
+              scope_name: r.scope_name || '',
+              deployment_id: String(r.deployment_id),
+              deployed_ami: ami,
+              expected_ami: expected,
+              application: r.application || '',
+              detected_at: detectedAt
+            }
+          });
+        }
+        var findings = [];
+        for (var k = 0; k < keyOrder.length; k++) findings.push(byKey[keyOrder[k]]);
+        log.info('AMI drift detection (provider-matched expected)', {
+          total_rows: rows.length,
+          skipped_no_metadata: skipped,
+          skipped_unconfigured: unconfigured,
+          drifted: findings.length
+        });
+        return {
+          findings: findings,
+          total: rows.length,
+          skipped_no_metadata: skipped,
+          skipped_unconfigured: unconfigured,
+          drifted: findings.length
+        };
+
+  # ── Ensure one action item per finding ───────────────────────────────
+  # forEach: one sub-execution per finding, 5 in parallel (v1.6 — safe now
+  # that child execution ids carry the itemIndex; sequential took ~50 min
+  # for the 1000-finding org run). Empty findings → no calls.
+  - id: ensure_items
+    type: module
+    plugin_type: sub-workflow
+    name: "Ensure Action Items"
+    forEach:
+      expression: "${{ steps.detect_drift.outputs.findings }}"
+      itemVariable: finding
+      parallel: true
+      maxConcurrency: 5
+    inputs:
+      category_slug:   "${{ vars.AMI_DRIFT_CATEGORY_SLUG || 'engineering' }}"
+      organization_id: "${{ vars.NP_ORGANIZATION_ID }}"
+    config:
+      # PER-ORG id of the loaded "AMI Drift — Ensure Action Item" workflow.
+      # Sub-workflow resolution is by workflow id (slugs do NOT resolve —
+      # regressed once on republish, 2026-07-16). When loading this set into
+      # an org, upload ensure-drift-action-item.yaml first and set this to the
+      # workflow id it returns (looks like `wf_...`).
+      workflowId: "__ENSURE_ACTION_ITEM_WORKFLOW_ID__"
+      waitForCompletion: true
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Build Summary"
+    inputs:
+      scan:       "${{ steps.detect_drift.outputs }}"
+      results:    "${{ steps.ensure_items.outputs.items }}"
+      nrn_filter: "${{ steps.filter_rows.outputs.nrn_filter }}"
+    config:
+      code: |
+        var scan = inputs.scan || {};
+        var results = inputs.results || [];
+        var created = 0, updated = 0, unchanged = 0, other = 0;
+        var createdIds = [];
+        for (var i = 0; i < results.length; i++) {
+          var r = results[i] || {};
+          if (r.action === 'created') { created++; if (r.action_item_id) createdIds.push(r.action_item_id); }
+          else if (r.action === 'updated') updated++;
+          else if (r.action === 'unchanged') unchanged++;
+          else other++;
+        }
+        return {
+          nrn_filter: inputs.nrn_filter || null,
+          total_deployments: scan.total || 0,
+          skipped_no_metadata: scan.skipped_no_metadata || 0,
+          skipped_unconfigured: scan.skipped_unconfigured || 0,
+          drifted: scan.drifted || 0,
+          created: created,
+          updated: updated,
+          unchanged: unchanged,
+          other: other,
+          action_item_ids: createdIds
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Scan Complete"
+    config:
+      level: info
+      message: "AMI drift scan complete. Deployments: ${{ steps.summary.outputs.total_deployments }} (no AMI metadata: ${{ steps.summary.outputs.skipped_no_metadata }}), drifted: ${{ steps.summary.outputs.drifted }} — created ${{ steps.summary.outputs.created }}, updated ${{ steps.summary.outputs.updated }}, unchanged ${{ steps.summary.outputs.unchanged }}."
+
+connections:
+  - { id: c1, from: start_manual,      to: lake_deployments }
+  - { id: c2, from: start_cron,        to: lake_deployments }
+  - { id: c3, from: lake_deployments,       to: filter_rows }
+  - { id: c3b, from: filter_rows,           to: fetch_providers }
+  - { id: c4, from: fetch_providers,        to: build_rc_paths }
+  - { id: c5, from: build_rc_paths,         to: fetch_runtime_configs }
+  - { id: c5b, from: fetch_runtime_configs, to: build_provider_index }
+  - { id: c6, from: build_provider_index,   to: detect_drift }
+  - { id: c7, from: detect_drift,      to: ensure_items }
+  - { id: c8, from: ensure_items,      to: summary }
+  - { id: c9, from: summary,           to: log_done }
+
+outputs:
+  nrn_filter:          "${{ steps.summary.outputs.nrn_filter }}"
+  total_deployments:   "${{ steps.summary.outputs.total_deployments }}"
+  skipped_no_metadata: "${{ steps.summary.outputs.skipped_no_metadata }}"
+  drifted:             "${{ steps.summary.outputs.drifted }}"
+  created:             "${{ steps.summary.outputs.created }}"
+  updated:             "${{ steps.summary.outputs.updated }}"
+  unchanged:           "${{ steps.summary.outputs.unchanged }}"
+  action_item_ids:     "${{ steps.summary.outputs.action_item_ids }}"

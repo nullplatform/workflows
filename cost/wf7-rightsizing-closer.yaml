@@ -1,0 +1,172 @@
+# Right Sizing Closer — weekly verification of acted-on right-sizing items.
+#
+# The scanner OPENS items; wf4 closes the ones it deploys itself. Everything
+# else — apply-only accepts that ship with the next regular deployment, and
+# changes applied BY HAND — leaves the item open with no one confirming the
+# outcome. This closer walks every scope whose cost_tracking metadata points
+# at a live right-sizing item and, from tracker data alone (no Prometheus,
+# no AI), verifies whether the requested resources actually changed and how
+# the scope behaves since: healthy → comment the realized before/after
+# numbers and close; running hot → close with a warning and flag the scope
+# under-provisioned; nothing changed / not enough post-change days → wait.
+#
+# Config: reuses the /cost entries (NP_API_KEY, RIGHTSIZING_TARGET_UTIL_BY_ENV,
+# COST_PER_*). No entries of its own.
+id: right_sizing_closer
+name: "Right Sizing — Closer"
+description: >
+  Weekly job (Thursdays 06:00, also manual) that verifies open right-sizing
+  items: detects applied/manual request changes from tracker data, comments
+  the realized outcome and closes the item (flagging regressions).
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  nrn:
+    type: string
+    required: false
+    description: "Optional NRN prefix filter — only scopes under this NRN are verified (empty = whole organization)"
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Now"
+    config:
+      description: "Runs the closer verification immediately."
+      inputs:
+        nrn:
+          type: string
+          required: false
+          description: "Only verify scopes under this NRN (prefix match)"
+          placeholder: "organization=…:account=…"
+
+  - id: start_cron
+    type: trigger
+    plugin_type: cron
+    name: "Weekly Thursday 06:00"
+    config:
+      schedule: "0 6 * * 4"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  - id: lake_scopes
+    type: module
+    plugin_type: np-lake-query
+    name: "Active K8s Scopes (lake)"
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      sql: |
+        SELECT s.id AS scope_id, s.name AS scope_name, s.scope_slug AS scope_slug,
+               s.nrn AS scope_nrn, s.type AS scope_type, a.app_name AS app_name
+        FROM core_entities_scope AS s FINAL
+        JOIN core_entities_application AS a FINAL
+          ON s.application_id = a.app_id AND a._deleted = 0
+        WHERE s._deleted = 0
+          AND s.status = 'active'
+          AND s.type IN ('web_pool_k8s', 'custom', 'web_pool')
+        LIMIT 5000
+
+  - id: filter_scopes
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (Temporal sandbox
+    # cannot see executeMode "all" — see wf2 filter_scopes).
+    metadata: { fanOutPerItem: false }
+    name: "Filter by NRN"
+    inputs:
+      rows: "${{ steps.lake_scopes.outputs.rows }}"
+      nrn:  "${{ workflow.inputs.nrn }}"
+    config:
+      code: |
+        var rows = inputs.rows || [];
+        var nrn = String(inputs.nrn || '').trim();
+        if (!nrn) return { scopes: rows, total: rows.length };
+        var out = [];
+        for (var i = 0; i < rows.length; i++) {
+          var s = (rows[i] || {}).scope_nrn || '';
+          if (s === nrn || s.indexOf(nrn + ':') === 0) out.push(rows[i]);
+        }
+        return { scopes: out, total: out.length };
+
+  # Each child is 2-4 cheap API calls (tracker metadata + item) — higher
+  # concurrency than the scanner is fine (no agent, no AI).
+  - id: verify_scopes
+    type: module
+    plugin_type: sub-workflow
+    name: "Verify per Scope"
+    forEach:
+      expression: "${{ steps.filter_scopes.outputs.scopes }}"
+      itemVariable: scope
+      parallel: true
+      maxConcurrency: 5
+    config:
+      # PER-ORG id of "Right Sizing — Verify Scope"; patched by
+      # setup/04-upload-workflows.mjs on upload.
+      workflowId: right_sizing_verify_scope
+      waitForCompletion: true
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item.
+    metadata: { fanOutPerItem: false }
+    name: "Build Summary"
+    inputs:
+      results: "${{ steps.verify_scopes.outputs.items }}"
+      total:   "${{ steps.filter_scopes.outputs.total }}"
+    config:
+      code: |
+        var results = inputs.results || [];
+        var counts = { no_item: 0, unchanged: 0, awaiting_data: 0, verified: 0, verified_warning: 0, stale_pointer: 0, other: 0 };
+        var realized = 0;
+        var closedIds = [];
+        for (var i = 0; i < results.length; i++) {
+          // Live engine wraps fan-out items as {outputs, _childExecutionId};
+          // the E2E harness stubs return the outputs flat. Accept both.
+          var r = (results[i] || {}).outputs || results[i] || {};
+          var s = String(r.status || 'other');
+          if (counts[s] === undefined) s = 'other';
+          counts[s]++;
+          realized += Number(r.realized_savings_usd_month) || 0;
+          if (r.action_item_id && (r.status === 'verified' || r.status === 'verified_warning')) closedIds.push(r.action_item_id);
+        }
+        return {
+          scopes: inputs.total || 0,
+          no_item: counts.no_item,
+          unchanged: counts.unchanged,
+          awaiting_data: counts.awaiting_data,
+          verified: counts.verified,
+          verified_warning: counts.verified_warning,
+          stale_pointer: counts.stale_pointer,
+          other: counts.other,
+          realized_savings_usd_month: Math.round(realized * 100) / 100,
+          closed_item_ids: closedIds
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Closer Complete"
+    config:
+      level: info
+      message: "Right-sizing closer: ${{ steps.summary.outputs.scopes }} scopes — closed verified: ${{ steps.summary.outputs.verified }}, closed with warning: ${{ steps.summary.outputs.verified_warning }}, stale pointers cleaned: ${{ steps.summary.outputs.stale_pointer }} (unchanged: ${{ steps.summary.outputs.unchanged }}, awaiting post-change data: ${{ steps.summary.outputs.awaiting_data }}, no item: ${{ steps.summary.outputs.no_item }}). Realized saving confirmed: ${{ steps.summary.outputs.realized_savings_usd_month }}/month."
+
+connections:
+  - { id: c1, from: start_manual,  to: lake_scopes }
+  - { id: c2, from: start_cron,    to: lake_scopes }
+  - { id: c3, from: lake_scopes,   to: filter_scopes }
+  - { id: c4, from: filter_scopes, to: verify_scopes }
+  - { id: c5, from: verify_scopes, to: summary }
+  - { id: c6, from: summary,       to: log_done }
+
+outputs:
+  scopes:                     "${{ steps.summary.outputs.scopes }}"
+  verified:                   "${{ steps.summary.outputs.verified }}"
+  verified_warning:           "${{ steps.summary.outputs.verified_warning }}"
+  stale_pointer:              "${{ steps.summary.outputs.stale_pointer }}"
+  unchanged:                  "${{ steps.summary.outputs.unchanged }}"
+  awaiting_data:              "${{ steps.summary.outputs.awaiting_data }}"
+  no_item:                    "${{ steps.summary.outputs.no_item }}"
+  realized_savings_usd_month: "${{ steps.summary.outputs.realized_savings_usd_month }}"
+  closed_item_ids:            "${{ steps.summary.outputs.closed_item_ids }}"

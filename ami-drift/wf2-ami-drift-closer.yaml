@@ -1,0 +1,383 @@
+# AMI Drift Closer — closes ami-drift action items that no longer apply.
+#
+# Recomputes the CURRENT drift set with the same detection logic as the
+# scanner (lake → active EC2 deployments + scope dimensions; EC2 PROVIDERS
+# + runtime configurations → per-scope expected AMI via nrn+dimensions
+# matching), then closes every open ami-drift item whose drift_key is not
+# in that set (scope redeployed with the configured AMI, scope no longer
+# active, or the provider config changed to match). A comment with the
+# close reason is added before closing (the close transition itself
+# carries no reason field).
+#
+# Data flows step→step through declared `inputs:`/forEach expressions — no
+# set-variable hops. Besides the serializer shared-ref hazard, the np-*
+# plugins merge `{...config, ...ctx.inputs}`, so an upstream output field
+# named like a config key (set-variable emits `path`!) silently hijacks the
+# plugin config.
+#
+# v1 limits: only `open` items are closed (deferred ones are left alone);
+# find uses limit 200 without cursor pagination.
+#
+# Per-org configuration: same config entries as the scanner.
+id: ami_drift_closer
+name: "AMI Drift Closer"
+description: >
+  Daily job (04:00, also manual) that closes ami-drift action items whose
+  drift is no longer detected. Only closes after a full successful recompute
+  of the drift set.
+path: "/action-items/ami-drift"
+semantic_version: 2.0.0
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Closer Now"
+    config:
+      description: "Re-validates open ami-drift action items and closes the ones that no longer apply."
+
+  - id: start_cron
+    type: trigger
+    plugin_type: cron
+    name: "Nightly Close"
+    config:
+      schedule: "0 4 * * *"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  # ── Open ami-drift items ──────────────────────────────────────────────
+  - id: find_open_items
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Open ami-drift Items"
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      status:
+        - open
+      labels:
+        workflow_type: "ami-drift"
+      limit: 200
+
+  # ── Recompute current drift set (same logic as the scanner) ──────────
+  - id: lake_deployments
+    type: module
+    plugin_type: np-lake-query
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Active EC2 Deployments (lake)"
+    # Explicit inputs so the upstream envelope (find_open_items outputs)
+    # never leaks into this plugin's merged config.
+    inputs:
+      upstream_count: "${{ steps.find_open_items.outputs.count }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      # scope_dimensions joined from core_entities_scope_dimension — same
+      # enriched query as the scanner (provider matching needs them).
+      sql: |
+        SELECT d.id AS deployment_id, d.scope_id AS scope_id, s.name AS scope_name, s.nrn AS scope_nrn,
+               a.app_name AS application,
+               JSONExtractString(m.data, 'ec2', 'ami_id') AS deployed_ami,
+               toString(d.created_at) AS deployed_at,
+               dims.dimensions AS scope_dimensions
+        FROM core_entities_deployment AS d FINAL
+        JOIN core_entities_scope AS s FINAL ON d.scope_id = s.id AND s._deleted = 0
+        JOIN core_entities_application AS a FINAL ON s.application_id = a.app_id AND a._deleted = 0
+        LEFT JOIN core_entities_metadata AS m FINAL
+          ON m.entity = 'deployment' AND m.metadata_type = 'infrastructure_configuration'
+          AND m.id = toString(d.id) AND m._deleted = 0
+        LEFT JOIN (
+          SELECT scope_id, mapFromArrays(groupArray(dimension_slug), groupArray(value_slug)) AS dimensions
+          FROM core_entities_scope_dimension FINAL
+          WHERE _deleted = 0
+          GROUP BY scope_id
+        ) AS dims ON dims.scope_id = d.scope_id
+        WHERE d._deleted = 0
+          AND d.status_in_scope = 'active'
+          AND s.type = 'web_pool'
+          AND s.provider = 'AWS:WEB_POOL:EC2INSTANCES'
+          AND s.status = 'active'
+        LIMIT 5000
+
+  # ── Baseline: configured AMIs from EC2 PROVIDERS (mirrors the scanner) ─
+  - id: fetch_providers
+    type: module
+    plugin_type: np-api-call
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "List EC2 Providers"
+    inputs:
+      upstream_count: "${{ steps.lake_deployments.outputs.count }}"
+    output_projection:
+      - status
+      - body.results[].id
+      - body.results[].nrn
+      - body.results[].dimensions
+      - body.results[].data_source
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/provider?nrn=organization=${{ vars.NP_ORGANIZATION_ID }}&specification_id=f784061e-5b6d-4a0d-a19b-754e7f4ef72c&show_descendants=true&limit=200"
+
+  - id: build_rc_paths
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Build Provider Detail Paths"
+    inputs:
+      providers: "${{ steps.fetch_providers.outputs.body.results }}"
+    config:
+      code: |
+        // v1.5: fetch each provider BY ID — the detail endpoint returns the
+        // provider's RESOLVED attributes (attributes.ami.id) regardless of
+        // whether the org stores values inline or behind a data_source →
+        // runtime_configuration pointer, and it resolves fine even when the
+        // pointer references a deleted application (orphan rc entries 401).
+        var provs = inputs.providers || [];
+        if (provs.length >= 200) {
+          log.warn('Provider list hit the page limit — results may be incomplete', { count: provs.length });
+        }
+        var paths = [];
+        for (var i = 0; i < provs.length; i++) {
+          var id = (provs[i] || {}).id;
+          if (id === undefined || id === null || id === '') continue;
+          paths.push('/provider/' + encodeURIComponent(String(id)));
+        }
+        log.info('EC2 providers', { providers: provs.length, detail_fetches: paths.length });
+        return { paths: paths, providers_total: provs.length };
+
+  - id: fetch_runtime_configs
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Runtime Configurations"
+    forEach:
+      expression: "${{ steps.build_rc_paths.outputs.paths }}"
+      itemVariable: path
+    # Source-side trim: build_provider_index only reads these paths.
+    output_projection:
+      - status
+      - body.id
+      - body.nrn
+      - body.dimensions
+      - body.attributes.ami.id
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      # Providers can point at runtime configs of DELETED applications
+      # (orphan entries — seen live: the NP API answers 401 for them). A
+      # single dead pointer must not kill the whole scan: with
+      # failOnHttpError off, the 4xx response has no body.id, so
+      # build_provider_index skips it and the affected scopes count as
+      # skipped_unconfigured. The empty-baseline guard still aborts if
+      # NOTHING resolves.
+      failOnHttpError: false
+      # Placeholder so validateConfig() (config-only, pre-execute) passes;
+      # forEach injects inputs.path per iteration (merged over config).
+      path: "/__foreach_placeholder__"
+
+  - id: build_provider_index
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Build Provider Baseline"
+    inputs:
+      providers: "${{ steps.fetch_providers.outputs.body.results }}"
+      configs:   "${{ steps.fetch_runtime_configs.outputs.items }}"
+    config:
+      code: |
+        // v1.5: each detail row IS the provider with resolved attributes —
+        // no runtime_configuration join needed. Details that failed to fetch
+        // (failOnHttpError: false → 4xx body without attributes) or lack an
+        // AMI are skipped; their scopes count as skipped_unconfigured.
+        var rcs = inputs.configs || [];
+        var providers = [];
+        for (var i = 0; i < rcs.length; i++) {
+          var body = (rcs[i] || {}).body || rcs[i] || {};
+          var ami = (((body.attributes || {}).ami) || {}).id;
+          if (!ami) continue;
+          providers.push({ nrn: body.nrn || '', dimensions: body.dimensions || {}, ami: ami });
+        }
+        if (providers.length === 0) {
+          // Guard: an empty baseline would mark every item stale and close
+          // them all. Fail the run instead.
+          throw new Error('No active EC2 provider AMIs configured for the organization — aborting close evaluation');
+        }
+        log.info('EC2 provider baseline', { providers: providers.length });
+        return { providers: providers };
+
+  - id: detect_valid
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Current Drift Keys"
+    inputs:
+      rows:      "${{ steps.lake_deployments.outputs.rows }}"
+      providers: "${{ steps.build_provider_index.outputs.providers }}"
+    config:
+      code: |
+        var rows = inputs.rows || [];
+        var providers = inputs.providers || [];
+        // Same provider matching as the scanner: nrn ancestry + dimensions,
+        // most-specific wins (deeper nrn, then more matching dimensions).
+        function expectedFor(r) {
+          var scopeNrn = r.scope_nrn || '';
+          var dims = r.scope_dimensions || {};
+          var best = null;
+          var bestScore = -1;
+          for (var i = 0; i < providers.length; i++) {
+            var p = providers[i];
+            if (!(scopeNrn === p.nrn || scopeNrn.indexOf(p.nrn + ':') === 0)) continue;
+            var pd = p.dimensions || {};
+            var dimKeys = Object.keys(pd);
+            var ok = true;
+            for (var j = 0; j < dimKeys.length; j++) {
+              if (String(dims[dimKeys[j]]) !== String(pd[dimKeys[j]])) { ok = false; break; }
+            }
+            if (!ok) continue;
+            var score = p.nrn.split(':').length * 100 + dimKeys.length;
+            if (score > bestScore) { bestScore = score; best = p; }
+          }
+          return best ? best.ami : null;
+        }
+        var keys = [];
+        for (var i = 0; i < rows.length; i++) {
+          var r = rows[i] || {};
+          var ami = r.deployed_ami || '';
+          if (!ami) continue;
+          var expected = expectedFor(r);
+          if (!expected) continue;
+          if (ami === expected) continue;
+          var key = 'ami-drift:' + String(r.scope_id);
+          if (keys.indexOf(key) === -1) keys.push(key);
+        }
+        return { valid_keys: keys };
+
+  - id: select_to_close
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Select Items To Close"
+    inputs:
+      open:  "${{ steps.find_open_items.outputs.items }}"
+      valid: "${{ steps.detect_valid.outputs.valid_keys }}"
+    config:
+      code: |
+        var open = inputs.open || [];
+        var valid = inputs.valid || [];
+        var toClose = [];
+        var kept = 0;
+        for (var i = 0; i < open.length; i++) {
+          var it = open[i] || {};
+          var key = it.metadata && it.metadata.drift_key;
+          if (!key) { kept++; continue; }
+          if (valid.indexOf(key) !== -1) { kept++; continue; }
+          toClose.push(it.id);
+        }
+        log.info('AMI drift close evaluation', {
+          checked: open.length,
+          still_valid: kept,
+          to_close: toClose.length
+        });
+        return {
+          to_close: toClose,
+          checked: open.length,
+          still_valid: kept,
+          to_close_count: toClose.length
+        };
+
+  # ── Close (comment first — the close transition has no reason field) ──
+  # forEach injects each id as inputs.actionItemId; the np plugins merge
+  # ctx.inputs over config, so the id lands per iteration.
+  - id: comment_closing
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment Close Reason"
+    forEach:
+      expression: "${{ steps.select_to_close.outputs.to_close }}"
+      itemVariable: actionItemId
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      # Placeholder so validateConfig() passes; forEach injects
+      # inputs.actionItemId per iteration (merged over config).
+      actionItemId: "__foreach_placeholder__"
+      author: "agent:ami-drift-closer"
+      content: "Closing automatically: AMI drift no longer detected (scope redeployed with a configured AMI, scope no longer active, or the AMI is now configured)."
+
+  - id: close_items
+    type: module
+    plugin_type: np-action-item-update
+    name: "Close Items"
+    forEach:
+      expression: "${{ steps.select_to_close.outputs.to_close }}"
+      itemVariable: actionItemId
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      # Placeholder so validateConfig() passes; forEach injects
+      # inputs.actionItemId per iteration (merged over config).
+      actionItemId: "__foreach_placeholder__"
+      action: close
+      actor: "agent:ami-drift-closer"
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Build Summary"
+    inputs:
+      plan:   "${{ steps.select_to_close.outputs }}"
+      closed: "${{ steps.close_items.outputs.count }}"
+    config:
+      code: |
+        var plan = inputs.plan || {};
+        return {
+          checked: plan.checked || 0,
+          still_valid: plan.still_valid || 0,
+          closed: Number(inputs.closed) || 0
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Closer Complete"
+    config:
+      level: info
+      message: "AMI drift closer complete. Checked ${{ steps.summary.outputs.checked }} open items — still valid: ${{ steps.summary.outputs.still_valid }}, closed: ${{ steps.summary.outputs.closed }}."
+
+connections:
+  - { id: c1, from: start_manual,          to: find_open_items }
+  - { id: c2, from: start_cron,            to: find_open_items }
+  - { id: c3, from: find_open_items,       to: lake_deployments }
+  - { id: c4, from: lake_deployments,        to: fetch_providers }
+  - { id: c5, from: fetch_providers,         to: build_rc_paths }
+  - { id: c6, from: build_rc_paths,          to: fetch_runtime_configs }
+  - { id: c7, from: fetch_runtime_configs,   to: build_provider_index }
+  - { id: c8, from: build_provider_index,    to: detect_valid }
+  - { id: c9, from: detect_valid,          to: select_to_close }
+  - { id: c10, from: select_to_close,      to: comment_closing }
+  - { id: c11, from: comment_closing,      to: close_items }
+  - { id: c12, from: close_items,          to: summary }
+  - { id: c13, from: summary,              to: log_done }
+
+outputs:
+  checked:     "${{ steps.summary.outputs.checked }}"
+  still_valid: "${{ steps.summary.outputs.still_valid }}"
+  closed:      "${{ steps.summary.outputs.closed }}"

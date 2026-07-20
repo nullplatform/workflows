@@ -1,0 +1,167 @@
+# Agent tool: PromQL zoom-in for the right-sizing AI analysis.
+#
+# Exposed to the claude-code-agent step of wf2b as tool `query_metrics`
+# ({type: workflow}). Wraps collect-metrics.sh --mode query, which runs on the
+# cluster via the np agent and caps results at 2000 samples (the script asks
+# the model for a coarser step when exceeded — keeps the agent channel and
+# the model context bounded).
+id: cost_metrics_tool
+name: "Right Sizing — Metrics Tool"
+description: >
+  Runs a bounded PromQL query_range against the cluster's Prometheus via the
+  np agent. Used as an AI-agent tool for right-sizing deep-dives.
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  promql:
+    type: string
+    required: true
+    description: "PromQL expression (include the scope's label matchers)"
+  start:
+    type: string
+    required: false
+    description: "Unix seconds or relative (-14d, -6h). Default: -24h"
+  end:
+    type: string
+    required: false
+    description: "Unix seconds or 'now'. Default: now"
+  step:
+    type: number
+    required: false
+    description: "Resolution in seconds. Default: 3600"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Query"
+    config:
+      description: "Runs one PromQL query_range on the cluster's Prometheus."
+      inputs:
+        promql:
+          type: string
+          required: true
+          description: "PromQL expression"
+          placeholder: "sum(rate(container_cpu_usage_seconds_total{namespace=\"…\"}[5m])) * 1000"
+        start:
+          type: string
+          required: false
+          description: "Unix seconds or relative (-14d, -6h)"
+        end:
+          type: string
+          required: false
+          description: "Unix seconds or 'now'"
+        step:
+          type: number
+          required: false
+          description: "Resolution in seconds (default 3600)"
+
+  - id: build_command
+    type: module
+    plugin_type: code-exec
+    name: "Build Query Command"
+    inputs:
+      promql: "${{ workflow.inputs.promql }}"
+      range_start: "${{ workflow.inputs.start }}"
+      range_end:   "${{ workflow.inputs.end }}"
+      step:        "${{ workflow.inputs.step }}"
+      base: "${{ vars.COST_AGENT_CMDLINE || '/opt/nullplatform/cost/collect-metrics.sh' }}"
+    config:
+      code: |
+        var promql = String(inputs.promql || '').trim();
+        if (!promql) throw new Error('promql is required');
+        // The controlplane-agent exec validator rejects ( ) { } on the
+        // command line, and PromQL always has them — ship it base64-encoded
+        // (the script's --promql-b64 flag decodes).
+        var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+        function b64encode(str) {
+          var bytes = [];
+          for (var i = 0; i < str.length; i++) {
+            var c = str.charCodeAt(i);
+            if (c < 128) bytes.push(c);
+            else if (c < 2048) { bytes.push(192 | (c >> 6), 128 | (c & 63)); }
+            else { bytes.push(224 | (c >> 12), 128 | ((c >> 6) & 63), 128 | (c & 63)); }
+          }
+          var out = '';
+          for (var j = 0; j < bytes.length; j += 3) {
+            var b0 = bytes[j], b1 = bytes[j + 1], b2 = bytes[j + 2];
+            out += B64.charAt(b0 >> 2) + B64.charAt(((b0 & 3) << 4) | ((b1 || 0) >> 4));
+            out += (b1 === undefined) ? '=' : B64.charAt(((b1 & 15) << 2) | ((b2 || 0) >> 6));
+            out += (b2 === undefined) ? '=' : B64.charAt(b2 & 63);
+          }
+          return out;
+        }
+        // Resolve times to unix seconds HERE: the agent host's `date` may be
+        // BSD (macOS), where the script's GNU-style relative date math breaks.
+        // Accepts unix seconds, now, -14d/-6h/-30m and the now-14d spelling.
+        function toUnix(v, name) {
+          var s = String(v == null ? '' : v).trim().toLowerCase();
+          if (!s) return '';
+          var nowSec = Math.floor(new Date().getTime() / 1000);
+          if (s === 'now') return String(nowSec);
+          if (/^\d+$/.test(s)) return s;
+          var m = /^(?:now)?-(\d+)([dhm])$/.exec(s);
+          if (!m) throw new Error('invalid ' + name + ': ' + s + ' (use unix seconds, now, or -14d/-6h/-30m)');
+          var mult = m[2] === 'd' ? 86400 : m[2] === 'h' ? 3600 : 60;
+          return String(nowSec - Number(m[1]) * mult);
+        }
+        var start = toUnix(inputs.range_start, 'start');
+        var end = toUnix(inputs.range_end, 'end');
+        var step = Number(inputs.step) > 0 ? Math.floor(Number(inputs.step)) : 3600;
+        var cmdline = String(inputs.base) + " --mode query --promql-b64 " + b64encode(promql) + " --step " + step;
+        if (start) cmdline += " --start " + start;
+        if (end) cmdline += " --end " + end;
+        return { cmdline: cmdline };
+
+  - id: run_query
+    type: module
+    plugin_type: np-agent-command
+    name: "Run PromQL (np agent)"
+    inputs:
+      cmdline: "${{ steps.build_command.outputs.cmdline }}"
+    config:
+      command_type: exec
+      apikey: "${{ secrets.NP_API_KEY }}"
+      timeout_seconds: 120
+      # Control plane rejects `data.env` on exec — see wf1b run_collector.
+      inject_workflow_env: false
+      agent_selector:
+        nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
+        tags:
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+      # The script exits 3 with {"error": …} on oversized results — surface
+      # that JSON to the model instead of failing the tool call.
+      fail_on_nonzero_exit: false
+      # Placeholder so validateConfig() (config-only, pre-execute) passes;
+      # inputs.cmdline (whitelisted override) replaces it at run time.
+      cmdline: "/bin/true"
+
+  - id: parse_result
+    type: module
+    plugin_type: code-exec
+    name: "Parse Result"
+    inputs:
+      stdout: "${{ steps.run_query.outputs.stdout }}"
+      stderr: "${{ steps.run_query.outputs.stderr }}"
+      exit_code: "${{ steps.run_query.outputs.exitCode }}"
+    config:
+      code: |
+        var out = String(inputs.stdout || '').trim();
+        try {
+          return JSON.parse(out);
+        } catch (e) {
+          return {
+            error: 'query produced no parseable output',
+            exit_code: inputs.exit_code,
+            stderr: String(inputs.stderr || '').slice(0, 500)
+          };
+        }
+
+connections:
+  - { id: c1, from: start,         to: build_command }
+  - { id: c2, from: build_command, to: run_query }
+  - { id: c3, from: run_query,     to: parse_result }
+
+outputs:
+  result: "${{ steps.parse_result.outputs }}"

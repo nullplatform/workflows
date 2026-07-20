@@ -1,0 +1,165 @@
+# Check Release Staged — checklist external item resolver.
+#
+# Pairs with checklist external items of `kind: check-release-staged`.
+# Verifies that the current release was previously deployed to a scope
+# whose `dimensions.environment=stage` for the same application.
+#
+# All credentials are passed via `secrets.*` from the workflow `secrets:`
+# block — those reference NP secrets, never env vars.
+id: check_release_staged
+name: "Check release was deployed to stage"
+description: >
+  Searches the last 30 finalized deployments for the application; passes
+  if any of them belong to a scope with dimensions.environment=stage and
+  the same release id, fails otherwise.
+path: "/governance/check-release-staged"
+semantic_version: 1.0.0
+
+secrets: {}
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-checklist-trigger
+    name: "On checklist dispatch (check-release-staged)"
+    config:
+      pathPrefix: /np/checklist/check-release-staged
+      mode: start
+      kind: check-release-staged
+      # Org NRN the checklist trigger registers under (config entry).
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      # NP API key from a config entry (write-only secret), never inline.
+      npApiKey: "${{ secrets.NP_API_KEY }}"
+
+  - id: progress_listing_deploys
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: listing recent deployments"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Scanning the last 30 finalized deployments for application ${{ steps.trigger.outputs.inputs.application_id }}…"
+
+  - id: list_deploys
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "List recent finalized deployments"
+    config:
+      entity: deployment
+      limit: 30
+      mode: accumulate
+      # NP API key from a config entry (write-only secret), never inline.
+      apiKey: "${{ secrets.NP_API_KEY }}"
+    inputs:
+      filters:
+        # `$item` after the progress heartbeat is the heartbeat's output,
+        # not the trigger's. Read from the trigger explicitly so this
+        # stays stable when more progress steps are inserted.
+        application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
+        status: finalized
+    # If NP API is down / apikey expired / etc., resolve the item as
+    # failed instead of leaving it pending until the timeout fires.
+    error_handling:
+      fallback_step: resolve_failure
+
+  - id: filter
+    type: module
+    plugin_type: code-exec
+    name: "Find stage deploy for this release"
+    inputs:
+      release_id: "${{ steps.trigger.outputs.inputs.release_id }}"
+      application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
+      deploys: "${{ steps.list_deploys.outputs.items }}"
+    config:
+      code: |
+        var deploys = inputs.deploys || [];
+        var releaseId     = String(inputs.release_id);
+        var applicationId = inputs.application_id;
+        var stage = [];
+        for (var i = 0; i < deploys.length; i++) {
+          var d = deploys[i] || {};
+          var dims = (d.scope && d.scope.dimensions) || d.dimensions || {};
+          if (dims.environment === 'stage' || dims.environment === 'staging') {
+            stage.push(d);
+          }
+        }
+        var match = null;
+        for (var j = 0; j < stage.length; j++) {
+          if (String(stage[j].release_id || stage[j].releaseId) === releaseId) {
+            match = stage[j];
+            break;
+          }
+        }
+        if (match) {
+          return {
+            status: 'passed',
+            message: 'Release ' + releaseId + ' was deployed to a stage scope (scope ' + (match.scope_id || match.scopeId) + ') on ' + (match.created_at || match.createdAt) + '.',
+            details: {
+              matched_deployment_id: match.id,
+              matched_scope_id:      match.scope_id || match.scopeId,
+              matched_created_at:    match.created_at || match.createdAt,
+            },
+          };
+        }
+        var preview = [];
+        for (var k = 0; k < stage.length && k < 10; k++) {
+          preview.push(stage[k].release_id || stage[k].releaseId);
+        }
+        return {
+          status: 'failed',
+          message: 'Release ' + releaseId + ' was not found in the last ' + deploys.length + ' finalized deployments for application ' + applicationId + ' (stage scopes scanned: ' + stage.length + ').',
+          details: {
+            stage_deploy_count:  stage.length,
+            recent_release_ids:  preview,
+            scanned_total:       deploys.length,
+          },
+        };
+
+  - id: resolve
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        "${{ steps.filter.outputs.status }}"
+      message:       "${{ steps.filter.outputs.message }}"
+      details:       "${{ steps.filter.outputs.details }}"
+
+  # Reached only via list_deploys' `error_handling.fallback_step`.
+  # Resolves the checklist item as `failed` with the NP API error
+  # surfaced as the failure message — see the equivalent step in
+  # validate-jira-epic.yaml for the rationale.
+  - id: resolve_failure
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item (NP API lookup failed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Could not verify stage release: ${{ steps.list_deploys.error.message }}"
+      details:
+        release_id:    "${{ steps.trigger.outputs.inputs.release_id }}"
+        application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
+        error_code:    "${{ steps.list_deploys.error.code }}"
+        error_message: "${{ steps.list_deploys.error.message }}"
+
+connections:
+  - { id: c1,  from: trigger,                  to: progress_listing_deploys }
+  - { id: c1b, from: progress_listing_deploys, to: list_deploys }
+  - { id: c2,  from: list_deploys,             to: filter }
+  - { id: c3,  from: filter,                   to: resolve }
+  # Dormant edge: keeps resolve_failure out of the entry-point set;
+  # the engine routes here on terminal failure via fallback_step.
+  - { id: c4,  from: list_deploys,             to: resolve_failure, condition: "false" }
+
+outputs:
+  resolved_status:  "${{ steps.filter.outputs.status }}"
+  resolved_message: "${{ steps.filter.outputs.message }}"
+  callback_ok:      "${{ steps.resolve.outputs.ok }}"

@@ -1,0 +1,395 @@
+# Sub-workflow: collect + price ONE scope's day of usage, upsert its
+# cost-tracking catalog instance.
+#
+# Called by wf1-cost-tracker once per active K8s scope (forEach fan-out).
+# Pipeline: build the collector command → run it on the cluster via the np
+# agent → price the day → merge into the existing instance (365-day FIFO
+# series + rollups) → POST /metadata/scope/{id}/cost-tracking.
+#
+# The scope→pods mapping is a configurable PromQL matcher template
+# (COST_POD_MATCHERS_TEMPLATE) with {scope_id} {scope_slug} {scope_name}
+# {app_name} placeholders — fixing the mapping is a config-entry change.
+id: cost_scope_collect
+name: "Cost Tracker — Collect Scope"
+description: >
+  Collects one scope's hourly usage for one day from cluster Prometheus (via
+  np agent), prices it, and upserts the scope's cost-tracking catalog
+  instance (rollups + bounded 365-day series).
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  scope:
+    type: object
+    required: true
+    description: "Scope row: {scope_id, scope_name, scope_slug, scope_nrn, app_name}"
+  date:
+    type: string
+    required: true
+    description: "UTC day to compute (YYYY-MM-DD)"
+
+variables:
+  result: { initialValue: { status: "failed", cost_day: 0 } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Collects and prices one scope for one day (normally invoked by the cost tracker)."
+      inputs:
+        scope:
+          type: object
+          required: true
+          description: "Scope row (see workflow description)"
+        date:
+          type: string
+          required: true
+          description: "UTC day (YYYY-MM-DD)"
+        matchers_template:
+          type: string
+          required: false
+          description: "Override for COST_POD_MATCHERS_TEMPLATE ('scope' delegates pod mapping to the collector)"
+
+  # ── Build the collector command line ──────────────────────────────────
+  - id: build_command
+    type: module
+    plugin_type: code-exec
+    name: "Build Collector Command"
+    inputs:
+      scope: "${{ workflow.inputs.scope }}"
+      date:  "${{ workflow.inputs.date }}"
+      base:     "${{ vars.COST_AGENT_CMDLINE || '/opt/nullplatform/cost/collect-metrics.sh' }}"
+      template: "${{ workflow.inputs.matchers_template || vars.COST_POD_MATCHERS_TEMPLATE || 'namespace=\"{app_name}\",pod=~\"{scope_slug}.*\"' }}"
+    config:
+      code: |
+        var s = inputs.scope || {};
+        var tpl = String(inputs.template || '');
+        // Template value 'scope' delegates the null->k8s pod mapping to the
+        // collector script (--scope): it matches BOTH k8s scope naming styles
+        // by pod name, covering pods recreated/removed by past deployments.
+        // Required for the controlplane-agent, whose exec validator rejects
+        // the ( ) a matcher regex needs on the command line.
+        if (tpl === 'scope') {
+          if (!s.scope_id) throw new Error('scope.scope_id is required for the scope template');
+          var cmdline = String(inputs.base) +
+            " --mode day --date " + String(inputs.date) +
+            " --scope " + String(s.scope_id);
+          return { cmdline: cmdline, matchers: 'scope:' + String(s.scope_id) };
+        }
+        var matchers = tpl
+          .split('{scope_id}').join(String(s.scope_id || ''))
+          .split('{scope_slug}').join(String(s.scope_slug || ''))
+          .split('{scope_name}').join(String(s.scope_name || ''))
+          .split('{app_name}').join(String(s.app_name || ''));
+        // Single-quote the matchers for the shell; the template must not
+        // contain single quotes (PromQL uses double quotes).
+        if (matchers.indexOf("'") !== -1) {
+          throw new Error('COST_POD_MATCHERS_TEMPLATE must not contain single quotes');
+        }
+        var cmdline = String(inputs.base) +
+          " --mode day --date " + String(inputs.date) +
+          " --matchers '" + matchers + "'";
+        return { cmdline: cmdline, matchers: matchers };
+
+  # ── Run the collector on the cluster via the np agent ─────────────────
+  - id: run_collector
+    type: module
+    plugin_type: np-agent-command
+    name: "Collect Usage (np agent)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "5s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      cmdline: "${{ steps.build_command.outputs.cmdline }}"
+    config:
+      command_type: exec
+      apikey: "${{ secrets.NP_API_KEY }}"
+      timeout_seconds: 120
+      # The control plane rejects `data.env` on exec commands — env for the
+      # collector (PROM_URL etc.) is configured on the agent itself
+      # (--command-executor-env), never sent per command.
+      inject_workflow_env: false
+      agent_selector:
+        nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
+        tags:
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+      # Placeholder so validateConfig() (config-only, pre-execute) passes;
+      # inputs.cmdline (whitelisted override) replaces it at run time.
+      cmdline: "/bin/true"
+
+  # ── Price the day + merge into the catalog instance ──────────────────
+  - id: fetch_instance
+    type: module
+    plugin_type: np-api-call
+    name: "Read Current Instance"
+    inputs:
+      collector_status: "${{ steps.run_collector.outputs.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      # 404 = first run for this scope (no instance yet) — not an error.
+      failOnHttpError: false
+
+  - id: price_and_merge
+    type: module
+    plugin_type: code-exec
+    name: "Price Day & Merge Series"
+    inputs:
+      stdout:   "${{ steps.run_collector.outputs.stdout }}"
+      existing_status: "${{ steps.fetch_instance.outputs.status }}"
+      existing: "${{ steps.fetch_instance.outputs.body }}"
+      date:     "${{ workflow.inputs.date }}"
+      price_cpu: "${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }}"
+      price_mem: "${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }}"
+      currency:  "${{ vars.COST_CURRENCY || 'USD' }}"
+    config:
+      code: |
+        var parsed;
+        try { parsed = JSON.parse(String(inputs.stdout || '')); }
+        catch (e) { throw new Error('Collector stdout is not JSON: ' + String(inputs.stdout).slice(0, 200)); }
+        if (parsed.error) throw new Error('Collector failed: ' + parsed.error);
+
+        var pCpu = Number(inputs.price_cpu);
+        var pMem = Number(inputs.price_mem);
+        if (!(pCpu > 0) || !(pMem > 0)) throw new Error('Prices must be positive numbers (COST_PER_MILLICORE_HOUR / COST_PER_MB_RAM_HOUR)');
+
+        var cpuMcH = Number(parsed.cpu_mc_hours) || 0;   // millicore-hours of the day
+        var memMbH = Number(parsed.mem_mb_hours) || 0;   // MB-hours of the day
+        var cpuReq = Number(parsed.cpu_req_mc_avg) || 0; // avg requested millicores
+        var memReq = Number(parsed.mem_req_mb_avg) || 0; // avg requested MB
+        var noData = !parsed.samples;
+        var samples = Number(parsed.samples) || 0;
+
+        // CHARGEBACK basis (headline cost): a scope pays for what it RESERVED
+        // — requests bind cluster nodes whether used or not — or for usage
+        // when it bursts above its request: max(usage, request) per hour.
+        // USAGE basis is kept alongside; the difference is the scope's waste.
+        var hrs = parsed.hours || [];
+        var billCpuH = 0, billMemH = 0;
+        if (hrs.length > 0) {
+          for (var hi = 0; hi < hrs.length; hi++) {
+            var hh = hrs[hi] || {};
+            var hc = Number(hh.cpu_mc) || 0, hm = Number(hh.mem_mb) || 0;
+            if (hc <= 0 && hm <= 0) continue; // hour without data: not billed
+            // THAT hour's request when the collector provides it (replica
+            // scaling within the day is real: 100 pods at 10:00, 2 at 11:00);
+            // daily average only as fallback for older collectors / KSM gaps.
+            var hcr = Number(hh.cpu_req_mc) || 0;
+            var hmr = Number(hh.mem_req_mb) || 0;
+            billCpuH += Math.max(hc, hcr > 0 ? hcr : cpuReq);
+            billMemH += Math.max(hm, hmr > 0 ? hmr : memReq);
+          }
+        } else {
+          // Aggregate-only payloads (no hourly detail): coarse fallback.
+          billCpuH = Math.max(cpuMcH, cpuReq * samples);
+          billMemH = Math.max(memMbH, memReq * samples);
+        }
+        var billCpuCost = billCpuH * pCpu;
+        var billMemCost = billMemH * pMem;
+        var billCost = billCpuCost + billMemCost;   // what the scope COSTS
+        var useCpuCost = cpuMcH * pCpu;
+        var useMemCost = memMbH * pMem;
+        var useCost = useCpuCost + useMemCost;      // what the scope USED
+        // Headline components (breakdown chips follow the chargeback basis).
+        var cpuCost = billCpuCost;
+        var memCost = billMemCost;
+        var cost = billCost;
+        // Average usage across the hours that had data — comparable against
+        // the requested values (over/under-provisioning signal).
+        var cpuAvg = samples > 0 ? cpuMcH / samples : 0;
+        var memAvg = samples > 0 ? memMbH / samples : 0;
+        var cpuUtil = r2(cpuReq > 0 ? (cpuAvg / cpuReq) * 100 : 0);
+        var memUtil = r2(memReq > 0 ? (memAvg / memReq) * 100 : 0);
+
+        function r2(x) { return Math.round(x * 100) / 100; }
+        function r4(x) { return Math.round(x * 10000) / 10000; }
+
+        // Existing instance body: the GET returns the instance keys for this
+        // metadata group (404/no body on first run).
+        var prev = (Number(inputs.existing_status) === 200 && inputs.existing) ? inputs.existing : {};
+        var series = prev.daily_series || [];
+
+        // FIFO window of 365 daily points; same-day rerun replaces the point.
+        var next = [];
+        for (var i = 0; i < series.length; i++) {
+          var p = series[i] || {};
+          if (p.d !== inputs.date) next.push(p);
+        }
+        next.push({
+          d: inputs.date,
+          cpu_mc_h: r2(cpuMcH), mem_mb_h: r2(memMbH),
+          cpu_req_mc: r2(cpuReq), mem_req_mb: r2(memReq),
+          // True reserved totals (Σ hourly requests) — comparable with the
+          // usage mc-h/MB-h columns; falls back to avg×hours when the
+          // collector predates hourly requests.
+          cpu_req_mc_h: r2(Number(parsed.cpu_req_mc_hours) || cpuReq * samples),
+          mem_req_mb_h: r2(Number(parsed.mem_req_mb_hours) || memReq * samples),
+          // Replica envelope of the day — feeds min/max instance sizing.
+          pods_min: Number(parsed.pods_min) || 0,
+          pods_max: Number(parsed.pods_max) || 0,
+          pods_avg: Number(parsed.pods_avg) || 0,
+          // 10m-resolution peak profile of the day (collector v3; zeros from
+          // older collectors). Preserves the load SHAPE beyond Prometheus
+          // retention: daily averages hide traffic peaks, and production
+          // sizing/descale checks work from these.
+          cpu_mc_p95: r2(Number(parsed.cpu_mc_p95) || 0),
+          cpu_mc_pk10m: r2(Number(parsed.cpu_mc_pk10m) || 0),
+          mem_mb_pk: r2(Number(parsed.mem_mb_pk) || 0),
+          cpu_mc_valley: r2(Number(parsed.cpu_mc_valley) || 0),
+          peak_hour: Number(parsed.peak_hour) || 0,
+          cost: r4(cost),
+          use_cost: r4(useCost)
+        });
+        next.sort(function (a, b) { return a.d < b.d ? -1 : a.d > b.d ? 1 : 0; });
+        if (next.length > 365) next = next.slice(next.length - 365);
+
+        function sumLast(n) {
+          var s = 0;
+          for (var i = Math.max(0, next.length - n); i < next.length; i++) s += Number(next[i].cost) || 0;
+          return s;
+        }
+        var cost30 = sumLast(30);
+        var days30 = Math.min(next.length, 30);
+
+        var instance = {
+          cost_today: r4(cost),
+          usage_cost_today: r4(useCost),
+          waste_today: r4(Math.max(cost - useCost, 0)),
+          pods_min_today: Number(parsed.pods_min) || 0,
+          pods_max_today: Number(parsed.pods_max) || 0,
+          pods_avg_today: Number(parsed.pods_avg) || 0,
+          cpu_peak10m_mc_today: r2(Number(parsed.cpu_mc_pk10m) || 0),
+          mem_peak_mb_today: r2(Number(parsed.mem_mb_pk) || 0),
+          cost_7d: r4(sumLast(7)),
+          cost_30d: r4(cost30),
+          cost_365d: r4(sumLast(365)),
+          avg_daily_cost_30d: r4(days30 > 0 ? cost30 / days30 : 0),
+          cost_breakdown: {
+            cpu_pct: r2(cost > 0 ? (cpuCost / cost) * 100 : 0),
+            mem_pct: r2(cost > 0 ? (memCost / cost) * 100 : 0)
+          },
+          cpu_request_mc: r2(cpuReq),
+          mem_request_mb: r2(memReq),
+          cpu_avg_usage_mc: r2(cpuAvg),
+          mem_avg_usage_mb: r2(memAvg),
+          // Usage/requested as raw daily data — readable straight from the
+          // catalog or the lake, no Prometheus round-trip.
+          cpu_utilization_pct: cpuUtil,
+          mem_utilization_pct: memUtil,
+          // provisioning_status is OWNED BY THE SCANNER (wf2b): it reflects
+          // the lifecycle of a right-sizing action item (per-pod stats, peaks,
+          // per-env thresholds, AI validation) — not a naive daily average.
+          // The tracker only PRESERVES whatever the scanner last wrote; same
+          // for the last-scan stamp (drives the 15-day rescan window).
+          provisioning_status: prev.provisioning_status || 'unknown',
+          rightsizing_item_id: prev.rightsizing_item_id || null,
+          last_scan_at: prev.last_scan_at || null,
+          last_scan_status: prev.last_scan_status || null,
+          last_scan_note: prev.last_scan_note || null,
+          last_scan_savings_usd_month: prev.last_scan_savings_usd_month === undefined ? null : prev.last_scan_savings_usd_month,
+          currency: String(inputs.currency),
+          last_computed_at: inputs.date,
+          daily_series: next
+        };
+        return { instance: instance, cost_day: r4(cost), status: noData ? 'no-data' : 'ok' };
+
+  # No samples = this scope's pods are not in the monitored cluster (or the
+  # matchers miss). Writing zeros would pollute the catalog of every scope
+  # in other clusters — skip the write entirely and report no-data.
+  - id: has_data
+    type: decider
+    plugin_type: conditional
+    name: "Got Usage Data?"
+    config:
+      expression: "steps.price_and_merge.outputs.status != 'no-data'"
+
+  - id: stash_no_data
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: no-data"
+    config:
+      path: result
+      value:
+        status: "no-data"
+        cost_day: 0
+
+  # The metadata API is strict: POST creates (400 when the instance already
+  # exists), PATCH updates (validated live 2026-07-17). Create-then-patch:
+  - id: create_instance
+    type: module
+    plugin_type: np-api-call
+    name: "Create Catalog Instance"
+    inputs:
+      payload: "${{ steps.price_and_merge.outputs.instance }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: POST
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      body: "${{ inputs.payload }}"
+      # 400 "already exists" routes to the PATCH below.
+      failOnHttpError: false
+
+  - id: created_ok
+    type: decider
+    plugin_type: conditional
+    name: "Created?"
+    config:
+      expression: "steps.create_instance.outputs.status < 300"
+
+  - id: update_instance
+    type: module
+    plugin_type: np-api-call
+    name: "Update Catalog Instance"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      payload: "${{ steps.price_and_merge.outputs.instance }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/metadata/scope/${{ workflow.inputs.scope.scope_id }}/cost_tracking"
+      body: "${{ inputs.payload }}"
+
+  - id: stash_ok
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result"
+    # Reached from both the create and the update path — only one fires.
+    join_strategy: any
+    inputs:
+      cost:        "${{ steps.price_and_merge.outputs.cost_day }}"
+      cost_status: "${{ steps.price_and_merge.outputs.status }}"
+    config:
+      path: result
+      value:
+        status: "${{ inputs.cost_status }}"
+        cost_day: "${{ inputs.cost }}"
+
+connections:
+  - { id: c1, from: start,           to: build_command }
+  - { id: c2, from: build_command,   to: run_collector }
+  - { id: c3, from: run_collector,   to: fetch_instance }
+  - { id: c4, from: fetch_instance,  to: price_and_merge }
+  - { id: c5, from: price_and_merge, to: has_data }
+  - { id: c5b, from: has_data,       to: create_instance, source_port: "true" }
+  - { id: c5c, from: has_data,       to: stash_no_data,   source_port: "false" }
+  - { id: c6, from: create_instance, to: created_ok }
+  - { id: c7, from: created_ok,      to: stash_ok,        source_port: "true" }
+  - { id: c8, from: created_ok,      to: update_instance, source_port: "false" }
+  - { id: c9, from: update_instance, to: stash_ok }
+
+outputs:
+  status:     "${{ variables.result.status }}"
+  cost_day:   "${{ variables.result.cost_day }}"
+  scope_id:   "${{ workflow.inputs.scope.scope_id }}"
+  scope_name: "${{ workflow.inputs.scope.scope_name }}"

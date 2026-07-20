@@ -1,0 +1,303 @@
+# Create Jira Ticket — checklist external item resolver.
+#
+# Pairs with checklist external items of `kind: create-jira-ticket`. The
+# `np-checklist-trigger` step auto-registers a notification_channel in NP at
+# activation and emits parsed dispatch payloads (with `callbackUrl`,
+# `callbackToken`, and `inputs.summary` / `inputs.description`).
+#
+# Flow:
+#   1. Derive a per-execution callback URL from `execution.id` (no chicken-and-egg:
+#      the id is known from the start; nothing to register).
+#   2. Create the Jira ticket, writing that callback URL into a custom field so a
+#      one-time Jira Automation rule can POST to it on every transition.
+#   3. Heartbeat the checklist item with the ticket key/url.
+#   4. Park on `signal-wait` (correlationKey = execution.id) until poked or 2h.
+#   5. On poke, RE-READ the ticket from Jira (source of truth) and two visible
+#      `if`s route: success -> passed; discard -> failed; anything else -> keep waiting.
+#
+# The poke is delivered by the generic, unauthenticated callback route
+# `POST /workflows/webhooks/callback/:executionId/:signalName`, which signals by
+# executionId (works on local AND Temporal). The webhook payload is NOT trusted —
+# the outcome comes from the Jira re-read — so a manual/forged poke is harmless.
+#
+# 2h cap: the `signal-wait` timeout. NOTE: on a keep-waiting reentry the wait
+# re-arms with a fresh 2h, so the effective semantics are "fail after 2h with no
+# Jira transition". A hard wall-clock 2h regardless of intermediate transitions
+# needs a deterministic deadline primitive — tracked as a follow-up.
+id: create_jira_ticket
+name: "Create Jira Ticket"
+description: |
+  Resolves nullplatform checklist items of kind `create-jira-ticket`: creates a
+  Jira ticket, heartbeats the item with the ticket key/url, waits for the ticket
+  to be resolved in Jira, then marks the item passed (success status) or failed
+  (discard status / 2h timeout).
+
+  HOW THE WAIT WORKS — push + re-read, spoofing-safe (this is the design decision):
+  - We do NOT poll Jira. The ticket carries this execution's callback URL in a
+    custom field, and a Jira Automation rule POSTs to that URL on every status
+    transition. That POST is only a "poke": its body is NOT trusted.
+  - On the poke the workflow RE-READS the ticket from Jira (`reread` /
+    jira-get-issue) and decides the outcome from that authoritative read. So a
+    forged or replayed poke is harmless — worst case we re-read, see no change,
+    and keep waiting. The Jira API key (not the webhook payload) is the trust
+    boundary.
+  - The callback URL is the generic unauthenticated route
+    POST /workflows/webhooks/callback/:executionId/:signalName, which signals by
+    executionId and behaves identically on the local and Temporal runtimes.
+
+  ONE-TIME JIRA SETUP (per project, done by an operator once):
+  - Custom field "Workflow Callback" (customfield_10776, string) on the project
+    screen — holds the callback URL written by `create_issue`.
+  - Automation rule: trigger "Issue transitioned" -> action "Send web request"
+    to {{issue.customfield_10776}} with body { key, status }. This is the only
+    Jira admin step required; the workflow author writes no URLs.
+
+  TIMEOUT: signal-wait caps each wait at 2h; on a keep-waiting reentry it re-arms
+  a fresh 2h ("fail after 2h with no transition"). A hard wall-clock cap is a
+  tracked follow-up.
+path: "/governance/create-jira-ticket"
+semantic_version: 1.0.0
+
+# NP and Jira credentials are supplied as config entries (secrets/vars) scoped
+# to this workflow or its folder, referenced as `${{ secrets.* }}` / `${{ vars.* }}`
+# on the steps below — never inlined.
+secrets: {}
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+variables:
+  # Public base URL the Jira callback should hit (should match the engine's
+  # WORKFLOW_PUBLIC_BASE_URL). Declared as a VARIABLE, not an input with a
+  # `default`: the runner seeds variables from `initialValue` but does NOT
+  # apply input defaults at runtime, and the checklist dispatch never carries
+  # this value — as an input it resolved to `undefined`, producing a
+  # "undefined/workflows/webhooks/..." callback URL.
+  callbackBaseUrl:
+    initialValue: "https://api.nullplatform.com"
+  # Per-execution Jira callback URL, written by `set_url` and read by `create_issue`.
+  callback_url:
+    initialValue: ""
+  # Jira statuses that resolve the item as passed / failed. Declared as variables
+  # (not inputs) so the engine reliably seeds them from initialValue even when the
+  # checklist dispatch doesn't carry them. Edit here to reconfigure ok/fail.
+  okStatuses:
+    initialValue: ["Done", "Resolved", "Closed"]
+  failStatuses:
+    initialValue: ["Cancelled", "Won't Do", "Rejected"]
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-checklist-trigger
+    name: "On checklist dispatch (create-jira-ticket)"
+    config:
+      pathPrefix: /np/checklist/create-jira-ticket
+      mode: start
+      kind: create-jira-ticket
+      # Org NRN the checklist trigger registers under (config entry).
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      # NP API key from a config entry (write-only secret), never inline.
+      npApiKey: "${{ secrets.NP_API_KEY }}"
+
+  # Derive the per-execution callback URL. execution.id is in expression scope.
+  - id: set_url
+    type: module
+    plugin_type: set-variable
+    name: "Build callback URL"
+    config:
+      path: callback_url
+      value: "${{ variables.callbackBaseUrl }}/workflows/webhooks/callback/${{ execution.id }}/jira-callback"
+
+  - id: create_issue
+    type: module
+    plugin_type: jira-create-issue
+    name: "Create Jira ticket"
+    config:
+      # Jira credentials + project settings come from config entries.
+      baseUrl:  "${{ vars.JIRA_BASE_URL }}"
+      email:    "${{ vars.JIRA_EMAIL }}"
+      apiToken: "${{ secrets.JIRA_API_TOKEN }}"
+      project_key: "${{ vars.JIRA_PROJECT_KEY }}"
+      issue_type:  "Task"
+      custom_fields:
+        # The Jira custom field id that holds the callback URL the Automation
+        # rule reads (e.g. customfield_10776). Replace with your field id.
+        __JIRA_CALLBACK_FIELD_ID__: "${{ variables.callback_url }}"
+    inputs:
+      summary:     "${{ steps.trigger.outputs.inputs.summary }}"
+      description: "${{ steps.trigger.outputs.inputs.description }}"
+    # Creation failure (Jira 4xx/5xx) is a meaningful outcome: mark the item
+    # failed. Dedicated resolve node (see resolve_timeout rationale).
+    error_handling:
+      fallback_step: resolve_create_fail
+
+  - id: progress
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: ticket created"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Created Jira ticket ${{ steps.create_issue.outputs.key }} (${{ steps.create_issue.outputs.url }}) — waiting for resolution."
+      details:
+        jira_key: "${{ steps.create_issue.outputs.key }}"
+        jira_url: "${{ steps.create_issue.outputs.url }}"
+        # Clickable link rendered by ExternalItemRow (`item.details.markdown`).
+        # NOTE: the approval-api /progress route stores details only inside
+        # progressHistory, not at item level — so this surfaces on RESOLVE, not
+        # while waiting. TODO(approval-api): persist item.details on /progress so
+        # the link is clickable during the wait too.
+        markdown: "🎫 [${{ steps.create_issue.outputs.key }}](${{ steps.create_issue.outputs.url }}) — waiting for resolution in Jira."
+
+  # MUST be `type: wait` (not module): only `type: wait` routes signal-wait to
+  # the engine's inline dispatcher, which runs the pause IN the workflow sandbox
+  # with the signalPort. As `type: module` it is dispatched as an ACTIVITY on the
+  # Temporal worker, where `helpers.waitForSignal` throws ("no signalPort was
+  # injected") and the wait fails instantly. The local executor injects signalPort
+  # into every step, so `type: module` only breaks on Temporal — a local/Temporal
+  # parity trap. See packages/core/src/engine/runner/dispatch.ts (case 'wait').
+  - id: wait
+    type: wait
+    plugin_type: signal-wait
+    name: "Wait for Jira resolution (poke)"
+    # Two incoming edges: the normal entry (from progress) and the keep_waiting
+    # reentry (from classify). `any` lets either one (re)arm the wait instead of
+    # blocking on both — the loop would deadlock under the default `all`.
+    join_strategy: any
+    config:
+      signalName: jira-callback
+      correlationKey: "${{ execution.id }}"
+      timeout: "2h"
+      # On 2h timeout the wait FAILS, and error_handling routes to its OWN
+      # dedicated resolve node. We deliberately do NOT use signal-wait's
+      # `timeout` output port: that port is only on the plugin DESCRIPTOR, which
+      # the Temporal worker's in-sandbox graph validation may not have (modules
+      # run as activities), so an edge off `timeout` trips
+      # CONNECTION_SOURCE_PORT_UNKNOWN at runtime. fallback_step is
+      # descriptor-independent. It needs a DEDICATED node because a fallback
+      # arrives as a FAILED edge, and a node mixing failed + completed/skipped
+      # predecessors can't be made ready by any single join strategy.
+      onTimeout: error
+    error_handling:
+      fallback_step: resolve_timeout
+
+  - id: reread
+    type: module
+    plugin_type: jira-get-issue
+    name: "Re-read Jira ticket (source of truth)"
+    config:
+      baseUrl:  "${{ vars.JIRA_BASE_URL }}"
+      email:    "${{ vars.JIRA_EMAIL }}"
+      apiToken: "${{ secrets.JIRA_API_TOKEN }}"
+    inputs:
+      issueKey: "${{ steps.create_issue.outputs.key }}"
+
+  # Two visible `if`s decide the outcome from the re-read status:
+  #  - is it a success status?  -> resolve passed
+  #  - else is it a discard status?  -> resolve failed
+  #  - else keep waiting (reentry into `wait`)
+  # Expressions are BARE (the engine pre-resolves ${{ }} in config before the
+  # decider runs). `$item` is the upstream jira-get-issue item.
+  - id: classify_ok
+    type: decider
+    plugin_type: conditional
+    name: "Is the ticket resolved OK?"
+    config:
+      expression: "contains(variables.okStatuses, $item.status)"
+
+  - id: classify_fail
+    type: decider
+    plugin_type: conditional
+    name: "Is the ticket discarded?"
+    config:
+      expression: "contains(variables.failStatuses, $item.status)"
+
+  - id: resolve_ok
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item (passed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        passed
+      message:       "Jira ${{ steps.reread.outputs.key }} resolved (${{ steps.reread.outputs.status }}) — ${{ steps.reread.outputs.url }}"
+      details:
+        jira_key: "${{ steps.reread.outputs.key }}"
+        status:   "${{ steps.reread.outputs.status }}"
+        markdown: "✅ [${{ steps.reread.outputs.key }}](${{ steps.reread.outputs.url }}) — resolved (${{ steps.reread.outputs.status }})."
+
+  # Discard path (single COMPLETED edge from classify_fail). One predecessor,
+  # default join.
+  - id: resolve_fail
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item (discarded)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Jira ${{ steps.reread.outputs.key }} discarded (${{ steps.reread.outputs.status }}) — ${{ steps.reread.outputs.url }}"
+      details:
+        jira_key: "${{ steps.reread.outputs.key }}"
+        status:   "${{ steps.reread.outputs.status }}"
+        markdown: "🚫 [${{ steps.reread.outputs.key }}](${{ steps.reread.outputs.url }}) — discarded (${{ steps.reread.outputs.status }})."
+
+  # 2h-timeout path — reached ONLY via wait.error_handling.fallback_step (a
+  # single FAILED edge). Dedicated node so the default `all` join is satisfied
+  # by that one terminal edge.
+  - id: resolve_timeout
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item (timed out)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Jira ticket ${{ steps.create_issue.outputs.key }} (${{ steps.create_issue.outputs.url }}) not resolved within 2h."
+      details:
+        jira_key: "${{ steps.create_issue.outputs.key }}"
+        markdown: "⏰ [${{ steps.create_issue.outputs.key }}](${{ steps.create_issue.outputs.url }}) — not resolved within 2h."
+
+  # Create-error path — reached ONLY via create_issue.error_handling.fallback_step.
+  - id: resolve_create_fail
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item (Jira create failed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Could not create the Jira ticket: ${{ steps.create_issue.error.message }}"
+      details:
+        error_code:    "${{ steps.create_issue.error.code }}"
+        error_message: "${{ steps.create_issue.error.message }}"
+
+connections:
+  - { id: c1, from: trigger,      to: set_url }
+  - { id: c2, from: set_url,      to: create_issue }
+  - { id: c3, from: create_issue, to: progress }
+  - { id: c4, from: progress,     to: wait }
+  - { id: c5, from: wait,         to: reread,        sourcePort: default }
+  # Declared (condition:false → never traversed on success) so the engine knows
+  # the wait→resolve_timeout edge exists; wait's 2h timeout fails the step and
+  # error_handling.fallback_step routes here through it. (NOT a `timeout` source
+  # port — see the wait step comment.)
+  - { id: c6, from: wait,         to: resolve_timeout, condition: "false" }
+  - { id: c7, from: reread,       to: classify_ok }
+  - { id: c8, from: classify_ok,  to: resolve_ok,    sourcePort: "true" }
+  - { id: c9, from: classify_ok,  to: classify_fail, sourcePort: "false" }
+  - { id: c10, from: classify_fail, to: resolve_fail, sourcePort: "true" }
+  # keep-waiting: re-enter the wait (n8n-style back-edge / cycle).
+  - { id: c11, from: classify_fail, to: wait,        sourcePort: "false" }
+  # Declared (condition:false) so the graph knows the create_issue→resolve_create_fail
+  # edge exists; create_issue's error_handling.fallback_step routes here on a
+  # Jira create failure.
+  - { id: c12, from: create_issue, to: resolve_create_fail, condition: "false" }
+
+outputs:
+  resolved_status: "${{ steps.reread.outputs.status }}"
+  jira_key:        "${{ steps.create_issue.outputs.key }}"
+  jira_url:        "${{ steps.create_issue.outputs.url }}"

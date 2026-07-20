@@ -1,0 +1,155 @@
+# Right Sizing — event router.
+#
+# Listens to action-item events for items labeled workflow_type=rightsizing:
+#   - suggestion accepted → starts wf4-apply-rightsizing (fire-and-forget: a
+#     nocturnal deploy can take hours).
+#   - comment added → command channel for in-flight deploys: `deploy now` /
+#     `abort` comments are forwarded as engine signals to the wf4 execution
+#     waiting on rightsizing-command (correlation key rightsizing:<item id>).
+#     No execution waiting → the signal POST answers 409 — which doubles as
+#     the routing signal: a human comment that NO apply consumed is handed
+#     to the Q&A workflow (wf8), whose AI decides whether it is a question
+#     about the analysis worth answering on the thread.
+#
+# Activation note: the trigger auto-creates its NP notification channel with
+# the ACTIVATING ACTOR's session bearer — activate the alias with a session
+# that can manage notification channels.
+id: right_sizing_events
+name: "Right Sizing — Events"
+description: >
+  Routes right-sizing action-item events: accepted suggestions start the
+  apply workflow; comments on in-flight deploys are forwarded as engine
+  signals (deploy now / abort).
+path: "/cost"
+semantic_version: 1.0.0
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-action-item-trigger
+    name: "Action Item Events"
+    config:
+      pathPrefix: np-rightsizing-events
+      mode: start
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      labelFilters:
+        workflow_type: rightsizing
+
+  # ── Accepted suggestion → apply workflow ──────────────────────────────
+  - id: on_suggestion_accepted
+    type: module
+    plugin_type: sub-workflow
+    name: "Start Apply"
+    config:
+      # PER-ORG id of "Right Sizing — Apply"; patched by
+      # setup/04-upload-workflows.mjs on upload.
+      workflowId: right_sizing_apply
+      # Fire-and-forget: the apply may wait hours for the nocturnal window.
+      waitForCompletion: false
+    inputs:
+      action_item_id: "${{ $item.actionItem.id }}"
+      suggestion_id: "${{ $item.suggestion.id }}"
+
+  # ── Comment → command signal for the waiting apply execution ─────────
+  - id: parse_command
+    type: module
+    plugin_type: code-exec
+    name: "Parse Comment Command"
+    inputs:
+      event: "${{ $item }}"
+    config:
+      code: |
+        var ev = inputs.event || {};
+        var item = ev.actionItem || {};
+        // The audit event does not carry the comment body — commands are
+        // conventions checked by the apply workflow itself when it wakes up;
+        // here we only forward "something was commented" plus the author.
+        // Wf4 fetches the latest comments and decides.
+        var author = String(ev.userEmail || 'unknown');
+        var a = author.toLowerCase();
+        return {
+          action_item_id: item.id || null,
+          author: author,
+          // Agent/executor comments (our own narration, closer verdicts, QA
+          // replies) never route to the Q&A — no bot-to-bot loops.
+          is_bot: a.indexOf('agent:') === 0 || a.indexOf('executor:') === 0,
+          has_item: item.id ? true : false
+        };
+
+  - id: has_item
+    type: decider
+    plugin_type: conditional
+    name: "Comment on a Known Item?"
+    config:
+      expression: "steps.parse_command.outputs.has_item == true"
+
+  - id: signal_apply
+    type: module
+    plugin_type: np-api-call
+    name: "Signal In-flight Apply"
+    inputs:
+      correlation: "${{ steps.parse_command.outputs.action_item_id }}"
+      author:      "${{ steps.parse_command.outputs.author }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: POST
+      # Engine signal-by-correlation route (engine base path /workflows).
+      path: "/workflows/signals/rightsizing-command"
+      # 409 execution-not-waiting = no deploy in flight for this item — benign.
+      failOnHttpError: false
+      body:
+        correlationKey: "rightsizing:${{ inputs.correlation }}"
+        payload:
+          kind: "comment"
+          author: "${{ inputs.author }}"
+
+  - id: log_signal
+    type: module
+    plugin_type: log
+    name: "Signal Result"
+    config:
+      level: info
+      message: "Comment on item ${{ steps.parse_command.outputs.action_item_id }} forwarded (signal status ${{ steps.signal_apply.outputs.status }} — 409 means no deploy waiting)."
+
+  # No apply execution claimed the comment (non-2xx signal) and it came from
+  # a human → hand it to the Q&A workflow. Its AI decides whether the
+  # comment is a question about the analysis worth answering.
+  - id: qa_worthy
+    type: decider
+    plugin_type: conditional
+    name: "Unclaimed Human Comment?"
+    config:
+      expression: "steps.signal_apply.outputs.status >= 300 && steps.parse_command.outputs.is_bot == false"
+
+  - id: start_qa
+    type: module
+    plugin_type: sub-workflow
+    name: "Start Q&A"
+    config:
+      # PER-ORG id of "Right Sizing — Q&A"; patched by
+      # setup/04-upload-workflows.mjs on upload.
+      workflowId: right_sizing_qa
+      # Fire-and-forget: the AI answer can take a couple of minutes.
+      waitForCompletion: false
+    inputs:
+      action_item_id: "${{ steps.parse_command.outputs.action_item_id }}"
+      author: "${{ steps.parse_command.outputs.author }}"
+
+  # ── Everything else: visibility only ──────────────────────────────────
+  - id: on_rejected
+    type: module
+    plugin_type: log
+    name: "Suggestion Rejected"
+    config:
+      level: info
+      message: "Suggestion ${{ $item.suggestion.id }} rejected on item ${{ $item.actionItem.id }} by ${{ $item.userEmail }}"
+
+connections:
+  - { id: c1, from: trigger, to: on_suggestion_accepted, source_port: onSuggestionAccepted }
+  - { id: c2, from: trigger, to: parse_command,          source_port: onCommentAdded }
+  - { id: c3, from: parse_command, to: has_item }
+  - { id: c4, from: has_item, to: signal_apply, source_port: "true" }
+  - { id: c5, from: signal_apply, to: log_signal }
+  - { id: c6, from: trigger, to: on_rejected, source_port: onSuggestionRejected }
+  - { id: c7, from: log_signal, to: qa_worthy }
+  - { id: c8, from: qa_worthy, to: start_qa, source_port: "true" }

@@ -1,0 +1,355 @@
+# Progressive blue-green deploy — AI-orchestrated, reusable.
+#
+# One Opus agent drives the whole rollout through five HARD-SCOPED tools
+# (deploy_start / deploy_status / deploy_switch_traffic / deploy_finish /
+# deploy_metrics) plus item_comment for narration. The tools define what CAN
+# happen (only deployment operations on the given scope, with the
+# degradation verdict computed deterministically inside deploy_metrics);
+# the agent decides WHEN and narrates every step, decision and blocker
+# (approvals / checklists / policies) as action-item comments.
+#
+# Waits cost nothing: the agent ends its turn with {action: "wait",
+# wait_seconds}, the graph parks on a Temporal signal-wait (the E2B microVM
+# is paused — resumeSession), and on wake the agent step RE-ENTERS, resuming
+# the same conversation from nodeContext. No VM burns CPU during soaks or
+# gate waits. The signal-wait timeout uses a `variables.*` reference on
+# purpose: `vars.*` never resolves for inline waits on Temporal (see the
+# PLUGIN_CONFIG_INVALID guard added in PR #81).
+#
+# Reusable: any workflow that needs a safe REDEPLOY (right-sizing, config
+# changes, AMI/base-image rotation…) calls this with a scope_id and an
+# action item to narrate on. The deployment re-ships the release the scope
+# is already running.
+id: progressive_deploy
+name: "Progressive Deploy (AI-orchestrated)"
+description: >
+  Reusable narrated blue-green redeploy: an AI operator moves traffic in
+  configured steps with deterministic telemetry checks between moves,
+  comments every step/decision/blocker on an action item, finalizes on
+  success and rolls back on degradation. Waits are parked in Temporal
+  (resumable agent — no live microVM while waiting).
+path: "/deploy"
+semantic_version: 1.0.0
+
+inputs:
+  scope_id:
+    type: string
+    required: true
+    description: "Scope to redeploy"
+  action_item_id:
+    type: string
+    required: true
+    description: "Action item that receives the narration comments"
+  description:
+    type: string
+    required: false
+    description: "Deployment description shown in the platform"
+
+variables:
+  # The next user message for the (resumed) agent conversation. Seeded by
+  # brief, replaced by wake-up notes on every wait cycle.
+  agent_msg: { initialValue: "" }
+  wait_req: { initialValue: { seconds: 30 } }
+  turns: { initialValue: 0 }
+  outcome: { initialValue: { status: "failed", deployment_id: null, detail: "agent returned no outcome" } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Progressive Deploy"
+    config:
+      description: "Runs a narrated, AI-orchestrated progressive blue-green redeploy on a scope."
+      inputs:
+        scope_id: { type: string, required: true }
+        action_item_id: { type: string, required: true }
+        description: { type: string, required: false }
+
+  - id: build_brief
+    type: module
+    plugin_type: code-exec
+    name: "Build Mission Brief"
+    inputs:
+      scope_id: "${{ workflow.inputs.scope_id }}"
+      item_id: "${{ workflow.inputs.action_item_id }}"
+      description: "${{ workflow.inputs.description }}"
+      steps_cfg:   "${{ vars.DEPLOY_TRAFFIC_STEPS || '10,50,100' }}"
+      soak_cfg:    "${{ vars.DEPLOY_STEP_WAIT_SECONDS || '120' }}"
+      err_cfg:     "${{ vars.DEPLOY_MAX_ERROR_RATE_INCREASE || '1' }}"
+      rt_cfg:      "${{ vars.DEPLOY_MAX_RESPONSE_TIME_RATIO || '1.5' }}"
+      pending_cfg: "${{ vars.DEPLOY_PENDING_TIMEOUT_MINUTES || '30' }}"
+    config:
+      code: |
+        var steps = String(inputs.steps_cfg || '10,50,100');
+        var brief = [
+          'Run a progressive blue-green redeploy now.',
+          '',
+          'Target:',
+          '- scope_id: ' + inputs.scope_id,
+          '- action_item_id (narrate here): ' + inputs.item_id,
+          '- deployment description: ' + String(inputs.description || 'Progressive redeploy'),
+          '',
+          'Configuration (hard numbers — do not improvise others):',
+          '- traffic steps: ' + steps + ' (percent, in order, always ending at 100)',
+          '- soak between steps: ' + inputs.soak_cfg + ' seconds',
+          '- degradation thresholds for deploy_metrics: max_err_increase=' + inputs.err_cfg + ', max_rt_ratio=' + inputs.rt_cfg,
+          '- give up on gated/pending states after ' + inputs.pending_cfg + ' minutes total',
+          '',
+          'Begin with the baseline measurement and the plan comment.'
+        ].join('\n');
+        return { brief: brief };
+
+  - id: seed_msg
+    type: module
+    plugin_type: set-variable
+    name: "Seed Agent Message"
+    inputs:
+      brief: "${{ steps.build_brief.outputs.brief }}"
+    config:
+      path: agent_msg
+      value: "${{ inputs.brief }}"
+
+  # ── The operator. Re-entered after every wait; the conversation resumes
+  #    from nodeContext (paused E2B sandbox via resumeSession). ────────────
+  - id: agent
+    type: module
+    plugin_type: claude-code-agent
+    name: "AI Deploy Operator"
+    join_strategy: any
+    # observed_prompt: observation input for the E2E harness (stubs cannot
+    # see config); the plugin ignores unknown inputs, so the merge is inert.
+    inputs:
+      observed_prompt: "${{ variables.agent_msg }}"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 25
+      resumeSession: true
+      tools:
+        # Workflow keys are patched to per-org wf_ ids by the upload script.
+        - type: workflow
+          workflow: deploy_start
+          name: deploy_start
+        - type: workflow
+          workflow: deploy_status
+          name: deploy_status
+        - type: workflow
+          workflow: deploy_switch_traffic
+          name: deploy_switch_traffic
+        - type: workflow
+          workflow: deploy_finish
+          name: deploy_finish
+        - type: workflow
+          workflow: deploy_metrics
+          name: deploy_metrics
+        - type: workflow
+          workflow: item_comment
+          name: item_comment
+      systemPrompt: |
+        You are the deploy operator for ONE scope of the nullplatform demo
+        org. You run a progressive blue-green redeploy end to end using ONLY
+        the tools provided. You never invent state: every number or status
+        you mention must come from a tool result.
+
+        NARRATION (non-negotiable): before every action and after every
+        decision, post a short comment with item_comment — the plan, the
+        baseline numbers, each traffic move and WHY, each health check with
+        its numbers, anything that blocks you (approvals, checklists,
+        policies — quote the platform's message), the rollback or the
+        finalize. A reader following only the comments must understand
+        everything that happened and why.
+
+        PROTOCOL:
+        1. Baseline: deploy_metrics (minutes=15, no baselines) — keep rpm /
+           error_rate / response_time / has_data as THE baseline for every
+           later check. Comment the plan (traffic steps, soak, thresholds)
+           and the baseline.
+        2. deploy_start. If ok=false: comment blocked_reason verbatim and
+           finish with {action:"done", status:"blocked"}.
+        3. Wait for instances: deploy_status until status=running (healthy
+           instances reported). Between polls end your turn with
+           {action:"wait", wait_seconds:15-30}. If it stays pre-running
+           >2 minutes, comment that an approval/checklist/policy gate may be
+           holding it and keep polling up to the configured pending budget;
+           past it, deploy_finish action=cancel, comment, and finish
+           {status:"failed"}. If deploy_status shows finalizing/finalized
+           without you asking, the provider auto-finalized: comment it, run
+           a final deploy_metrics check and finish {status:"deployed"}.
+        4. For each configured traffic step: comment the move and the
+           reason (previous check's numbers) → deploy_switch_traffic →
+           confirm with deploy_status that switched_traffic reached the
+           target (wait+poll as needed; a switch held >2 minutes may be
+           gated — comment it) → soak by ending the turn with
+           {action:"wait", wait_seconds:<configured soak>} → deploy_metrics
+           (minutes=5, WITH the baseline values and the configured
+           thresholds). The tool computes `degraded` deterministically:
+           - degraded=false → comment the numbers, next step.
+           - degraded=true  → comment the problems array verbatim,
+             deploy_finish action=cancel, confirm rolled_back via
+             deploy_status, comment, finish {status:"rolled_back"}.
+        5. After the last step is healthy at 100%: comment, deploy_finish
+           action=finalize, confirm status=finalized via deploy_status
+           (wait+poll; narrate a held finalize), comment the success and
+           finish {action:"done", status:"deployed", deployment_id:...}.
+
+        TURN CONTRACT: you are resumed across waits — the conversation
+        continues where it left off. EVERY turn ends with the structured
+        output: {action:"wait", wait_seconds:N, detail:"why"} to pause, or
+        {action:"done", status:"deployed"|"rolled_back"|"blocked"|"failed",
+        deployment_id, detail} to finish. Never claim success without the
+        terminal status confirmed by deploy_status.
+      userPrompt: "${{ variables.agent_msg }}"
+      outputSchema:
+        type: object
+        required: [action, detail]
+        properties:
+          action:
+            type: string
+            enum: [wait, done]
+            description: "wait = park the workflow and resume me in wait_seconds; done = rollout finished"
+          wait_seconds:
+            type: number
+            description: "Required when action=wait (15-600)"
+          status:
+            type: string
+            enum: [deployed, rolled_back, blocked, failed]
+            description: "Required when action=done"
+          deployment_id:
+            type: string
+            description: "The deployment this run operated on (when one was created)"
+          detail:
+            type: string
+            description: "One line: what happened / why waiting"
+
+  - id: wants_wait
+    type: decider
+    plugin_type: conditional
+    name: "Agent Requested a Wait?"
+    config:
+      expression: "steps.agent.outputs.action == 'wait'"
+
+  - id: clamp_wait
+    type: module
+    plugin_type: code-exec
+    name: "Clamp Wait & Guard Turns"
+    inputs:
+      seconds: "${{ steps.agent.outputs.wait_seconds }}"
+      detail:  "${{ steps.agent.outputs.detail }}"
+      turns:   "${{ variables.turns }}"
+    config:
+      code: |
+        var turns = (Number(inputs.turns) || 0) + 1;
+        // Backstop against a stuck conversation: ~60 wake-ups is far beyond
+        // any sane rollout (soaks included).
+        if (turns > 60) throw new Error('Progressive deploy exceeded 60 agent turns — aborting');
+        var s = Math.round(Number(inputs.seconds));
+        if (!isFinite(s)) s = 30;
+        if (s < 5) s = 5;
+        if (s > 600) s = 600;
+        return {
+          seconds: s,
+          turns: turns,
+          wake_msg: 'You waited ' + s + ' seconds (reason noted: ' + String(inputs.detail || 'n/a') +
+            '). Re-check the live state with your tools and continue the protocol from where you left off.'
+        };
+
+  - id: stash_wait
+    type: module
+    plugin_type: set-variable
+    name: "Arm Wait"
+    inputs:
+      seconds: "${{ steps.clamp_wait.outputs.seconds }}"
+    config:
+      path: wait_req
+      value:
+        seconds: "${{ inputs.seconds }}"
+
+  - id: stash_turns
+    type: module
+    plugin_type: set-variable
+    name: "Track Turns"
+    inputs:
+      turns: "${{ steps.clamp_wait.outputs.turns }}"
+    config:
+      path: turns
+      value: "${{ inputs.turns }}"
+
+  - id: stash_wake_msg
+    type: module
+    plugin_type: set-variable
+    name: "Prepare Wake Message"
+    inputs:
+      msg: "${{ steps.clamp_wait.outputs.wake_msg }}"
+    config:
+      path: agent_msg
+      value: "${{ inputs.msg }}"
+
+  # The actual pause — a Temporal timer, no VM alive. `variables.*` resolves
+  # in-sandbox (a `vars.*` here would hang pre-PR#81 workers and fail loudly
+  # on fixed ones). A human can nudge it early by posting the signal.
+  # NOTE: default join (single predecessor) on purpose — in a cycle, only the
+  # back-edge TARGET (`agent`) declares `join_strategy: any`, mirroring the
+  # proven wf4 loop topology.
+  - id: pace
+    type: module
+    plugin_type: signal-wait
+    name: "Park Until Wake-up"
+    config:
+      signalName: progressive-deploy-nudge
+      correlationKey: "deployagent:${{ execution.id }}"
+      timeout: "${{ variables.wait_req.seconds }}s"
+      onTimeout: continue
+
+  - id: read_outcome
+    type: module
+    plugin_type: code-exec
+    name: "Read Final Outcome"
+    inputs:
+      action: "${{ steps.agent.outputs.action }}"
+      status: "${{ steps.agent.outputs.status }}"
+      deployment_id: "${{ steps.agent.outputs.deployment_id }}"
+      detail: "${{ steps.agent.outputs.detail }}"
+    config:
+      code: |
+        var VALID = { deployed: 1, rolled_back: 1, blocked: 1, failed: 1 };
+        var status = String(inputs.status || '').toLowerCase();
+        if (!VALID[status]) status = 'failed';
+        return {
+          status: status,
+          deployment_id: inputs.deployment_id || null,
+          detail: String(inputs.detail || '')
+        };
+
+  - id: stash_outcome
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome"
+    inputs:
+      out: "${{ steps.read_outcome.outputs }}"
+    config:
+      path: outcome
+      value: "${{ inputs.out }}"
+
+connections:
+  - { id: c1, from: start,          to: build_brief }
+  - { id: c2, from: build_brief,    to: seed_msg }
+  - { id: c3, from: seed_msg,       to: agent }
+  - { id: c4, from: agent,          to: wants_wait }
+  # Wait cycle: clamp → arm timer → park → re-enter the agent (same
+  # conversation via nodeContext/resumeSession).
+  - { id: c5, from: wants_wait,     to: clamp_wait,     source_port: "true" }
+  - { id: c6, from: clamp_wait,     to: stash_wait }
+  - { id: c7, from: stash_wait,     to: stash_turns }
+  - { id: c8, from: stash_turns,    to: stash_wake_msg }
+  - { id: c9, from: stash_wake_msg, to: pace }
+  # onTimeout=continue exits via the DEFAULT port with timedOut=true
+  # (signal-wait semantics fixed in PR #82 — the timeout port is unwireable
+  # on Temporal and must not appear on connections).
+  - { id: c10, from: pace,          to: agent }
+  # Done
+  - { id: c11, from: wants_wait,    to: read_outcome,   source_port: "false" }
+  - { id: c12, from: read_outcome,  to: stash_outcome }
+
+outputs:
+  status:        "${{ variables.outcome.status }}"
+  deployment_id: "${{ variables.outcome.deployment_id }}"
+  detail:        "${{ variables.outcome.detail }}"

@@ -1,0 +1,783 @@
+# Right Sizing — Apply an accepted suggestion.
+#
+# Started by wf3-right-sizing-events on suggestion accept (fire-and-forget).
+#
+# Timing resolution (compute_plan): the workflow input `deploy_timing`
+# (manual override, e.g. smoke tests) wins over the suggestion's
+# `user_metadata.deploy_timing` (the accept-form answer rendered from
+# user_metadata_config.schema), which wins over the AI's metadata.mode
+# (apply-only → next-deploy, nocturnal-deploy → scheduled):
+#   next-deploy — apply-only mode below
+#   scheduled   — nocturnal mode; deploys at user_metadata.deploy_at (HH:MM
+#                 in the window tz) or, when empty, at tonight's window
+#                 ("tonight" is accepted as a legacy alias)
+#   now         — nocturnal mode but deploys immediately (no wait)
+#
+# Two modes:
+#
+#   apply-only       — patch the scope's requested spec, comment, mark the
+#                      suggestion applied. The item STAYS OPEN (the change
+#                      ships with the owner's next deploy).
+#   nocturnal-deploy — announce the schedule, wait for the nocturnal window
+#                      with a signal-wait; every comment on the item wakes it
+#                      (wf3 forwards comments as `rightsizing-command` signals,
+#                      correlation key rightsizing:<item id>): `deploy now`
+#                      deploys immediately, `abort` cancels (suggestion
+#                      rejected, item open), anything else re-arms the wait.
+#                      On window/deploy-now: patch the scope, poll the
+#                      triggered deployment to a terminal state, post progress
+#                      comments, mark applied and CLOSE the item on success;
+#                      on failure mark failed and leave the item open.
+#
+# Window configuration (config entries on folder /cost):
+#   DEPLOY_WINDOW_START (var)     — HH:MM, e.g. 01:00
+#   DEPLOY_WINDOW_END (var)       — HH:MM, e.g. 05:00
+#   DEPLOY_WINDOW_TZ_OFFSET (var) — window timezone as ±HH:MM, e.g. -03:00
+#                                   (no IANA tz: the sandbox has no Intl).
+id: right_sizing_apply
+name: "Right Sizing — Apply"
+description: >
+  Applies an accepted right-sizing suggestion: apply-only patches the scope
+  spec and leaves the item open; nocturnal-deploy waits for the deploy
+  window (comments = deploy now / abort), deploys with progress comments and
+  closes the item on success.
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  action_item_id:
+    type: string
+    required: true
+    description: "Action item whose suggestion was accepted"
+  suggestion_id:
+    type: string
+    required: true
+    description: "Accepted suggestion id"
+  deploy_timing:
+    type: string
+    required: false
+    description: >
+      Override when the change goes live: next-deploy | scheduled | now.
+      Normally empty — the user's accept-form answer (suggestion
+      user_metadata.deploy_timing) or the AI's mode decides.
+
+variables:
+  wait_seconds: { initialValue: 0 }
+  outcome: { initialValue: { status: "pending", deployment_id: null } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Apply"
+    config:
+      description: "Applies an accepted right-sizing suggestion (normally started by the events router)."
+      inputs:
+        action_item_id:
+          type: string
+          required: true
+        suggestion_id:
+          type: string
+          required: true
+        deploy_timing:
+          type: string
+          required: false
+          description: "next-deploy | scheduled | now (empty = user's accept answer or AI mode)"
+
+  # ── Load item + suggestion, resolve mode & target ──────────────────────
+  - id: fetch_item
+    type: module
+    plugin_type: np-action-item-get
+    name: "Get Action Item"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+
+  - id: fetch_suggestion
+    type: module
+    plugin_type: np-api-call
+    name: "Get Suggestion"
+    inputs:
+      item_status: "${{ steps.fetch_item.outputs.actionItem.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/governance/action_item/${{ workflow.inputs.action_item_id }}/suggestions/${{ workflow.inputs.suggestion_id }}"
+
+  - id: fetch_scope
+    type: module
+    plugin_type: np-api-call
+    name: "Get Scope"
+    inputs:
+      suggestion_status: "${{ steps.fetch_suggestion.outputs.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/scope/${{ steps.fetch_item.outputs.actionItem.metadata.scope_id }}"
+
+  - id: compute_plan
+    type: module
+    plugin_type: code-exec
+    name: "Compute New Spec & Mode"
+    inputs:
+      item:       "${{ steps.fetch_item.outputs.actionItem }}"
+      suggestion: "${{ steps.fetch_suggestion.outputs.body }}"
+      scope:      "${{ steps.fetch_scope.outputs.body }}"
+      timing_override: "${{ workflow.inputs.deploy_timing }}"
+      cpu_min: "${{ vars.CPU_MIN_MILLICORES || '100' }}"
+      mem_min: "${{ vars.MEM_MIN_MB || '128' }}"
+    config:
+      code: |
+        var item = inputs.item || {};
+        var sug = inputs.suggestion || {};
+        var scope = inputs.scope || {};
+        var meta = sug.metadata || {};
+        var recCpu = Math.max(Number(meta.recommended_cpu_request_mc) || 0, Number(inputs.cpu_min) || 100);
+        var recMem = Math.max(Number(meta.recommended_mem_request_mb) || 0, Number(inputs.mem_min) || 128);
+        if (!(recCpu > 0) || !(recMem > 0)) throw new Error('Suggestion has no recommended values (metadata.recommended_*)');
+
+        // Timing: manual override > the user's accept-form answer
+        // (user_metadata, filled from user_metadata_config.schema) > the AI's
+        // recommended mode. next-deploy = apply-only; scheduled/now = deploy.
+        // "tonight" is a legacy alias of scheduled-without-time.
+        var VALID = { 'next-deploy': 1, tonight: 1, scheduled: 1, now: 1 };
+        var timing = String(inputs.timing_override || '').trim().toLowerCase();
+        if (!VALID[timing]) timing = String((sug.user_metadata || {}).deploy_timing || '').trim().toLowerCase();
+        if (!VALID[timing]) timing = String(meta.mode || '') === 'nocturnal-deploy' ? 'scheduled' : 'next-deploy';
+        if (timing === 'tonight') timing = 'scheduled';
+        var mode = timing === 'next-deploy' ? 'apply-only' : 'nocturnal-deploy';
+
+        // Optional user-picked deploy time (HH:MM in the window tz); empty →
+        // tonight's window start.
+        var deployAt = String((sug.user_metadata || {}).deploy_at || '').trim();
+        if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(deployAt)) deployAt = '';
+
+        // Clone the scope's requested spec and override the resource request
+        // fields we can recognize. K8s scope spec field names vary per
+        // provider version — every known spelling is handled; the morning
+        // smoke run against the demo org validates which one applies.
+        var spec = JSON.parse(JSON.stringify(scope.requested_spec || scope.specification || {}));
+        var applied = [];
+        function setIf(obj, key, value) {
+          if (obj && Object.prototype.hasOwnProperty.call(obj, key)) { obj[key] = value; applied.push(key); return true; }
+          return false;
+        }
+        var res = spec.resources || spec;
+        setIf(res, 'cpu_millicores', recCpu) || setIf(res, 'cpu_request_millicores', recCpu) || setIf(res, 'cpu', recCpu / 1000);
+        setIf(res, 'memory_in_mb', recMem) || setIf(res, 'memory_request_mb', recMem) || setIf(res, 'memory', recMem);
+        // Nullplatform K8s profile shape (validated live in production):
+        // {cpu_profile, memory_in_gb, local_storage_in_gb}. CPU is DERIVED
+        // from the profile (kubernetes_processor.millicores = -1), so the
+        // only right-sizable field is memory_in_gb — rounded UP to the next
+        // platform tier; the CPU request follows the profile automatically.
+        if (applied.length === 0 && Object.prototype.hasOwnProperty.call(res, 'memory_in_gb')) {
+          var TIERS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
+          var wantGb = recMem / 1024;
+          var newGb = TIERS[TIERS.length - 1];
+          for (var ti = 0; ti < TIERS.length; ti++) { if (TIERS[ti] >= wantGb) { newGb = TIERS[ti]; break; } }
+          if (newGb >= Number(res.memory_in_gb)) {
+            throw new Error('Nothing to right-size: recommended memory tier ' + newGb + 'GB is not below the current ' + res.memory_in_gb + 'GB (cpu is profile-derived on this provider)');
+          }
+          res.memory_in_gb = newGb;
+          applied.push('memory_in_gb:' + newGb);
+        }
+        if (applied.length === 0) throw new Error('Could not locate cpu/memory request fields in the scope spec — adjust compute_plan for this provider. Spec keys: ' + Object.keys(res).join(','));
+
+        return {
+          mode: mode,
+          timing: timing,
+          immediate: timing === 'now',
+          deploy_at: deployAt,
+          scope_id: String((item.metadata || {}).scope_id || scope.id || ''),
+          scope_name: (item.metadata || {}).scope_name || scope.name || '',
+          new_spec: spec,
+          applied_fields: applied,
+          recommended_cpu_request_mc: recCpu,
+          recommended_mem_request_mb: recMem
+        };
+
+  - id: is_apply_only
+    type: decider
+    plugin_type: conditional
+    name: "Apply Without Deploy?"
+    config:
+      expression: "steps.compute_plan.outputs.mode == 'apply-only'"
+
+  # ── Mode A: apply-only (item stays open) ──────────────────────────────
+  # The scope PATCH itself can be rejected by approvals/policies — interpret
+  # instead of blowing up, and narrate the blocker on the item.
+  - id: patch_scope_only
+    type: module
+    plugin_type: np-api-call
+    name: "Patch Scope Spec"
+    inputs:
+      payload: "${{ steps.compute_plan.outputs.new_spec }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/scope/${{ steps.compute_plan.outputs.scope_id }}"
+      failOnHttpError: false
+      body:
+        requested_spec: "${{ inputs.payload }}"
+
+  - id: check_patch_only
+    type: module
+    plugin_type: code-exec
+    name: "Interpret Patch Result"
+    inputs:
+      status: "${{ steps.patch_scope_only.outputs.status }}"
+      body:   "${{ steps.patch_scope_only.outputs.body }}"
+    config:
+      code: |
+        var st = Number(inputs.status) || 0;
+        if (st >= 200 && st < 300) return { ok: true, reason: '' };
+        var msg = String(((inputs.body || {}).message) || JSON.stringify(inputs.body || {})).slice(0, 400);
+        var kind = /approval|policy|checklist|not allowed|forbidden|denied/i.test(msg) || st === 403
+          ? 'blocked by an approval/policy/checklist gate' : 'rejected by the platform';
+        return { ok: false, reason: kind + ' — HTTP ' + st + ': ' + msg };
+
+  - id: patch_only_ok
+    type: decider
+    plugin_type: conditional
+    name: "Patch Applied?"
+    config:
+      expression: "steps.check_patch_only.outputs.ok == true"
+
+  - id: comment_patch_blocked_only
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Patch Blocked"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: "🚫 Could not update the scope configuration: ${{ steps.check_patch_only.outputs.reason }}. Nothing was changed; resolve the gate and accept again."
+
+  - id: mark_failed_only
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Failed (patch blocked)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      executionResult:
+        success: false
+        message: "Scope patch was blocked — see the item comments."
+
+  - id: stash_patch_blocked_only
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: patch blocked"
+    config:
+      path: outcome
+      value:
+        status: "blocked"
+        deployment_id: null
+
+  - id: comment_applied_only
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Applied (no deploy)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: "Applied the recommended requests (cpu ${{ steps.compute_plan.outputs.recommended_cpu_request_mc }}m / mem ${{ steps.compute_plan.outputs.recommended_mem_request_mb }}MB) to the scope configuration. No deploy was triggered — the change ships with your next deployment. This item stays open until then."
+
+  - id: mark_applied_only
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Applied"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-applied
+      executionResult:
+        success: true
+        message: "Spec patched; deploy left to the scope owner. Item intentionally left open."
+
+  - id: stash_applied_only
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: applied-only"
+    config:
+      path: outcome
+      value:
+        status: "applied-no-deploy"
+        deployment_id: null
+
+  # ── Mode B: nocturnal deploy ──────────────────────────────────────────
+  - id: compute_window
+    type: module
+    plugin_type: code-exec
+    name: "Compute Wait Until Window"
+    inputs:
+      immediate: "${{ steps.compute_plan.outputs.immediate }}"
+      deploy_at: "${{ steps.compute_plan.outputs.deploy_at }}"
+      rec_cpu:   "${{ steps.compute_plan.outputs.recommended_cpu_request_mc }}"
+      rec_mem:   "${{ steps.compute_plan.outputs.recommended_mem_request_mb }}"
+      window_start: "${{ vars.DEPLOY_WINDOW_START || '01:00' }}"
+      window_end:   "${{ vars.DEPLOY_WINDOW_END || '05:00' }}"
+      tz_offset:    "${{ vars.DEPLOY_WINDOW_TZ_OFFSET || '-03:00' }}"
+    config:
+      code: |
+        function parseHm(s, name) {
+          var m = /^(\d{1,2}):(\d{2})$/.exec(String(s || '').trim());
+          if (!m) throw new Error('Invalid ' + name + ': ' + s);
+          return Number(m[1]) * 60 + Number(m[2]);
+        }
+        function parseOffset(s) {
+          var m = /^([+-])(\d{2}):(\d{2})$/.exec(String(s || '').trim());
+          if (!m) throw new Error('Invalid DEPLOY_WINDOW_TZ_OFFSET (use ±HH:MM): ' + s);
+          return (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+        }
+        var startMin = parseHm(inputs.window_start, 'DEPLOY_WINDOW_START');
+        var endMin = parseHm(inputs.window_end, 'DEPLOY_WINDOW_END');
+        var offMin = parseOffset(inputs.tz_offset);
+
+        // Minutes-of-day in the window's timezone, from UTC now.
+        var now = new Date();
+        var localMin = (now.getUTCHours() * 60 + now.getUTCMinutes() + offMin + 1440) % 1440;
+        var immediate = inputs.immediate === true || inputs.immediate === 'true';
+        var deployAt = String(inputs.deploy_at || '').trim();
+        var change = 'cpu ' + inputs.rec_cpu + 'm / mem ' + inputs.rec_mem + 'MB';
+        var label = String(inputs.window_start) + '-' + String(inputs.window_end) + ' (' + String(inputs.tz_offset) + ')';
+
+        var inWindow, waitMin, announce;
+        if (deployAt) {
+          // User-picked time: wait until that HH:MM (grace 15' — "reached" if
+          // we are within it, else target the next occurrence).
+          var target = parseHm(deployAt, 'deploy_at');
+          var delta = (target - localMin + 1440) % 1440;
+          inWindow = delta === 0 || delta > 1425; // within [target, target+15')
+          waitMin = (inWindow || immediate) ? 0 : delta;
+          announce = immediate
+            ? 'Immediate deploy requested at accept time — applying ' + change + ' and deploying now.'
+            : inWindow
+              ? 'Scheduled time ' + deployAt + ' (' + String(inputs.tz_offset) + ') reached — applying ' + change + ' and deploying now.'
+              : 'Deploy scheduled for ' + deployAt + ' (' + String(inputs.tz_offset) + ') — applying ' + change + '. Comment `deploy now` to run immediately or `abort` to cancel.';
+        } else {
+          inWindow = startMin <= endMin
+            ? (localMin >= startMin && localMin < endMin)
+            : (localMin >= startMin || localMin < endMin); // window crosses midnight
+          waitMin = (inWindow || immediate) ? 0 : (startMin - localMin + 1440) % 1440;
+          announce = immediate
+            ? 'Immediate deploy requested at accept time — applying ' + change + ' and deploying now.'
+            : inWindow
+              ? 'Already inside the deploy window ' + label + ' — applying ' + change + ' and deploying now.'
+              : 'Deploy scheduled for tonight\'s window ' + label + ' — applying ' + change + '. Comment `deploy now` to run immediately or `abort` to cancel.';
+        }
+        return {
+          in_window: inWindow,
+          wait_seconds: waitMin * 60,
+          window_label: deployAt ? (deployAt + ' (' + String(inputs.tz_offset) + ')') : label,
+          announce: announce
+        };
+
+  - id: stash_wait
+    type: module
+    plugin_type: set-variable
+    name: "Arm Wait Timer"
+    inputs:
+      seconds: "${{ steps.compute_window.outputs.wait_seconds }}"
+    config:
+      path: wait_seconds
+      value: "${{ inputs.seconds }}"
+
+  - id: comment_scheduled
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Scheduled"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: "${{ steps.compute_window.outputs.announce }}"
+
+  - id: needs_wait
+    type: decider
+    plugin_type: conditional
+    name: "Outside the Window?"
+    config:
+      expression: "variables.wait_seconds > 0"
+
+  # Re-entered from the comment loop below (keep waiting) — needs `any`:
+  # the default `all` join would deadlock on entry-edge + re-entry edge.
+  - id: wait_window
+    type: module
+    plugin_type: signal-wait
+    name: "Wait for Window / Commands"
+    join_strategy: any
+    config:
+      signalName: rightsizing-command
+      correlationKey: "rightsizing:${{ workflow.inputs.action_item_id }}"
+      timeout: "${{ variables.wait_seconds }}s"
+      # Timeout = the window arrived. `continue` keeps everything on the
+      # default port (a MODULE's non-default port on a connection breaks
+      # in-sandbox re-validation on the Temporal worker).
+      onTimeout: continue
+
+  - id: was_signal
+    type: decider
+    plugin_type: conditional
+    name: "Woken by a Comment?"
+    config:
+      expression: "steps.wait_window.outputs.timedOut != true"
+
+  - id: fetch_comments
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Latest Comments"
+    inputs:
+      wake: "${{ steps.wait_window.outputs.receivedAt }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/governance/action_item/${{ workflow.inputs.action_item_id }}/comments"
+
+  - id: parse_command
+    type: module
+    plugin_type: code-exec
+    name: "Parse Command & Re-arm"
+    inputs:
+      body: "${{ steps.fetch_comments.outputs.body }}"
+      deploy_at: "${{ steps.compute_plan.outputs.deploy_at }}"
+      window_start: "${{ vars.DEPLOY_WINDOW_START || '01:00' }}"
+      window_end:   "${{ vars.DEPLOY_WINDOW_END || '05:00' }}"
+      tz_offset:    "${{ vars.DEPLOY_WINDOW_TZ_OFFSET || '-03:00' }}"
+    config:
+      code: |
+        var body = inputs.body || {};
+        var list = body.results || body.comments || (Array.isArray(body) ? body : []);
+        // Latest human comment decides; agent progress comments are ignored.
+        var command = 'none';
+        for (var i = list.length - 1; i >= 0; i--) {
+          var c = list[i] || {};
+          var author = String(c.author || c.created_by || '');
+          if (author.indexOf('agent:') === 0) continue;
+          var text = String(c.content || c.text || '').trim().toLowerCase();
+          if (text === 'deploy now' || text === 'deploy-now') { command = 'deploy-now'; }
+          else if (text === 'abort' || text === 'cancel') { command = 'abort'; }
+          break;
+        }
+        // Re-arm the timer for the keep-waiting loop (same math as
+        // compute_window; duplicated because expressions cannot call steps).
+        function parseHm(s) { var m = /^(\d{1,2}):(\d{2})$/.exec(String(s || '').trim()); return m ? Number(m[1]) * 60 + Number(m[2]) : 60; }
+        function parseOffset(s) { var m = /^([+-])(\d{2}):(\d{2})$/.exec(String(s || '').trim()); return m ? (m[1] === '-' ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3])) : 0; }
+        var offMin = parseOffset(inputs.tz_offset);
+        var now = new Date();
+        var localMin = (now.getUTCHours() * 60 + now.getUTCMinutes() + offMin + 1440) % 1440;
+        var deployAt = String(inputs.deploy_at || '').trim();
+        var inWindow, waitMin;
+        if (deployAt) {
+          var delta = (parseHm(deployAt) - localMin + 1440) % 1440;
+          inWindow = delta === 0 || delta > 1425; // grace 15' — see compute_window
+          waitMin = inWindow ? 0 : delta;
+        } else {
+          var startMin = parseHm(inputs.window_start);
+          var endMin = parseHm(inputs.window_end);
+          inWindow = startMin <= endMin ? (localMin >= startMin && localMin < endMin) : (localMin >= startMin || localMin < endMin);
+          waitMin = inWindow ? 0 : (startMin - localMin + 1440) % 1440;
+        }
+        if (command === 'none' && inWindow) command = 'window-reached';
+        return { command: command, wait_seconds: waitMin * 60 };
+
+  - id: is_abort
+    type: decider
+    plugin_type: conditional
+    name: "Abort Requested?"
+    config:
+      expression: "steps.parse_command.outputs.command == 'abort'"
+
+  - id: keep_waiting
+    type: decider
+    plugin_type: conditional
+    name: "Keep Waiting?"
+    config:
+      expression: "steps.parse_command.outputs.command == 'none'"
+
+  - id: rearm_wait
+    type: module
+    plugin_type: set-variable
+    name: "Re-arm Wait Timer"
+    inputs:
+      seconds: "${{ steps.parse_command.outputs.wait_seconds }}"
+    config:
+      path: wait_seconds
+      value: "${{ inputs.seconds }}"
+
+  # ── Abort path ────────────────────────────────────────────────────────
+  - id: comment_aborted
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Aborted"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: "Deploy aborted by request. No changes were applied. The suggestion was marked rejected — re-run the right-sizing scan to get a fresh one."
+
+  - id: reject_suggestion
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Rejected"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: reject
+      reason: "Aborted by user comment before the deploy window."
+
+  - id: stash_aborted
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: aborted"
+    config:
+      path: outcome
+      value:
+        status: "aborted"
+        deployment_id: null
+
+  # ── Deploy path ───────────────────────────────────────────────────────
+  - id: comment_deploying
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Deploying"
+    # Both the timeout branch (was_signal=false) and the deploy-now /
+    # window-reached branch land here — only ever ONE of them per pass.
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: "Deploy window reached — patching the scope and starting the deployment (cpu ${{ steps.compute_plan.outputs.recommended_cpu_request_mc }}m / mem ${{ steps.compute_plan.outputs.recommended_mem_request_mb }}MB)."
+
+  - id: patch_scope_deploy
+    type: module
+    plugin_type: np-api-call
+    name: "Patch Scope Spec"
+    inputs:
+      payload: "${{ steps.compute_plan.outputs.new_spec }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/scope/${{ steps.compute_plan.outputs.scope_id }}"
+      failOnHttpError: false
+      body:
+        requested_spec: "${{ inputs.payload }}"
+
+  - id: check_patch_deploy
+    type: module
+    plugin_type: code-exec
+    name: "Interpret Patch Result"
+    inputs:
+      status: "${{ steps.patch_scope_deploy.outputs.status }}"
+      body:   "${{ steps.patch_scope_deploy.outputs.body }}"
+    config:
+      code: |
+        var st = Number(inputs.status) || 0;
+        if (st >= 200 && st < 300) return { ok: true, reason: '' };
+        var msg = String(((inputs.body || {}).message) || JSON.stringify(inputs.body || {})).slice(0, 400);
+        var kind = /approval|policy|checklist|not allowed|forbidden|denied/i.test(msg) || st === 403
+          ? 'blocked by an approval/policy/checklist gate' : 'rejected by the platform';
+        return { ok: false, reason: kind + ' — HTTP ' + st + ': ' + msg };
+
+  - id: patch_deploy_ok
+    type: decider
+    plugin_type: conditional
+    name: "Patch Applied?"
+    config:
+      expression: "steps.check_patch_deploy.outputs.ok == true"
+
+  - id: comment_patch_blocked_deploy
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Patch Blocked"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: "🚫 Could not update the scope configuration: ${{ steps.check_patch_deploy.outputs.reason }}. Nothing was deployed; resolve the gate and accept again."
+
+  # The narrated progressive blue-green deploy (wf5): creates a REAL
+  # deployment for the running release, moves traffic in configured steps
+  # with telemetry checks, comments every step/decision/blocker, and
+  # finalizes or rolls back. Returns {status, deployment_id, detail}.
+  - id: run_progressive
+    type: module
+    plugin_type: sub-workflow
+    name: "Progressive Deploy"
+    inputs:
+      scope_id: "${{ steps.compute_plan.outputs.scope_id }}"
+      action_item_id: "${{ workflow.inputs.action_item_id }}"
+      description: "Right-sizing: cpu ${{ steps.compute_plan.outputs.recommended_cpu_request_mc }}m / mem ${{ steps.compute_plan.outputs.recommended_mem_request_mb }}MB"
+    config:
+      # PER-ORG id of "Progressive Deploy (narrated)"; patched by
+      # setup/04-upload-workflows.mjs on upload.
+      workflowId: progressive_deploy
+      waitForCompletion: true
+
+  - id: read_outcome
+    type: module
+    plugin_type: code-exec
+    name: "Read Deploy Outcome"
+    inputs:
+      raw: "${{ steps.run_progressive.outputs }}"
+    config:
+      code: |
+        var r = inputs.raw || {};
+        // Live engine may nest child outputs under `outputs` — accept both.
+        var o = r.outputs || r;
+        return {
+          status: String(o.status || 'failed'),
+          deployment_id: o.deployment_id || null,
+          detail: String(o.detail || '')
+        };
+
+  - id: prog_deployed
+    type: decider
+    plugin_type: conditional
+    name: "Deploy Finalized?"
+    config:
+      expression: "steps.read_outcome.outputs.status == 'deployed'"
+
+  # ── Success ───────────────────────────────────────────────────────────
+  - id: comment_success
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Closing"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: "New requests are live (cpu ${{ steps.compute_plan.outputs.recommended_cpu_request_mc }}m / mem ${{ steps.compute_plan.outputs.recommended_mem_request_mb }}MB) on deployment ${{ steps.read_outcome.outputs.deployment_id }}. Closing this item."
+
+  - id: mark_applied_deploy
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Applied"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-applied
+      executionResult:
+        success: true
+        message: "Nocturnal deploy finalized; item closed."
+
+  - id: close_item
+    type: module
+    plugin_type: np-action-item-update
+    name: "Close Action Item"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      action: close
+      # Lifecycle transitions require an actor (validated live: close without
+      # it fails PLUGIN_CONFIG_INVALID).
+      actor: "agent:rightsizing-applier"
+      reason: "Right-sizing deploy finalized successfully."
+
+  - id: stash_deployed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: deployed"
+    inputs:
+      deployment: "${{ steps.read_outcome.outputs.deployment_id }}"
+    config:
+      path: outcome
+      value:
+        status: "deployed"
+        deployment_id: "${{ inputs.deployment }}"
+
+  # ── Failure (wf5 already narrated the details as comments) ─────────────
+  - id: mark_failed
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Failed"
+    # Two ways in: the scope patch was blocked, or wf5 ended blocked /
+    # rolled_back / failed — only ever ONE per run.
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      executionResult:
+        success: false
+        message: "Deploy did not complete — see the item comments for the step-by-step narration."
+
+  - id: stash_deploy_failed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: deploy-failed"
+    config:
+      path: outcome
+      value:
+        status: "deploy-failed"
+        deployment_id: null
+
+connections:
+  - { id: c1,  from: start,             to: fetch_item }
+  - { id: c2,  from: fetch_item,        to: fetch_suggestion }
+  - { id: c3,  from: fetch_suggestion,  to: fetch_scope }
+  - { id: c4,  from: fetch_scope,       to: compute_plan }
+  - { id: c5,  from: compute_plan,      to: is_apply_only }
+  # Mode A: apply-only
+  - { id: c6,  from: is_apply_only,     to: patch_scope_only,    source_port: "true" }
+  - { id: c6b, from: patch_scope_only,  to: check_patch_only }
+  - { id: c6c, from: check_patch_only,  to: patch_only_ok }
+  - { id: c7,  from: patch_only_ok,     to: comment_applied_only, source_port: "true" }
+  - { id: c8,  from: comment_applied_only, to: mark_applied_only }
+  - { id: c9,  from: mark_applied_only, to: stash_applied_only }
+  - { id: c9b, from: patch_only_ok,     to: comment_patch_blocked_only, source_port: "false" }
+  - { id: c9c, from: comment_patch_blocked_only, to: mark_failed_only }
+  - { id: c9d, from: mark_failed_only,  to: stash_patch_blocked_only }
+  # Mode B: nocturnal
+  - { id: c10, from: is_apply_only,     to: compute_window,      source_port: "false" }
+  - { id: c11, from: compute_window,    to: stash_wait }
+  - { id: c12, from: stash_wait,        to: comment_scheduled }
+  - { id: c13, from: comment_scheduled, to: needs_wait }
+  - { id: c14, from: needs_wait,        to: wait_window,         source_port: "true" }
+  # Already inside the window → deploy immediately.
+  - { id: c15, from: needs_wait,        to: comment_deploying,   source_port: "false" }
+  # Wait outcomes
+  - { id: c16, from: wait_window,       to: was_signal }
+  - { id: c17, from: was_signal,        to: comment_deploying,   source_port: "false" }
+  - { id: c18, from: was_signal,        to: fetch_comments,      source_port: "true" }
+  - { id: c19, from: fetch_comments,    to: parse_command }
+  - { id: c20, from: parse_command,     to: is_abort }
+  - { id: c21, from: is_abort,          to: comment_aborted,     source_port: "true" }
+  - { id: c22, from: comment_aborted,   to: reject_suggestion }
+  - { id: c23, from: reject_suggestion, to: stash_aborted }
+  - { id: c24, from: is_abort,          to: keep_waiting,        source_port: "false" }
+  # Plain comment → re-arm and wait again (re-entry into wait_window).
+  - { id: c25, from: keep_waiting,      to: rearm_wait,          source_port: "true" }
+  - { id: c26, from: rearm_wait,        to: wait_window }
+  # deploy-now / window-reached
+  - { id: c27, from: keep_waiting,      to: comment_deploying,   source_port: "false" }
+  # Deploy pipeline: patch (approval-aware) -> narrated progressive deploy
+  - { id: c28, from: comment_deploying,   to: patch_scope_deploy }
+  - { id: c29, from: patch_scope_deploy,  to: check_patch_deploy }
+  - { id: c30, from: check_patch_deploy,  to: patch_deploy_ok }
+  - { id: c31, from: patch_deploy_ok,     to: run_progressive,     source_port: "true" }
+  - { id: c32, from: run_progressive,     to: read_outcome }
+  - { id: c33, from: read_outcome,        to: prog_deployed }
+  - { id: c36, from: prog_deployed,       to: comment_success,     source_port: "true" }
+  - { id: c37, from: comment_success,     to: mark_applied_deploy }
+  - { id: c38, from: mark_applied_deploy, to: close_item }
+  - { id: c39, from: close_item,          to: stash_deployed }
+  - { id: c40, from: prog_deployed,       to: mark_failed,         source_port: "false" }
+  - { id: c41, from: patch_deploy_ok,     to: comment_patch_blocked_deploy, source_port: "false" }
+  - { id: c41b, from: comment_patch_blocked_deploy, to: mark_failed }
+  - { id: c42, from: mark_failed,         to: stash_deploy_failed }
+
+outputs:
+  status:         "${{ variables.outcome.status }}"
+  deployment_id:  "${{ variables.outcome.deployment_id }}"
+  action_item_id: "${{ workflow.inputs.action_item_id }}"
+  suggestion_id:  "${{ workflow.inputs.suggestion_id }}"
+  mode:           "${{ steps.compute_plan.outputs.mode }}"

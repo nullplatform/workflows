@@ -1,0 +1,45 @@
+# AI-deploy tool: post a narration comment on an action item.
+id: item_comment
+name: "Deploy Tool — Item Comment"
+description: >
+  Posts a comment on an action item (deploy narration). Inputs:
+  action_item_id (string, required), content (string, required — plain text,
+  keep it one short paragraph with the concrete numbers/ids). Returns
+  {commentId}.
+path: "/deploy"
+semantic_version: 1.0.0
+
+inputs:
+  action_item_id:
+    type: string
+    required: true
+  content:
+    type: string
+    required: true
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Posts a narration comment (AI-deploy tool)."
+      inputs:
+        action_item_id: { type: string, required: true }
+        content: { type: string, required: true }
+
+  - id: post
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Add Comment"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:progressive-deploy"
+      content: "${{ workflow.inputs.content }}"
+
+connections:
+  - { id: c1, from: start, to: post }
+
+outputs:
+  commentId: "${{ steps.post.outputs.commentId }}"

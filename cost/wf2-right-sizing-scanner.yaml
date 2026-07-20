@@ -1,0 +1,395 @@
+# Right Sizing Scanner — weekly usage-vs-request analysis over K8s scopes.
+#
+# For every active K8s scope, dispatches a per-scope analysis sub-workflow:
+# 14 days of hourly usage vs requests from cluster Prometheus (np agent) →
+# deterministic over-provision filter (>RIGHTSIZING_DEVIATION_PCT%, not at
+# platform minimums, saving above the per-environment minimum) → AI deep-dive
+# (claude-code-agent with a metrics zoom-in tool) → idempotent action item +
+# ONE applyable suggestion whose mode the AI chose (nocturnal-deploy /
+# apply-only).
+#
+# Per-org configuration (config entries on folder /cost) — on top of the
+# cost-tracker entries (NP_API_KEY, NP_ORGANIZATION_ID, COST_AGENT_*,
+# COST_POD_MATCHERS_TEMPLATE, COST_PER_*):
+#   RIGHTSIZING_DEVIATION_PCT (var)  — request-over-usage % threshold (e.g. 50)
+#   RIGHTSIZING_LOOKBACK_DAYS (var)  — usage window in days (e.g. 14)
+#   RIGHTSIZING_CATEGORY_SLUG (var)  — action item category slug (e.g. finops)
+#   CPU_MIN_MILLICORES (var)         — platform CPU request floor (e.g. 100)
+#   MEM_MIN_MB (var)                 — platform memory request floor (e.g. 128)
+#   RIGHTSIZING_MIN_SAVINGS_BY_ENV (var) — JSON {env → min USD/month to open
+#     an item}, e.g. {"default":1,"production":5}; savings below the floor
+#     are not worth a ticket
+id: right_sizing_scanner
+name: "Right Sizing Scanner"
+description: >
+  Weekly job (Mondays 05:00, also manual) that finds over-provisioned K8s
+  scopes (14-day hourly usage vs requests), validates each candidate with an
+  AI analysis, and ensures an action item with applyable suggestions per
+  genuine opportunity.
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  nrn:
+    type: string
+    required: false
+    description: "Optional NRN prefix filter — only scopes under this NRN are analyzed (empty = whole organization)"
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Now"
+    config:
+      description: "Runs the right-sizing analysis immediately."
+      inputs:
+        nrn:
+          type: string
+          required: false
+          description: "Only analyze scopes under this NRN (prefix match)"
+          placeholder: "organization=…:account=…"
+
+  - id: start_cron
+    type: trigger
+    plugin_type: cron
+    name: "Weekly Monday 05:00"
+    config:
+      schedule: "0 5 * * 1"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  - id: lake_scopes
+    type: module
+    plugin_type: np-lake-query
+    name: "Active K8s Scopes (lake)"
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      sql: |
+        SELECT s.id AS scope_id, s.name AS scope_name, s.scope_slug AS scope_slug,
+               s.nrn AS scope_nrn, s.type AS scope_type, a.app_name AS app_name
+        FROM core_entities_scope AS s FINAL
+        JOIN core_entities_application AS a FINAL
+          ON s.application_id = a.app_id AND a._deleted = 0
+        WHERE s._deleted = 0
+          AND s.status = 'active'
+          -- Any type that can be k8s-backed: custom and web_pool scopes run
+          -- in the cluster too (verified live: 74 scopes with pods vs the 39
+          -- web_pool_k8s). Non-k8s ones fall out naturally as no_data — the
+          -- collector finds no pods for them. serverless (lambda) excluded.
+          AND s.type IN ('web_pool_k8s', 'custom', 'web_pool')
+        LIMIT 5000
+
+  - id: filter_scopes
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
+    # sandbox plugin descriptors are unavailable, so the engine cannot see
+    # executeMode "all" and would fan out per item (N identical runs).
+    metadata: { fanOutPerItem: false }
+    name: "Filter by NRN"
+    inputs:
+      rows: "${{ steps.lake_scopes.outputs.rows }}"
+      nrn:  "${{ workflow.inputs.nrn }}"
+    config:
+      code: |
+        var rows = inputs.rows || [];
+        var nrn = String(inputs.nrn || '').trim();
+        if (!nrn) return { scopes: rows, total: rows.length, nrn_filter: null };
+        var out = [];
+        for (var i = 0; i < rows.length; i++) {
+          var s = (rows[i] || {}).scope_nrn || '';
+          if (s === nrn || s.indexOf(nrn + ':') === 0) out.push(rows[i]);
+        }
+        return { scopes: out, total: out.length, nrn_filter: nrn };
+
+  # ── One analysis sub-execution per scope ──────────────────────────────
+  # maxConcurrency 3: each child may run an AI agent — keep the E2B /
+  # token pressure low.
+  - id: analyze_scopes
+    type: module
+    plugin_type: sub-workflow
+    name: "Analyze per Scope"
+    forEach:
+      expression: "${{ steps.filter_scopes.outputs.scopes }}"
+      itemVariable: scope
+      parallel: true
+      maxConcurrency: 3
+    config:
+      # PER-ORG id of "Right Sizing — Analyze Scope"; patched by
+      # setup/04-upload-workflows.mjs on upload.
+      workflowId: right_sizing_analyze_scope
+      waitForCompletion: true
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (see filter_scopes note).
+    metadata: { fanOutPerItem: false }
+    name: "Build Summary"
+    inputs:
+      results:    "${{ steps.analyze_scopes.outputs.items }}"
+      total:      "${{ steps.filter_scopes.outputs.total }}"
+      nrn_filter: "${{ steps.filter_scopes.outputs.nrn_filter }}"
+    config:
+      code: |
+        var results = inputs.results || [];
+        var counts = { not_candidate: 0, below_min_savings: 0, not_genuine: 0, created: 0, updated: 0, unchanged: 0, no_data: 0, prefiltered: 0, active_valid: 0, closed_stale: 0, other: 0 };
+        var saving = 0;
+        var itemIds = [];
+        // The scan's own AI bill: summed from each child's ai_usage
+        // (claude-code-agent outputs.usage rollup).
+        var ai = { runs: 0, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cost_usd: 0 };
+        for (var i = 0; i < results.length; i++) {
+          // Live engine wraps each fan-out item as {outputs, _childExecutionId};
+          // the E2E harness stubs return the outputs flat. Accept both.
+          var r = (results[i] || {}).outputs || results[i] || {};
+          var s = String(r.status || 'other');
+          if (counts[s] === undefined) s = 'other';
+          counts[s]++;
+          if (r.action_item_id && (r.status === 'created' || r.status === 'updated')) itemIds.push(r.action_item_id);
+          saving += Number(r.estimated_savings_usd_month) || 0;
+          var u = r.ai_usage;
+          if (u && typeof u === 'object') {
+            ai.runs++;
+            ai.input_tokens += Number(u.input_tokens) || 0;
+            ai.output_tokens += Number(u.output_tokens) || 0;
+            ai.cache_read_tokens += Number(u.cache_read_tokens) || 0;
+            ai.cost_usd += Number(u.cost_usd) || 0;
+          }
+        }
+        ai.cost_usd = Math.round(ai.cost_usd * 100) / 100;
+        return {
+          nrn_filter: inputs.nrn_filter || null,
+          scopes: inputs.total || 0,
+          ai_usage: ai,
+          not_candidate: counts.not_candidate,
+          below_min_savings: counts.below_min_savings,
+          no_data: counts.no_data,
+          not_genuine: counts.not_genuine,
+          created: counts.created,
+          updated: counts.updated,
+          unchanged: counts.unchanged,
+          prefiltered: counts.prefiltered,
+          active_valid: counts.active_valid,
+          closed_stale: counts.closed_stale,
+          other: counts.other,
+          estimated_savings_usd_month: Math.round(saving * 100) / 100,
+          action_item_ids: itemIds
+        };
+
+  # ── Portfolio item: the sub-ticket long tail ──────────────────────────
+  # Opportunities below the per-environment ticket floor are invisible one
+  # by one but real money in aggregate.
+  # ONE org-level item accumulates them: entries are upserted when a scan
+  # concludes below_min_savings, removed when the scope resolves any other
+  # way (real item, healthy, discarded), and kept while skipped/prefiltered.
+  - id: build_micro
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (see filter_scopes).
+    metadata: { fanOutPerItem: false }
+    name: "Collect Sub-ticket Findings"
+    inputs:
+      results: "${{ steps.analyze_scopes.outputs.items }}"
+    config:
+      code: |
+        var results = inputs.results || [];
+        var upserts = {};
+        var resolved = [];
+        for (var i = 0; i < results.length; i++) {
+          var r = (results[i] || {}).outputs || results[i] || {};
+          var st = String(r.status || '');
+          var sid = String(r.scope_id || '');
+          if (!sid) continue;
+          if (st === 'below_min_savings' && Number(r.naive_savings_usd_month) > 0) {
+            var stats = r.stats || {}; var c = stats.cpu || {}; var m = stats.mem || {};
+            var rec = r.naive_recommendation || {};
+            upserts[sid] = {
+              scope_id: sid,
+              scope_name: String(r.scope_name || ''),
+              environment: String(r.environment || ''),
+              savings_usd_month: Math.round(Number(r.naive_savings_usd_month) * 100) / 100,
+              cur_cpu_mc: Number(c.avg_request_mc) || 0,
+              cur_mem_mb: Number(m.avg_request_mb) || 0,
+              rec_cpu_mc: Number(rec.cpu_request_mc) || 0,
+              rec_mem_mb: Number(rec.mem_request_mb) || 0
+            };
+          } else if (st === 'created' || st === 'updated' || st === 'unchanged' ||
+                     st === 'closed_stale' || st === 'not_candidate' || st === 'not_genuine' ||
+                     st === 'active_valid') {
+            // Conclusive non-micro outcome → this scope leaves the portfolio.
+            resolved.push(sid);
+          }
+          // prefiltered / no_data: no new information — keep old entries.
+        }
+        return { upserts: upserts, resolved: resolved, fresh: Object.keys(upserts).length };
+
+  - id: find_portfolio
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Portfolio Item"
+    # SHIELD: declared inputs so the upstream passthrough never merges over
+    # this plugin's config (see wf2b get_flag_inst).
+    inputs:
+      fresh: "${{ steps.build_micro.outputs.fresh }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      metadataKey: rightsizing_key
+      metadataValue: "rightsizing-portfolio"
+
+  - id: build_portfolio
+    type: module
+    plugin_type: code-exec
+    name: "Build Portfolio Payload"
+    inputs:
+      upserts:  "${{ steps.build_micro.outputs.upserts }}"
+      resolved: "${{ steps.build_micro.outputs.resolved }}"
+      found:    "${{ steps.find_portfolio.outputs }}"
+    config:
+      code: |
+        function r2(x) { return Math.round(x * 100) / 100; }
+        var found = inputs.found || {};
+        var existing = found.count > 0 ? (found.firstMatch || {}) : null;
+        // Start from the live item's entries, drop resolved scopes, upsert
+        // this run's findings.
+        var entries = {};
+        var prev = existing && existing.metadata ? existing.metadata.entries : null;
+        if (prev && typeof prev === 'object') { for (var k in prev) entries[k] = prev[k]; }
+        var resolved = inputs.resolved || [];
+        for (var i = 0; i < resolved.length; i++) delete entries[String(resolved[i])];
+        var ups = inputs.upserts || {};
+        for (var s in ups) entries[s] = ups[s];
+        var list = [];
+        var total = 0;
+        for (var e in entries) { list.push(entries[e]); total += Number(entries[e].savings_usd_month) || 0; }
+        list.sort(function (a, b) { return (b.savings_usd_month || 0) - (a.savings_usd_month || 0); });
+        total = r2(total);
+        if (list.length === 0 && !existing) return { action: 'none' };
+        var lines = [
+          '## Right-sizing portfolio — the long tail',
+          '',
+          'Opportunities individually below the ticket floor, worth **' + total + ' USD/month** in aggregate.',
+          'Each row is the deterministic recommendation (usage vs requests over the lookback window);',
+          'apply them in batch during regular deploys — none justifies its own ticket.',
+          '',
+          '| scope | env | current (cpu/mem) | recommended | saving |',
+          '|---|---|---|---|---|'
+        ];
+        var shown = list.slice(0, 30);
+        for (var j = 0; j < shown.length; j++) {
+          var x = shown[j];
+          lines.push('| ' + x.scope_name + ' (' + x.scope_id + ') | ' + x.environment + ' | ' +
+            Math.round(x.cur_cpu_mc) + 'mc / ' + Math.round(x.cur_mem_mb) + 'MB | ' +
+            Math.round(x.rec_cpu_mc) + 'mc / ' + Math.round(x.rec_mem_mb) + 'MB | $' + x.savings_usd_month + ' |');
+        }
+        if (list.length > 30) lines.push('', '…plus ' + (list.length - 30) + ' more (see metadata.entries).');
+        return {
+          action: existing ? 'update' : 'create',
+          item_id: existing ? existing.id : null,
+          title: 'Right-sizing portfolio: ' + list.length + ' small scopes — save ~' + total + ' USD/month in aggregate',
+          description: lines.join('\n'),
+          value: total,
+          metadata: {
+            rightsizing_key: 'rightsizing-portfolio',
+            entries: entries,
+            scope_count: list.length,
+            total_savings_usd_month: total,
+            updated_at: new Date().toISOString()
+          }
+        };
+
+  - id: portfolio_route
+    type: decider
+    plugin_type: case
+    name: "Portfolio Action"
+    config:
+      # RAW expression (no ${{ }}) — see wf2b scan_route.
+      expression: "steps.build_portfolio.outputs.action"
+      cases:
+        - { match: "create", port: "create" }
+        - { match: "update", port: "update" }
+      default: "skip"
+
+  - id: create_portfolio
+    type: module
+    plugin_type: np-action-item-create
+    name: "Create Portfolio Item"
+    # SHIELD inputs (observation + passthrough guard).
+    inputs:
+      observed_value: "${{ steps.build_portfolio.outputs.value }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      categorySlug: "${{ vars.RIGHTSIZING_CATEGORY_SLUG || 'finops' }}"
+      createdBy: "agent:right-sizing-scanner"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      title: "${{ steps.build_portfolio.outputs.title }}"
+      description: "${{ steps.build_portfolio.outputs.description }}"
+      priority: low
+      value: "${{ steps.build_portfolio.outputs.value }}"
+      labels:
+        # Distinct label value: the events router / apply pipeline must
+        # never treat the portfolio as an applyable right-sizing item.
+        workflow_type: "rightsizing_portfolio"
+        auto_detected: "true"
+      metadata: "${{ steps.build_portfolio.outputs.metadata }}"
+
+  - id: update_portfolio
+    type: module
+    plugin_type: np-action-item-update
+    name: "Update Portfolio Item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    # SHIELD inputs (passthrough guard).
+    inputs:
+      observed_value: "${{ steps.build_portfolio.outputs.value }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ steps.build_portfolio.outputs.item_id }}"
+      title: "${{ steps.build_portfolio.outputs.title }}"
+      description: "${{ steps.build_portfolio.outputs.description }}"
+      value: "${{ steps.build_portfolio.outputs.value }}"
+      metadata: "${{ steps.build_portfolio.outputs.metadata }}"
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Scan Complete"
+    config:
+      level: info
+      message: "Right-sizing scan: ${{ steps.summary.outputs.scopes }} scopes — candidates confirmed: ${{ steps.summary.outputs.created }} new / ${{ steps.summary.outputs.updated }} refreshed / ${{ steps.summary.outputs.unchanged }} unchanged; items kept: ${{ steps.summary.outputs.active_valid }}, auto-closed: ${{ steps.summary.outputs.closed_stale }} (skipped by prefilter/rescan-window: ${{ steps.summary.outputs.prefiltered }}, not candidates: ${{ steps.summary.outputs.not_candidate }}, below min saving: ${{ steps.summary.outputs.below_min_savings }}, AI discarded: ${{ steps.summary.outputs.not_genuine }}, no data: ${{ steps.summary.outputs.no_data }}). Estimated total saving: ${{ steps.summary.outputs.estimated_savings_usd_month }}/month."
+
+connections:
+  - { id: c1, from: start_manual,   to: lake_scopes }
+  - { id: c2, from: start_cron,     to: lake_scopes }
+  - { id: c3, from: lake_scopes,    to: filter_scopes }
+  - { id: c4, from: filter_scopes,  to: analyze_scopes }
+  - { id: c5, from: analyze_scopes, to: summary }
+  - { id: c6, from: summary,        to: log_done }
+  # portfolio branch (sub-ticket long tail)
+  - { id: c7, from: summary,          to: build_micro }
+  - { id: c8, from: build_micro,      to: find_portfolio }
+  - { id: c9, from: find_portfolio,   to: build_portfolio }
+  - { id: c10, from: build_portfolio, to: portfolio_route }
+  - { id: c11, from: portfolio_route, to: create_portfolio, source_port: "create" }
+  - { id: c12, from: portfolio_route, to: update_portfolio, source_port: "update" }
+
+outputs:
+  scopes:                      "${{ steps.summary.outputs.scopes }}"
+  ai_usage:                    "${{ steps.summary.outputs.ai_usage }}"
+  created:                     "${{ steps.summary.outputs.created }}"
+  updated:                     "${{ steps.summary.outputs.updated }}"
+  unchanged:                   "${{ steps.summary.outputs.unchanged }}"
+  prefiltered:                 "${{ steps.summary.outputs.prefiltered }}"
+  active_valid:                "${{ steps.summary.outputs.active_valid }}"
+  closed_stale:                "${{ steps.summary.outputs.closed_stale }}"
+  not_candidate:               "${{ steps.summary.outputs.not_candidate }}"
+  below_min_savings:           "${{ steps.summary.outputs.below_min_savings }}"
+  not_genuine:                 "${{ steps.summary.outputs.not_genuine }}"
+  no_data:                     "${{ steps.summary.outputs.no_data }}"
+  estimated_savings_usd_month: "${{ steps.summary.outputs.estimated_savings_usd_month }}"
+  action_item_ids:             "${{ steps.summary.outputs.action_item_ids }}"

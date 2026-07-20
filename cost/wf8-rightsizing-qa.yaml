@@ -1,0 +1,290 @@
+# Right Sizing — Q&A responder for action-item comments.
+#
+# Invoked by wf3 (fire-and-forget) when someone comments on a right-sizing
+# item and NO apply execution consumed the comment as a command (the engine
+# signal answered non-2xx = nobody waiting). An AI analyst reads the item's
+# analysis + the whole thread and, when the last human comment is a question
+# or an objection about the analysis, answers it as a comment — with the
+# metrics tool available to back the answer with fresh queries.
+#
+# Guard rails (deterministic, before any AI spend):
+#   - agent/executor authors never get a reply (no bot-to-bot loops);
+#   - the LAST comment must be from a human (a reply landing after ours
+#     means a race — skip, wf3 will fire again on the next human comment);
+#   - at most RIGHTSIZING_QA_MAX_REPLIES replies per item (runaway brake);
+#   - the AI itself returns should_reply=false for chatter/commands that
+#     are not addressed to the analysis.
+id: right_sizing_qa
+name: "Right Sizing — Q&A"
+description: >
+  Answers questions posted as comments on right-sizing action items: an AI
+  analyst with metric-query access replies on the thread (invoked by the
+  events router when no apply execution claimed the comment).
+path: "/cost"
+semantic_version: 1.0.0
+
+inputs:
+  action_item_id:
+    type: string
+    required: true
+    description: "Action item whose thread got a new comment"
+  author:
+    type: string
+    required: false
+    description: "Author of the triggering comment (event userEmail)"
+
+variables:
+  result: { initialValue: { status: "skipped" } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Answers the latest question on a right-sizing item (normally invoked by the events router)."
+      inputs:
+        action_item_id: { type: string, required: true }
+        author: { type: string, required: false }
+
+  - id: fetch_item
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Action Item"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/governance/action_item/${{ workflow.inputs.action_item_id }}"
+      failOnHttpError: false
+
+  - id: fetch_comments
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Comments"
+    # SHIELD: without declared inputs, fetch_item's passthrough (status/
+    # body/headers) merges over this config — `body`/`headers` are config
+    # keys. See wf2b get_flag_inst.
+    inputs:
+      item_status: "${{ steps.fetch_item.outputs.status }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/governance/action_item/${{ workflow.inputs.action_item_id }}/comments"
+      failOnHttpError: false
+
+  - id: guard
+    type: module
+    plugin_type: code-exec
+    name: "Reply Guards"
+    inputs:
+      author: "${{ workflow.inputs.author }}"
+      item_status: "${{ steps.fetch_item.outputs.status }}"
+      item: "${{ steps.fetch_item.outputs.body }}"
+      comments_body: "${{ steps.fetch_comments.outputs.body }}"
+      max_replies: "${{ vars.RIGHTSIZING_QA_MAX_REPLIES || '10' }}"
+    config:
+      code: |
+        function isBot(a) {
+          a = String(a || '').toLowerCase();
+          return a.indexOf('agent:') === 0 || a.indexOf('executor:') === 0;
+        }
+        var author = String(inputs.author || '');
+        if (isBot(author)) return { proceed: false, why: 'comment author is an agent/executor' };
+        var item = (Number(inputs.item_status) === 200 && inputs.item) ? inputs.item : null;
+        if (!item) return { proceed: false, why: 'item not found' };
+        var CLOSED = { closed: 1, resolved: 1, done: 1, cancelled: 1, dismissed: 1 };
+        if (CLOSED[String(item.status || '').toLowerCase()]) {
+          return { proceed: false, why: 'item is closed' };
+        }
+        var body = inputs.comments_body || {};
+        var list = body.results || body.comments || (Array.isArray(body) ? body : []);
+        if (list.length === 0) return { proceed: false, why: 'no comments on the item' };
+        var last = list[list.length - 1] || {};
+        var lastAuthor = String(last.author || last.created_by || '');
+        if (isBot(lastAuthor)) {
+          // A bot answered after the triggering comment (our own reply, the
+          // closer, a deploy narration) — nothing pending for us.
+          return { proceed: false, why: 'last comment is from an agent (' + lastAuthor + ')' };
+        }
+        var maxReplies = Number(inputs.max_replies) > 0 ? Number(inputs.max_replies) : 10;
+        var ours = 0;
+        for (var i = 0; i < list.length; i++) {
+          var a = String((list[i] || {}).author || (list[i] || {}).created_by || '');
+          if (a === 'agent:rightsizing-qa') ours++;
+        }
+        if (ours >= maxReplies) return { proceed: false, why: 'reply cap reached (' + ours + ')' };
+        // Compact thread digest for the prompt: last 15 comments, truncated.
+        var digest = [];
+        var from = Math.max(0, list.length - 15);
+        for (var j = from; j < list.length; j++) {
+          var c = list[j] || {};
+          digest.push({
+            author: String(c.author || c.created_by || 'unknown'),
+            text: String(c.content || c.text || '').slice(0, 600)
+          });
+        }
+        var md = item.metadata || {};
+        return {
+          proceed: true,
+          thread: digest,
+          question: String(last.content || last.text || '').slice(0, 1200),
+          question_author: lastAuthor,
+          item_title: String(item.title || ''),
+          item_description: String(item.description || '').slice(0, 4000),
+          metadata: md,
+          matchers: String(md.matchers || '')
+        };
+
+  - id: should_run
+    type: decider
+    plugin_type: conditional
+    name: "Reply Worth Considering?"
+    config:
+      expression: "steps.guard.outputs.proceed == true"
+
+  - id: stash_guarded
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: guarded"
+    inputs:
+      why: "${{ steps.guard.outputs.why }}"
+    config:
+      path: result
+      value:
+        status: "skipped"
+        reason: "${{ inputs.why }}"
+
+  - id: ai_answer
+    type: module
+    plugin_type: claude-code-agent
+    name: "AI Thread Answer"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 8
+      tools:
+        # PER-ORG id of "Right Sizing — Metrics Tool"; patched by
+        # setup/04-upload-workflows.mjs on upload.
+        - type: workflow
+          workflow: cost_metrics_tool
+          name: query_metrics
+          description: >
+            Runs a PromQL query_range against the cluster's Prometheus. Inputs:
+            promql (string, required), start (unix seconds or relative like
+            -14d/-6h, default -24h), end (unix seconds or 'now'), step
+            (seconds, default 3600). Returns the raw Prometheus series. Keep
+            results small: prefer aggregations and coarse steps.
+      systemPrompt: |
+        You are the right-sizing analyst who produced the analysis on this
+        action item, now answering the conversation on its thread. You get
+        the item (title, analysis, metadata with the exact numbers and the
+        Prometheus pod matchers) and the recent comments; the LAST comment
+        is what you are deciding to answer.
+
+        should_reply=false when the last comment is NOT addressed to the
+        analysis: operational commands (deploy now / abort), chatter between
+        humans, acknowledgements ("ok", "thanks"), or anything a human owner
+        should decide rather than you. Reply ONLY when there is a question,
+        a doubt or an objection about the analysis, the numbers, the risk,
+        or how the change will be applied.
+
+        When you reply:
+        - Answer the question directly, in the language it was asked in.
+        - Ground every number: reuse the item's recorded metrics, and when
+          the question needs fresh or finer data (peaks, a specific time
+          range, throttling), run query_metrics with the item's pod matchers
+          before answering. Never invent values.
+        - If the question challenges the recommendation and the data proves
+          it right, say so and explain; if the challenge has merit, concede
+          it and recommend rejecting or waiting — trust matters more than
+          being right.
+        - One short Markdown comment: a direct answer first, then at most a
+          few supporting bullets with the key numbers in bold. No headings,
+          no sign-off.
+      userPrompt: |
+        Action item: ${{ steps.guard.outputs.item_title }}
+
+        Item analysis (as posted):
+        ${{ steps.guard.outputs.item_description }}
+
+        Item metrics metadata (recorded by the scanner at analysis time):
+        ${{ steps.guard.outputs.metadata }}
+
+        Prometheus pod matchers for query_metrics — copy VERBATIM into your
+        PromQL selectors: ${{ steps.guard.outputs.matchers }}
+
+        Recent thread (oldest → newest):
+        ${{ steps.guard.outputs.thread }}
+
+        LAST comment (by ${{ steps.guard.outputs.question_author }} — decide
+        whether to answer this):
+        ${{ steps.guard.outputs.question }}
+      outputSchema:
+        type: object
+        required: [should_reply, reply]
+        properties:
+          should_reply:
+            type: boolean
+            description: "true only when the last comment is a question/doubt/objection about the analysis that deserves an answer"
+          reply:
+            type: string
+            description: "The Markdown comment to post (empty when should_reply is false)"
+
+  - id: should_post
+    type: decider
+    plugin_type: conditional
+    name: "Post The Reply?"
+    config:
+      expression: "steps.ai_answer.outputs.should_reply == true"
+
+  - id: post_reply
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Post Reply"
+    inputs:
+      text: "${{ steps.ai_answer.outputs.reply }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-qa"
+      content: "${{ inputs.text }}"
+
+  - id: stash_replied
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: replied"
+    inputs:
+      ai_usage: "${{ steps.ai_answer.outputs.usage }}"
+    config:
+      path: result
+      value:
+        status: "replied"
+        ai_usage: "${{ inputs.ai_usage }}"
+
+  - id: stash_no_reply
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: AI declined"
+    inputs:
+      ai_usage: "${{ steps.ai_answer.outputs.usage }}"
+    config:
+      path: result
+      value:
+        status: "no_reply"
+        ai_usage: "${{ inputs.ai_usage }}"
+
+connections:
+  - { id: c1, from: start,         to: fetch_item }
+  - { id: c2, from: fetch_item,    to: fetch_comments }
+  - { id: c3, from: fetch_comments, to: guard }
+  - { id: c4, from: guard,         to: should_run }
+  - { id: c5, from: should_run,    to: ai_answer,     source_port: "true" }
+  - { id: c6, from: should_run,    to: stash_guarded, source_port: "false" }
+  - { id: c7, from: ai_answer,     to: should_post }
+  - { id: c8, from: should_post,   to: post_reply,    source_port: "true" }
+  - { id: c9, from: post_reply,    to: stash_replied }
+  - { id: c10, from: should_post,  to: stash_no_reply, source_port: "false" }
+
+outputs:
+  status:   "${{ variables.result.status }}"
+  ai_usage: "${{ variables.result.ai_usage }}"
+  action_item_id: "${{ workflow.inputs.action_item_id }}"

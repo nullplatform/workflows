@@ -1,0 +1,113 @@
+# AI-deploy tool: start a blue-green deployment on a scope.
+#
+# Resolves the RUNNING release (newest finalized deployment — never a newer
+# build) and POSTs the deployment. Rejections are interpreted instead of
+# thrown: approval/policy/checklist gates and duplicate-deployment come back
+# as {ok:false, blocked_reason} so the agent can narrate them.
+id: deploy_start
+name: "Deploy Tool — Start"
+description: >
+  Starts a blue-green deployment for a scope, redeploying the release it is
+  currently running. Inputs: scope_id (string, required), description
+  (string, optional). Returns {ok, deployment_id, blocked_reason, release_id}.
+  ok=false with blocked_reason set when the platform rejected the creation
+  (approval/policy/checklist gate, or another deployment already running).
+path: "/deploy"
+semantic_version: 1.0.0
+
+inputs:
+  scope_id:
+    type: string
+    required: true
+    description: "Scope to deploy"
+  description:
+    type: string
+    required: false
+    description: "Deployment description shown in the platform"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Starts a blue-green deployment (AI-deploy tool)."
+      inputs:
+        scope_id: { type: string, required: true }
+        description: { type: string, required: false }
+
+  - id: list_deployments
+    type: module
+    plugin_type: np-api-call
+    name: "List Deployments"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/deployment?scope_id=${{ workflow.inputs.scope_id }}"
+      failOnHttpError: false
+
+  - id: resolve_release
+    type: module
+    plugin_type: code-exec
+    name: "Resolve Running Release"
+    inputs:
+      deployments: "${{ steps.list_deployments.outputs.body }}"
+    config:
+      code: |
+        var deps = ((inputs.deployments || {}).results) || [];
+        var best = null;
+        for (var i = 0; i < deps.length; i++) {
+          var d = deps[i] || {};
+          if (d.status !== 'finalized') continue;
+          if (!best || String(d.created_at || '') > String(best.created_at || '')) best = d;
+        }
+        if (!best || !best.release_id) throw new Error('No finalized deployment found — cannot resolve the running release');
+        return { release_id: best.release_id };
+
+  - id: create
+    type: module
+    plugin_type: np-api-call
+    name: "Create Deployment"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: POST
+      path: "/deployment"
+      failOnHttpError: false
+      body:
+        scope_id: "${{ workflow.inputs.scope_id }}"
+        release_id: "${{ steps.resolve_release.outputs.release_id }}"
+        description: "${{ workflow.inputs.description || 'Progressive deploy' }}"
+
+  - id: interpret
+    type: module
+    plugin_type: code-exec
+    name: "Interpret Result"
+    inputs:
+      status: "${{ steps.create.outputs.status }}"
+      body:   "${{ steps.create.outputs.body }}"
+    config:
+      code: |
+        var st = Number(inputs.status) || 0;
+        var body = inputs.body || {};
+        if (st >= 200 && st < 300 && body.id) {
+          return { ok: true, deployment_id: String(body.id), blocked_reason: '' };
+        }
+        var msg = String(body.message || body.title || JSON.stringify(body)).slice(0, 400);
+        var kind = /approval|policy|checklist|not allowed|forbidden|denied/i.test(msg) || st === 403
+          ? 'blocked by an approval/policy/checklist gate'
+          : /already.*running/i.test(msg)
+            ? 'another deployment is already running on this scope'
+            : 'rejected by the platform';
+        return { ok: false, deployment_id: null, blocked_reason: kind + ' — HTTP ' + st + ': ' + msg };
+
+connections:
+  - { id: c1, from: start,            to: list_deployments }
+  - { id: c2, from: list_deployments, to: resolve_release }
+  - { id: c3, from: resolve_release,  to: create }
+  - { id: c4, from: create,           to: interpret }
+
+outputs:
+  ok:             "${{ steps.interpret.outputs.ok }}"
+  deployment_id:  "${{ steps.interpret.outputs.deployment_id }}"
+  blocked_reason: "${{ steps.interpret.outputs.blocked_reason }}"
+  release_id:     "${{ steps.resolve_release.outputs.release_id }}"
