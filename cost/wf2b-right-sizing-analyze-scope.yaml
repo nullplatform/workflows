@@ -1044,9 +1044,10 @@ steps:
       code: |
         var s = inputs.scope || {};
         var a = inputs.analysis || {};
-        // Production policy: report the opportunity, but NEVER attach an
-        // auto-apply suggestion — production changes go through the normal
-        // change process.
+        // Production policy: the suggestion IS attached (one-click apply of
+        // the config change) but production NEVER deploys automatically —
+        // the accept form offers apply-only and wf4 enforces it server-side
+        // regardless of what the form says.
         var isProd = String(inputs.environment || '').toLowerCase() === 'production';
         // Auto-apply patches the scope's requested_spec — only the standard
         // k8s scope type has that shape. Other k8s-backed types (custom,
@@ -1057,7 +1058,7 @@ steps:
         // custom (wf4 patches capabilities.cpu_millicores/ram_memory —
         // the verified PATCH /scope/:id shape). Other types are report-only.
         var applyable = stype === 'web_pool_k8s' || stype === 'custom';
-        var autoApply = !isProd && applyable;
+        var autoApply = applyable;
         var st = inputs.stats || {};
         var cpu = st.cpu || {};
         var mem = st.mem || {};
@@ -1091,7 +1092,7 @@ steps:
         // default should the model ever return something unexpected. It is
         // only the DEFAULT of the accept form below — the user has the final
         // word via deploy_timing/deploy_at when accepting.
-        var mode = a.recommended_mode === 'nocturnal-deploy' ? 'nocturnal-deploy' : 'apply-only';
+        var mode = isProd ? 'apply-only' : (a.recommended_mode === 'nocturnal-deploy' ? 'nocturnal-deploy' : 'apply-only');
 
         // Suggestion description = the exact execution plan (what + how).
         // MARKDOWN: the SuggestionCard renders it with ReactMarkdown — a
@@ -1102,17 +1103,18 @@ steps:
             '3. On a finalized deployment the suggestion is marked applied and the item is **closed**; on failure the item stays open.'
           : '1. `PATCH` the scope configuration via the platform API — **no deployment is triggered**.\n' +
             '2. The change ships with your next regular deployment; the suggestion is marked applied and the item **stays open** until the change is live.';
+        var choiceLine = isProd
+          ? '**Production policy:** approve only patches the scope configuration — an automatic deploy is **never** triggered; the change ships with your next regular deployment.'
+          : '**Your choice on approve** (Execution Parameters below): *apply only* (ships with the next deploy), *deploy now*, or *schedule* it at a specific time.';
         var suggestionDescription =
           '**Right-size ' + s.scope_name + '** — CPU **' + curCpu + 'm → ' + recCpu + 'm**, memory **' +
           curMem + 'MB → ' + recMem + 'MB** · estimated saving **~' + saving + ' USD/month**\n\n' +
-          '**Execution plan**\n\n' + planSteps + '\n\n' +
-          '**Your choice on approve** (Execution Parameters below): *apply only* (ships with the next deploy), ' +
-          '*deploy now*, or *schedule* it at a specific time.';
+          '**Execution plan**\n\n' + planSteps + '\n\n' + choiceLine;
 
         var howLine = isProd
-          ? 'Production policy: no auto-apply suggestion is attached. Review the analysis and ' +
-            'apply the recommended requests through your normal change process; the item stays ' +
-            'open until the change is live.'
+          ? 'Accepting the suggestion applies the recommended requests to the scope ' +
+            'configuration — **production never deploys automatically**: the change ships with ' +
+            'your next regular deployment and the item stays open until it is live.'
           : mode === 'nocturnal-deploy'
           ? 'Accepting it applies the change and runs a controlled deploy in the nocturnal window ' +
             windowLabel + ' (closes this item on success) — on accept you can instead deploy ' +
@@ -1132,30 +1134,38 @@ steps:
         // with the defaults — the user tweaks them before approving; wf4
         // reads the final answers from user_metadata.
         var timingDefault = mode === 'nocturnal-deploy' ? 'scheduled' : 'next-deploy';
-        var userMetadataConfig = {
-          type: 'object',
-          properties: {
-            deploy_timing: {
-              type: 'string',
-              title: 'How to apply',
-              // oneOf const+title: JSONForms (isOneOfEnumSchema) renders the
-              // human labels while user_metadata keeps the machine values.
-              oneOf: [
-                { const: 'next-deploy', title: 'Apply only — ships with the next regular deploy' },
-                { const: 'now', title: 'Deploy now' },
-                { const: 'scheduled', title: 'Schedule the deploy (time below, or tonight\'s window)' }
-              ],
-              default: timingDefault
-            },
-            deploy_at: {
-              type: 'string',
-              title: 'Scheduled deploy time — optional (HH:MM ' + String(inputs.tz_offset) + ')',
-              description: 'Only used with "Schedule the deploy". Leave empty for tonight\'s window start (' + String(inputs.window_start) + ').'
-            }
+        // Production form: a single choice (apply only) and no schedule
+        // field — deploys never happen automatically in prod. wf4 enforces
+        // the same rule server-side (defense in depth: the form is data).
+        var timingOptions = isProd
+          ? [{ const: 'next-deploy', title: 'Apply only — ships with the next regular deploy (production never auto-deploys)' }]
+          : [
+              { const: 'next-deploy', title: 'Apply only — ships with the next regular deploy' },
+              { const: 'now', title: 'Deploy now' },
+              { const: 'scheduled', title: 'Schedule the deploy (time below, or tonight\'s window)' }
+            ];
+        var timingProps = {
+          deploy_timing: {
+            type: 'string',
+            title: 'How to apply',
+            // oneOf const+title: JSONForms (isOneOfEnumSchema) renders the
+            // human labels while user_metadata keeps the machine values.
+            oneOf: timingOptions,
+            default: timingDefault
           }
         };
+        if (!isProd) {
+          timingProps.deploy_at = {
+            type: 'string',
+            title: 'Scheduled deploy time — optional (HH:MM ' + String(inputs.tz_offset) + ')',
+            description: 'Only used with "Schedule the deploy". Leave empty for tonight\'s window start (' + String(inputs.window_start) + ').'
+          };
+        }
+        var userMetadataConfig = { type: 'object', properties: timingProps };
         // Seeded answers (all scalar, flat — user_metadata contract).
-        var userMetadataDefaults = { deploy_timing: timingDefault, deploy_at: '' };
+        var userMetadataDefaults = isProd
+          ? { deploy_timing: 'next-deploy' }
+          : { deploy_timing: timingDefault, deploy_at: '' };
 
         var au = inputs.autoscaling || {};
         var tg = inputs.targets || {};
@@ -1391,7 +1401,8 @@ steps:
         var isProd = String(inputs.environment || '').toLowerCase() === 'production';
         var stype = String((inputs.scope || {}).scope_type || 'web_pool_k8s');
         // Same applyable set as the create path: web_pool_k8s + custom.
-        var autoApply = !isProd && (stype === 'web_pool_k8s' || stype === 'custom');
+        // Production included — its suggestion is apply-only (never deploys).
+        var autoApply = stype === 'web_pool_k8s' || stype === 'custom';
         return {
           metadata: {
             rightsizing_key: 'rightsizing:' + String(s.scope_id),
