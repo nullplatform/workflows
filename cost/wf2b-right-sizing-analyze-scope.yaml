@@ -1094,20 +1094,20 @@ steps:
         var mode = a.recommended_mode === 'nocturnal-deploy' ? 'nocturnal-deploy' : 'apply-only';
 
         // Suggestion description = the exact execution plan (what + how).
-        var planHead = 'Right-size ' + s.scope_name + ': patch the scope resource configuration — CPU ' +
-          curCpu + 'm → ' + recCpu + 'm, memory ' + curMem + 'MB → ' + recMem + 'MB (estimated saving ~' + saving + ' USD/month).';
+        // MARKDOWN: the SuggestionCard renders it with ReactMarkdown — a
+        // single run-on paragraph reads terribly; structure it.
         var planSteps = mode === 'nocturnal-deploy'
-          ? 'Execution: 1) PATCH the scope configuration via the platform API. 2) Trigger a controlled ' +
-            'deployment in the nocturnal window ' + windowLabel + ' and poll it to completion, posting ' +
-            'progress as comments (while scheduled, comment \'deploy now\' or \'abort\'). 3) On a ' +
-            'finalized deployment the suggestion is marked applied and the item is CLOSED; on failure ' +
-            'the item stays open.'
-          : 'Execution: 1) PATCH the scope configuration via the platform API — no deployment is ' +
-            'triggered. 2) The change ships with your next regular deployment; the suggestion is ' +
-            'marked applied and the item STAYS OPEN until the change is live.';
-        var planChoices = 'On accept you choose: apply only (next deploy), deploy now, or schedule ' +
-          'the deploy at a specific time.';
-        var suggestionDescription = planHead + ' ' + planSteps + ' ' + planChoices;
+          ? '1. `PATCH` the scope configuration via the platform API.\n' +
+            '2. Trigger a controlled deployment in the nocturnal window **' + windowLabel + '** and poll it to completion, posting progress as comments (while scheduled, comment `deploy now` or `abort`).\n' +
+            '3. On a finalized deployment the suggestion is marked applied and the item is **closed**; on failure the item stays open.'
+          : '1. `PATCH` the scope configuration via the platform API — **no deployment is triggered**.\n' +
+            '2. The change ships with your next regular deployment; the suggestion is marked applied and the item **stays open** until the change is live.';
+        var suggestionDescription =
+          '**Right-size ' + s.scope_name + '** — CPU **' + curCpu + 'm → ' + recCpu + 'm**, memory **' +
+          curMem + 'MB → ' + recMem + 'MB** · estimated saving **~' + saving + ' USD/month**\n\n' +
+          '**Execution plan**\n\n' + planSteps + '\n\n' +
+          '**Your choice on approve** (Execution Parameters below): *apply only* (ships with the next deploy), ' +
+          '*deploy now*, or *schedule* it at a specific time.';
 
         var howLine = isProd
           ? 'Production policy: no auto-apply suggestion is attached. Review the analysis and ' +
@@ -1138,14 +1138,19 @@ steps:
             deploy_timing: {
               type: 'string',
               title: 'How to apply',
-              description: 'next-deploy: config only, ships with your next deployment (item stays open). scheduled: controlled deploy at the scheduled time below. now: deploy immediately.',
-              enum: ['next-deploy', 'scheduled', 'now'],
+              // oneOf const+title: JSONForms (isOneOfEnumSchema) renders the
+              // human labels while user_metadata keeps the machine values.
+              oneOf: [
+                { const: 'next-deploy', title: 'Apply only — ships with the next regular deploy' },
+                { const: 'now', title: 'Deploy now' },
+                { const: 'scheduled', title: 'Schedule the deploy (time below, or tonight\'s window)' }
+              ],
               default: timingDefault
             },
             deploy_at: {
               type: 'string',
-              title: 'Scheduled deploy time (HH:MM ' + String(inputs.tz_offset) + ')',
-              description: 'Only used when "How to apply" is scheduled. Empty = tonight\'s window start (' + String(inputs.window_start) + ').'
+              title: 'Scheduled deploy time — optional (HH:MM ' + String(inputs.tz_offset) + ')',
+              description: 'Only used with "Schedule the deploy". Leave empty for tonight\'s window start (' + String(inputs.window_start) + ').'
             }
           }
         };
