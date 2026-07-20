@@ -1123,28 +1123,34 @@ steps:
             'run a controlled deploy **now** or **schedule it** at a specific time (either closes ' +
             'the item on success).';
 
-        // Accept form (rendered by the UI from user_metadata_config.schema;
-        // the answers land in the suggestion's user_metadata, read by wf4).
+        // Accept form. The admin-dashboard SuggestionCard renders the
+        // "Execution Parameters" block ONLY when user_metadata has keys
+        // (`expanded && hasUserMetadata`), and it feeds DynamicForm with
+        // userMetadataConfig AS a JSON schema (top-level `.properties` — a
+        // `{schema: {...}}` wrapper is ignored and the form degrades to an
+        // auto-schema). So: send the schema DIRECTLY and SEED user_metadata
+        // with the defaults — the user tweaks them before approving; wf4
+        // reads the final answers from user_metadata.
+        var timingDefault = mode === 'nocturnal-deploy' ? 'scheduled' : 'next-deploy';
         var userMetadataConfig = {
-          schema: {
-            type: 'object',
-            properties: {
-              deploy_timing: {
-                type: 'string',
-                title: 'How to apply',
-                description: 'next-deploy: config only, ships with your next deployment (item stays open). scheduled: controlled deploy at the scheduled time below. now: deploy immediately.',
-                enum: ['next-deploy', 'scheduled', 'now'],
-                default: mode === 'nocturnal-deploy' ? 'scheduled' : 'next-deploy'
-              },
-              deploy_at: {
-                type: 'string',
-                title: 'Scheduled deploy time (HH:MM ' + String(inputs.tz_offset) + ')',
-                description: 'Only used when "How to apply" is scheduled. Empty = tonight\'s window start (' + String(inputs.window_start) + ').',
-                pattern: '^([01]?\\d|2[0-3]):[0-5]\\d$'
-              }
+          type: 'object',
+          properties: {
+            deploy_timing: {
+              type: 'string',
+              title: 'How to apply',
+              description: 'next-deploy: config only, ships with your next deployment (item stays open). scheduled: controlled deploy at the scheduled time below. now: deploy immediately.',
+              enum: ['next-deploy', 'scheduled', 'now'],
+              default: timingDefault
+            },
+            deploy_at: {
+              type: 'string',
+              title: 'Scheduled deploy time (HH:MM ' + String(inputs.tz_offset) + ')',
+              description: 'Only used when "How to apply" is scheduled. Empty = tonight\'s window start (' + String(inputs.window_start) + ').'
             }
           }
         };
+        // Seeded answers (all scalar, flat — user_metadata contract).
+        var userMetadataDefaults = { deploy_timing: timingDefault, deploy_at: '' };
 
         var au = inputs.autoscaling || {};
         var tg = inputs.targets || {};
@@ -1180,6 +1186,7 @@ steps:
           auto_apply: autoApply,
           suggestion_description: suggestionDescription,
           user_metadata_config: userMetadataConfig,
+          user_metadata_defaults: userMetadataDefaults,
           title: 'Right-sizing: ' + s.scope_name + ' (' + s.app_name + ') — save ~' + saving + ' USD/month',
           description: lines.join('\n'),
           priority: priority,
@@ -1298,9 +1305,12 @@ steps:
       owner: "executor:rightsizing-applier"
       confidence: "${{ steps.ai_analysis.outputs.confidence }}"
       description: "${{ steps.build_item.outputs.suggestion_description }}"
-      # Accept form: the UI renders this schema when the user accepts; the
-      # answers land in the suggestion's user_metadata (read by wf4).
+      # Accept form: the UI (SuggestionCard) renders DynamicForm from this
+      # schema, but ONLY when userMetadata below has keys — seed the
+      # defaults so the options are visible/editable before approving; the
+      # final answers land in user_metadata (read by wf4).
       userMetadataConfig: "${{ steps.build_item.outputs.user_metadata_config }}"
+      userMetadata: "${{ steps.build_item.outputs.user_metadata_defaults }}"
       metadata:
         mode: "${{ steps.build_item.outputs.mode }}"
         recommended_cpu_request_mc: "${{ steps.ai_analysis.outputs.recommended_cpu_request_mc }}"

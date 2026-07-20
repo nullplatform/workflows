@@ -163,13 +163,13 @@ steps:
     # "undefined") — the prompt below references inputs.* only. Same fix as
     # wf2b's ai_analysis.
     inputs:
-      item_title: "${{ inputs.item_title }}"
-      item_description: "${{ inputs.item_description }}"
-      metadata: "${{ inputs.metadata }}"
-      matchers: "${{ inputs.matchers }}"
-      thread: "${{ inputs.thread }}"
-      question_author: "${{ inputs.question_author }}"
-      question: "${{ inputs.question }}"
+      item_title: "${{ steps.guard.outputs.item_title }}"
+      item_description: "${{ steps.guard.outputs.item_description }}"
+      metadata: "${{ steps.guard.outputs.metadata }}"
+      matchers: "${{ steps.guard.outputs.matchers }}"
+      thread: "${{ steps.guard.outputs.thread }}"
+      question_author: "${{ steps.guard.outputs.question_author }}"
+      question: "${{ steps.guard.outputs.question }}"
     config:
       model: claude-opus-4-8
       maxIterations: 8
