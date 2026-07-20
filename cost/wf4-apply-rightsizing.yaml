@@ -145,6 +145,16 @@ steps:
         if (!VALID[timing]) timing = String((sug.user_metadata || {}).deploy_timing || '').trim().toLowerCase();
         if (!VALID[timing]) timing = String(meta.mode || '') === 'nocturnal-deploy' ? 'scheduled' : 'next-deploy';
         if (timing === 'tonight') timing = 'scheduled';
+        // PRODUCTION HARD GATE: production never deploys automatically —
+        // the accept only patches the scope configuration and the change
+        // ships with the owner's next regular deploy. Enforced HERE (not
+        // just in the accept form, which is editable data) so no input
+        // combination can trigger a deploy on a production scope.
+        var envProd = String((item.metadata || {}).environment || '').toLowerCase() === 'production';
+        if (envProd && timing !== 'next-deploy') {
+          log.warn('Production policy: forcing apply-only (deploys are never automatic in production)', { requested_timing: timing });
+          timing = 'next-deploy';
+        }
         var mode = timing === 'next-deploy' ? 'apply-only' : 'nocturnal-deploy';
 
         // Optional user-picked deploy time (HH:MM in the window tz); empty →

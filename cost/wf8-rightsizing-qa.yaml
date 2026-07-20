@@ -142,6 +142,24 @@ steps:
     config:
       expression: "steps.guard.outputs.proceed == true"
 
+  # Immediate ack BEFORE the AI runs (it takes 1-3 minutes): the human sees
+  # their question was picked up instead of staring at a silent thread. The
+  # ack comment re-triggers wf3 → wf8, where the guard skips it (bot author)
+  # — same anti-recursion path every agent comment takes.
+  - id: post_ack
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Ack: Reply Incoming"
+    inputs:
+      author_asked: "${{ steps.guard.outputs.question_author }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-qa"
+      # Honest for both outcomes: the AI may legitimately decide the comment
+      # needs no reply (chatter, commands) — never promise an answer.
+      content: "👀 Taking a look at the comment from ${{ inputs.author_asked }} — checking the live metrics; if this needs an answer it lands here in a couple of minutes."
+
   - id: stash_guarded
     type: module
     plugin_type: set-variable
@@ -289,7 +307,8 @@ connections:
   - { id: c2, from: fetch_item,    to: fetch_comments }
   - { id: c3, from: fetch_comments, to: guard }
   - { id: c4, from: guard,         to: should_run }
-  - { id: c5, from: should_run,    to: ai_answer,     source_port: "true" }
+  - { id: c5, from: should_run,    to: post_ack,      source_port: "true" }
+  - { id: c5b, from: post_ack,     to: ai_answer }
   - { id: c6, from: should_run,    to: stash_guarded, source_port: "false" }
   - { id: c7, from: ai_answer,     to: should_post }
   - { id: c8, from: should_post,   to: post_reply,    source_port: "true" }
