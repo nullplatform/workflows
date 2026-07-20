@@ -715,6 +715,32 @@ steps:
     type: module
     plugin_type: claude-code-agent
     name: "AI Opportunity Analysis"
+    # DECLARED inputs, mandatory: the prompt templates below reference
+    # `inputs.*`, never `steps.*` — steps.* references inside this plugin's
+    # config resolve activity-side WITHOUT step state (observed live: every
+    # steps.* template arrived as the literal string "undefined" while
+    # vars.* and workflow.inputs.* resolved fine), which silently fed the
+    # AI an empty prompt and burned Opus runs on garbage verdicts.
+    inputs:
+      matchers: "${{ steps.build_command.outputs.matchers }}"
+      days: "${{ steps.build_command.outputs.days }}"
+      environment: "${{ steps.evaluate.outputs.environment }}"
+      targets: "${{ steps.evaluate.outputs.targets }}"
+      autoscaling: "${{ steps.evaluate.outputs.autoscaling }}"
+      stats: "${{ steps.evaluate.outputs.stats }}"
+      per_pod_request: "${{ steps.evaluate.outputs.per_pod_request }}"
+      pods_avg: "${{ steps.evaluate.outputs.pods_avg }}"
+      per_pod: "${{ steps.evaluate.outputs.per_pod }}"
+      health: "${{ steps.evaluate.outputs.health }}"
+      coverage: "${{ steps.evaluate.outputs.coverage }}"
+      series_digest: "${{ steps.evaluate.outputs.series_digest }}"
+      cpu_over: "${{ steps.evaluate.outputs.cpu_over }}"
+      mem_over: "${{ steps.evaluate.outputs.mem_over }}"
+      naive_recommendation: "${{ steps.evaluate.outputs.naive_recommendation }}"
+      naive_savings_usd_month: "${{ steps.evaluate.outputs.naive_savings_usd_month }}"
+      floors: "${{ steps.evaluate.outputs.floors }}"
+      min_savings_usd_month: "${{ steps.evaluate.outputs.min_savings_usd_month }}"
+      min_change_pct: "${{ steps.evaluate.outputs.min_change_pct }}"
     config:
       model: claude-opus-4-8
       maxIterations: 15
@@ -833,63 +859,65 @@ steps:
       userPrompt: |
         Scope under analysis:
         - name: ${{ workflow.inputs.scope.scope_name }} (app ${{ workflow.inputs.scope.app_name }}, scope_id ${{ workflow.inputs.scope.scope_id }})
-        - Prometheus pod matchers — copy them VERBATIM into your PromQL selectors: ${{ steps.build_command.outputs.matchers }}
-        - Lookback window: ${{ steps.build_command.outputs.days }} days
+        - Prometheus pod matchers — copy them VERBATIM into your PromQL selectors: ${{ inputs.matchers }}
+        - Lookback window: ${{ inputs.days }} days
         - Available metrics (cAdvisor + kube-state-metrics; labels namespace/pod/container):
           container_cpu_usage_seconds_total, container_memory_working_set_bytes,
           kube_pod_container_resource_requests, container_cpu_cfs_throttled_periods_total,
           kube_pod_container_status_restarts_total
 
-        Environment: ${{ steps.evaluate.outputs.environment }}
+        Environment: ${{ inputs.environment }}
         Policy for this environment — max post-change utilization:
-        cpu ${{ steps.evaluate.outputs.targets.cpu_util_pct }}%,
-        mem ${{ steps.evaluate.outputs.targets.mem_util_pct }}%,
-        cpu measured on basis "${{ steps.evaluate.outputs.targets.cpu_basis }}",
-        memory on basis "${{ steps.evaluate.outputs.targets.mem_basis }}"
+        cpu ${{ inputs.targets.cpu_util_pct }}%,
+        mem ${{ inputs.targets.mem_util_pct }}%,
+        cpu measured on basis "${{ inputs.targets.cpu_basis }}",
+        memory on basis "${{ inputs.targets.mem_basis }}"
         (p95_10m = p95 of 10-minute windows, deployment bursts excluded;
         peak10m = absolute highest 10-minute average);
-        minimum replicas: ${{ steps.evaluate.outputs.targets.min_replicas }}
+        minimum replicas: ${{ inputs.targets.min_replicas }}
 
         Replica behavior over the window (flat replicas + varying load =
         the scope never scales down; if flat_replicas is true, fill
         autoscaling_note):
-        ${{ steps.evaluate.outputs.autoscaling }}
+        ${{ inputs.autoscaling }}
 
         Deterministic filter findings (hourly averages over the window, from
         the scope's cost-metadata pipeline — these are FLEET sums across all
         pods):
-        ${{ steps.evaluate.outputs.stats }}
+        ${{ inputs.stats }}
 
         Current PER-POD request (the sizing ground truth — recommendations
-        replace THESE values) and average replica count:
-        request ${{ steps.evaluate.outputs.per_pod_request }} × ${{ steps.evaluate.outputs.pods_avg }} pods
+        replace THESE values; it is the scope's CONFIGURED request, which the
+        owner pays for — the cluster may run a platform-tuned value, visible
+        in kube_pod_container_resource_requests) and average replica count:
+        request ${{ inputs.per_pod_request }} × ${{ inputs.pods_avg }} pods
 
         Per-pod stats over the window (requests are per instance — size from
         these; pod_count_avg vs the minimum-replicas policy is your
         reliability check; fleet sums move with the autoscaler, NEVER size
         from them):
-        ${{ steps.evaluate.outputs.per_pod }}
+        ${{ inputs.per_pod }}
 
         Health (cpu throttling ratio, restarts in window):
-        ${{ steps.evaluate.outputs.health }}
+        ${{ inputs.health }}
 
         Collector data coverage (trust the averages only when coverage is
         high; low coverage → report data_sufficiency accordingly):
-        ${{ steps.evaluate.outputs.coverage }}
+        ${{ inputs.coverage }}
 
         Daily usage digest (per-day avg/max from the same collector — START
         from this, then zoom in with queries on anything that looks spiky,
         trending or odd):
-        ${{ steps.evaluate.outputs.series_digest }}
+        ${{ inputs.series_digest }}
 
-        Over-provisioned dimensions: cpu=${{ steps.evaluate.outputs.cpu_over }}, memory=${{ steps.evaluate.outputs.mem_over }}
-        Naive recommendation (p95 + 20%): ${{ steps.evaluate.outputs.naive_recommendation }}
-        Naive monthly saving estimate: ${{ steps.evaluate.outputs.naive_savings_usd_month }} USD
+        Over-provisioned dimensions: cpu=${{ inputs.cpu_over }}, memory=${{ inputs.mem_over }}
+        Naive recommendation (p95 + 20%): ${{ inputs.naive_recommendation }}
+        Naive monthly saving estimate: ${{ inputs.naive_savings_usd_month }} USD
 
-        Platform floors for THIS environment: CPU ${{ steps.evaluate.outputs.floors.cpu_mc }} millicores, memory ${{ steps.evaluate.outputs.floors.mem_mb }} MB. Round recommendations UP to a multiple of 50 below 1000, of 100 above.
+        Platform floors for THIS environment: CPU ${{ inputs.floors.cpu_mc }} millicores, memory ${{ inputs.floors.mem_mb }} MB. Round recommendations UP to a multiple of 50 below 1000, of 100 above.
         Prices: ${{ vars.COST_PER_MILLICORE_HOUR || '0.000011' }} USD per millicore-hour, ${{ vars.COST_PER_MB_RAM_HOUR || '0.0000048' }} USD per MB-hour.
-        Scope environment: ${{ steps.evaluate.outputs.environment }}. Minimum saving to open an item in this environment: ${{ steps.evaluate.outputs.min_savings_usd_month }} USD/month (below that, report genuine=false).
-        Minimum meaningful change in this environment: ${{ steps.evaluate.outputs.min_change_pct }}% of the current request (or ≥100 units absolute).
+        Scope environment: ${{ inputs.environment }}. Minimum saving to open an item in this environment: ${{ inputs.min_savings_usd_month }} USD/month (below that, report genuine=false).
+        Minimum meaningful change in this environment: ${{ inputs.min_change_pct }}% of the current request (or ≥100 units absolute).
 
         Zoom into the metrics with query_metrics (use the matchers above in
         your PromQL) and decide.
