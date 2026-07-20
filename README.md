@@ -54,3 +54,7 @@ the verification steps to run before activating anything.
   replaced with placeholders (`<org-id>`, `${{ secrets.* }}`, `my-cluster`, …) —
   substitute your own.
 - Test suites are maintained separately and are not included here.
+
+## Authoring guides
+
+- [AI Suggestions that render well in the UI](docs/ai-suggestions-ux.md) — seeding user_metadata, JSON-schema config, oneOf labels, markdown descriptions.
