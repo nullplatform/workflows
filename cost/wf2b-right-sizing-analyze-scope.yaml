@@ -1053,7 +1053,10 @@ steps:
         // web_pool) get the ITEM (report + numbers) but no apply suggestion.
         // Rows without scope_type (older callers) keep the old behavior.
         var stype = String(s.scope_type || 'web_pool_k8s');
-        var applyable = stype === 'web_pool_k8s';
+        // Applyable types: web_pool_k8s (wf4 patches requested_spec) and
+        // custom (wf4 patches capabilities.cpu_millicores/ram_memory —
+        // the verified PATCH /scope/:id shape). Other types are report-only.
+        var applyable = stype === 'web_pool_k8s' || stype === 'custom';
         var autoApply = !isProd && applyable;
         var st = inputs.stats || {};
         var cpu = st.cpu || {};
@@ -1091,7 +1094,7 @@ steps:
         var mode = a.recommended_mode === 'nocturnal-deploy' ? 'nocturnal-deploy' : 'apply-only';
 
         // Suggestion description = the exact execution plan (what + how).
-        var planHead = 'Right-size ' + s.scope_name + ': patch the scope requested spec — CPU ' +
+        var planHead = 'Right-size ' + s.scope_name + ': patch the scope resource configuration — CPU ' +
           curCpu + 'm → ' + recCpu + 'm, memory ' + curMem + 'MB → ' + recMem + 'MB (estimated saving ~' + saving + ' USD/month).';
         var planSteps = mode === 'nocturnal-deploy'
           ? 'Execution: 1) PATCH the scope configuration via the platform API. 2) Trigger a controlled ' +
@@ -1372,7 +1375,8 @@ steps:
         var memSavings = r2(memReclaimMb * pods * (Number(inputs.price_mem) || 0) * HOURS_MONTH);
         var isProd = String(inputs.environment || '').toLowerCase() === 'production';
         var stype = String((inputs.scope || {}).scope_type || 'web_pool_k8s');
-        var autoApply = !isProd && stype === 'web_pool_k8s';
+        // Same applyable set as the create path: web_pool_k8s + custom.
+        var autoApply = !isProd && (stype === 'web_pool_k8s' || stype === 'custom');
         return {
           metadata: {
             rightsizing_key: 'rightsizing:' + String(s.scope_id),

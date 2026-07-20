@@ -163,25 +163,52 @@ steps:
           return false;
         }
         var res = spec.resources || spec;
-        setIf(res, 'cpu_millicores', recCpu) || setIf(res, 'cpu_request_millicores', recCpu) || setIf(res, 'cpu', recCpu / 1000);
-        setIf(res, 'memory_in_mb', recMem) || setIf(res, 'memory_request_mb', recMem) || setIf(res, 'memory', recMem);
-        // Nullplatform K8s profile shape (validated live in production):
-        // {cpu_profile, memory_in_gb, local_storage_in_gb}. CPU is DERIVED
-        // from the profile (kubernetes_processor.millicores = -1), so the
-        // only right-sizable field is memory_in_gb — rounded UP to the next
-        // platform tier; the CPU request follows the profile automatically.
-        if (applied.length === 0 && Object.prototype.hasOwnProperty.call(res, 'memory_in_gb')) {
-          var TIERS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
-          var wantGb = recMem / 1024;
-          var newGb = TIERS[TIERS.length - 1];
-          for (var ti = 0; ti < TIERS.length; ti++) { if (TIERS[ti] >= wantGb) { newGb = TIERS[ti]; break; } }
-          if (newGb >= Number(res.memory_in_gb)) {
-            throw new Error('Nothing to right-size: recommended memory tier ' + newGb + 'GB is not below the current ' + res.memory_in_gb + 'GB (cpu is profile-derived on this provider)');
+        var patchBody = null;
+
+        // CUSTOM scopes: the dev-configured request lives in scope
+        // CAPABILITIES, not requested_spec. Verified PATCH shape:
+        // {capabilities: {cpu_millicores: INT, ram_memory: INT}} with
+        // platform constraints cpu >= 100 mc, ram >= 128 MB (below → 400
+        // with the misleading "The id is not valid for a scope").
+        var caps = scope.capabilities || {};
+        if (Number(caps.cpu_millicores) > 0 || Number(caps.ram_memory) > 0) {
+          var newCpu = Math.max(recCpu, 100);
+          var newMem = Math.max(recMem, 128);
+          if (newCpu !== recCpu || newMem !== recMem) {
+            log.warn('Clamped recommendation to platform minimums', { rec_cpu: recCpu, rec_mem: recMem, clamped_cpu: newCpu, clamped_mem: newMem });
           }
-          res.memory_in_gb = newGb;
-          applied.push('memory_in_gb:' + newGb);
+          var curCpuCfg = Number(caps.cpu_millicores) || 0;
+          var curMemCfg = Number(caps.ram_memory) || 0;
+          if ((curCpuCfg > 0 && newCpu < curCpuCfg) || (curMemCfg > 0 && newMem < curMemCfg)) {
+            patchBody = { capabilities: { cpu_millicores: newCpu, ram_memory: newMem } };
+            applied.push('capabilities.cpu_millicores:' + newCpu, 'capabilities.ram_memory:' + newMem);
+          } else {
+            throw new Error('Nothing to right-size: recommended ' + newCpu + 'mc/' + newMem + 'MB is not below the configured ' + curCpuCfg + 'mc/' + curMemCfg + 'MB');
+          }
         }
-        if (applied.length === 0) throw new Error('Could not locate cpu/memory request fields in the scope spec — adjust compute_plan for this provider. Spec keys: ' + Object.keys(res).join(','));
+
+        if (patchBody === null) {
+          setIf(res, 'cpu_millicores', recCpu) || setIf(res, 'cpu_request_millicores', recCpu) || setIf(res, 'cpu', recCpu / 1000);
+          setIf(res, 'memory_in_mb', recMem) || setIf(res, 'memory_request_mb', recMem) || setIf(res, 'memory', recMem);
+          // Nullplatform K8s profile shape (validated live on a demo organization):
+          // {cpu_profile, memory_in_gb, local_storage_in_gb}. CPU is DERIVED
+          // from the profile (kubernetes_processor.millicores = -1), so the
+          // only right-sizable field is memory_in_gb — rounded UP to the next
+          // platform tier; the CPU request follows the profile automatically.
+          if (applied.length === 0 && Object.prototype.hasOwnProperty.call(res, 'memory_in_gb')) {
+            var TIERS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
+            var wantGb = recMem / 1024;
+            var newGb = TIERS[TIERS.length - 1];
+            for (var ti = 0; ti < TIERS.length; ti++) { if (TIERS[ti] >= wantGb) { newGb = TIERS[ti]; break; } }
+            if (newGb >= Number(res.memory_in_gb)) {
+              throw new Error('Nothing to right-size: recommended memory tier ' + newGb + 'GB is not below the current ' + res.memory_in_gb + 'GB (cpu is profile-derived on this provider)');
+            }
+            res.memory_in_gb = newGb;
+            applied.push('memory_in_gb:' + newGb);
+          }
+          if (applied.length === 0) throw new Error('Could not locate cpu/memory request fields in the scope spec — adjust compute_plan for this provider. Spec keys: ' + Object.keys(res).join(','));
+          patchBody = { requested_spec: spec };
+        }
 
         return {
           mode: mode,
@@ -191,6 +218,7 @@ steps:
           scope_id: String((item.metadata || {}).scope_id || scope.id || ''),
           scope_name: (item.metadata || {}).scope_name || scope.name || '',
           new_spec: spec,
+          patch_body: patchBody,
           applied_fields: applied,
           recommended_cpu_request_mc: recCpu,
           recommended_mem_request_mb: recMem
@@ -211,14 +239,16 @@ steps:
     plugin_type: np-api-call
     name: "Patch Scope Spec"
     inputs:
-      payload: "${{ steps.compute_plan.outputs.new_spec }}"
+      # patch_body is SHAPED per scope type by compute_plan:
+      # {capabilities: {cpu_millicores, ram_memory}} for custom scopes,
+      # {requested_spec: {...}} for web_pool_k8s spec shapes.
+      payload: "${{ steps.compute_plan.outputs.patch_body }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       method: PATCH
       path: "/scope/${{ steps.compute_plan.outputs.scope_id }}"
       failOnHttpError: false
-      body:
-        requested_spec: "${{ inputs.payload }}"
+      body: "${{ inputs.payload }}"
 
   - id: check_patch_only
     type: module
@@ -560,14 +590,16 @@ steps:
     plugin_type: np-api-call
     name: "Patch Scope Spec"
     inputs:
-      payload: "${{ steps.compute_plan.outputs.new_spec }}"
+      # patch_body is SHAPED per scope type by compute_plan:
+      # {capabilities: {cpu_millicores, ram_memory}} for custom scopes,
+      # {requested_spec: {...}} for web_pool_k8s spec shapes.
+      payload: "${{ steps.compute_plan.outputs.patch_body }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       method: PATCH
       path: "/scope/${{ steps.compute_plan.outputs.scope_id }}"
       failOnHttpError: false
-      body:
-        requested_spec: "${{ inputs.payload }}"
+      body: "${{ inputs.payload }}"
 
   - id: check_patch_deploy
     type: module
