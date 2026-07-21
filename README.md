@@ -1,5 +1,11 @@
 # nullplatform workflows
 
+[![tests](https://github.com/nullplatform/workflows/actions/workflows/ci.yml/badge.svg)](https://github.com/nullplatform/workflows/actions/workflows/ci.yml)
+
+> **Start here → [AUTHORING.md](./AUTHORING.md)**: clone, `npm install`,
+> `npx vitest` — every suite's E2E tests run on your machine with the same
+> engine and test harness the platform team uses.
+
 Production-grade **workflow suites** for the [nullplatform](https://nullplatform.com)
 workflow system, published as reference and examples. Each suite is a set of
 declarative workflow definitions (plus setup runbooks and design docs) that

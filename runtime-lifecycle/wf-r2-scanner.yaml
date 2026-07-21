@@ -163,7 +163,7 @@ steps:
   # building candidates. This keeps detection to ONE query and never returns
   # more than the actionable candidates (+1 sentinel).
   #
-  # Verified live against kwik-e-mart (org 1255165411), 2026-07-21, via
+  # Verified live against a demo organization, 2026-07-21, via
   # ~/workspace/null/np-claude-skills/src/skills/np-lake/scripts/ch_query.sh
   # (read-only).
   #

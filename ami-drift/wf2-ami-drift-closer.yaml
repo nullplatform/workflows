@@ -9,14 +9,113 @@
 # close reason is added before closing (the close transition itself
 # carries no reason field).
 #
-# Data flows step→step through declared `inputs:`/forEach expressions — no
-# set-variable hops. Besides the serializer shared-ref hazard, the np-*
-# plugins merge `{...config, ...ctx.inputs}`, so an upstream output field
-# named like a config key (set-variable emits `path`!) silently hijacks the
-# plugin config.
+# v2.1 FIX (2026-07-21): v2.0 only ever closed items on the FIRST page —
+# `np-action-item-find` was called once with `limit: 200` and no cursor, so
+# an org with >200 open ami-drift items silently left the rest open
+# forever. The streaming-pagination pattern (CLAUDE.md § Workflow
+# Authoring) was broken on Temporal until this week's engine fix; now that
+# it works, this revision replaces the single-page find with a proper
+# paged sweep — every page of open items gets evaluated, not just the
+# first 200. Mirrors workflows/runtime-lifecycle/wf-r5-closer.yaml's
+# wiring (the post-fix canonical reference for this pattern), adapted
+# because this closer does its own close/comment side effects inline
+# (no per-item sub-workflow — the decision logic here is simple enough
+# not to need one).
 #
-# v1 limits: only `open` items are closed (deferred ones are left alone);
-# find uses limit 200 without cursor pagination.
+# Two phases, kept clearly separate on the canvas:
+#   Phase A (unchanged logic, still runs exactly ONCE per run): recompute
+#     the current drift set from the lake + EC2 providers, same as before,
+#     and stash it into `variables.drift_set`. Still gated by
+#     build_provider_index's empty-baseline guard — "only close after a
+#     full successful recompute" holds because Phase B (which can close
+#     items) is structurally downstream of Phase A's last step and can
+#     only start once Phase A finished without throwing.
+#   Phase B (new): stream every page of open ami-drift items
+#     (np-entity-paginated-fetch, mode: stream) and, per item, decide
+#     close vs keep against `variables.drift_set` — then run the
+#     close/comment side effects only for the ones marked `close`.
+#
+# Why there's an extra `select_to_close` node between `decide` and the
+# close/comment steps (unlike wf-r5, which routes 100% of items into its
+# per-item sub-workflow): a `decider` (type: decider) can only look at
+# `$item` (== items[0]) when it receives a BATCH of items — it does NOT
+# fan out per item and branch each one to a different port (see
+# packages/core/src/plugins/built-in/conditional/plugin.ts). So a decider
+# cannot filter "only the close ones" out of a multi-item page. Instead
+# `decide` computes a verdict per item (per-item fan-out, see below) and
+# `select_to_close` (a plain aggregate step) filters that list down to the
+# ids that actually need closing, which `comment_closing`/`close_items`
+# then iterate via `forEach` — same forEach mechanism v2.0 already used,
+# just re-scoped to one page instead of the whole (broken) single find.
+#
+# Engine fact — single-item pages: the generic per-item fan-out
+# (workflow-runner.ts `shouldFanOut`) only activates when the upstream
+# page has MORE THAN ONE item (`upstreamItems.length <= 1` short-circuits
+# to a single plain call even with `metadata.fanOutPerItem: true`). Reading
+# `steps.decide.items` (NOT `steps.decide.outputs.items` — `items` is a
+# TOP-LEVEL sibling of `outputs` on a step's result, only nested under
+# `outputs` for plugins that put it there themselves, like the `forEach`
+# coordinator's own `{outputs: {items, count}}` shape) is safe either way:
+# `buildScope()` (workflow-runner.ts) defaults `steps.<id>.items` to
+# `[outputs]` whenever the step didn't report a real `items[]`, which is
+# exactly the fan-out-skipped, single-item-page case. So a 1-item last
+# page is never silently dropped — no manual fallback needed here.
+#
+# Engine fact — status filter: `np-entity-paginated-fetch` hits the
+# generic `/governance/action_item` listing endpoint, which — per
+# wf-r5-closer.yaml's own header note — does not reliably honor a
+# `status` filter server-side. `filters.status: open` is declared below
+# for intent/documentation, but `decide` ALSO double-guards on
+# `item.status === 'open'` so a non-open item that slips through the
+# filter is always `keep`d (matches v2.0's "only open items are closed,
+# deferred ones left alone" invariant, now enforced defensively instead
+# of assumed).
+#
+# Failure isolation: `close_items` (the step that actually performs the
+# close — the highest-value thing to protect) is the ONE lane, mirroring
+# wf-r5's single-lane pattern (verify_item → verify_item_failed →
+# acc_results_failed), but wired differently: `close_items` is a `forEach`
+# step, and `error_handling.fallback_step` does NOT work on `forEach` (see
+# the engine-fact comment right above the `close_items` step below — the
+# runner's forEach branch only ever consults `continueOnError`, never
+# `fallbackStep`). So `close_items` uses `continueOnError: true` and a
+# `close_ok` decider (reading `steps.close_items.status`) routes to either
+# `acc_results` (success) or `close_failed` (failure) — same two
+# destinations a `fallback_step` lane would have, just reached through a
+# decider instead of a declared `condition: "false"` edge. A failure there
+# discards per-item attribution for the WHOLE page (documented, same
+# accepted trade-off as wf-r5 — the engine has no per-item attribution on
+# a failed batch) but does NOT stop the sweep: the failure lane re-enters
+# the pagination loop so later pages still get processed. `decide` and
+# `comment_closing` are NOT separately protected in this revision — a
+# failure in either of those two fails the whole run today (same as
+# v2.0's "no isolation on any step" behavior for everything except this
+# fix's target). Flagged as a follow-up, not required by this fix.
+#
+# Payload diet: `fetch_items.config.limit: 25` (NOT the usual 100) —
+# ami-drift action item rows carry a heavier `metadata` object
+# (scope_name, application, deployed_ami, expected_ami, deployment_id,
+# detected_at, drift_key) than wf-r5's lambda-runtime rows; 25 keeps a
+# page's payload well clear of Temporal's 2MB activity-input cap (the
+# same class of finding documented in wf-r5-closer.yaml's header).
+#
+# /provider fetch pagination (judgment call): `fetch_providers` below is
+# UNCHANGED from v2.0/the scanner — still a single call with `limit: 200`
+# and a `build_rc_paths` warning log if that limit is hit. EC2 providers
+# are operator-managed CONFIG entries (one per nrn+dimensions combination
+# an operator has explicitly set up), not per-deployment/per-scope data —
+# realistically bounded well under 200 for any org today, unlike the
+# thousands-of-scopes scale that made the item-list pagination bug a real
+# problem. Left unpaginated deliberately (same as the scanner, wf1, which
+# has this exact same shape and is out of scope for this fix); the
+# existing >=200 warning log is the acceptable degradation signal if that
+# assumption ever breaks.
+#
+# Data flows step→step through declared `inputs:`/forEach expressions — no
+# set-variable hops for Phase A. Besides the serializer shared-ref hazard,
+# the np-* plugins merge `{...config, ...ctx.inputs}`, so an upstream
+# output field named like a config key (set-variable emits `path`!)
+# silently hijacks the plugin config.
 #
 # Per-org configuration: same config entries as the scanner.
 id: ami_drift_closer
@@ -24,9 +123,20 @@ name: "AMI Drift Closer"
 description: >
   Daily job (04:00, also manual) that closes ami-drift action items whose
   drift is no longer detected. Only closes after a full successful recompute
-  of the drift set.
+  of the drift set. Streams every page of open ami-drift items (not just the
+  first 200).
 path: "/action-items/ami-drift"
-semantic_version: 2.0.0
+semantic_version: 2.1.0
+
+variables:
+  # Phase A's output: drift_key set for scopes still genuinely drifted
+  # right now. Stashed once, read by every page's `decide` in Phase B.
+  drift_set:
+    initialValue: []
+  # Phase B accumulator: one row per evaluated item (or one failure-lane
+  # row per failed page). Read by `summary` at the very end.
+  results:
+    initialValue: []
 
 steps:
   - id: start_manual
@@ -44,34 +154,18 @@ steps:
       schedule: "0 4 * * *"
       timezone: "America/Argentina/Buenos_Aires"
 
-  # ── Open ami-drift items ──────────────────────────────────────────────
-  - id: find_open_items
-    type: module
-    plugin_type: np-action-item-find
-    name: "Find Open ami-drift Items"
-    join_strategy: any
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
-      status:
-        - open
-      labels:
-        workflow_type: "ami-drift"
-      limit: 200
-
-  # ── Recompute current drift set (same logic as the scanner) ──────────
+  # ── Phase A: recompute current drift set (same logic as the scanner) ──
   - id: lake_deployments
     type: module
     plugin_type: np-lake-query
+    # Reached from either trigger directly (find_open_items no longer sits
+    # in front of it — see header note).
+    join_strategy: any
     # Aggregate step: NEVER dispatch per upstream item. In the Temporal
     # sandbox plugin descriptors are unavailable, so the engine cannot see
     # executeMode "all" and would fan out per item (N identical runs).
     metadata: { fanOutPerItem: false }
     name: "Active EC2 Deployments (lake)"
-    # Explicit inputs so the upstream envelope (find_open_items outputs)
-    # never leaks into this plugin's merged config.
-    inputs:
-      upstream_count: "${{ steps.find_open_items.outputs.count }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       # scope_dimensions joined from core_entities_scope_dimension — same
@@ -121,6 +215,9 @@ steps:
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       method: GET
+      # NOT paginated — see header note "/provider fetch pagination
+      # (judgment call)". build_rc_paths below still logs a warning if
+      # this 200 limit is ever hit.
       path: "/provider?nrn=organization=${{ vars.NP_ORGANIZATION_ID }}&specification_id=f784061e-5b6d-4a0d-a19b-754e7f4ef72c&show_descendants=true&limit=200"
 
   - id: build_rc_paths
@@ -209,7 +306,8 @@ steps:
         }
         if (providers.length === 0) {
           // Guard: an empty baseline would mark every item stale and close
-          // them all. Fail the run instead.
+          // them all. Fail the run instead — Phase B (which can close
+          // items) is structurally unreachable until this step succeeds.
           throw new Error('No active EC2 provider AMIs configured for the organization — aborting close evaluation');
         }
         log.info('EC2 provider baseline', { providers: providers.length });
@@ -265,45 +363,121 @@ steps:
         }
         return { valid_keys: keys };
 
+  # Stash Phase A's result into a workflow variable — Phase B's `decide`
+  # (one call per item, possibly per page) reads `variables.drift_set`
+  # instead of re-running the whole lake+provider recompute per item.
+  - id: stash_drift_set
+    type: module
+    plugin_type: set-variable
+    name: "Stash Drift Set"
+    config:
+      path: drift_set
+      value: "${{ steps.detect_valid.outputs.valid_keys }}"
+
+  # ── Phase B: stream every page of open ami-drift items ────────────────
+  # One page per invocation; `decide` fans out per item in that page.
+  - id: fetch_items
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "List Open ami-drift Items"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: governance/action_item
+      filters:
+        nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+        "labels.workflow_type": "ami-drift"
+        status: open
+      # Payload diet — see header note. Do NOT raise this to 100.
+      limit: 25
+      mode: stream
+
+  # Per-item decision: item's metadata.drift_key vs variables.drift_set →
+  # close | keep. `metadata.fanOutPerItem: true` forces per-item dispatch
+  # (code-exec defaults to executeMode 'all'). ONLY `$item`/`$itemIndex`
+  # are read here — never `$items` (fan-out collapses it to one element
+  # per invocation; see CLAUDE.md § Workflow Authoring).
+  - id: decide
+    type: module
+    plugin_type: code-exec
+    metadata: { fanOutPerItem: true }
+    name: "Decide: Close or Keep"
+    inputs:
+      item:       "${{ $item }}"
+      drift_set:  "${{ variables.drift_set }}"
+    config:
+      code: |
+        var item = inputs.item || {};
+        var driftSet = inputs.drift_set || [];
+        var status = String(item.status || '').toLowerCase();
+        // Double-guard: np-entity-paginated-fetch hits the generic
+        // /governance/action_item endpoint, which does not reliably honor
+        // `status` server-side (same engine fact as
+        // wf-r5-closer.yaml). A non-open item that slips through the
+        // `filters.status: open` above is always kept, never touched —
+        // matches the original "only open items are closed" invariant.
+        if (status !== 'open') {
+          return { item_id: item.id, verdict: 'keep', reason: 'not_open', status: status };
+        }
+        var key = item.metadata && item.metadata.drift_key;
+        var verdict;
+        if (!key) {
+          // Same as v2.0: an open item with no drift_key metadata is left
+          // untouched (kept), never closed.
+          verdict = 'keep';
+        } else if (driftSet.indexOf(key) !== -1) {
+          // Still in the current drift set — the drift is still real.
+          verdict = 'keep';
+        } else {
+          // No longer drifted (redeployed, scope gone, or provider
+          // reconfigured to match).
+          verdict = 'close';
+        }
+        return { item_id: item.id, verdict: verdict, drift_key: key || null };
+
+  # Filters `decide`'s per-item verdicts down to the ids that need
+  # closing — a `decider` can't do this (it only ever looks at
+  # items[0] against a batch; see header note).
   - id: select_to_close
     type: module
     plugin_type: code-exec
-    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
-    # sandbox plugin descriptors are unavailable, so the engine cannot see
-    # executeMode "all" and would fan out per item (N identical runs).
     metadata: { fanOutPerItem: false }
-    name: "Select Items To Close"
+    name: "Select Items To Close (this page)"
     inputs:
-      open:  "${{ steps.find_open_items.outputs.items }}"
-      valid: "${{ steps.detect_valid.outputs.valid_keys }}"
+      # `steps.decide.items` — NOT `.outputs.items` (see header note on
+      # single-item pages). buildScope() always normalizes this to an
+      # array, whether `decide` fanned out (real aggregate) or ran as one
+      # plain call on a 1-item page (`[outputs]` fallback).
+      decisions: "${{ steps.decide.items }}"
     config:
       code: |
-        var open = inputs.open || [];
-        var valid = inputs.valid || [];
+        var decisions = inputs.decisions || [];
         var toClose = [];
         var kept = 0;
-        for (var i = 0; i < open.length; i++) {
-          var it = open[i] || {};
-          var key = it.metadata && it.metadata.drift_key;
-          if (!key) { kept++; continue; }
-          if (valid.indexOf(key) !== -1) { kept++; continue; }
-          toClose.push(it.id);
+        for (var i = 0; i < decisions.length; i++) {
+          var d = decisions[i] || {};
+          if (d.verdict === 'close' && d.item_id) { toClose.push(d.item_id); }
+          else { kept++; }
         }
-        log.info('AMI drift close evaluation', {
-          checked: open.length,
+        log.info('AMI drift close evaluation (page)', {
+          checked: decisions.length,
           still_valid: kept,
           to_close: toClose.length
         });
         return {
           to_close: toClose,
-          checked: open.length,
+          checked: decisions.length,
           still_valid: kept,
-          to_close_count: toClose.length
+          to_close_count: toClose.length,
+          // Full per-item decision list for this page — acc_results below
+          // reads this (not `steps.decide.items` directly) so there's one
+          // place that owns "the full list for this page".
+          all: decisions
         };
 
   # ── Close (comment first — the close transition has no reason field) ──
   # forEach injects each id as inputs.actionItemId; the np plugins merge
-  # ctx.inputs over config, so the id lands per iteration.
+  # ctx.inputs over config, so the id lands per iteration. Empty to_close
+  # → forEach no-ops (zero calls), so a page with nothing to close is free.
   - id: comment_closing
     type: module
     plugin_type: np-action-item-add-comment
@@ -319,6 +493,18 @@ steps:
       author: "agent:ami-drift-closer"
       content: "Closing automatically: AMI drift no longer detected (scope redeployed with a configured AMI, scope no longer active, or the AMI is now configured)."
 
+  # Engine fact — `error_handling.fallback_step` does NOT work on a
+  # `forEach` step: the runner's forEach branch (workflow-runner.ts,
+  # `step.forEach !== undefined`) only ever consults
+  # `errorHandling.continueOnError` — it throws (or, with
+  # `continueOnError: true`, routes successors with a 'failed' edge status)
+  # WITHOUT ever checking `errorHandling.fallbackStep`. Only the generic
+  # per-item module dispatch path (`shouldFanOut`, e.g. `decide` above, or
+  # a `sub-workflow` per-item call like wf-r5's `verify_item`) honors
+  # `fallback_step`. So failure isolation here uses `continueOnError: true`
+  # + an explicit decider (`close_ok`) reading `steps.close_items.status`
+  # instead — deciders run in-sandbox, so this port is always safe to wire
+  # (CLAUDE.md § Deciders/ports).
   - id: close_items
     type: module
     plugin_type: np-action-item-update
@@ -326,6 +512,14 @@ steps:
     forEach:
       expression: "${{ steps.select_to_close.outputs.to_close }}"
       itemVariable: actionItemId
+    # Failure isolation (the fix this revision is about): a persistent
+    # failure closing this page's items (5xx after retries, a malformed
+    # id) must NOT kill the whole sweep — without continueOnError it
+    # throws and every remaining page never gets fetched. `close_ok`
+    # (below) routes a failure to `close_failed`, which re-enters the
+    # pagination loop so the sweep continues.
+    error_handling:
+      continueOnError: true
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       # Placeholder so validateConfig() passes; forEach injects
@@ -334,24 +528,94 @@ steps:
       action: close
       actor: "agent:ami-drift-closer"
 
+  # Did the close actually succeed for this page? (See the engine-fact
+  # note above `close_items` — this is how failure is detected instead of
+  # `fallback_step`.)
+  - id: close_ok
+    type: decider
+    plugin_type: conditional
+    name: "Close Succeeded?"
+    config:
+      expression: "steps.close_items.status == 'completed'"
+
+  # Accumulator: appends this page's full per-item decision list into a
+  # workflow variable. Runs once per page (set-variable defaults to
+  # executeMode='all').
+  - id: acc_results
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate Item Decisions"
+    metadata: { flipPorts: true }
+    config:
+      path: results
+      value: "${{ concat(variables.results, steps.select_to_close.outputs.all) }}"
+
+  # ── failure lane (close_ok:false target) ──────────────────────────────
+  # close_items failed for this page's to_close ids — discard per-item
+  # attribution for the page (same accepted trade-off as
+  # wf-r5-closer.yaml's verify_item_failed — the engine has no per-item
+  # attribution on a failed batch). comment_closing may already have
+  # posted comments for these ids even though the close call failed
+  # (v2.0 had the same ordering risk — not introduced by this fix).
+  - id: close_failed
+    type: module
+    plugin_type: code-exec
+    name: "Stash Result: close_failed (child failure)"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      error_message: "${{ steps.close_items.error.message }}"
+      error_code: "${{ steps.close_items.error.code }}"
+      attempted_ids: "${{ steps.select_to_close.outputs.to_close }}"
+      page_checked: "${{ steps.select_to_close.outputs.checked }}"
+    config:
+      code: |
+        var ids = inputs.attempted_ids || [];
+        return {
+          verdict: 'close_failed',
+          item_id: null,
+          checked: Number(inputs.page_checked) || ids.length,
+          error_code: inputs.error_code || 'UNKNOWN',
+          error_message: String(inputs.error_message || 'close_items failed'),
+          affected_item_ids: ids
+        };
+
+  - id: acc_close_failed
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate Item Decisions (close failure lane)"
+    metadata: { flipPorts: true }
+    config:
+      path: results
+      value: "${{ concat(variables.results, $items) }}"
+
   - id: summary
     type: module
     plugin_type: code-exec
-    # Aggregate step: NEVER dispatch per upstream item. In the Temporal
-    # sandbox plugin descriptors are unavailable, so the engine cannot see
-    # executeMode "all" and would fan out per item (N identical runs).
+    # Aggregate step: NEVER dispatch per upstream item.
     metadata: { fanOutPerItem: false }
-    name: "Build Summary"
+    # Reached only from fetch_items:done — the :done envelope is empty by
+    # design, so this reads variables.results, never $items.
     inputs:
-      plan:   "${{ steps.select_to_close.outputs }}"
-      closed: "${{ steps.close_items.outputs.count }}"
+      results: "${{ variables.results }}"
     config:
       code: |
-        var plan = inputs.plan || {};
+        var results = inputs.results || [];
+        var checked = 0, stillValid = 0, closed = 0, closeFailed = 0;
+        for (var i = 0; i < results.length; i++) {
+          // Live engine wraps each fan-out/forEach item plainly here (no
+          // {outputs,...} envelope — decide/close_failed both return flat
+          // objects), unlike wf-r5's sub-workflow items.
+          var r = results[i] || {};
+          var v = String(r.verdict || 'other');
+          if (v === 'close') { checked++; closed++; }
+          else if (v === 'keep') { checked++; stillValid++; }
+          else if (v === 'close_failed') { checked += Number(r.checked) || 0; closeFailed += (r.affected_item_ids || []).length; }
+        }
         return {
-          checked: plan.checked || 0,
-          still_valid: plan.still_valid || 0,
-          closed: Number(inputs.closed) || 0
+          checked: checked,
+          still_valid: stillValid,
+          closed: closed,
+          close_failed: closeFailed
         };
 
   - id: log_done
@@ -360,24 +624,39 @@ steps:
     name: "Closer Complete"
     config:
       level: info
-      message: "AMI drift closer complete. Checked ${{ steps.summary.outputs.checked }} open items — still valid: ${{ steps.summary.outputs.still_valid }}, closed: ${{ steps.summary.outputs.closed }}."
+      message: "AMI drift closer complete. Checked ${{ steps.summary.outputs.checked }} open items — still valid: ${{ steps.summary.outputs.still_valid }}, closed: ${{ steps.summary.outputs.closed }}, close failed: ${{ steps.summary.outputs.close_failed }}."
 
 connections:
-  - { id: c1, from: start_manual,          to: find_open_items }
-  - { id: c2, from: start_cron,            to: find_open_items }
-  - { id: c3, from: find_open_items,       to: lake_deployments }
-  - { id: c4, from: lake_deployments,        to: fetch_providers }
-  - { id: c5, from: fetch_providers,         to: build_rc_paths }
-  - { id: c6, from: build_rc_paths,          to: fetch_runtime_configs }
-  - { id: c7, from: fetch_runtime_configs,   to: build_provider_index }
-  - { id: c8, from: build_provider_index,    to: detect_valid }
-  - { id: c9, from: detect_valid,          to: select_to_close }
-  - { id: c10, from: select_to_close,      to: comment_closing }
-  - { id: c11, from: comment_closing,      to: close_items }
-  - { id: c12, from: close_items,          to: summary }
-  - { id: c13, from: summary,              to: log_done }
+  - { id: c1,  from: start_manual,        to: lake_deployments }
+  - { id: c2,  from: start_cron,          to: lake_deployments }
+  - { id: c3,  from: lake_deployments,        to: fetch_providers }
+  - { id: c4,  from: fetch_providers,         to: build_rc_paths }
+  - { id: c5,  from: build_rc_paths,          to: fetch_runtime_configs }
+  - { id: c6,  from: fetch_runtime_configs,   to: build_provider_index }
+  - { id: c7,  from: build_provider_index,    to: detect_valid }
+  - { id: c8,  from: detect_valid,            to: stash_drift_set }
+  - { id: c9,  from: stash_drift_set,         to: fetch_items }
+  # fetch_items streams: `loop` port → decide (per-page items fan out).
+  - { id: c10, from: fetch_items,   to: decide,          source_port: loop }
+  - { id: c11, from: decide,        to: select_to_close }
+  - { id: c12, from: select_to_close, to: comment_closing }
+  - { id: c13, from: comment_closing, to: close_items }
+  - { id: c14, from: close_items,   to: close_ok }
+  - { id: c14t, from: close_ok,     to: acc_results,     source_port: "true" }
+  - { id: c14f, from: close_ok,     to: close_failed,    source_port: "false" }
+  - { id: c14g, from: close_failed, to: acc_close_failed }
+  # Both the success lane and the failure lane re-enter
+  # fetch_items:callback (reentry port) so a page-level failure doesn't
+  # stop later pages from being fetched. The engine soft-resets
+  # fetch_items' join state on each reentry-edge settle so it can re-fire.
+  - { id: c15, from: acc_results,          to: fetch_items, target_port: callback }
+  - { id: c15b, from: acc_close_failed,    to: fetch_items, target_port: callback }
+  # When fetch_items detects the last page, it activates `done`.
+  - { id: c16, from: fetch_items,   to: summary,         source_port: done }
+  - { id: c17, from: summary,       to: log_done }
 
 outputs:
-  checked:     "${{ steps.summary.outputs.checked }}"
-  still_valid: "${{ steps.summary.outputs.still_valid }}"
-  closed:      "${{ steps.summary.outputs.closed }}"
+  checked:        "${{ steps.summary.outputs.checked }}"
+  still_valid:    "${{ steps.summary.outputs.still_valid }}"
+  closed:         "${{ steps.summary.outputs.closed }}"
+  close_failed:   "${{ steps.summary.outputs.close_failed }}"
