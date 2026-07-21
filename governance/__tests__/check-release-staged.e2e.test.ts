@@ -12,8 +12,7 @@ import { describe, expect, it } from 'vitest';
 
 import { runWorkflowE2E } from '@nullplatform/workflow-kit/test';
 
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const WF_PATH = resolve(REPO_ROOT, 'workflows', 'governance', 'check-release-staged.yaml');
+const WF_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'check-release-staged.yaml');
 
 const TRIGGER_OUTPUTS = {
   kind: 'check-release-staged',
