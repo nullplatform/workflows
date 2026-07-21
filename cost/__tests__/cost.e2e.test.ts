@@ -229,6 +229,8 @@ const DAY_STDOUT = JSON.stringify({
 async function runCollect(opts: {
   existing?: Record<string, unknown> | null;
   stdout?: string;
+  /** GET /scope body for the config-billing basis; omitted → 404 → KSM fallback. */
+  scopeBody?: Record<string, unknown>;
 }) {
   let upserted: Record<string, unknown> | null = null;
   let upsertPath: string | null = null;
@@ -244,6 +246,14 @@ async function runCollect(opts: {
       },
       'np-api-call': {
         handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
+          if (ctx.stepId === 'fetch_scope') {
+            // No scope config in these fixtures → billing falls back to the
+            // KSM request basis (the numbers asserted below). Config-basis
+            // billing has its own coverage via `scopeBody`.
+            return opts.scopeBody
+              ? ok({ status: 200, body: opts.scopeBody })
+              : ok({ status: 404, body: null });
+          }
           if (ctx.stepId === 'fetch_instance') {
             return opts.existing
               ? ok({ status: 200, body: opts.existing })
@@ -600,13 +610,17 @@ describe('wf2b-right-sizing-analyze-scope (E2E)', () => {
     expect(meta.mem_savings_usd_month).toBe(0);
   });
 
-  it('production: creates the item but attaches NO auto-apply suggestion', async () => {
+  it('production: creates the item WITH a suggestion, forced to apply-only (never deploys)', async () => {
     const { result, created, suggestions } = await runAnalyze({
       environment: 'production',
       minSavingsByEnv: '{"default":1,"production":1}',
     });
     expect(created).toHaveLength(1);
-    expect(suggestions).toHaveLength(0);
+    // Production policy v2: the one-click apply IS offered, but the mode is
+    // apply-only regardless of the AI's recommendation — wf4 enforces it
+    // server-side too. (Was: no suggestion at all.)
+    expect(suggestions).toHaveLength(1);
+    expect((suggestions[0] as { mode?: string }).mode).toBe('apply-only');
     expect(result.outputs.status).toBe('created');
   });
 
@@ -813,7 +827,7 @@ describe('wf2b-right-sizing-analyze-scope (E2E)', () => {
     expect(flagWrites).toHaveLength(0);
   });
 
-  it('non-web_pool_k8s scopes get the item but never an apply suggestion', async () => {
+  it('custom scopes are auto-applyable too (capabilities patch) — item AND suggestion', async () => {
     const { suggestions } = await runAnalyze({});
     // sanity: default fixture (web_pool_k8s-less row) still suggests
     expect(suggestions).toHaveLength(1);
@@ -873,7 +887,11 @@ describe('wf2b-right-sizing-analyze-scope (E2E)', () => {
       },
     });
     expect(created2).toHaveLength(1); // the opportunity IS reported
-    expect(suggestions2).toBe(0); // but custom scopes are not auto-applyable
+    // Auto-apply v2: `custom` scopes patch capabilities.cpu_millicores /
+    // ram_memory (verified PATCH shape), so they get the one-click apply
+    // like web_pool_k8s. Only non-applyable types (EC2 web_pool,
+    // serverless) stay report-only.
+    expect(suggestions2).toBe(1);
   });
 
   // ── tracker-data prefilter ──────────────────────────────────────────────
@@ -1549,11 +1567,13 @@ async function runQa(opts: {
 }
 
 describe('wf8-rightsizing-qa (E2E)', () => {
-  it('answers a human question on the thread', async () => {
+  it('answers a human question on the thread (immediate ack, then the answer)', async () => {
     const { result, posted, agentRan } = await runQa({});
     expect(agentRan).toBe(true);
-    expect(posted).toHaveLength(1);
-    expect(String(posted[0]!.text)).toContain('300mc');
+    // The ack posts BEFORE the AI runs (humans see "on it" instead of
+    // minutes of silence); the grounded answer follows.
+    expect(posted).toHaveLength(2);
+    expect(String(posted[1]!.text)).toContain('300mc');
     expect(result.outputs.status).toBe('replied');
   });
 
@@ -1592,10 +1612,12 @@ describe('wf8-rightsizing-qa (E2E)', () => {
     expect(posted).toHaveLength(0);
   });
 
-  it('posts nothing when the AI declines (chatter, commands)', async () => {
+  it('acks but posts no ANSWER when the AI declines (chatter, commands)', async () => {
     const { result, posted, agentRan } = await runQa({ shouldReply: false });
     expect(agentRan).toBe(true);
-    expect(posted).toHaveLength(0);
+    // Only the immediate ack — the guards that never ack (bot authors,
+    // closed items, reply cap) are covered by the tests above.
+    expect(posted).toHaveLength(1);
     expect(result.outputs.status).toBe('no_reply');
   });
 });
@@ -1743,7 +1765,10 @@ describe('wf4-apply-rightsizing (E2E)', () => {
     });
     expect(patches).toHaveLength(1);
     expect(patches[0]!.stepId).toBe('patch_scope_only');
-    const resources = (patches[0]!.payload as { resources: Record<string, number> }).resources;
+    // compute_plan wraps the cloned spec: PATCH body = { requested_spec }.
+    const resources = (
+      patches[0]!.payload as { requested_spec: { resources: Record<string, number> } }
+    ).requested_spec.resources;
     expect(resources.cpu_millicores).toBe(200);
     expect(resources.memory_in_mb).toBe(256);
     expect(suggestionUpdates).toEqual(['mark_applied_only']);
@@ -1839,10 +1864,11 @@ describe('wf4-apply-rightsizing (E2E)', () => {
       profileSpec: { cpu_profile: 'standard', memory_in_gb: 1, local_storage_in_gb: 8 },
     });
     expect(patches).toHaveLength(1);
-    const payload = patches[0]!.payload as Record<string, unknown>;
+    const spec = (patches[0]!.payload as { requested_spec: Record<string, unknown> })
+      .requested_spec;
     // rec 256MB → 0.25GB tier; cpu_profile untouched (CPU is profile-derived)
-    expect(payload.memory_in_gb).toBe(0.25);
-    expect(payload.cpu_profile).toBe('standard');
+    expect(spec.memory_in_gb).toBe(0.25);
+    expect(spec.cpu_profile).toBe('standard');
     expect(result.outputs.status).toBe('applied-no-deploy');
   });
 });

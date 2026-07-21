@@ -11,6 +11,14 @@ git clone https://github.com/nullplatform/workflows && cd workflows
 npm install        # pulls @nullplatform/workflow-kit + vitest
 ```
 
+`@nullplatform/workflow-kit` is served from GitHub Packages during the
+pilot, so `npm install` needs a GitHub token with `read:packages` once:
+
+```bash
+npm config set //npm.pkg.github.com/:_authToken YOUR_GITHUB_TOKEN
+# or, with the gh CLI: npm config set //npm.pkg.github.com/:_authToken $(gh auth token)
+```
+
 Auth for anything that talks to the platform (publish/run): set `NP_API_KEY`
 (an org API key — exchanged automatically) or `NP_TOKEN` in your environment.
 
