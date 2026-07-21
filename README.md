@@ -5,6 +5,10 @@
 > **Start here → [AUTHORING.md](./AUTHORING.md)**: clone, `npm install`,
 > `npx vitest` — every suite's E2E tests run on your machine with the same
 > engine and test harness the platform team uses.
+>
+> **New to the system? → [docs/](./docs)**: how workflows run
+> ([concepts](./docs/README.md)), the full plugin catalog and YAML/API
+> reference, and the authoring gotchas guide.
 
 Production-grade **workflow suites** for the [nullplatform](https://nullplatform.com)
 workflow system, published as reference and examples. Each suite is a set of
@@ -60,7 +64,7 @@ the verification steps to run before activating anything.
   organization ids, credentials, hostnames, and internal figures have been
   replaced with placeholders (`<org-id>`, `${{ secrets.* }}`, `my-cluster`, …) —
   substitute your own.
-- Test suites are maintained separately and are not included here.
+- Every suite ships its E2E tests (`__tests__/`) — `npm install && npx vitest` runs them all; see [AUTHORING.md](./AUTHORING.md).
 
 ## Authoring guides
 
