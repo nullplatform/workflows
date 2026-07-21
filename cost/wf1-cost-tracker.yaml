@@ -22,7 +22,7 @@
 #   COST_AGENT_CMDLINE (var)       — base command on the agent host
 #                                    (e.g. /opt/nullplatform/cost/collect-metrics.sh)
 #   COST_AGENT_NRN (var)           — nrn for agent selection (e.g. organization=…)
-#   COST_AGENT_CLUSTER (var)       — agent tag `cluster` value (e.g. my-cluster)
+#   COST_AGENT_CLUSTER (var)       — agent tag `cluster` value (e.g. runtime)
 #   COST_POD_MATCHERS_TEMPLATE (var) — PromQL matchers with {scope_id}
 #                                    {scope_slug} {scope_name} {app_name}
 #                                    placeholders
