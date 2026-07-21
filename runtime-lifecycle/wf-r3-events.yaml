@@ -197,7 +197,10 @@ steps:
         var act = null;
         for (var j = 0; j < (inputs.deployments || []).length; j++) {
           var d = inputs.deployments[j];
-          if (d.status_in_scope === 'active') {
+          // 'finalized' required: an in-flight or failed/rolled-back deploy
+          // can still read status_in_scope 'active' — only a deployment that
+          // actually FINISHED is compliance evidence (owner rule 2026-07-21).
+          if (d.status_in_scope === 'active' && d.status === 'finalized') {
             if (!act || Date.parse(d.created_at) > Date.parse(act.created_at)) act = d;
           }
         }
@@ -212,7 +215,7 @@ steps:
           reason: !configOk
             ? 'scope config still on ' + rt + ' (' + c.verdict + ')'
             : (!deployedOk
-                ? 'config is on ' + rt + ' but the ACTIVE deployment predates the change — deploy to finish'
+                ? 'config is on ' + rt + ' but no FINALIZED deployment reflects it yet — a deploy must complete'
                 : 'active deployment runs ' + rt)
         };
 

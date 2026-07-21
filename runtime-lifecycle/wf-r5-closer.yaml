@@ -181,7 +181,11 @@ steps:
         LEFT JOIN (
           SELECT toString(scope_id) AS scope_id, max(created_at) AS active_created_at
           FROM core_entities_deployment FINAL
-          WHERE _deleted = 0 AND status_in_scope = 'active'
+          -- status='finalized' is REQUIRED alongside status_in_scope='active':
+          -- the lake carries failed/deleted/deleting rows still flagged active
+          -- in scope (observed live: 8 failed+active). Only a deployment that
+          -- actually FINISHED counts as compliance evidence.
+          WHERE _deleted = 0 AND status_in_scope = 'active' AND status = 'finalized'
           GROUP BY scope_id
         ) AS dep ON dep.scope_id = item.scope_id
 
