@@ -6,9 +6,17 @@
 #   - onResolved → a human (or automation) marked the item resolved; this is
 #     the compliance GATE — it re-derives whether the scope's runtime config
 #     AND its currently-active deployment actually reflect the fix before
-#     trusting the resolution. Non-compliant → reopen + explain exactly
-#     what's still missing (config vs stale deploy — two distinct reasons).
-#     Compliant → a confirmation comment, item stays resolved.
+#     trusting the resolution. Non-compliant → a COMMENT explaining exactly
+#     what's still missing (config vs stale deploy — two distinct reasons);
+#     the item STAYS resolved. We do NOT reopen: the platform API forbids
+#     reopen from `resolved` (400 "Cannot reopen action item from current
+#     status" — reopen only works from deferred/rejected; live finding on
+#     kwik, 2026-07-21). Instead the DAILY scanner (wf-r2, 07:00) opens a
+#     NEW action item within 24h while the scope stays non-compliant — the
+#     comment tells the resolver exactly that. (The trigger's onReopened
+#     port is intentionally unwired: audit-derived `reopened` events can
+#     fire even for FAILED reopen attempts — phantom events — so no handler
+#     hangs off it.) Compliant → a confirmation comment, item stays resolved.
 #   - onCommentAdded → bot-authored comments (our own narration) are ignored
 #     (no bot-to-bot loops). A human comment gets an immediate ack, then an
 #     AI answer grounded ONLY in declared facts (item, scope, the catalog
@@ -34,7 +42,7 @@ description: >
   apply workflow; resolutions are gated against the live scope config and
   the currently-active deployment; comments get an ack + a fact-grounded AI
   answer, capped per item.
-path: "/runtime-lifecycle"
+path: "/action-items/runtime-lifecycle"
 semantic_version: 1.0.0
 
 steps:
@@ -228,22 +236,18 @@ steps:
       author: "agent:runtime-lifecycle"
       content: "✅ Verified: ${{ inputs.reason }}."
 
-  - id: reopen_item
-    type: module
-    plugin_type: np-action-item-update
-    name: "Reopen: Not Yet Compliant"
-    inputs:
-      item_id: "${{ steps.gate_start.outputs.action_item_id }}"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      actionItemId: "${{ inputs.item_id }}"
-      action: reopen
-      actor: "agent:runtime-lifecycle"
-
-  - id: comment_reopen_reason
+  # NON-COMPLIANT resolution: we do NOT reopen. The platform API forbids
+  # reopen from `resolved` (400 "Cannot reopen action item from current
+  # status") — a resolved item stays resolved. Instead we leave a comment
+  # that (a) says the resolution could not be verified, (b) states exactly
+  # what's still missing (gate_check.reason: config still deprecated vs a
+  # stale deploy), and (c) tells the resolver a NEW item will be opened
+  # automatically by the next daily scan (wf-r2, within 24h) while the
+  # scope stays non-compliant. The item's status is left untouched.
+  - id: comment_not_verified
     type: module
     plugin_type: np-action-item-add-comment
-    name: "Comment: Reopen Reason"
+    name: "Comment: Resolution Not Verified"
     inputs:
       reason: "${{ steps.gate_check.outputs.reason }}"
       item_id: "${{ steps.gate_start.outputs.action_item_id }}"
@@ -251,7 +255,12 @@ steps:
       apiKey: "${{ secrets.NP_API_KEY }}"
       actionItemId: "${{ inputs.item_id }}"
       author: "agent:runtime-lifecycle"
-      content: "🔁 Reopened — not yet compliant: ${{ inputs.reason }}."
+      content: |
+        ⚠️ This resolution could not be verified — ${{ inputs.reason }}.
+
+        This item stays **resolved** (it is not reopened). While the scope
+        remains non-compliant, the next daily runtime scan (within 24h) will
+        automatically open a NEW action item for it.
 
   # ── Comment → bot filter, ack, AI answer (fact-grounded, no egress) ─────
   - id: comment_guard
@@ -507,8 +516,7 @@ connections:
   - { id: c6,  from: gate_fetch_catalog, to: gate_check }
   - { id: c7,  from: gate_check,         to: gate_compliant }
   - { id: c8,  from: gate_compliant,     to: comment_confirm,      source_port: "true" }
-  - { id: c9,  from: gate_compliant,     to: reopen_item,          source_port: "false" }
-  - { id: c10, from: reopen_item,        to: comment_reopen_reason }
+  - { id: c9,  from: gate_compliant,     to: comment_not_verified, source_port: "false" }
 
   - { id: c11, from: trigger,            to: comment_guard,        source_port: onCommentAdded }
   - { id: c12, from: comment_guard,      to: is_actionable }

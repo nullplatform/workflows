@@ -1,50 +1,37 @@
 # Lambda Runtime Lifecycle — Closer. Lake-first DAILY job (08:00 Buenos
 # Aires, also manual), FLAT writes.
 #
-# REDESIGN v3 (owner-decided, 2026-07-21, same rationale as wf-r2-scanner.yaml):
-# detection is ONE lake query and every side effect is now a FLAT per-item
-# `np-api-call` pass on THIS workflow — there is no per-item verification
-# sub-workflow child anymore (`wf-r5b-verify-item` is retired/deleted). v2
-# already collapsed detection into `lake_candidates` (one ClickHouse round-
-# trip joining the live lambda-runtime item set, the scope it points at, the
-# `lambda_runtimes` catalog, and the scope's newest active deployment) but
-# still fanned out to wf-r5b. v3 folds wf-r5b's status guard / scope-gone /
-# compliance logic into the pure `verdicts` step (VERBATIM parseRuntime/
-# verNum/classify) and does the scope+deployment READS and the close+comment
-# WRITES here as flat forEach passes.
+# REDESIGN v4 (owner-decided, 2026-07-21): the closeability VERDICT is now
+# computed ENTIRELY IN THE LAKE QUERY. `lake_candidates` joins the live
+# lambda-runtime action items ⋈ core_entities_scope FINAL ⋈ the
+# lambda_runtimes catalog ⋈ the scope's newest ACTIVE deployment and returns
+# a per-item `verdict` (close_compliant / close_scope_gone / still_open).
+# There is NO live `/scope/:id` or `/deployment` re-verification pass anymore
+# (the v3 fetch_scope / fetch_deployments / verdicts steps are GONE), and no
+# separate catalog read (the compliance status comes from the catalog JOIN).
+# `prep` reads the verdict, double-guards the human-owned + stray cases, and
+# builds the close requests; then the same flat close_item → zip_closed →
+# close_comment → summary chain runs as before.
+#
+# ACCEPTED TRADEOFF (owner decision, 2026-07-21 — documented explicitly per
+# the owner's instruction): closing purely on lake data trades a small,
+# self-healing risk of a FALSE close for a much simpler workflow. The lake has
+# sync lag and its timestamp columns are stringly-typed in mismatched formats
+# ('YYYY-MM-DD HH:MM:SS.ffffff' vs the ISO 'Z' stamp) — the verdict parses
+# them with ClickHouse's parseDateTimeBestEffort, which is lenient but not
+# infallible. A false close is NOT permanent: `close_item` only closes an item
+# that is LIVE, and the lake query's anti-join only sees LIVE items — so once
+# an item is closed it drops out of this query. If a close turns out wrong
+# (the scope was not really compliant), the DAILY scanner (wf-r2, 07:00) sees
+# a scope still on a deprecated runtime with no live item and OPENS A NEW ONE
+# within 24h. That <24h self-heal window is WHY query-only closing is
+# acceptable here — the closer never has to be perfect, only mostly right.
 #
 # The closer only CLOSES — it never reopens a resolved item (that's wf-r3's
-# onResolved gate, at resolve time).
-#
-# NEVER CLOSE ON LAKE DATA ALONE (spec principle 4). `lake_candidates`
-# returns the FULL live lambda-runtime item set and `prep` PREfilters it to a
-# candidate subset, but a close is decided ONLY by the `verdicts` step over
-# LIVE `/scope/:id` + `/deployment` responses. The lake has sync lag and its
-# `active_created_at`/`runtime_patched_at` columns are string timestamps in
-# MISMATCHED formats ('YYYY-MM-DD HH:MM:SS.ffffff' vs the ISO 'Z' stamp) — a
-# string compare there is UNRELIABLE, so `prep` NEVER uses it to gate a
-# close. `prep`'s prefilter keeps a row ONLY on RELIABLE signals: the scope
-# is gone (missing/deleted/stopped in the join) OR its CURRENT runtime is
-# catalog-`supported`. Any open item on a supported runtime FALLS THROUGH to
-# live verification (verdicts does the real `deployedOk` with PARSED
-# timestamps); an item whose current runtime is still deprecated/unknown and
-# whose scope is alive is reliably not-closeable and is prefiltered out.
-# Verified live against kwik-e-mart (org 1255165411), 2026-07-21.
-#
-# fetch_scope / fetch_deployments failure model (owner-adjudicated tension):
-# a 404 on `/scope/:id` is a VERDICT (scope gone → close), NOT an error. With
-# `failOnHttpError: true` a 404 would be absorbed as a `{}` slot in parallel
-# forEach, LOSING the 404-vs-other-error distinction. So the reads use
-# `failOnHttpError: false` and `verdicts` branches on the STATUS: 404 →
-# scope_gone (close), 200 → evaluate live state, >=500 / 401 / 403 →
-# verify_failed → SKIP (never close). The trade-off is that a transient 5xx
-# on a read can NOT be retried (it arrives as a success slot, not a failure),
-# so it settles as verify_failed and the item is simply left open for the
-# next DAILY run — self-healing, and NEVER a false close. `retry_policy` is
-# still declared: it only ever fires on a genuine NETWORK failure (idempotent
-# GET, safe to retry); an exhausted network failure absorbs as `{}` → also
-# verify_failed. A failed `/deployment` read degrades to "no deployments" →
-# `deployedOk` false → still_open (never a false close).
+# onResolved gate, at resolve time). Human-owned states (deferred/pending_*)
+# are excluded IN THE QUERY (status = 'open') AND double-guarded in `prep`.
+# Stray items with no metadata.scope_id are surfaced (bucketed `stray`) and
+# NEVER auto-closed — a close must rest on a scope, and there is none.
 #
 # close_item / close_comment are hardened (`failOnHttpError: true` → a >=400
 # is a per-iteration FAILURE), NON-retryable POSTs, and ORDERED close→comment
@@ -52,52 +39,43 @@
 # CLOSED it never re-appears as a candidate. Closing FIRST means a failed
 # comment leaves a closed item with a missing (cosmetic) comment — no
 # duplicate. Commenting first would risk a DUPLICATE comment on every run
-# where the close then fails (the item stays open and is re-detected).
-# `zip_closed` pairs comments to only the items that ACTUALLY closed (2xx),
-# mirroring wf-r2-scanner's create→zip→suggestion chain. Neither POST retries
-# (a lost-ack close/comment retry re-hits the same item; a missed close/
-# comment self-heals next DAILY run — idempotency + the daily cadence win
-# over availability, matching wf-r2-scanner's no-retry-on-POST rule).
+# where the close then fails. `zip_closed` pairs comments to only the items
+# that ACTUALLY closed (2xx). Neither POST retries (a lost-ack close/comment
+# retry re-hits the same item; a missed close/comment self-heals next DAILY
+# run — idempotency + the daily cadence win over availability).
 #
-# Fan-out mechanism + engine gaps (all still true for v3, same as
-# wf-r2-scanner.yaml — see that file's header for the full explanation):
-#  - `forEach.spreadItem` (engine capability landed 2026-07-21, commit
-#    9526c4d) merges each request object's `{path, method, body|query}` into
-#    the per-iteration `np-api-call` inputs (inputs override config), so one
-#    generic np-api-call step parameterizes itself per item. The static
+# Fan-out mechanism + engine gaps (same as wf-r2-scanner.yaml — see that
+# file's header for the full explanation):
+#  - `forEach.spreadItem` merges each request object's `{path, method, body}`
+#    into the per-iteration `np-api-call` inputs (inputs override config), so
+#    one generic np-api-call step parameterizes itself per item. The static
 #    shields (apiKey, failOnHttpError) stay in config.
 #  - forEach has NO `error_handling.fallback_step` — a settled child failure
 #    is ABSORBED as a `{}` slot in the results array, in the SAME position as
 #    its input (forEach preserves order). Every pass is FOLLOWED by a pure
 #    `code-exec` that detects failures INDEX-ALIGNED, treating BOTH shapes as
 #    a failure: the absorbed `{}` slot AND a `{status>=400}` response slot.
-#  - `code-exec` can only ever emit ONE wrapped output object — it can NOT
-#    become an items[]-producer for a filtered subset, which is exactly why
-#    the native items[]-fan-out + `fallback_step` pattern is unavailable and
-#    `forEach.expression` is used instead.
 #  - deciders evaluate `items[0]` only, so a decider must never split a batch
-#    — `prep`/`verdicts`/`zip_closed` partition into arrays and each action
-#    gets its OWN forEach pass.
+#    — `prep`/`zip_closed` partition into arrays and each action gets its OWN
+#    forEach pass.
 #
-# Per-org configuration (config entries on folder /runtime-lifecycle):
+# Per-org configuration (config entries on folder /action-items/runtime-lifecycle):
 #   NP_API_KEY (secret)         — NP API key
 #   NP_ORGANIZATION_ID (var)    — organization id
 #   RUNTIME_WARN_DAYS (var)     — days-to-deprecation "expiring" threshold
-#                                 (default 31). SINGLE source: verdicts'
-#                                 classify() reads it so the closer and the
-#                                 scanner agree on exactly one threshold (a
-#                                 runtime the scanner still flags "expiring"
-#                                 must not be treated "ok"/closeable here).
+#                                 (default 31). The query's compliance verdict
+#                                 treats a runtime deprecating within this
+#                                 window as NOT ok/closeable, so the closer and
+#                                 the scanner agree on exactly one threshold.
 id: runtime_lifecycle_closer
 name: "Runtime Lifecycle — Closer"
 description: >
   Daily job (08:00, also manual) that detects closeable lambda-runtime action
-  items via ONE lake query (scope gone, or runtime now catalog-supported),
-  re-verifies each against the LIVE scope + deployment state, then closes the
-  compliant/gone ones and comments — all via flat per-item API passes, no
-  sub-workflow fan-out.
-path: "/runtime-lifecycle"
-semantic_version: 3.0.0
+  items via ONE lake query which computes the close verdict in-query (scope
+  gone, or runtime now catalog-supported with a fresh active deployment), then
+  closes the compliant/gone ones and comments — all via flat per-item API
+  passes, no sub-workflow fan-out and no live re-verification.
+path: "/action-items/runtime-lifecycle"
 
 steps:
   - id: start_manual
@@ -105,7 +83,7 @@ steps:
     plugin_type: manual
     name: "Run Closer Now"
     config:
-      description: "Detects closeable lambda-runtime action items via one lake query and closes the ones the live scope/deploy confirm."
+      description: "Detects closeable lambda-runtime action items via one lake query (verdict computed in-query) and closes them."
 
   - id: start_cron
     type: trigger
@@ -115,86 +93,44 @@ steps:
       schedule: "0 8 * * *"
       timezone: "America/Argentina/Buenos_Aires"
 
-  # ── Read the catalog ONCE, before touching a single item ────────────────
-  - id: read_catalog
-    type: module
-    plugin_type: np-api-call
-    name: "Read Runtime Catalog"
-    # Reached from either trigger.
-    join_strategy: any
-    # DECLARED inputs (CLAUDE.md np-api-call shield rule): np-api-call's
-    # execute() does `cfg = {...config, ...ctx.inputs}` — a step with no
-    # `inputs:` map falls back to the predecessor's raw output object as
-    # ctx.inputs, which clobbers request fields (e.g. `headers`) when chained
-    # after another np-api-call step. Shielded here for consistency even
-    # though this step's only predecessors are triggers.
-    inputs:
-      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      method: GET
-      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
-      # 404 (instance never seeded) is a valid "empty catalog" case, not a
-      # hard error — the guard below handles it uniformly.
-      failOnHttpError: false
-
-  - id: catalog_guard
-    type: module
-    plugin_type: code-exec
-    name: "Guard: Catalog Has Runtimes?"
-    # Aggregate step: NEVER dispatch per upstream item (single response).
-    metadata: { fanOutPerItem: false }
-    inputs:
-      status: "${{ steps.read_catalog.outputs.status }}"
-      body: "${{ steps.read_catalog.outputs.body }}"
-    config:
-      code: |
-        var body = inputs.body || {};
-        var runtimes = Array.isArray(body.runtimes) ? body.runtimes : [];
-        if (inputs.status !== 200 || runtimes.length === 0) {
-          return { ok: false, catalog: null, reason: 'empty catalog — run catalog-sync first' };
-        }
-        return { ok: true, catalog: body, reason: null };
-
-  # Deciders run in-sandbox (ports always known) — safe to wire.
-  - id: catalog_ok
-    type: decider
-    plugin_type: conditional
-    name: "Catalog Has Runtimes?"
-    config:
-      expression: "steps.catalog_guard.outputs.ok == true"
-
-  # ── ONE lake query: every LIVE lambda-runtime action item, joined ──────
-  # against its scope (if any), the lambda_runtimes catalog (by the scope's
-  # CURRENT runtime), and the scope's newest active deployment. This is a
-  # PREfilter ONLY (see the header) — `prep` decides the candidate set on
-  # RELIABLE columns and `verdicts` re-verifies live before any close.
-  # Verified live against kwik-e-mart (org 1255165411), 2026-07-21: 99 live
-  # items, and the one row that looked closeable was a stray item with no
-  # `metadata.scope_id` — v3 buckets that as `stray` (surfaced to a human,
-  # NEVER auto-closed), so on that snapshot there are zero auto-closes.
-  # Verified via ~/workspace/null/np-claude-skills/src/skills/np-lake/scripts/ch_query.sh
+  # ── ONE lake query: every LIVE (open) lambda-runtime action item, joined ──
+  # against its scope, the lambda_runtimes catalog (by the scope's CURRENT
+  # runtime), and the scope's newest ACTIVE deployment — and a per-item
+  # `verdict` computed IN QUERY:
+  #   close_scope_gone : the scope row is PRESENT in the lake with status
+  #                      deleted/stopped (a tombstone). Pure ABSENCE from the
+  #                      lake (join missed) is still_open — a transient
+  #                      replication gap must never read as a deletion.
+  #   close_compliant  : the CURRENT runtime is catalog-supported AND not
+  #                      expiring within RUNTIME_WARN_DAYS, AND the newest
+  #                      active deployment's created_at is at/after the item's
+  #                      runtime_patched_at stamp (or scope.updated_at when the
+  #                      item was never patched by wf-r4).
+  #   still_open       : anything else (leave open, zero side effects).
+  # NB: timestamps are compared with parseDateTimeBestEffort (the lake stores
+  # them stringly in mismatched formats) — see the ACCEPTED TRADEOFF header.
+  # Verified live against kwik-e-mart (org 1255165411), 2026-07-21, via
+  # ~/workspace/null/np-claude-skills/src/skills/np-lake/scripts/ch_query.sh
   # (read-only).
   #
-  # Same gotchas as wf-r2-scanner.yaml's `lake_detect` (kept as comments so
-  # the next author doesn't rediscover them the hard way):
+  # Same gotchas as wf-r2-scanner.yaml's lake query (kept as comments so the
+  # next author doesn't rediscover them the hard way):
   #  - `core_entities_metadata` carries TWO rows per org for
   #    (entity='organization', metadata_type='lambda_runtimes'): the actual
-  #    instance (id = the org id) and the metadata SPECIFICATION itself (id
-  #    = a uuid, `data` is NULL). Filtering `id = '<org id>'` is required —
-  #    without it the catalog join silently returns empty columns, no error.
-  #  - Never alias an extracted column `id` inside a subquery that also
-  #    filters `WHERE id = ...` on the same source table — ClickHouse
-  #    resolves the WHERE against the alias and the join silently returns
-  #    zero rows (no error). Every id-like column below is aliased away
-  #    from the bare name `id`.
+  #    instance (id = the org id) and the metadata SPECIFICATION (id = a uuid,
+  #    `data` NULL). Filtering `id = '<org id>'` is required — otherwise the
+  #    catalog join silently returns empty columns (no error).
+  #  - Never alias an extracted column `id` inside a subquery that also filters
+  #    `WHERE id = ...` on the same source table — ClickHouse resolves the
+  #    WHERE against the alias and the join silently returns zero rows.
   #  - The `ARRAY JOIN ... AS rt` alias must differ from the subquery's own
-  #    alias (`cat`) or the join silently breaks (empty `cat.*` columns, no
-  #    error).
+  #    alias (`cat`) or the join silently breaks (empty `cat.*` columns).
   - id: lake_candidates
     type: module
     plugin_type: np-lake-query
-    name: "Live Lambda-Runtime Items + Compliance (lake)"
+    name: "Live Lambda-Runtime Items + In-Query Verdict (lake)"
+    # Reached from either trigger.
+    join_strategy: any
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
@@ -202,12 +138,20 @@ steps:
           item.item_id AS item_id,
           item.item_status AS item_status,
           item.scope_id AS scope_id,
-          item.runtime_patched_at AS runtime_patched_at,
-          s.scope_status AS scope_status,
-          s.scope_updated_at AS scope_updated_at,
-          cat.status AS catalog_status,
-          cat.deprecation_date AS deprecation_date,
-          dep.active_created_at AS active_created_at
+          s.runtime AS live_runtime,
+          multiIf(
+            s.scope_present = 1 AND s.scope_status IN ('deleted', 'stopped'), 'close_scope_gone',
+            ifNull(
+              (cat.status != '' AND cat.status != 'deprecated'
+                AND (cat.deprecation_date = ''
+                     OR toDateOrNull(cat.deprecation_date) > today() + ${{ vars.RUNTIME_WARN_DAYS || 31 }}))
+              AND (dep.active_created_at IS NOT NULL
+                AND dep.active_created_at >= parseDateTimeBestEffortOrNull(
+                  if(item.runtime_patched_at != '', item.runtime_patched_at, s.scope_updated_at))),
+              0),
+            'close_compliant',
+            'still_open'
+          ) AS verdict
         FROM (
           SELECT
             action_item_id AS item_id, status AS item_status,
@@ -215,10 +159,11 @@ steps:
             JSONExtractString(metadata, 'runtime_patched_at') AS runtime_patched_at
           FROM governance_action_items_action_items FINAL
           WHERE _deleted = 0 AND JSONExtractString(labels, 'workflow_type') = 'lambda-runtime'
-            AND status IN ('open', 'deferred', 'pending_deferral', 'pending_verification', 'pending_rejection')
+            AND status = 'open'
         ) AS item
         LEFT JOIN (
-          SELECT toString(id) AS scope_id, status AS scope_status, toString(updated_at) AS scope_updated_at,
+          SELECT toString(id) AS scope_id, 1 AS scope_present, status AS scope_status,
+                 toString(updated_at) AS scope_updated_at,
                  JSONExtractString(capabilities, 'serverless_runtime', 'id') AS runtime
           FROM core_entities_scope FINAL
           WHERE _deleted = 0
@@ -240,19 +185,19 @@ steps:
           GROUP BY scope_id
         ) AS dep ON dep.scope_id = item.scope_id
 
-  # ── Prefilter to the candidate set + build the LIVE fetch requests ─────
-  # Keep ONLY `open` items (deferred/pending are human-owned — double-guarded
-  # again in `verdicts`). Keep a candidate on RELIABLE signals only: scope
-  # gone, or the current runtime catalog-`supported` (falls through to live
-  # verification). Emits index-aligned `fetch_scope_requests` /
-  # `fetch_deployments_requests` (the forEach reads them) and a SMALL
-  # `candidates` array (payload diet — only `{item_id, scope_id,
-  # runtime_patched_at}` per row; the catalog rides ONCE at workflow scope,
-  # never per item).
+  # ── Prep: read the in-query verdict, build the close requests ──────────
+  # Double-guards two safety cases the verdict cannot own alone:
+  #   - item_status != 'open' → skipped (human-owned; already excluded by the
+  #     query WHERE, guarded here too).
+  #   - no scope_id → `stray`: surfaced for a human, NEVER auto-closed (a close
+  #     must rest on a scope, and the verdict would read scope_gone for it).
+  # Everything else follows the verdict. Emits index-aligned close requests +
+  # `closeable_meta` (item_id, verdict, comment_content). A SMALL payload per
+  # item — the catalog/scope/deploy state was already resolved in the query.
   - id: prep
     type: module
     plugin_type: code-exec
-    name: "Prep: Candidate Set + Fetch Requests"
+    name: "Prep: Read Verdict + Build Close Requests"
     metadata: { fanOutPerItem: false }
     inputs:
       rows: "${{ steps.lake_candidates.outputs.rows }}"
@@ -260,308 +205,65 @@ steps:
       code: |
         var MAX_FANOUT = 200;
         var rows = inputs.rows || [];
-        var candidates = [];
-        var scopeReqs = [];
-        var deployReqs = [];
-        var not_open = 0;
-        var still_open = 0;
-        var stray = 0;
-        for (var i = 0; i < rows.length; i++) {
-          var r = rows[i] || {};
-          // Only `open` items are ever closed (double-guard, mirrored here to
-          // avoid a wasted fetch — deferred/pending are human-owned).
-          if (r.item_status !== 'open') { not_open++; continue; }
-          var scopeId = r.scope_id || '';
-          // A stray item with NO scope reference at all is NOT closeable on
-          // lake evidence alone (ADJUDICATED: the safety invariant wins — a
-          // close must rest on a live scope response, and there is no scope
-          // to fetch). Surface it in the `stray` bucket so a human sees it
-          // on the daily run; never close, never fetch.
-          if (!scopeId) { stray++; continue; }
-          // RELIABLE prefilter ONLY. scopeGone comes from the join (no
-          // timestamp). `supported` is the catalog status of the CURRENT
-          // runtime (no timestamp). The lake's active_created_at /
-          // runtime_patched_at string compare is UNRELIABLE (mismatched
-          // formats) and must NEVER gate whether we verify — a supported
-          // runtime FALLS THROUGH to live `deployedOk` in verdicts.
-          var scopeGone = !r.scope_status || r.scope_status === 'deleted' || r.scope_status === 'stopped';
-          var supported = !!r.catalog_status && r.catalog_status !== 'deprecated';
-          if (!scopeGone && !supported) { still_open++; continue; }
-          candidates.push({
-            item_id: r.item_id,
-            item_status: r.item_status,
-            scope_id: scopeId,
-            runtime_patched_at: r.runtime_patched_at || null
-          });
-          scopeReqs.push({ path: '/scope/' + scopeId, method: 'GET' });
-          deployReqs.push({ path: '/deployment', method: 'GET', query: { scope_id: scopeId, limit: 20 } });
-        }
-        // total_candidates: FULL count before the safety-cap slice — kept
-        // distinct from the dispatched (possibly-truncated) subset so the
-        // summary reports both honestly (mirrors wf-r2-scanner).
-        var total_candidates = candidates.length;
-        var truncated = candidates.length > MAX_FANOUT;
-        if (truncated) {
-          log.warn('prep: candidate set exceeds the fan-out safety cap — truncating', {
-            candidates: candidates.length, cap: MAX_FANOUT, dropped: candidates.length - MAX_FANOUT
-          });
-          candidates = candidates.slice(0, MAX_FANOUT);
-          scopeReqs = scopeReqs.slice(0, MAX_FANOUT);
-          deployReqs = deployReqs.slice(0, MAX_FANOUT);
-        }
-        return {
-          candidates: candidates,
-          fetch_scope_requests: scopeReqs,
-          fetch_deployments_requests: deployReqs,
-          total_candidates: total_candidates,
-          total_live_items: rows.length,
-          not_open: not_open,
-          still_open_prefiltered: still_open,
-          stray: stray,
-          truncated: truncated
-        };
-
-  # ── LIVE read pass: the scope, per candidate ──────────────────────────
-  # forEach over prep.fetch_scope_requests. `spreadItem` merges each
-  # request's {path, method} onto the per-iteration np-api-call inputs.
-  # failOnHttpError:false — a 404 is the scope-gone VERDICT, not an error
-  # (see the header). retry_policy only ever fires on a genuine network
-  # failure (idempotent GET, safe to retry); an HTTP 5xx arrives as a success
-  # slot and is handled by verdicts (verify_failed), NOT retried.
-  - id: fetch_scope
-    type: module
-    plugin_type: np-api-call
-    name: "Get Scope (per candidate)"
-    # Per-iteration output projection (engine applies it inside the forEach
-    # coordinator, BEFORE the aggregate is recorded — see foreach-coordinator
-    # projectStepResult): trim each scope response down to ONLY the fields
-    # verdicts reads, so the aggregate `items[]` fed into verdicts stays small
-    # (200 candidates would otherwise carry 200 full scope bodies into one
-    # activity input, risking the Temporal 2MB cap). `status` is the HTTP
-    # status verdicts branches on; the body fields are the live scope state.
-    output_projection:
-      - status
-      - body.status
-      - body.updated_at
-      - body.capabilities.serverless_runtime.id
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      failOnHttpError: false
-      # Placeholder so validateConfig() (path required at configure() time,
-      # before per-item inputs merge) passes; overridden per item by the
-      # spread `path`.
-      path: "/scope"
-    error_handling:
-      retry_policy:
-        max_attempts: 3
-        initial_interval: "2s"
-        backoff_strategy: exponential
-        jitter: 0.3
-    forEach:
-      expression: "${{ steps.prep.outputs.fetch_scope_requests }}"
-      itemVariable: item
-      spreadItem: true
-      parallel: true
-      maxConcurrency: 5
-
-  # ── LIVE read pass: the deployments, per candidate ────────────────────
-  # forEach over prep.fetch_deployments_requests. Same failure model as
-  # fetch_scope; a failed read degrades to "no deployments" → deployedOk
-  # false → still_open (never a false close).
-  - id: fetch_deployments
-    type: module
-    plugin_type: np-api-call
-    name: "Get Deployments (per candidate)"
-    # Per-iteration projection (same 2MB rationale as fetch_scope): verdicts
-    # only needs each deployment's active flag + timestamp to find the newest
-    # active one, so trim the results array to those two fields. `limit: 20`
-    # (below) stays — it is a per-scope margin so the newest ACTIVE deploy is
-    # not missed behind more-recent non-active rows; the projection already
-    # bounds the payload regardless of the page size.
-    output_projection:
-      - status
-      - body.results[].status_in_scope
-      - body.results[].created_at
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      failOnHttpError: false
-      path: "/deployment"
-    error_handling:
-      retry_policy:
-        max_attempts: 3
-        initial_interval: "2s"
-        backoff_strategy: exponential
-        jitter: 0.3
-    forEach:
-      expression: "${{ steps.prep.outputs.fetch_deployments_requests }}"
-      itemVariable: item
-      spreadItem: true
-      parallel: true
-      maxConcurrency: 5
-
-  # ── Verdicts: the ONLY place a close is decided (pure, ONE call) ───────
-  # Zips candidates × fetch_scope × fetch_deployments × catalog by index
-  # (forEach preserves order). parseRuntime/verNum/classify are copied
-  # VERBATIM from the retired wf-r5b (workflow steps can't import). Per item:
-  #   scope 404 / status deleted|stopped → close, comment "scope no longer
-  #     active". (A stray item with no scope_id never reaches here — prep
-  #     buckets it as `stray` and it is NEVER auto-closed.)
-  #   scope 200 + runtime catalog-`ok` (classify) + newest active deployment
-  #     at least as new as runtime_patched_at (or scope.updated_at fallback)
-  #     → close, comment "resolved: active deployment on <runtime>".
-  #   scope 200 but not compliant → still_open (leave open, zero side effects).
-  #   scope read >=500 / 401 / 403 / absorbed {} → verify_failed → SKIP.
-  # NEVER closes on lake data — only on these live responses.
-  - id: verdicts
-    type: module
-    plugin_type: code-exec
-    name: "Verdicts: Closeable / Still-Open / Verify-Failed"
-    metadata: { fanOutPerItem: false }
-    inputs:
-      candidates: "${{ steps.prep.outputs.candidates }}"
-      scope_results: "${{ steps.fetch_scope.outputs.items }}"
-      deploy_results: "${{ steps.fetch_deployments.outputs.items }}"
-      catalog: "${{ steps.catalog_guard.outputs.catalog }}"
-      # SINGLE source for the "expiring" window — the same var the scanner
-      # uses, so a runtime the scanner still flags "expiring" is never treated
-      # "ok"/closeable here.
-      warn_days: "${{ vars.RUNTIME_WARN_DAYS }}"
-    config:
-      code: |
-        // ── VERBATIM shared helpers (copied from the retired wf-r5b —
-        // workflow steps can't import, duplication is the convention) ──
-        function parseRuntime(id) {
-          id = String(id || '');
-          if (id.indexOf('provided') === 0) {
-            return { language: 'provided', version: id.split('.').slice(1).join('.') };
-          }
-          var m = id.match(/^([a-z]+)([0-9]+(?:\.[0-9]+)?)/);
-          return m ? { language: m[1], version: m[2] } : { language: id, version: '' };
-        }
-        function verNum(v) {
-          var p = String(v).split('.');
-          var a = Number(String(p[0] || '').replace(/[^0-9]/g, '')) || 0;
-          var b = Number(String(p[1] || '').replace(/[^0-9]/g, '')) || 0;
-          return a * 1000 + b;
-        }
-        // classify: identical to wf-r5b's, EXCEPT the expiring window is
-        // `warnDays` (RUNTIME_WARN_DAYS) instead of a hardcoded 31 — so the
-        // closer and the scanner agree on exactly one threshold.
-        function classify(entry, todayMs, warnDays) {
-          if (!entry) return { verdict: 'unknown_runtime' };
-          var dep = entry.deprecation_date ? Date.parse(entry.deprecation_date) : null;
-          if (entry.status === 'deprecated' || (dep !== null && dep <= todayMs)) {
-            return { verdict: 'deprecated' };
-          }
-          if (dep !== null && dep - todayMs <= warnDays * 86400000) {
-            return { verdict: 'expiring' };
-          }
-          return { verdict: 'ok' };
-        }
         function closeReq(id) {
           // POST /governance/action_item/:id/close — the API records the
           // actor; the human-readable reason rides on the comment.
           return { path: '/governance/action_item/' + id + '/close', method: 'POST', body: { actor: 'agent:runtime-lifecycle' } };
         }
-
-        var candidates = inputs.candidates || [];
-        var scopeResults = inputs.scope_results || [];
-        var deployResults = inputs.deploy_results || [];
-        var cat = (inputs.catalog || {}).runtimes || [];
-        var warnDays = Number(inputs.warn_days) || 31;
-        var today = Date.now();
-
         var closeItemRequests = [];
         var closeableMeta = [];
         var still_open = 0;
-        var verify_failed = 0;
-
-        for (var i = 0; i < candidates.length; i++) {
-          var meta = candidates[i] || {};
-          // Double-guard (prep already filtered): a human-owned state must
-          // NEVER be closed.
-          if (meta.item_status !== 'open') { verify_failed++; continue; }
-          var itemId = meta.item_id;
-          var scopeId = meta.scope_id;
-          // Stray items (no scope reference) are filtered out by prep into the
-          // `stray` bucket and never reach here — this is pure defense: a
-          // missing scope_id must NEVER close on lake evidence alone.
-          if (!scopeId) { verify_failed++; continue; }
-
-          var scopeSlot = scopeResults[i];
-          // Absorbed `{}` (network failure after retries) — could not verify.
-          if (!scopeSlot || scopeSlot.status === undefined || scopeSlot.status === null) {
-            verify_failed++; continue;
-          }
-          var st = Number(scopeSlot.status);
-          if (st === 404) {
-            // 404 = scope gone (single-org credential — a genuine absence,
-            // not an org-mismatch mask). Verdict, not an error.
-            closeItemRequests.push(closeReq(itemId));
-            closeableMeta.push({ item_id: itemId, verdict: 'closed_scope_gone', comment_content: 'scope no longer active' });
-            continue;
-          }
-          if (st !== 200) {
-            // 401 / 403 / 5xx: could not verify → skip (never close). Not
-            // retried (failOnHttpError:false); the next DAILY run re-checks.
-            verify_failed++; continue;
-          }
-
-          // 200 — evaluate the LIVE scope state.
-          var scope = scopeSlot.body || {};
-          var ss = String(scope.status || '').toLowerCase();
-          if (ss === 'deleted' || ss === 'stopped') {
-            closeItemRequests.push(closeReq(itemId));
-            closeableMeta.push({ item_id: itemId, verdict: 'closed_scope_gone', comment_content: 'scope no longer active' });
-            continue;
-          }
-
-          // Compliance: current runtime catalog-`ok` AND the newest active
-          // deployment is at least as new as the runtime_patched_at stamp
-          // (or scope.updated_at as a fallback for a manual fix). This is the
-          // ONLY place the real (parsed-timestamp) deployedOk is computed.
-          var rt = ((scope.capabilities || {}).serverless_runtime || {}).id || '';
-          var entry = null;
-          for (var k = 0; k < cat.length; k++) if (cat[k].id === rt) { entry = cat[k]; break; }
-          var configOk = classify(entry, today, warnDays).verdict === 'ok';
-
-          var deploySlot = deployResults[i];
-          // A failed deployments read (absorbed `{}` or {status>=400}) → no
-          // deployments → deployedOk false → still_open (never a false close).
-          var deployments = (deploySlot && deploySlot.body && deploySlot.body.results) || [];
-          var act = null;
-          for (var j = 0; j < deployments.length; j++) {
-            var d = deployments[j];
-            if (d && d.status_in_scope === 'active') {
-              if (!act || Date.parse(d.created_at) > Date.parse(act.created_at)) act = d;
-            }
-          }
-          var patchedAt = meta.runtime_patched_at ? Date.parse(meta.runtime_patched_at) : Date.parse(scope.updated_at);
-          var deployedOk = !!act && Date.parse(act.created_at) >= patchedAt;
-
-          if (configOk && deployedOk) {
-            closeItemRequests.push(closeReq(itemId));
-            closeableMeta.push({ item_id: itemId, verdict: 'closed_compliant', comment_content: 'resolved: active deployment on ' + rt });
+        var stray = 0;
+        var not_open = 0;
+        for (var i = 0; i < rows.length; i++) {
+          var r = rows[i] || {};
+          // Human-owned double-guard (query already filters status='open').
+          if (r.item_status !== 'open') { not_open++; continue; }
+          var scopeId = r.scope_id || '';
+          // Stray item with no scope reference — never closeable on lake
+          // evidence alone (the verdict would say scope_gone, but there is no
+          // scope to have gone). Surface it; never close.
+          if (!scopeId) { stray++; continue; }
+          var verdict = r.verdict;
+          if (verdict === 'close_scope_gone') {
+            closeItemRequests.push(closeReq(r.item_id));
+            closeableMeta.push({ item_id: r.item_id, verdict: 'closed_scope_gone', comment_content: 'scope no longer active' });
+          } else if (verdict === 'close_compliant') {
+            closeItemRequests.push(closeReq(r.item_id));
+            closeableMeta.push({ item_id: r.item_id, verdict: 'closed_compliant', comment_content: 'resolved: active deployment on ' + (r.live_runtime || '') });
           } else {
             still_open++;
           }
         }
-
+        // total_closeable: FULL count before the safety-cap slice — kept
+        // distinct from the dispatched (possibly-truncated) subset so the
+        // summary reports both honestly (mirrors wf-r2-scanner).
+        var total_closeable = closeItemRequests.length;
+        var truncated = closeItemRequests.length > MAX_FANOUT;
+        if (truncated) {
+          log.warn('prep: closeable set exceeds the fan-out safety cap — truncating', {
+            closeable: closeItemRequests.length, cap: MAX_FANOUT, dropped: closeItemRequests.length - MAX_FANOUT
+          });
+          closeItemRequests = closeItemRequests.slice(0, MAX_FANOUT);
+          closeableMeta = closeableMeta.slice(0, MAX_FANOUT);
+        }
         return {
           close_item_requests: closeItemRequests,
           closeable_meta: closeableMeta,
-          verified: candidates.length,
+          total_live_items: rows.length,
+          total_closeable: total_closeable,
           still_open: still_open,
-          verify_failed: verify_failed
+          stray: stray,
+          not_open: not_open,
+          truncated: truncated
         };
 
   # ── Close the confirmed items ─────────────────────────────────────────
-  # forEach over verdicts.close_item_requests. failOnHttpError:true → a >=400
-  # is a per-iteration failure, absorbed as `{}` (parallel mode); zip_closed
-  # detects it by the missing 2xx status → close_failed. NO retry_policy: a
-  # lost-ack close retry re-hits the same item, and a missed close self-heals
-  # next DAILY run (the item stays open and is re-detected) — idempotency +
-  # daily cadence over availability, matching wf-r2-scanner's POST rule.
+  # forEach over prep.close_item_requests. failOnHttpError:true → a >=400 is a
+  # per-iteration failure, absorbed as `{}` (parallel mode); zip_closed detects
+  # it by the missing 2xx status → close_failed. NO retry_policy: a lost-ack
+  # close retry re-hits the same item, and a missed close self-heals next DAILY
+  # run — idempotency + daily cadence over availability.
   - id: close_item
     type: module
     plugin_type: np-api-call
@@ -571,25 +273,25 @@ steps:
       failOnHttpError: true
       path: "/governance/action_item"
     forEach:
-      expression: "${{ steps.verdicts.outputs.close_item_requests }}"
+      expression: "${{ steps.prep.outputs.close_item_requests }}"
       itemVariable: item
       spreadItem: true
       parallel: true
       maxConcurrency: 5
 
   # ── Pair a comment to each item that ACTUALLY closed ──────────────────
-  # Zip verdicts.closeable_meta × close_item results by index (forEach
-  # preserves order). A close absorbed as `{}` (or a non-2xx slot) is a
-  # close_failed and drops its comment — we never comment "scope deleted" on
-  # an item that is still open. Emits the comment POST requests + the counts
-  # of what closed (by verdict). Mirrors wf-r2-scanner's zip_ids.
+  # Zip prep.closeable_meta × close_item results by index (forEach preserves
+  # order). A close absorbed as `{}` (or a non-2xx slot) is a close_failed and
+  # drops its comment — we never comment "scope deleted" on an item that is
+  # still open. Emits the comment POST requests + the counts of what closed
+  # (by verdict). Mirrors wf-r2-scanner's zip_ids.
   - id: zip_closed
     type: module
     plugin_type: code-exec
     name: "Zip Closed Items → Comment Requests"
     metadata: { fanOutPerItem: false }
     inputs:
-      meta: "${{ steps.verdicts.outputs.closeable_meta }}"
+      meta: "${{ steps.prep.outputs.closeable_meta }}"
       close_results: "${{ steps.close_item.outputs.items }}"
     config:
       code: |
@@ -650,29 +352,20 @@ steps:
       maxConcurrency: 5
 
   # ── Summary: counts + index-aligned failure buckets ───────────────────
-  # No silent caps: every failure is attributed by index alignment against
-  # the request array that drove it (forEach preserves order).
+  # No silent caps: every failure is attributed by index alignment against the
+  # request array that drove it (forEach preserves order).
   - id: summary
     type: module
     plugin_type: code-exec
     name: "Build Summary"
     metadata: { fanOutPerItem: false }
-    # Reached either from close_comment (catalog ok, the whole chain ran —
-    # even over zero candidates) or directly from catalog_ok:false (empty
-    # catalog). Exactly one path fires per run.
-    join_strategy: any
     inputs:
-      catalog_ok: "${{ steps.catalog_guard.outputs.ok }}"
-      reason: "${{ steps.catalog_guard.outputs.reason }}"
       total_live_items: "${{ steps.prep.outputs.total_live_items }}"
-      total_candidates: "${{ steps.prep.outputs.total_candidates }}"
-      not_open: "${{ steps.prep.outputs.not_open }}"
-      still_open_prefiltered: "${{ steps.prep.outputs.still_open_prefiltered }}"
+      total_closeable: "${{ steps.prep.outputs.total_closeable }}"
+      still_open: "${{ steps.prep.outputs.still_open }}"
       stray: "${{ steps.prep.outputs.stray }}"
+      not_open: "${{ steps.prep.outputs.not_open }}"
       truncated: "${{ steps.prep.outputs.truncated }}"
-      verified: "${{ steps.verdicts.outputs.verified }}"
-      still_open: "${{ steps.verdicts.outputs.still_open }}"
-      verify_failed: "${{ steps.verdicts.outputs.verify_failed }}"
       closed_scope_gone: "${{ steps.zip_closed.outputs.closed_scope_gone }}"
       closed_compliant: "${{ steps.zip_closed.outputs.closed_compliant }}"
       close_failed: "${{ steps.zip_closed.outputs.close_failed }}"
@@ -682,8 +375,6 @@ steps:
       comment_results: "${{ steps.close_comment.outputs.items }}"
     config:
       code: |
-        var catalogOk = inputs.catalog_ok === true;
-
         // Comments: index-align close_comment results against the requests
         // that drove them. Success is `{status, body}` with a 2xx status; a
         // failure — absorbed `{}` (>=400, POST not retried) or a
@@ -703,25 +394,20 @@ steps:
         }
 
         return {
-          catalog_ok: catalogOk,
-          reason: catalogOk ? null : inputs.reason,
           live_items: Number(inputs.total_live_items) || 0,
-          // candidates: FULL detected count (before any truncation slice);
-          // the verified count may be smaller when truncated is true.
-          candidates: Number(inputs.total_candidates) || 0,
-          verified: Number(inputs.verified) || 0,
-          // not_candidate: live items prep decided NOT to verify (not open, a
-          // still-deprecated runtime on a live scope, or a stray no-scope item).
-          not_candidate: (Number(inputs.not_open) || 0) + (Number(inputs.still_open_prefiltered) || 0) + (Number(inputs.stray) || 0),
-          truncated: inputs.truncated === true,
+          // closeable: FULL detected count (before any truncation slice); the
+          // closed counts may be smaller when truncated is true.
+          closeable: Number(inputs.total_closeable) || 0,
           closed_scope_gone: Number(inputs.closed_scope_gone) || 0,
           closed_compliant: Number(inputs.closed_compliant) || 0,
           still_open: Number(inputs.still_open) || 0,
-          skipped_human: Number(inputs.not_open) || 0,
           // stray: open items with no metadata.scope_id — surfaced for a
           // human, never auto-closed (safety invariant).
           stray: Number(inputs.stray) || 0,
-          verify_failed: Number(inputs.verify_failed) || 0,
+          // skipped_not_open: human-owned states the query already excluded
+          // (defensive double-guard count).
+          skipped_not_open: Number(inputs.not_open) || 0,
+          truncated: inputs.truncated === true,
           close_failed: Number(inputs.close_failed) || 0,
           close_failed_item_ids: inputs.close_failed_item_ids || [],
           comment_failed: comment_failed,
@@ -734,41 +420,28 @@ steps:
     name: "Closer Complete"
     config:
       level: info
-      message: "Runtime lifecycle closer: ${{ steps.summary.outputs.live_items }} live items, ${{ steps.summary.outputs.candidates }} candidates (${{ steps.summary.outputs.not_candidate }} prefiltered not-candidate, ${{ steps.summary.outputs.stray }} stray no-scope), ${{ steps.summary.outputs.verified }} verified — closed (scope gone) ${{ steps.summary.outputs.closed_scope_gone }}, closed (compliant) ${{ steps.summary.outputs.closed_compliant }}, still open ${{ steps.summary.outputs.still_open }}, verify failed ${{ steps.summary.outputs.verify_failed }}. Failures: close ${{ steps.summary.outputs.close_failed }}, comment ${{ steps.summary.outputs.comment_failed }}. (catalog_ok=${{ steps.summary.outputs.catalog_ok }}, reason=${{ steps.summary.outputs.reason }}, truncated=${{ steps.summary.outputs.truncated }})"
+      message: "Runtime lifecycle closer: ${{ steps.summary.outputs.live_items }} live items, ${{ steps.summary.outputs.closeable }} closeable (${{ steps.summary.outputs.still_open }} still open, ${{ steps.summary.outputs.stray }} stray no-scope, ${{ steps.summary.outputs.skipped_not_open }} human-owned) — closed (scope gone) ${{ steps.summary.outputs.closed_scope_gone }}, closed (compliant) ${{ steps.summary.outputs.closed_compliant }}. Failures: close ${{ steps.summary.outputs.close_failed }}, comment ${{ steps.summary.outputs.comment_failed }}. (truncated=${{ steps.summary.outputs.truncated }})"
 
 connections:
-  - { id: c1,  from: start_manual,      to: read_catalog }
-  - { id: c2,  from: start_cron,        to: read_catalog }
-  - { id: c3,  from: read_catalog,      to: catalog_guard }
-  - { id: c4,  from: catalog_guard,     to: catalog_ok }
-  - { id: c5,  from: catalog_ok,        to: lake_candidates,   source_port: "true" }
-  - { id: c6,  from: catalog_ok,        to: summary,           source_port: "false" }
-  - { id: c7,  from: lake_candidates,   to: prep }
-  - { id: c8,  from: prep,              to: fetch_scope }
-  - { id: c9,  from: prep,              to: fetch_deployments }
-  - { id: c10, from: fetch_scope,       to: verdicts }
-  - { id: c11, from: fetch_deployments, to: verdicts }
-  - { id: c12, from: verdicts,          to: close_item }
-  - { id: c13, from: close_item,        to: zip_closed }
-  - { id: c14, from: zip_closed,        to: close_comment }
-  - { id: c15, from: close_comment,     to: summary }
-  - { id: c16, from: summary,           to: log_done }
+  - { id: c1, from: start_manual,    to: lake_candidates }
+  - { id: c2, from: start_cron,      to: lake_candidates }
+  - { id: c3, from: lake_candidates, to: prep }
+  - { id: c4, from: prep,            to: close_item }
+  - { id: c5, from: close_item,      to: zip_closed }
+  - { id: c6, from: zip_closed,      to: close_comment }
+  - { id: c7, from: close_comment,   to: summary }
+  - { id: c8, from: summary,         to: log_done }
 
 outputs:
-  catalog_ok:                "${{ steps.summary.outputs.catalog_ok }}"
-  reason:                    "${{ steps.summary.outputs.reason }}"
   live_items:                "${{ steps.summary.outputs.live_items }}"
-  candidates:                "${{ steps.summary.outputs.candidates }}"
-  verified:                  "${{ steps.summary.outputs.verified }}"
-  not_candidate:             "${{ steps.summary.outputs.not_candidate }}"
+  closeable:                 "${{ steps.summary.outputs.closeable }}"
   closed_scope_gone:         "${{ steps.summary.outputs.closed_scope_gone }}"
   closed_compliant:          "${{ steps.summary.outputs.closed_compliant }}"
   still_open:                "${{ steps.summary.outputs.still_open }}"
-  skipped_human:             "${{ steps.summary.outputs.skipped_human }}"
   stray:                     "${{ steps.summary.outputs.stray }}"
-  verify_failed:             "${{ steps.summary.outputs.verify_failed }}"
+  skipped_not_open:          "${{ steps.summary.outputs.skipped_not_open }}"
+  truncated:                 "${{ steps.summary.outputs.truncated }}"
   close_failed:              "${{ steps.summary.outputs.close_failed }}"
   close_failed_item_ids:     "${{ steps.summary.outputs.close_failed_item_ids }}"
   comment_failed:            "${{ steps.summary.outputs.comment_failed }}"
   comment_failed_item_ids:   "${{ steps.summary.outputs.comment_failed_item_ids }}"
-  truncated:                 "${{ steps.summary.outputs.truncated }}"
