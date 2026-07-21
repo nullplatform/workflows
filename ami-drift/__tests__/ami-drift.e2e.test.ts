@@ -27,10 +27,9 @@ import { describe, expect, it } from 'vitest';
 import { runWorkflowE2E } from '@nullplatform/workflow-kit/test';
 
 const DIR = join(fileURLToPath(import.meta.url), '..', '..');
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const SCANNER = resolve(REPO_ROOT, 'workflows', 'ami-drift', 'wf1-ami-drift-scanner.yaml');
-const ENSURE = resolve(REPO_ROOT, 'workflows', 'ami-drift', 'ensure-drift-action-item.yaml');
-const CLOSER = resolve(REPO_ROOT, 'workflows', 'ami-drift', 'wf2-ami-drift-closer.yaml');
+const SCANNER = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'wf1-ami-drift-scanner.yaml');
+const ENSURE = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'ensure-drift-action-item.yaml');
+const CLOSER = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'wf2-ami-drift-closer.yaml');
 
 async function loadYaml(filename: string): Promise<IWorkflowDefinition> {
   const yaml = await readFile(join(DIR, filename), 'utf8');
