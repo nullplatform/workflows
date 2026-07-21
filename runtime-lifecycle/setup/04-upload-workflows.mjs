@@ -48,8 +48,9 @@ const DRY_RUN = process.argv.includes('--dry-run');
 // Upload order respects the reference graph (callee before caller): the
 // shared progressive-deploy pack (tools, then the orchestrator) first since
 // wf-r4 invokes it as a sub-workflow, then the runtime-lifecycle suite
-// itself in dependency order (wf-r2b before wf-r2, wf-r5b before wf-r5,
-// wf-r4/wf-r5 before wf-r3 which routes events to both).
+// itself in dependency order. Both scanner (wf-r2) and closer (wf-r5) write
+// FLAT now — there are no wf-r2b/wf-r5b sub-workflow children anymore.
+// wf-r4/wf-r5 go before wf-r3, which routes events to both.
 const FILES = [
   { file: '../deploy/tools/deploy-start.yaml', key: 'deploy_start' },
   { file: '../deploy/tools/deploy-status.yaml', key: 'deploy_status' },
@@ -58,10 +59,8 @@ const FILES = [
   { file: '../deploy/tools/deploy-metrics.yaml', key: 'deploy_metrics' },
   { file: '../deploy/tools/item-comment.yaml', key: 'item_comment' },
   { file: '../deploy/progressive-deploy.yaml', key: 'progressive_deploy' },
-  { file: 'wf-r2b-analyze-scope.yaml', key: 'runtime_lifecycle_analyze_scope' },
   { file: 'wf-r1-catalog-sync.yaml', key: 'runtime_catalog_sync' },
   { file: 'wf-r2-scanner.yaml', key: 'runtime_deprecation_scanner' },
-  { file: 'wf-r5b-verify-item.yaml', key: 'runtime_lifecycle_verify_item' },
   { file: 'wf-r5-closer.yaml', key: 'runtime_lifecycle_closer' },
   { file: 'wf-r4-apply.yaml', key: 'runtime_lifecycle_apply' },
   { file: 'wf-r3-events.yaml', key: 'runtime_lifecycle_events' },
@@ -229,9 +228,7 @@ async function main() {
   console.log(
     '\nRepoint reminder: definitions already on an ACTIVE alias (e.g. runtime_catalog_sync) only',
   );
-  console.log(
-    '  need the SAME alias re-activated after this PUT — do not create a second alias.',
-  );
+  console.log('  need the SAME alias re-activated after this PUT — do not create a second alias.');
 }
 
 main().catch((err) => {

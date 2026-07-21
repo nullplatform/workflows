@@ -6,27 +6,24 @@ one-click AI migration suggestions, gates claimed resolutions against the live
 deploy, and auto-closes items once a compliant deploy is active.
 
 Mirror of the [cost right-sizing suite](../cost/README.md)'s proven patterns:
-idempotency, streaming pagination, suggestion UX, prod hard gates, event
-routing. Design doc:
+idempotency, lake-first detection, flat per-item writes, suggestion UX, prod
+hard gates, event routing. Design doc:
 [`docs/superpowers/specs/2026-07-20-lambda-runtime-lifecycle-design.md`](../../docs/superpowers/specs/2026-07-20-lambda-runtime-lifecycle-design.md).
 
 Rollout target: **kwik-e-mart** (org `1255165411`, API key in repo-root `.env`)
 first; **null** (org 4, `.env.null`) later.
 
-## Pieces (planned — see the design doc for the full list)
+## Pieces (see the design doc for the full rationale)
 
 | File | What it is |
 |---|---|
 | `wf-r1-catalog-sync.yaml` | Weekly cron (Sunday): AI-agent scrape of the AWS Lambda runtime support/deprecation docs → validated upsert of the `lambda_runtimes` org metadata catalog |
-| `wf-r2-scanner.yaml` + `wf-r2b-*` | Weekly cron (Monday): streams active `serverless` scopes, classifies each against the catalog, opens/refreshes Engineering action items (label `workflow_type: lambda-runtime`) with an AI migration suggestion |
+| `wf-r2-scanner.yaml` | Weekly cron (Monday): ONE lake query finds active `serverless` scopes on a deprecated/expiring runtime, classifies each against the catalog, and opens/refreshes Engineering action items (label `workflow_type: lambda-runtime`) with a migration suggestion — all via flat per-item `np-api-call` passes (no sub-workflow fan-out; the old `wf-r2b` child is retired) |
 | `wf-r3-events.yaml` | Action-item events for `workflow_type=lambda-runtime`: suggestion accepted → wf-r4; resolved → live-deploy compliance gate; comments → ack + AI answer |
 | `wf-r4-apply.yaml` | Applies an accepted suggestion: patches `capabilities.serverless_runtime.id`, prod hard-gates to apply-only, dev/stage optionally redeploys via the shared `progressive_deploy` sub-workflow |
-| `wf-r5-closer.yaml` + `wf-r5b-*` | Weekly cron (Thursday): closes items whose scope/deploy is now on a supported runtime or whose scope is gone; never touches deferred/pending items |
+| `wf-r5-closer.yaml` | Daily cron (08:00): ONE lake query finds live items whose scope is gone or now on a supported runtime, re-verifies each against the LIVE scope/deploy, and closes + comments the confirmed ones — all via flat per-item `np-api-call` passes (no sub-workflow fan-out; the old `wf-r5b` child is retired); never touches deferred/pending items |
 | `setup/*` | Configuration runbook (below) |
 | `__tests__/*` | `runWorkflowE2E` coverage (catalog validation, classification, idempotency, prod gates, resolve gate, closer) |
-
-The workflow YAMLs themselves are built in later tasks of this plan; this
-directory currently holds the scaffold and the setup runbook.
 
 ## Catalog: `lambda_runtimes` organization metadata
 
@@ -89,4 +86,4 @@ Live state on kwik-e-mart (verified 2026-07-20): spec id
 |---|---|
 | wf-r1 catalog sync | Weekly, Sunday |
 | wf-r2 scanner | Weekly, Monday |
-| wf-r5 closer | Weekly, Thursday |
+| wf-r5 closer | Daily, 08:00 |
