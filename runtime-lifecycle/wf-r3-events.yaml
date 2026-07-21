@@ -11,7 +11,7 @@
 #     the item STAYS resolved. We do NOT reopen: the platform API forbids
 #     reopen from `resolved` (400 "Cannot reopen action item from current
 #     status" — reopen only works from deferred/rejected; live finding on
-#     kwik, 2026-07-21). Instead the DAILY scanner (wf-r2, 07:00) opens a
+#     a demo org, 2026-07-21). Instead the DAILY scanner (wf-r2, 07:00) opens a
 #     NEW action item within 24h while the scope stays non-compliant — the
 #     comment tells the resolver exactly that. (The trigger's onReopened
 #     port is intentionally unwired: audit-derived `reopened` events can

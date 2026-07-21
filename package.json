@@ -1,0 +1,15 @@
+{
+  "name": "nullplatform-workflows",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Production-grade workflow suites for the nullplatform workflow engine — executable documentation: clone, npm install, npx vitest.",
+  "scripts": {
+    "test": "vitest run",
+    "validate": "np-workflow validate */wf*.yaml */*.yaml"
+  },
+  "devDependencies": {
+    "@nullplatform/workflow-kit": "^0.1.0",
+    "vitest": "^2.1.9"
+  }
+}

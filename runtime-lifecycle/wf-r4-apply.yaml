@@ -100,7 +100,7 @@ steps:
   # np-api-call step, that upstream output is `{status, body, headers}` —
   # its RESPONSE headers (e.g. `transfer-encoding: chunked`) then clobber
   # this step's REQUEST headers and undici throws "fetch failed". Live E2E
-  # finding on kwik-e-mart: fetch_scope failed deterministically this way.
+  # finding on a demo org: fetch_scope failed deterministically this way.
   - id: fetch_suggestion
     type: module
     plugin_type: np-api-call
