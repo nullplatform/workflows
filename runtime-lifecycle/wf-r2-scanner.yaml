@@ -1,0 +1,307 @@
+# Lambda Runtime Deprecation Scanner — weekly streaming scan over active
+# serverless scopes.
+#
+# Reads the `lambda_runtimes` org catalog ONCE, then streams every active
+# `serverless` scope (paginated) and dispatches the per-scope analysis
+# sub-workflow (wf-r2b) for each, passing the SAME catalog object to every
+# call. wf-r2b classifies the scope's runtime and ensures an idempotent
+# Engineering action item. This workflow only aggregates: it never talks to
+# the action-item API directly.
+#
+# Streaming-pagination pattern (CLAUDE.md § Workflow Authoring): four
+# explicit nodes — `fetch_scopes` (np-entity-paginated-fetch, mode: stream)
+# → `analyze_scope` (sub-workflow, one call per scope) → `acc_results`
+# (set-variable accumulator into `variables.results`) → `summary` (code-exec
+# reading `variables.results`, never `$items`, since the `:done` envelope is
+# empty).
+#
+# Guard: if the catalog is missing or has zero runtimes, the scan stops
+# before fetching a single scope (catalog-sync must run first).
+#
+# Per-org configuration (config entries on folder /runtime-lifecycle):
+#   NP_API_KEY (secret)         — NP API key
+#   NP_ORGANIZATION_ID (var)    — organization id
+id: runtime_deprecation_scanner
+name: "Runtime Deprecation Scanner"
+description: >
+  Weekly job (Mondays 07:00, also manual) that streams active serverless
+  scopes, classifies each Lambda runtime against the lambda_runtimes
+  catalog, and ensures an Engineering action item per genuine finding via
+  the per-scope analysis sub-workflow.
+path: "/runtime-lifecycle"
+semantic_version: 1.0.0
+
+inputs:
+  force:
+    type: boolean
+    required: false
+    description: >
+      Forwarded to the per-scope analysis sub-workflow: refresh a live item
+      even when its priority already matches the freshly computed one —
+      useful for a manual recalibration re-run.
+
+variables:
+  results:
+    initialValue: []
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Scan Now"
+    config:
+      description: "Streams active serverless scopes and classifies each Lambda runtime against the catalog."
+      inputs:
+        force:
+          type: boolean
+          required: false
+          description: "Refresh live items even when priority already matches (recalibration)"
+
+  - id: start_cron
+    type: trigger
+    plugin_type: cron
+    name: "Weekly Monday 07:00"
+    config:
+      schedule: "0 7 * * 1"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  # ── Read the catalog ONCE, before touching a single scope ─────────────
+  - id: read_catalog
+    type: module
+    plugin_type: np-api-call
+    name: "Read Runtime Catalog"
+    # Reached from either trigger.
+    join_strategy: any
+    # DECLARED inputs: np-api-call's execute() does `cfg = {...config,
+    # ...ctx.inputs}` (inputs override config) — a step with no `inputs:`
+    # map falls back to the predecessor's raw output object as
+    # `ctx.inputs`, which clobbers request fields (e.g. `headers`) when
+    # chained after another np-api-call step (live E2E finding on wf-r4's
+    # fetch_scope). Shielded here too for consistency even though this
+    # step's only predecessors are triggers.
+    inputs:
+      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
+      # 404 (instance never seeded) is a valid "empty catalog" case, not a
+      # hard error — the guard below handles it uniformly.
+      failOnHttpError: false
+
+  - id: catalog_guard
+    type: module
+    plugin_type: code-exec
+    name: "Guard: Catalog Has Runtimes?"
+    # Aggregate step: NEVER dispatch per upstream item (single response).
+    metadata: { fanOutPerItem: false }
+    inputs:
+      status: "${{ steps.read_catalog.outputs.status }}"
+      body: "${{ steps.read_catalog.outputs.body }}"
+    config:
+      code: |
+        var body = inputs.body || {};
+        var runtimes = Array.isArray(body.runtimes) ? body.runtimes : [];
+        if (inputs.status !== 200 || runtimes.length === 0) {
+          return { ok: false, catalog: null, reason: 'empty catalog — run catalog-sync first' };
+        }
+        return { ok: true, catalog: body, reason: null };
+
+  # Deciders run in-sandbox (ports always known) — safe to wire.
+  - id: catalog_ok
+    type: decider
+    plugin_type: conditional
+    name: "Catalog Has Runtimes?"
+    config:
+      expression: "steps.catalog_guard.outputs.ok == true"
+
+  # ── One page per invocation; downstream fans out per scope in that page ─
+  - id: fetch_scopes
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "List Active Serverless Scopes"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: scope
+      filters:
+        nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+        type: serverless
+        status: active
+      limit: 100
+      mode: stream
+
+  # Per-scope analysis: SAME catalog object on every call (read once above).
+  #
+  # Failure isolation (review finding): a persistent child failure (5xx
+  # after retries, a code-exec throw inside wf-r2b) must NOT kill the whole
+  # sweep — without `fallback_step` it propagates as a terminal
+  # WorkflowStepFailedError and every remaining scope AND every later page
+  # never process until next Monday. `analyze_scope_failed` catches it,
+  # stashes an `analysis_failed` verdict, and re-enters the pagination loop
+  # so the sweep continues past the failed scope/page.
+  - id: analyze_scope
+    type: module
+    plugin_type: sub-workflow
+    name: "Analyze Scope"
+    error_handling:
+      fallback_step: analyze_scope_failed
+    config:
+      # PER-ORG id of "Runtime Lifecycle — Analyze Scope"; patched by
+      # setup/04-upload-workflows.mjs on upload.
+      workflowId: runtime_lifecycle_analyze_scope
+      waitForCompletion: true
+    inputs:
+      scope: "${{ $item }}"
+      catalog: "${{ steps.catalog_guard.outputs.catalog }}"
+      force: "${{ workflow.inputs.force }}"
+
+  # Accumulator: appends this page's per-scope outputs into a workflow
+  # variable. Runs once per page (set-variable defaults to executeMode='all').
+  - id: acc_results
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate Scope Results"
+    metadata: { flipPorts: true }
+    config:
+      path: results
+      value: "${{ concat(variables.results, $items) }}"
+
+  # ── failure lane (fallback_step target) ──────────────────────────────────
+  # NOT connected via a normal edge — the engine routes here only via
+  # `error_handling.fallback_step` on `analyze_scope` above (terminal
+  # failure after retries). `steps.fetch_scopes.outputs.items` is still
+  # THIS page's scope list at the moment the fallback fires (fetch_scopes
+  # has not been asked for the next page yet), so it's the best-effort
+  # source for which scopes were in flight — exact per-scope attribution
+  # isn't available (the engine discards the whole batch's aggregated
+  # results on any single item's failure, see workflow-runner.ts fan-out
+  # dispatch). Mirrors wf-r5-closer.yaml's verify_item_failed exactly.
+  - id: analyze_scope_failed
+    type: module
+    plugin_type: code-exec
+    name: "Stash Result: analysis_failed (child failure)"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      error_message: "${{ steps.analyze_scope.error.message }}"
+      error_code: "${{ steps.analyze_scope.error.code }}"
+      page_items: "${{ steps.fetch_scopes.outputs.items }}"
+    config:
+      code: |
+        var items = inputs.page_items || [];
+        var ids = [];
+        for (var i = 0; i < items.length; i++) {
+          var it = items[i] || {};
+          if (it.id) ids.push(it.id);
+        }
+        return {
+          scope_id: null,
+          verdict: 'analysis_failed',
+          priority: null,
+          item_id: null,
+          target_runtime: null,
+          error_code: inputs.error_code || 'UNKNOWN',
+          error_message: String(inputs.error_message || 'analyze_scope failed'),
+          affected_scope_ids: ids
+        };
+
+  # DEDICATED single-predecessor accumulator for the failure lane (CLAUDE.md
+  # § Join strategy: mixing a completed edge and a never-settled edge into
+  # ONE downstream node deadlocks under the default `all` strategy — and
+  # `acc_results` already has its own single edge from `analyze_scope`,
+  # whose stale `items` from a PRIOR successful page would otherwise get
+  # pulled into every subsequent page's accumulation if this shared the
+  # same node). Same accumulator VARIABLE (`variables.results`), separate
+  # NODE.
+  - id: acc_results_failed
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate Scope Results (failure lane)"
+    metadata: { flipPorts: true }
+    config:
+      path: results
+      value: "${{ concat(variables.results, $items) }}"
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Build Summary"
+    # Aggregate step: NEVER dispatch per upstream item.
+    metadata: { fanOutPerItem: false }
+    # Reached either from fetch_scopes:done (catalog ok) or directly from
+    # catalog_ok:false (empty catalog) — exactly one path fires per run.
+    join_strategy: any
+    inputs:
+      results: "${{ variables.results }}"
+      catalog_ok: "${{ steps.catalog_guard.outputs.ok }}"
+      reason: "${{ steps.catalog_guard.outputs.reason }}"
+    config:
+      code: |
+        var results = inputs.results || [];
+        var counts = { ok: 0, unknown_runtime: 0, skipped_existing: 0, priority_bumped: 0, created: 0, analysis_failed: 0, other: 0 };
+        for (var i = 0; i < results.length; i++) {
+          // Live engine wraps each fan-out item as {outputs, _childExecutionId};
+          // the E2E harness stubs return the outputs flat. Accept both.
+          var r = (results[i] || {}).outputs || results[i] || {};
+          var v = String(r.verdict || 'other');
+          if (counts[v] === undefined) v = 'other';
+          counts[v]++;
+        }
+        var catalogOk = inputs.catalog_ok === true;
+        return {
+          catalog_ok: catalogOk,
+          reason: catalogOk ? null : inputs.reason,
+          scopes_scanned: results.length,
+          ok: counts.ok,
+          unknown_runtime: counts.unknown_runtime,
+          skipped_existing: counts.skipped_existing,
+          priority_bumped: counts.priority_bumped,
+          created: counts.created,
+          analysis_failed: counts.analysis_failed,
+          other: counts.other
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Scan Complete"
+    config:
+      level: info
+      message: "Runtime deprecation scan: ${{ steps.summary.outputs.scopes_scanned }} scopes scanned — created ${{ steps.summary.outputs.created }}, priority bumped ${{ steps.summary.outputs.priority_bumped }}, skipped (existing) ${{ steps.summary.outputs.skipped_existing }}, ok ${{ steps.summary.outputs.ok }}, unknown runtime ${{ steps.summary.outputs.unknown_runtime }}, analysis failed ${{ steps.summary.outputs.analysis_failed }}. (catalog_ok=${{ steps.summary.outputs.catalog_ok }}, reason=${{ steps.summary.outputs.reason }})"
+
+connections:
+  - { id: c1,  from: start_manual,  to: read_catalog }
+  - { id: c2,  from: start_cron,    to: read_catalog }
+  - { id: c3,  from: read_catalog,  to: catalog_guard }
+  - { id: c4,  from: catalog_guard, to: catalog_ok }
+  - { id: c5,  from: catalog_ok,    to: fetch_scopes,   source_port: "true" }
+  - { id: c6,  from: catalog_ok,    to: summary,        source_port: "false" }
+  # fetch_scopes streams: `loop` port → analyze_scope (per-page items fan out).
+  - { id: c7,  from: fetch_scopes,  to: analyze_scope,  source_port: loop }
+  - { id: c8,  from: analyze_scope, to: acc_results }
+  # Declared so the graph knows analyze_scope_failed exists / is not an
+  # entry point; permanently false — only ever reached via
+  # error_handling.fallback_step on analyze_scope above (CLAUDE.md §
+  # Deciders/ports convention).
+  - { id: c8f, from: analyze_scope,        to: analyze_scope_failed, condition: "false" }
+  - { id: c8g, from: analyze_scope_failed, to: acc_results_failed }
+  # Failure lane also re-enters fetch_scopes:callback so a page-level
+  # failure doesn't stop later pages from being fetched.
+  - { id: c8h, from: acc_results_failed,   to: fetch_scopes, target_port: callback }
+  # acc_results loops back into fetch_scopes:callback (reentry port) to pull
+  # the next page. The engine soft-resets fetch_scopes' join state on each
+  # reentry-edge settle so it can re-fire.
+  - { id: c9,  from: acc_results,   to: fetch_scopes,   target_port: callback }
+  # When fetch_scopes detects the last page, it activates `done`.
+  - { id: c10, from: fetch_scopes,  to: summary,        source_port: done }
+  - { id: c11, from: summary,       to: log_done }
+
+outputs:
+  catalog_ok:        "${{ steps.summary.outputs.catalog_ok }}"
+  reason:             "${{ steps.summary.outputs.reason }}"
+  scopes_scanned:     "${{ steps.summary.outputs.scopes_scanned }}"
+  ok:                 "${{ steps.summary.outputs.ok }}"
+  unknown_runtime:    "${{ steps.summary.outputs.unknown_runtime }}"
+  analysis_failed:    "${{ steps.summary.outputs.analysis_failed }}"
+  skipped_existing:   "${{ steps.summary.outputs.skipped_existing }}"
+  priority_bumped:    "${{ steps.summary.outputs.priority_bumped }}"
+  created:            "${{ steps.summary.outputs.created }}"
