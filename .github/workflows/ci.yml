@@ -17,12 +17,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: 'https://npm.pkg.github.com'
-          scope: '@nullplatform'
       - name: Install
         run: npm install
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Validate every workflow YAML (production-parity)
         run: npm run validate
       - name: E2E tests (local executor)
