@@ -17,8 +17,7 @@ import { describe, expect, it } from 'vitest';
 
 import { runWorkflowE2E } from '@nullplatform/workflow-kit/test';
 
-const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const WF_PATH = resolve(REPO_ROOT, 'workflows', 'governance', 'validate-jira-epic.yaml');
+const WF_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'validate-jira-epic.yaml');
 
 const TRIGGER_OUTPUTS = {
   kind: 'validate-jira-epic',
