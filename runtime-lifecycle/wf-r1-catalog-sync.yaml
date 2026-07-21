@@ -251,7 +251,8 @@ steps:
             deprecation_date: r.deprecation_date || null,
             block_function_create: r.block_function_create || null,
             block_function_update: r.block_function_update || null,
-            os: r.os || null
+            os: r.os || null,
+            target: r.target === undefined ? null : r.target
           };
         }
         // Add the precomputed `target` to every row. pickTarget needs the
@@ -290,15 +291,19 @@ steps:
         };
 
         // ── Change detection vs the current instance ──────────────────
-        // Deep-equal on runtimes (sorted by id, normalized + re-targeted the
-        // SAME way as the new catalog — the current instance is re-derived
-        // too, so stale/inconsistent historical writes don't cause a false
-        // diff) and source_urls (sorted), IGNORING scraped_at and the counts
-        // — a metadata write should only happen when the catalog content
-        // (including each row's `target`) actually changed.
+        // Deep-equal on runtimes (sorted by id, both sides normalized) and
+        // source_urls (sorted), IGNORING scraped_at and the counts. The
+        // STORED side keeps its stored `target` AS-IS (normalize preserves
+        // it; missing → null) while the new side carries the freshly
+        // computed one — so a catalog that predates targets, or whose
+        // targets went stale as the horizon advanced, correctly reads as
+        // CHANGED and gets rewritten. Re-deriving targets on the stored
+        // side here would mask exactly those diffs (live migration bug,
+        // 2026-07-21: v4's first run read `unchanged` and never wrote
+        // targets).
         function byId(a, b) { return String(a.id).localeCompare(String(b.id)); }
         var currentOk = inputs.current_status === 200 && inputs.current && Array.isArray(inputs.current.runtimes);
-        var curRuntimes = currentOk ? withTargets(inputs.current.runtimes.map(normalizeRuntime)).slice().sort(byId) : [];
+        var curRuntimes = currentOk ? inputs.current.runtimes.map(normalizeRuntime).slice().sort(byId) : [];
         var newRuntimes = normalizedRts.slice().sort(byId);
         var curUrls = currentOk ? (inputs.current.source_urls || []).slice().sort() : [];
         var newUrls = (out.catalog.source_urls || []).slice().sort();
