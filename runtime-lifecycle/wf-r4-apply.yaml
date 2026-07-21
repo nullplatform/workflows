@@ -5,7 +5,8 @@
 # lambda_runtimes catalog, re-validates the target against the catalog
 # (it may have gone stale since the suggestion was created), patches the
 # scope's serverless runtime, stamps the action item with
-# `runtime_patched_at` (used by the wf-r5b compliance gate), and — outside
+# `runtime_patched_at` (used by wf-r5's verdicts compliance gate and
+# wf-r3's resolve gate), and — outside
 # production, and only when the accept-form asked for it — kicks off a
 # real deploy via the shared `progressive_deploy` sub-workflow.
 #
