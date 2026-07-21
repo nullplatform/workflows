@@ -1,0 +1,799 @@
+# Runtime Lifecycle — Apply an accepted migration suggestion.
+#
+# Started by the (not-yet-built) events router on suggestion accept
+# (fire-and-forget). Loads the item + suggestion + scope + the LIVE
+# lambda_runtimes catalog, re-validates the target against the catalog
+# (it may have gone stale since the suggestion was created), patches the
+# scope's serverless runtime, stamps the action item with
+# `runtime_patched_at` (used by the wf-r5b compliance gate), and — outside
+# production, and only when the accept-form asked for it — kicks off a
+# real deploy via the shared `progressive_deploy` sub-workflow.
+#
+# v1 scope (deliberately simple): no rightsizing-command-style comment
+# channel. `scheduled` timing waits once for `deploy_at` (an ISO
+# timestamp) via a single signal-wait with `onTimeout: continue`; an
+# empty or past `deploy_at` is treated as deploy-now. `deploy-now` /
+# `next-deploy` / `apply-only` never wait.
+#
+# Production hard gate (enforced in compute_plan, not just the accept
+# form): production scopes ALWAYS resolve to apply-only regardless of
+# what user_metadata says — the runtime config is patched but no deploy
+# is ever triggered automatically.
+#
+# Item metadata merge note: `np-action-item-update`'s patch mode forwards
+# `metadata` to the API as-is (see plugin.ts — no local merge), so the
+# runtime_patched_at stamp is a fetch-merge-write: existing
+# `steps.fetch_item.outputs.actionItem.metadata` is cloned and the new key
+# added, never replacing the item's other metadata.
+id: runtime_lifecycle_apply
+name: "Runtime Lifecycle — Apply"
+description: >
+  Applies an accepted Lambda runtime migration suggestion: re-validates
+  the target against the live catalog, patches the scope's
+  serverless_runtime, stamps runtime_patched_at on the item, and
+  optionally deploys (never in production).
+path: "/runtime-lifecycle"
+semantic_version: 1.0.0
+
+inputs:
+  action_item_id:
+    type: string
+    required: true
+    description: "Action item whose suggestion was accepted"
+  suggestion_id:
+    type: string
+    required: true
+    description: "Accepted suggestion id"
+
+variables:
+  wait_seconds: { initialValue: 0 }
+  result:
+    initialValue:
+      status: "pending"
+      deployment_id: null
+      from_runtime: null
+      to_runtime: null
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Apply"
+    config:
+      description: "Applies an accepted runtime-lifecycle migration suggestion (normally started by the events router)."
+      inputs:
+        action_item_id:
+          type: string
+          required: true
+        suggestion_id:
+          type: string
+          required: true
+
+  # ── Load item + suggestion + scope + LIVE catalog ───────────────────────
+  # Every fetch step below routes failure to its OWN dedicated
+  # resolve_fetch_*_failure node (see the shape note further down — a
+  # SHARED resolve node across multiple fallback_step sources can never
+  # become ready) so a pre-compute failure marks the suggestion failed and
+  # comments on the item instead of leaving it stuck in 'approved' with no
+  # human-visible feedback.
+  - id: fetch_item
+    type: module
+    plugin_type: np-action-item-get
+    name: "Get Action Item"
+    error_handling:
+      fallback_step: resolve_fetch_item_failure
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+
+  # DECLARED inputs on every np-api-call step below, even ones with no
+  # per-call data need: np-api-call's execute() does
+  # `cfg = {...config, ...ctx.inputs}` (inputs OVERRIDE config), and when a
+  # step declares no `inputs:` map the engine falls back to passing the
+  # single upstream predecessor's raw output object through as `ctx.inputs`
+  # (workflow-runner.ts `hasExplicitInputs`). Chained after another
+  # np-api-call step, that upstream output is `{status, body, headers}` —
+  # its RESPONSE headers (e.g. `transfer-encoding: chunked`) then clobber
+  # this step's REQUEST headers and undici throws "fetch failed". Live E2E
+  # finding on kwik-e-mart: fetch_scope failed deterministically this way.
+  - id: fetch_suggestion
+    type: module
+    plugin_type: np-api-call
+    name: "Get Suggestion"
+    error_handling:
+      fallback_step: resolve_fetch_suggestion_failure
+    inputs:
+      action_item_id: "${{ workflow.inputs.action_item_id }}"
+      suggestion_id: "${{ workflow.inputs.suggestion_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/governance/action_item/${{ inputs.action_item_id }}/suggestions/${{ inputs.suggestion_id }}"
+
+  - id: fetch_scope
+    type: module
+    plugin_type: np-api-call
+    name: "Get Scope"
+    error_handling:
+      fallback_step: resolve_fetch_scope_failure
+    inputs:
+      # np-action-item-get's real output shape is {actionItem, status} (see
+      # np-action-item-get/plugin.ts) — NOT {body}, that shape belongs to
+      # np-api-call. Verified against the plugin source, not assumed.
+      scope_id: "${{ steps.fetch_item.outputs.actionItem.metadata.scope_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/scope/${{ inputs.scope_id }}"
+
+  # LIVE catalog — the target must still be `supported` at apply time; it
+  # may have deprecated further since the suggestion was created.
+  - id: fetch_catalog
+    type: module
+    plugin_type: np-api-call
+    name: "Get Live Runtime Catalog"
+    error_handling:
+      fallback_step: resolve_fetch_catalog_failure
+    inputs:
+      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
+
+  # ── Compute the plan (pure function of item + suggestion + scope + catalog) ──
+  # Throws when the target is no longer supported per the live catalog or
+  # the scope is already on the target — both routed to resolve_failure
+  # via error_handling.fallback_step below (no scope PATCH happens).
+  - id: compute_plan
+    type: module
+    plugin_type: code-exec
+    name: "Compute Patch Plan"
+    error_handling:
+      fallback_step: resolve_failure
+    inputs:
+      item: "${{ steps.fetch_item.outputs.actionItem }}"
+      suggestion: "${{ steps.fetch_suggestion.outputs.body }}"
+      scope: "${{ steps.fetch_scope.outputs.body }}"
+      catalog: "${{ steps.fetch_catalog.outputs.body }}"
+    config:
+      code: |
+        var item = inputs.item || {};
+        var sug = inputs.suggestion || {};
+        var meta = item.metadata || {};
+        var smeta = sug.metadata || {};
+        var cat = (inputs.catalog || {}).runtimes || [];
+        var scope = inputs.scope || {};
+        var caps = scope.capabilities || {};
+        var current = ((caps.serverless_runtime) || {}).id || '';
+        var target = String(smeta.to_runtime || meta.target_runtime || '');
+        var timing = String((sug.user_metadata || {}).deploy_timing || 'next-deploy');
+        var envProd = String(meta.environment || '').toLowerCase() === 'production';
+        // production hard gate — server-side, regardless of what the form says
+        if (envProd && timing !== 'apply-only') { log.warn('prod scope: forcing apply-only (was ' + timing + ')'); timing = 'apply-only'; }
+        // target must still be supported per the live catalog
+        var entry = null;
+        for (var i = 0; i < cat.length; i++) if (cat[i].id === target) { entry = cat[i]; break; }
+        if (!entry || entry.status !== 'supported') throw new Error('target runtime ' + target + ' is not supported per current catalog — rerun the scanner');
+        if (current === target) throw new Error('scope already on ' + target + ' — nothing to apply');
+        var srt = {};
+        for (var k in caps.serverless_runtime) srt[k] = caps.serverless_runtime[k];
+        srt.id = target;
+        return {
+          patch_body: { capabilities: { serverless_runtime: srt } },
+          timing: timing, do_deploy: !envProd && (timing === 'deploy-now' || timing === 'scheduled'),
+          deploy_at: String((sug.user_metadata || {}).deploy_at || ''),
+          scope_id: String(meta.scope_id || scope.id), from_runtime: current, to_runtime: target
+        };
+
+  # ── Patch the scope's serverless runtime ────────────────────────────────
+  - id: patch_scope
+    type: module
+    plugin_type: np-api-call
+    name: "Patch Scope Runtime"
+    inputs:
+      # patch_body is the FULL serverless_runtime object with only `id`
+      # swapped — declared as an input (shield pattern) so np-api-call
+      # never inlines a raw `steps.*` reference into a fan-out body.
+      payload: "${{ steps.compute_plan.outputs.patch_body }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/scope/${{ steps.compute_plan.outputs.scope_id }}"
+      failOnHttpError: false
+      body: "${{ inputs.payload }}"
+
+  - id: check_patch
+    type: module
+    plugin_type: code-exec
+    name: "Interpret Patch Result"
+    inputs:
+      status: "${{ steps.patch_scope.outputs.status }}"
+      body: "${{ steps.patch_scope.outputs.body }}"
+    config:
+      code: |
+        var st = Number(inputs.status) || 0;
+        if (st >= 200 && st < 300) return { ok: true, reason: '' };
+        var msg = String(((inputs.body || {}).message) || JSON.stringify(inputs.body || {})).slice(0, 400);
+        var kind = /approval|policy|checklist|not allowed|forbidden|denied/i.test(msg) || st === 403
+          ? 'blocked by an approval/policy/checklist gate' : 'rejected by the platform';
+        return { ok: false, reason: kind + ' — HTTP ' + st + ': ' + msg };
+
+  - id: patch_ok
+    type: decider
+    plugin_type: conditional
+    name: "Patch Applied?"
+    config:
+      expression: "steps.check_patch.outputs.ok == true"
+
+  # ── Patch blocked: narrate + mark the suggestion failed (no stamping) ───
+  - id: comment_patch_blocked
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Patch Blocked"
+    inputs:
+      reason: "${{ steps.check_patch.outputs.reason }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "🚫 Could not update the scope's runtime configuration: ${{ inputs.reason }}. Nothing was changed; resolve the gate and accept again."
+
+  - id: mark_failed_patch_blocked
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Failed (patch blocked)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      reason: "${{ steps.check_patch.outputs.reason }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      executionResult:
+        success: false
+        message: "Scope patch was blocked — see the item comments."
+        details:
+          reason: "${{ inputs.reason }}"
+
+  - id: stash_patch_blocked
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: blocked"
+    inputs:
+      fr: "${{ steps.compute_plan.outputs.from_runtime }}"
+      tr: "${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      path: result
+      value:
+        status: "blocked"
+        deployment_id: null
+        from_runtime: "${{ inputs.fr }}"
+        to_runtime: "${{ inputs.tr }}"
+
+  # ── Patch applied: stamp the item, then decide apply-only vs deploy ─────
+  - id: stamp_metadata
+    type: module
+    plugin_type: code-exec
+    name: "Build Patched Item Metadata (merge, don't clobber)"
+    inputs:
+      existing: "${{ steps.fetch_item.outputs.actionItem.metadata }}"
+    config:
+      code: |
+        var merged = {};
+        var existing = inputs.existing || {};
+        for (var k in existing) merged[k] = existing[k];
+        merged.runtime_patched_at = new Date().toISOString();
+        return { metadata: merged };
+
+  - id: patch_item_metadata
+    type: module
+    plugin_type: np-action-item-update
+    name: "Stamp runtime_patched_at on Item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      metadata: "${{ steps.stamp_metadata.outputs.metadata }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      metadata: "${{ inputs.metadata }}"
+
+  - id: build_narration
+    type: module
+    plugin_type: code-exec
+    name: "Build Comment Narration"
+    inputs:
+      from_runtime: "${{ steps.compute_plan.outputs.from_runtime }}"
+      to_runtime: "${{ steps.compute_plan.outputs.to_runtime }}"
+      env: "${{ steps.fetch_item.outputs.actionItem.metadata.environment }}"
+    config:
+      code: |
+        var envProd = String(inputs.env || '').toLowerCase() === 'production';
+        var fr = inputs.from_runtime;
+        var tr = inputs.to_runtime;
+        var applyOnlyNote = envProd
+          ? 'Production policy: runtime changes never trigger an automatic deploy here — applied the configuration only (apply-only); it ships with the next regular deployment.'
+          : 'Applied the runtime configuration change (apply-only) — no deploy was triggered; it ships with your next regular deployment.';
+        return {
+          apply_only_comment: 'Migrated runtime configuration ' + fr + ' → ' + tr + '. ' + applyOnlyNote,
+          deploying_comment: 'Deploy window reached — patching runtime ' + fr + ' → ' + tr + ' already applied; starting the deployment.'
+        };
+
+  - id: do_deploy
+    type: decider
+    plugin_type: conditional
+    name: "Deploy Now?"
+    config:
+      expression: "steps.compute_plan.outputs.do_deploy == true"
+
+  # ── Apply-only: item stays open, no deploy ──────────────────────────────
+  - id: comment_apply_only
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Applied (no deploy)"
+    inputs:
+      text: "${{ steps.build_narration.outputs.apply_only_comment }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "${{ inputs.text }}"
+
+  - id: mark_applied_only
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Applied (no deploy)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      fr: "${{ steps.compute_plan.outputs.from_runtime }}"
+      tr: "${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-applied
+      executionResult:
+        success: true
+        message: "Runtime configuration patched (apply-only); deploy left to the scope owner."
+        details:
+          from_runtime: "${{ inputs.fr }}"
+          to_runtime: "${{ inputs.tr }}"
+          deployed: false
+
+  - id: stash_applied_only
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: applied-no-deploy"
+    inputs:
+      fr: "${{ steps.compute_plan.outputs.from_runtime }}"
+      tr: "${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      path: result
+      value:
+        status: "applied-no-deploy"
+        deployment_id: null
+        from_runtime: "${{ inputs.fr }}"
+        to_runtime: "${{ inputs.tr }}"
+
+  # ── Deploy path: wait for deploy_at (if any) then run progressive_deploy ─
+  - id: compute_wait
+    type: module
+    plugin_type: code-exec
+    name: "Compute Wait Until deploy_at"
+    inputs:
+      deploy_at: "${{ steps.compute_plan.outputs.deploy_at }}"
+    config:
+      code: |
+        // Empty or unparseable or already-past deploy_at → deploy now
+        // (wait_seconds 0). Only a genuinely future ISO timestamp waits.
+        var deployAt = String(inputs.deploy_at || '').trim();
+        var waitSeconds = 0;
+        if (deployAt) {
+          var t = Date.parse(deployAt);
+          if (!isNaN(t)) {
+            var delta = Math.floor((t - Date.now()) / 1000);
+            if (delta > 0) waitSeconds = delta;
+          }
+        }
+        return { wait_seconds: waitSeconds };
+
+  - id: stash_wait
+    type: module
+    plugin_type: set-variable
+    name: "Arm Wait Timer"
+    inputs:
+      seconds: "${{ steps.compute_wait.outputs.wait_seconds }}"
+    config:
+      path: wait_seconds
+      value: "${{ inputs.seconds }}"
+
+  - id: needs_wait
+    type: decider
+    plugin_type: conditional
+    name: "Wait for deploy_at?"
+    config:
+      expression: "variables.wait_seconds > 0"
+
+  - id: wait_deploy
+    type: module
+    plugin_type: signal-wait
+    name: "Wait for deploy_at"
+    config:
+      signalName: runtime-apply-command
+      correlationKey: "runtime-apply:${{ workflow.inputs.action_item_id }}"
+      timeout: "${{ variables.wait_seconds }}s"
+      # Timeout = deploy_at reached. `continue` keeps everything on the
+      # default port (a MODULE's non-default port on a connection breaks
+      # in-sandbox re-validation on the Temporal worker).
+      onTimeout: continue
+
+  - id: comment_deploying
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Deploying"
+    # Both the immediate branch (needs_wait=false) and the post-wait
+    # branch (wait_deploy) land here — only ever ONE per run.
+    join_strategy: any
+    inputs:
+      text: "${{ steps.build_narration.outputs.deploying_comment }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "${{ inputs.text }}"
+
+  # The narrated progressive blue-green deploy (shared with the cost
+  # suite): creates a real deployment, moves traffic in steps with
+  # telemetry checks, comments every step, finalizes or rolls back.
+  # Returns {status, deployment_id, detail}.
+  - id: run_progressive
+    type: module
+    plugin_type: sub-workflow
+    name: "Progressive Deploy"
+    inputs:
+      scope_id: "${{ steps.compute_plan.outputs.scope_id }}"
+      action_item_id: "${{ workflow.inputs.action_item_id }}"
+      description: "Runtime migration: ${{ steps.compute_plan.outputs.from_runtime }} → ${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      # PER-ORG id of "Progressive Deploy (narrated)"; patched by
+      # setup/04-upload-workflows.mjs on upload.
+      workflowId: progressive_deploy
+      waitForCompletion: true
+
+  - id: read_outcome
+    type: module
+    plugin_type: code-exec
+    name: "Read Deploy Outcome"
+    inputs:
+      raw: "${{ steps.run_progressive.outputs }}"
+    config:
+      code: |
+        var r = inputs.raw || {};
+        // Live engine may nest child outputs under `outputs` — accept both.
+        var o = r.outputs || r;
+        return {
+          status: String(o.status || 'failed'),
+          deployment_id: o.deployment_id || null,
+          detail: String(o.detail || '')
+        };
+
+  - id: prog_deployed
+    type: decider
+    plugin_type: conditional
+    name: "Deploy Finalized?"
+    config:
+      expression: "steps.read_outcome.outputs.status == 'deployed'"
+
+  # ── Deploy success ───────────────────────────────────────────────────────
+  - id: comment_success
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Deploy Finalized"
+    inputs:
+      did: "${{ steps.read_outcome.outputs.deployment_id }}"
+      fr: "${{ steps.compute_plan.outputs.from_runtime }}"
+      tr: "${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "Runtime ${{ inputs.fr }} → ${{ inputs.tr }} is live on deployment ${{ inputs.did }}."
+
+  - id: mark_applied_deploy
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Applied (deployed)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      did: "${{ steps.read_outcome.outputs.deployment_id }}"
+      fr: "${{ steps.compute_plan.outputs.from_runtime }}"
+      tr: "${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-applied
+      executionResult:
+        success: true
+        message: "Runtime patched and deploy finalized."
+        details:
+          from_runtime: "${{ inputs.fr }}"
+          to_runtime: "${{ inputs.tr }}"
+          deployed: true
+          deployment_id: "${{ inputs.did }}"
+
+  - id: stash_deployed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: deployed"
+    inputs:
+      did: "${{ steps.read_outcome.outputs.deployment_id }}"
+      fr: "${{ steps.compute_plan.outputs.from_runtime }}"
+      tr: "${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      path: result
+      value:
+        status: "deployed"
+        deployment_id: "${{ inputs.did }}"
+        from_runtime: "${{ inputs.fr }}"
+        to_runtime: "${{ inputs.tr }}"
+
+  # ── Deploy failure (progressive deploy already narrated the details) ────
+  - id: mark_failed_deploy
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Failed (deploy)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      did: "${{ steps.read_outcome.outputs.deployment_id }}"
+      detail: "${{ steps.read_outcome.outputs.detail }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      executionResult:
+        success: false
+        message: "Deploy did not complete — see the item comments for the step-by-step narration."
+        details:
+          deployment_id: "${{ inputs.did }}"
+          detail: "${{ inputs.detail }}"
+
+  - id: stash_deploy_failed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: deploy-failed"
+    inputs:
+      fr: "${{ steps.compute_plan.outputs.from_runtime }}"
+      tr: "${{ steps.compute_plan.outputs.to_runtime }}"
+    config:
+      path: result
+      value:
+        status: "deploy-failed"
+        deployment_id: null
+        from_runtime: "${{ inputs.fr }}"
+        to_runtime: "${{ inputs.tr }}"
+
+  # ── compute_plan failure (target unsupported / already on target) ───────
+  # NOT connected via a normal edge — the engine routes to this step via
+  # `error_handling.fallback_step` on compute_plan. Single predecessor
+  # (the declared, permanently-false edge below) so this can never mix a
+  # COMPLETED and a FAILED edge into one join.
+  - id: resolve_failure
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Plan Failed"
+    inputs:
+      errmsg: "${{ steps.compute_plan.error.message }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "🚫 Could not compute a migration plan: ${{ inputs.errmsg }}"
+
+  # ── fetch_* failure (item/suggestion/scope/catalog lookup) ──────────────
+  # FOUR dedicated single-predecessor resolve nodes, one per fetch step —
+  # NOT one shared node. A shared node fed by multiple fallback_step
+  # sources cannot ever become ready: the engine's fallback dispatch marks
+  # ONLY the actually-failed edge settled and then asks the join
+  # coordinator to evaluate the target (workflow-runner.ts, the
+  # `errorHandling.fallbackStep` branch) — with the default `all` strategy
+  # the other 3 declared-but-never-exercised edges stay unsettled forever,
+  # and `any` explicitly excludes FAILED edges from satisfying it (see the
+  # CLAUDE.md join-strategy notes) — so NEITHER strategy is ever ready.
+  # Confirmed empirically: a shared node here never fired in a live debug
+  # run. Each of these four has exactly one declared, permanently-false
+  # incoming edge, so the default `all` join trivially reads "ready" the
+  # moment that one edge settles — same shape as resolve_failure above.
+  - id: resolve_fetch_item_failure
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Fetch Item Failed"
+    inputs:
+      errmsg: "${{ steps.fetch_item.error.message }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "🚫 Could not load the action item needed to plan this migration: ${{ inputs.errmsg }}"
+
+  - id: resolve_fetch_suggestion_failure
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Fetch Suggestion Failed"
+    inputs:
+      errmsg: "${{ steps.fetch_suggestion.error.message }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "🚫 Could not load the suggestion needed to plan this migration: ${{ inputs.errmsg }}"
+
+  - id: resolve_fetch_scope_failure
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Fetch Scope Failed"
+    inputs:
+      errmsg: "${{ steps.fetch_scope.error.message }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "🚫 Could not load the scope needed to plan this migration: ${{ inputs.errmsg }}"
+
+  - id: resolve_fetch_catalog_failure
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Fetch Catalog Failed"
+    inputs:
+      errmsg: "${{ steps.fetch_catalog.error.message }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:runtime-lifecycle-applier"
+      content: "🚫 Could not load the runtime catalog needed to plan this migration: ${{ inputs.errmsg }}"
+
+  - id: mark_suggestion_failed
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Failed (plan)"
+    # Reached from resolve_failure (compute_plan) or any ONE of the four
+    # resolve_fetch_*_failure nodes — by the time these edges fire they are
+    # ordinary COMPLETED edges (the resolve node itself always finishes
+    # successfully), so `any` here is the same "one of N mutually
+    # exclusive predecessors" shape as `summary` below, not the
+    # never-ready shared-FAILED-node problem described above.
+    join_strategy: any
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      # Null-safe member access (expression/evaluator.ts): a step that
+      # never ran is simply absent from `steps.*`, so this OR-chain is
+      # safe — at most one of the five ever has `.error.message` set.
+      errmsg: "${{ steps.compute_plan.error.message || steps.fetch_item.error.message || steps.fetch_suggestion.error.message || steps.fetch_scope.error.message || steps.fetch_catalog.error.message || 'unknown error computing the migration plan' }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      executionResult:
+        success: false
+        message: "${{ inputs.errmsg }}"
+        details:
+          error: "${{ inputs.errmsg }}"
+
+  - id: stash_compute_failed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Outcome: failed"
+    config:
+      path: result
+      value:
+        status: "failed"
+        deployment_id: null
+        from_runtime: null
+        to_runtime: null
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Build Summary"
+    join_strategy: any
+    inputs:
+      data: "${{ variables.result }}"
+    config:
+      code: |
+        return inputs.data;
+
+connections:
+  - { id: c1,  from: start,                     to: fetch_item }
+  - { id: c2,  from: fetch_item,                to: fetch_suggestion }
+  - { id: c3,  from: fetch_suggestion,          to: fetch_scope }
+  - { id: c4,  from: fetch_scope,               to: fetch_catalog }
+  - { id: c5,  from: fetch_catalog,             to: compute_plan }
+  - { id: c6,  from: compute_plan,              to: patch_scope }
+  # Declared so the graph knows resolve_failure exists / is not an entry
+  # point; permanently false — only ever reached via fallback_step.
+  - { id: c6f, from: compute_plan,              to: resolve_failure,   condition: "false" }
+  # Same for the fetch lane: one declared, permanently-false edge per
+  # fetch_* step's error_handling.fallback_step — a DEDICATED node per
+  # step (never a shared one; see the note above resolve_fetch_item_failure).
+  - { id: c0a, from: fetch_item,                to: resolve_fetch_item_failure,       condition: "false" }
+  - { id: c0b, from: fetch_suggestion,          to: resolve_fetch_suggestion_failure, condition: "false" }
+  - { id: c0c, from: fetch_scope,               to: resolve_fetch_scope_failure,      condition: "false" }
+  - { id: c0d, from: fetch_catalog,             to: resolve_fetch_catalog_failure,    condition: "false" }
+  - { id: c7,  from: patch_scope,               to: check_patch }
+  - { id: c8,  from: check_patch,               to: patch_ok }
+  - { id: c9,  from: patch_ok,                  to: comment_patch_blocked, source_port: "false" }
+  - { id: c10, from: comment_patch_blocked,     to: mark_failed_patch_blocked }
+  - { id: c11, from: mark_failed_patch_blocked, to: stash_patch_blocked }
+  - { id: c12, from: stash_patch_blocked,       to: summary }
+  - { id: c13, from: patch_ok,                  to: stamp_metadata,    source_port: "true" }
+  - { id: c14, from: stamp_metadata,            to: patch_item_metadata }
+  - { id: c15, from: patch_item_metadata,       to: build_narration }
+  - { id: c16, from: build_narration,           to: do_deploy }
+  - { id: c17, from: do_deploy,                 to: comment_apply_only, source_port: "false" }
+  - { id: c18, from: comment_apply_only,        to: mark_applied_only }
+  - { id: c19, from: mark_applied_only,         to: stash_applied_only }
+  - { id: c20, from: stash_applied_only,        to: summary }
+  - { id: c21, from: do_deploy,                 to: compute_wait,      source_port: "true" }
+  - { id: c22, from: compute_wait,              to: stash_wait }
+  - { id: c23, from: stash_wait,                to: needs_wait }
+  - { id: c24, from: needs_wait,                to: wait_deploy,       source_port: "true" }
+  - { id: c25, from: needs_wait,                to: comment_deploying, source_port: "false" }
+  - { id: c26, from: wait_deploy,               to: comment_deploying }
+  - { id: c27, from: comment_deploying,         to: run_progressive }
+  - { id: c28, from: run_progressive,           to: read_outcome }
+  - { id: c29, from: read_outcome,              to: prog_deployed }
+  - { id: c30, from: prog_deployed,             to: comment_success,   source_port: "true" }
+  - { id: c31, from: comment_success,           to: mark_applied_deploy }
+  - { id: c32, from: mark_applied_deploy,       to: stash_deployed }
+  - { id: c33, from: stash_deployed,            to: summary }
+  - { id: c34, from: prog_deployed,             to: mark_failed_deploy, source_port: "false" }
+  - { id: c35, from: mark_failed_deploy,        to: stash_deploy_failed }
+  - { id: c36, from: stash_deploy_failed,       to: summary }
+  - { id: c37, from: resolve_failure,                    to: mark_suggestion_failed }
+  - { id: c37b, from: resolve_fetch_item_failure,        to: mark_suggestion_failed }
+  - { id: c37c, from: resolve_fetch_suggestion_failure,  to: mark_suggestion_failed }
+  - { id: c37d, from: resolve_fetch_scope_failure,       to: mark_suggestion_failed }
+  - { id: c37e, from: resolve_fetch_catalog_failure,     to: mark_suggestion_failed }
+  - { id: c38, from: mark_suggestion_failed,    to: stash_compute_failed }
+  - { id: c39, from: stash_compute_failed,      to: summary }
+
+outputs:
+  status: "${{ steps.summary.outputs.status }}"
+  deployment_id: "${{ steps.summary.outputs.deployment_id }}"
+  from_runtime: "${{ steps.summary.outputs.from_runtime }}"
+  to_runtime: "${{ steps.summary.outputs.to_runtime }}"
+  action_item_id: "${{ workflow.inputs.action_item_id }}"
+  suggestion_id: "${{ workflow.inputs.suggestion_id }}"

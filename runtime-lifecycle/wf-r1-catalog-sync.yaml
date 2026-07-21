@@ -1,0 +1,438 @@
+# Weekly AWS Lambda runtime catalog sync.
+#
+# Scrapes the AWS Lambda runtime support/deprecation tables (agent fetch +
+# extract), validates the result strictly, diffs it against the current
+# `lambda_runtimes` org metadata instance, and PATCHes only when the catalog
+# actually changed (keeps the metadata row's updated_at — and the lake
+# history built on it — meaningful). A scrape that fails validation raises a
+# find-or-comment-or-create alert action item instead of writing bad data.
+#
+# Lake-format contract: catalog `runtimes[].id` MUST be the verbatim AWS
+# runtime identifier (e.g. "nodejs20.x", not "Node.js 20") — the lake joins
+# core_entities_scope.capabilities.serverless_runtime.id against this table
+# on equal strings. `validate` enforces the id shape.
+#
+# Per-org configuration (config entries on folder /runtime-lifecycle):
+#   NP_API_KEY (secret)                    — NP API key
+#   NP_ORGANIZATION_ID (var)               — organization id
+#   RUNTIME_LIFECYCLE_CATEGORY_SLUG (var)  — action item category slug (engineering)
+id: runtime_catalog_sync
+name: "Runtime Lifecycle — Catalog Sync"
+description: >
+  Weekly (Sun 06:00, also manual): scrapes the AWS Lambda runtime
+  support/deprecation catalog, validates it, and upserts the org's
+  `lambda_runtimes` metadata instance only when the catalog changed.
+  Bad scrapes raise an alert action item instead of writing.
+path: "/runtime-lifecycle"
+semantic_version: 1.0.0
+
+inputs:
+  dry_run:
+    type: boolean
+    required: false
+    description: "Report what would change without writing the metadata instance."
+
+variables:
+  result: { initialValue: { applied: false, supported_count: null, deprecated_count: null, reason: "" } }
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Sync Now"
+    config:
+      description: "Scrapes the AWS Lambda runtime catalog and syncs the org metadata instance."
+      inputs:
+        dry_run:
+          type: boolean
+          required: false
+          description: "Report what would change without writing"
+
+  - id: start_cron
+    type: trigger
+    plugin_type: cron
+    name: "Weekly Sync"
+    config:
+      schedule: "0 6 * * 0"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  - id: scrape
+    type: module
+    plugin_type: claude-code-agent
+    name: "Scrape AWS Runtime Tables"
+    # Reached from either trigger.
+    join_strategy: any
+    # DECLARED inputs, mandatory: prompts below reference `inputs.*`, never
+    # `steps.*` (steps.* templates resolve activity-side as the literal
+    # string "undefined" in this plugin's config — see CLAUDE.md).
+    inputs:
+      primary_url: "https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtimes.html"
+      policy_url: "https://docs.aws.amazon.com/lambda/latest/dg/runtime-support-policy.html"
+    config:
+      # Deny-all egress by default (spec §"Sandboxed" in the plugin
+      # descriptor) — the fetch targets must be explicitly allowlisted.
+      allowedHosts:
+        - docs.aws.amazon.com
+      systemPrompt: |
+        You fetch AWS documentation pages and extract structured data.
+        Return ONLY the JSON object requested by the user prompt — no prose,
+        no markdown code fences, no commentary before or after it.
+      userPrompt: |
+        Fetch ${{ inputs.primary_url }} and ${{ inputs.policy_url }}. If those pages
+        link to another AWS docs page that contains runtime deprecation schedules
+        (e.g. a dedicated deprecated-runtimes page), fetch that too.
+
+        Build the complete AWS Lambda runtime catalog: BOTH currently supported
+        runtimes AND deprecated ones. For each runtime emit:
+          id (the exact runtime identifier, e.g. "nodejs20.x", "python3.13",
+          "java21", "dotnet8", "provided.al2023"),
+          language (nodejs|python|java|dotnet|go|ruby|provided),
+          version (e.g. "20", "3.13", "al2023"),
+          status ("supported" or "deprecated" — deprecated means the deprecation
+          date is in the past),
+          deprecation_date (ISO YYYY-MM-DD, or null if none announced),
+          block_function_create (ISO date or null),
+          block_function_update (ISO date or null),
+          os (e.g. "Amazon Linux 2023", or null).
+
+        Dates announced for the future keep status "supported" with the future
+        deprecation_date set. Do not invent dates — null when AWS shows none.
+
+        Return ONLY a JSON object, no prose:
+        { "runtimes": [ ... ], "source_urls": [ "every URL you actually read" ] }
+
+  - id: read_current
+    type: module
+    plugin_type: np-api-call
+    name: "Read Current Instance"
+    # DECLARED inputs (even though `scrape`'s output has no colliding
+    # field today): np-api-call's execute() does `cfg = {...config,
+    # ...ctx.inputs}` (inputs override config), and a step with no
+    # `inputs:` map falls back to the single upstream predecessor's raw
+    # output object as `ctx.inputs` — chained after ANOTHER np-api-call
+    # step that's `{status, body, headers}`, whose RESPONSE headers then
+    # clobber this step's REQUEST headers (live E2E finding on wf-r4's
+    # fetch_scope). Shielding every np-api-call step closes this off
+    # regardless of what the immediate predecessor happens to output.
+    inputs:
+      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
+      # 404 = instance not seeded yet — treated as "no current catalog",
+      # not an error (setup/01-catalog-spec.sh seeds an empty one, but the
+      # sync must not depend on that having run).
+      failOnHttpError: false
+
+  - id: validate
+    type: module
+    plugin_type: code-exec
+    name: "Validate Scrape & Detect Changes"
+    # Whole-batch aggregate, never per-item: this step evaluates ONE scrape.
+    metadata: { fanOutPerItem: false }
+    # DECLARED inputs: the agent's clean-JSON success path spreads the
+    # parsed object directly into steps.scrape.outputs (real plugin
+    # behavior — see claude-code-agent/sdk-runner-real.ts), so `runtimes`
+    # lands at the top level, NOT nested under `.result`. Fall back to
+    # `.result` (string or object) for the unparsed/wrapped-text case.
+    inputs:
+      agent_output: "${{ steps.scrape.outputs }}"
+      current_status: "${{ steps.read_current.outputs.status }}"
+      current: "${{ steps.read_current.outputs.body }}"
+    config:
+      code: |
+        var out = { ok: false, changed: false, catalog: null, reason: '' };
+        var data = inputs.agent_output;
+        if (!data || !Array.isArray(data.runtimes)) {
+          var raw = data && data.result;
+          if (typeof raw === 'string') {
+            var m = raw.match(/\{[\s\S]*\}/);
+            try { data = JSON.parse(m ? m[0] : raw); }
+            catch (e) { out.reason = 'unparseable agent output'; return out; }
+          } else if (raw && typeof raw === 'object') {
+            data = raw;
+          }
+        }
+        var rts = (data && data.runtimes) || [];
+        if (rts.length < 15) { out.reason = 'only ' + rts.length + ' runtimes (min 15)'; return out; }
+        // Allows hyphens: real AWS ids include historical/edge variants like
+        // "nodejs4.3-edge" (Lambda@Edge), not just "<lang><version>".
+        var ID_RE = /^(nodejs|python|java|dotnet|go|ruby|provided)[a-z0-9.-]*$/;
+        var SANITY = ['nodejs22.x', 'python3.13'];
+        for (var i = 0; i < rts.length; i++) {
+          var r = rts[i];
+          if (!r.id || !r.language || (r.status !== 'supported' && r.status !== 'deprecated')) {
+            out.reason = 'bad row: ' + JSON.stringify(r).slice(0, 120); return out;
+          }
+          if (!ID_RE.test(r.id)) {
+            out.reason = 'runtime id "' + r.id + '" does not match the AWS identifier format'; return out;
+          }
+          var dates = [r.deprecation_date, r.block_function_create, r.block_function_update];
+          for (var j = 0; j < dates.length; j++) {
+            if (dates[j] !== null && dates[j] !== undefined && isNaN(Date.parse(dates[j]))) {
+              out.reason = 'unparseable date on ' + r.id; return out;
+            }
+          }
+        }
+        for (var k = 0; k < SANITY.length; k++) {
+          var hit = rts.filter(function (r) { return r.id === SANITY[k] && r.status === 'supported'; });
+          if (!hit.length) { out.reason = 'sanity runtime missing/not-supported: ' + SANITY[k]; return out; }
+        }
+
+        // ── Normalize DERIVABLE fields from id ─────────────────────────
+        // language/version are deterministic functions of id (shared logic,
+        // see the plan's parseRuntime). LLM scrape variance on these fields
+        // (e.g. "provided" -> version "al" one run, "" the next) must never
+        // affect the written catalog OR change detection — derive them here,
+        // overwriting whatever the agent emitted. os '' is coerced to null
+        // (same class of spurious diff: omitted vs empty string).
+        function parseRuntime(id) {
+          id = String(id || '');
+          if (id.indexOf('provided') === 0) {
+            return { language: 'provided', version: id.split('.').slice(1).join('.') };
+          }
+          var m = id.match(/^([a-z]+)([0-9]+(?:\.[0-9]+)?)/);
+          return m ? { language: m[1], version: m[2] } : { language: id, version: '' };
+        }
+        function normalizeRuntime(r) {
+          var p = parseRuntime(r.id);
+          return {
+            id: r.id,
+            language: p.language,
+            version: p.version,
+            status: r.status,
+            deprecation_date: r.deprecation_date || null,
+            block_function_create: r.block_function_create || null,
+            block_function_update: r.block_function_update || null,
+            os: r.os || null
+          };
+        }
+        var normalizedRts = rts.map(normalizeRuntime);
+        var dep = normalizedRts.filter(function (r) { return r.status === 'deprecated'; }).length;
+        out.ok = true;
+        out.catalog = {
+          runtimes: normalizedRts,
+          source_urls: data.source_urls || [],
+          scraped_at: new Date().toISOString(),
+          supported_count: normalizedRts.length - dep,
+          deprecated_count: dep
+        };
+
+        // ── Change detection vs the current instance ──────────────────
+        // Deep-equal on runtimes (sorted by id, normalized the SAME way as
+        // the new catalog — the current instance is re-derived too, so
+        // stale/inconsistent historical writes don't cause a false diff)
+        // and source_urls (sorted), IGNORING scraped_at and the counts — a
+        // metadata write should only happen when the catalog content
+        // actually changed.
+        function byId(a, b) { return String(a.id).localeCompare(String(b.id)); }
+        var currentOk = inputs.current_status === 200 && inputs.current && Array.isArray(inputs.current.runtimes);
+        var curRuntimes = currentOk ? inputs.current.runtimes.map(normalizeRuntime).sort(byId) : [];
+        var newRuntimes = normalizedRts.slice().sort(byId);
+        var curUrls = currentOk ? (inputs.current.source_urls || []).slice().sort() : [];
+        var newUrls = (out.catalog.source_urls || []).slice().sort();
+        out.changed = !currentOk
+          || JSON.stringify(curRuntimes) !== JSON.stringify(newRuntimes)
+          || JSON.stringify(curUrls) !== JSON.stringify(newUrls);
+        out.reason = out.changed ? 'changed' : 'unchanged';
+        return out;
+
+  - id: is_valid
+    type: decider
+    plugin_type: conditional
+    name: "Scrape Valid?"
+    config:
+      expression: "steps.validate.outputs.ok == true"
+
+  - id: has_changes
+    type: decider
+    plugin_type: conditional
+    name: "Catalog Changed?"
+    config:
+      expression: "steps.validate.outputs.changed == true"
+
+  - id: dry_run_check
+    type: decider
+    plugin_type: conditional
+    name: "Dry Run?"
+    config:
+      expression: "workflow.inputs.dry_run == true"
+
+  - id: write_metadata
+    type: module
+    plugin_type: np-api-call
+    name: "Write Metadata Instance"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      catalog: "${{ steps.validate.outputs.catalog }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/metadata/organization/${{ vars.NP_ORGANIZATION_ID }}/lambda_runtimes"
+      body:
+        runtimes: "${{ inputs.catalog.runtimes }}"
+        source_urls: "${{ inputs.catalog.source_urls }}"
+        scraped_at: "${{ inputs.catalog.scraped_at }}"
+        supported_count: "${{ inputs.catalog.supported_count }}"
+        deprecated_count: "${{ inputs.catalog.deprecated_count }}"
+
+  - id: stash_applied
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: applied"
+    inputs:
+      catalog: "${{ steps.validate.outputs.catalog }}"
+    config:
+      path: result
+      value:
+        applied: true
+        supported_count: "${{ inputs.catalog.supported_count }}"
+        deprecated_count: "${{ inputs.catalog.deprecated_count }}"
+        reason: "updated"
+
+  - id: stash_unchanged
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: unchanged"
+    inputs:
+      catalog: "${{ steps.validate.outputs.catalog }}"
+    config:
+      path: result
+      value:
+        applied: false
+        supported_count: "${{ inputs.catalog.supported_count }}"
+        deprecated_count: "${{ inputs.catalog.deprecated_count }}"
+        reason: "unchanged"
+
+  - id: stash_dry_run
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: dry_run"
+    inputs:
+      catalog: "${{ steps.validate.outputs.catalog }}"
+    config:
+      path: result
+      value:
+        applied: false
+        supported_count: "${{ inputs.catalog.supported_count }}"
+        deprecated_count: "${{ inputs.catalog.deprecated_count }}"
+        reason: "dry_run"
+
+  # ── Bad scrape: find-or-comment-or-create alert ────────────────────
+  - id: find_alert
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Existing Alert"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      status:
+        - open
+      metadataKey: alert_key
+      metadataValue: runtime-catalog-scrape
+
+  - id: alert_missing
+    type: decider
+    plugin_type: conditional
+    name: "No Live Alert Yet?"
+    config:
+      expression: "steps.find_alert.outputs.count == 0"
+
+  - id: create_alert
+    type: module
+    plugin_type: np-action-item-create
+    name: "Create Alert Item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      reason: "${{ steps.validate.outputs.reason }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      categorySlug: "${{ vars.RUNTIME_LIFECYCLE_CATEGORY_SLUG }}"
+      createdBy: "agent:runtime-lifecycle"
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      title: "Lambda runtime catalog scrape failed validation"
+      priority: high
+      description: "The weekly AWS Lambda runtime catalog scrape failed validation: ${{ inputs.reason }}"
+      labels:
+        workflow_type: "lambda-runtime"
+      metadata:
+        alert_key: "runtime-catalog-scrape"
+
+  - id: comment_alert
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment Existing Alert"
+    inputs:
+      reason: "${{ steps.validate.outputs.reason }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ steps.find_alert.outputs.firstMatch.id }}"
+      author: "agent:runtime-lifecycle"
+      content: "Scrape still failing validation: ${{ inputs.reason }}"
+
+  - id: stash_invalid
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: invalid"
+    join_strategy: any
+    inputs:
+      reason: "${{ steps.validate.outputs.reason }}"
+    config:
+      path: result
+      value:
+        applied: false
+        supported_count: null
+        deprecated_count: null
+        reason: "${{ inputs.reason }}"
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    metadata: { fanOutPerItem: false }
+    name: "Build Summary"
+    join_strategy: any
+    inputs:
+      data: "${{ variables.result }}"
+    config:
+      code: |
+        return inputs.data;
+
+connections:
+  - { id: c1,  from: start_manual,  to: scrape }
+  - { id: c2,  from: start_cron,    to: scrape }
+  - { id: c3,  from: scrape,        to: read_current }
+  - { id: c4,  from: read_current,  to: validate }
+  - { id: c5,  from: validate,      to: is_valid }
+  - { id: c6,  from: is_valid,      to: has_changes,    source_port: "true" }
+  - { id: c7,  from: is_valid,      to: find_alert,     source_port: "false" }
+  - { id: c8,  from: has_changes,   to: dry_run_check,  source_port: "true" }
+  - { id: c9,  from: has_changes,   to: stash_unchanged, source_port: "false" }
+  - { id: c10, from: dry_run_check, to: stash_dry_run,  source_port: "true" }
+  - { id: c11, from: dry_run_check, to: write_metadata, source_port: "false" }
+  - { id: c12, from: write_metadata, to: stash_applied }
+  - { id: c13, from: find_alert,    to: alert_missing }
+  - { id: c14, from: alert_missing, to: create_alert,   source_port: "true" }
+  - { id: c15, from: alert_missing, to: comment_alert,  source_port: "false" }
+  - { id: c16, from: create_alert,  to: stash_invalid }
+  - { id: c17, from: comment_alert, to: stash_invalid }
+  - { id: c18, from: stash_applied,   to: summary }
+  - { id: c19, from: stash_unchanged, to: summary }
+  - { id: c20, from: stash_dry_run,   to: summary }
+  - { id: c21, from: stash_invalid,   to: summary }
+
+outputs:
+  applied: "${{ steps.summary.outputs.applied }}"
+  supported_count: "${{ steps.summary.outputs.supported_count }}"
+  deprecated_count: "${{ steps.summary.outputs.deprecated_count }}"
+  reason: "${{ steps.summary.outputs.reason }}"

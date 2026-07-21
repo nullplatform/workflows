@@ -1,0 +1,525 @@
+# Runtime Lifecycle — event router (trigger + resolve gate + comment answerer).
+#
+# Listens to action-item events for items labeled workflow_type=lambda-runtime:
+#   - onSuggestionAccepted → starts wf-r4 (runtime_lifecycle_apply) fire-and-
+#     forget (an apply may wait hours for a scheduled deploy window).
+#   - onResolved → a human (or automation) marked the item resolved; this is
+#     the compliance GATE — it re-derives whether the scope's runtime config
+#     AND its currently-active deployment actually reflect the fix before
+#     trusting the resolution. Non-compliant → reopen + explain exactly
+#     what's still missing (config vs stale deploy — two distinct reasons).
+#     Compliant → a confirmation comment, item stays resolved.
+#   - onCommentAdded → bot-authored comments (our own narration) are ignored
+#     (no bot-to-bot loops). A human comment gets an immediate ack, then an
+#     AI answer grounded ONLY in declared facts (item, scope, the catalog
+#     row for the scope's runtime) — no tools, no egress. A per-item reply
+#     cap (vars.RUNTIME_QA_MAX_REPLIES) is a runaway brake, same convention
+#     as the cost suite's wf8.
+#
+# Compliance gate math (Task 0 verdict, docs in the plan's scratchpad):
+# the deployment API has NO runtime/capabilities snapshot, so "deployed" is
+# inferred by TIME: the scope's currently-active deployment (status_in_scope
+# === 'active') must have been created at/after the item's
+# metadata.runtime_patched_at stamp (written by wf-r4 after a successful
+# scope PATCH). Falls back to scope.updated_at when the item was never
+# patched by wf-r4 (a manual runtime change resolved the item directly).
+#
+# Activation note: the trigger auto-creates its NP notification channel with
+# the ACTIVATING ACTOR's session bearer — activate the alias with a session
+# that can manage notification channels (same as the cost suite's wf3).
+id: runtime_lifecycle_events
+name: "Runtime Lifecycle — Events"
+description: >
+  Routes lambda-runtime action-item events: accepted suggestions start the
+  apply workflow; resolutions are gated against the live scope config and
+  the currently-active deployment; comments get an ack + a fact-grounded AI
+  answer, capped per item.
+path: "/runtime-lifecycle"
+semantic_version: 1.0.0
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-action-item-trigger
+    name: "Action Item Events"
+    config:
+      pathPrefix: np-runtime-lifecycle-events
+      mode: start
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      labelFilters:
+        workflow_type: lambda-runtime
+
+  # ── Accepted suggestion → apply workflow ────────────────────────────────
+  - id: start_apply
+    type: module
+    plugin_type: sub-workflow
+    name: "Start Apply"
+    config:
+      # PER-ORG id of "Runtime Lifecycle — Apply"; patched by the uploader
+      # on upload.
+      workflowId: runtime_lifecycle_apply
+      # Fire-and-forget: the apply may wait for a scheduled deploy window.
+      waitForCompletion: false
+    inputs:
+      action_item_id: "${{ $item.actionItem.id }}"
+      suggestion_id: "${{ $item.suggestion.id }}"
+
+  # ── Resolved → compliance gate ──────────────────────────────────────────
+  - id: gate_start
+    type: module
+    plugin_type: code-exec
+    name: "Parse Resolved Event"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      event: "${{ $item }}"
+    config:
+      code: |
+        var ev = inputs.event || {};
+        var item = ev.actionItem || {};
+        var meta = item.metadata || {};
+        return {
+          item: item,
+          action_item_id: item.id || null,
+          scope_id: meta.scope_id || null
+        };
+
+  - id: gate_fetch_scope
+    type: module
+    plugin_type: np-api-call
+    name: "Get Scope (Gate)"
+    inputs:
+      scope_id: "${{ steps.gate_start.outputs.scope_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/scope/${{ inputs.scope_id }}"
+      failOnHttpError: false
+
+  - id: gate_fetch_deployments
+    type: module
+    plugin_type: np-api-call
+    name: "Get Deployments (Gate)"
+    inputs:
+      scope_id: "${{ steps.gate_start.outputs.scope_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/deployment"
+      query:
+        scope_id: "${{ inputs.scope_id }}"
+        limit: 20
+      failOnHttpError: false
+
+  - id: gate_fetch_catalog
+    type: module
+    plugin_type: np-api-call
+    name: "Get Runtime Catalog (Gate)"
+    # DECLARED inputs: np-api-call's execute() does `cfg = {...config,
+    # ...ctx.inputs}` (inputs override config) — a step with no `inputs:`
+    # map falls back to its predecessor's raw output as `ctx.inputs`.
+    # gate_fetch_deployments (the predecessor here) is ALSO np-api-call,
+    # so without this its `{status, body, headers}` response would clobber
+    # this step's own REQUEST headers and undici throws "fetch failed" —
+    # exactly the live E2E finding on wf-r4's fetch_scope.
+    inputs:
+      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
+      failOnHttpError: false
+
+  # Pure function of item + scope + deployments + catalog. parseRuntime /
+  # verNum / classify pasted verbatim from the plan's Shared logic section
+  # (workflow steps can't import — duplication is the existing convention).
+  # deployedOk is the Task 0 verdict: currently-active deployment must be at
+  # least as new as the runtime_patched_at stamp (or scope.updated_at when
+  # the item was never patched by wf-r4).
+  - id: gate_check
+    type: module
+    plugin_type: code-exec
+    name: "Compliance Gate Check"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      item: "${{ steps.gate_start.outputs.item }}"
+      scope: "${{ steps.gate_fetch_scope.outputs.body }}"
+      deployments: "${{ steps.gate_fetch_deployments.outputs.body.results }}"
+      catalog: "${{ steps.gate_fetch_catalog.outputs.body }}"
+    config:
+      code: |
+        function parseRuntime(id) {
+          id = String(id || '');
+          if (id.indexOf('provided') === 0) {
+            return { language: 'provided', version: id.split('.').slice(1).join('.') };
+          }
+          var m = id.match(/^([a-z]+)([0-9]+(?:\.[0-9]+)?)/);
+          return m ? { language: m[1], version: m[2] } : { language: id, version: '' };
+        }
+        function verNum(v) {
+          var p = String(v).split('.');
+          var a = Number(String(p[0] || '').replace(/[^0-9]/g, '')) || 0;
+          var b = Number(String(p[1] || '').replace(/[^0-9]/g, '')) || 0;
+          return a * 1000 + b;
+        }
+        // entry = catalog row for the scope's runtime (or null/undefined if unknown)
+        function classify(entry, todayMs) {
+          if (!entry) return { verdict: 'unknown_runtime' };
+          var dep = entry.deprecation_date ? Date.parse(entry.deprecation_date) : null;
+          if (entry.status === 'deprecated' || (dep !== null && dep <= todayMs)) {
+            return { verdict: 'deprecated', priority: 'critical', deprecation_ms: dep };
+          }
+          if (dep !== null && dep - todayMs <= 31 * 86400000) {
+            return { verdict: 'expiring', priority: 'high', deprecation_ms: dep };
+          }
+          return { verdict: 'ok' };
+        }
+
+        var scope = inputs.scope || {};
+        var cat = (inputs.catalog || {}).runtimes || [];
+        var rt = ((scope.capabilities || {}).serverless_runtime || {}).id || '';
+        var entry = null;
+        for (var i = 0; i < cat.length; i++) if (cat[i].id === rt) { entry = cat[i]; break; }
+        var c = classify(entry, Date.now());
+        var configOk = c.verdict === 'ok';
+
+        // deployedOk (Task 0 verdict): the deployment API has no runtime
+        // snapshot, so compliance is inferred by TIME — the currently-active
+        // deployment must be at least as new as the runtime_patched_at
+        // stamp (or scope.updated_at as a fallback for manual fixes).
+        var act = null;
+        for (var j = 0; j < (inputs.deployments || []).length; j++) {
+          var d = inputs.deployments[j];
+          if (d.status_in_scope === 'active') {
+            if (!act || Date.parse(d.created_at) > Date.parse(act.created_at)) act = d;
+          }
+        }
+        var patchedAt = (inputs.item && inputs.item.metadata && inputs.item.metadata.runtime_patched_at)
+          ? Date.parse(inputs.item.metadata.runtime_patched_at)
+          : Date.parse(scope.updated_at);
+        var deployedOk = !!act && Date.parse(act.created_at) >= patchedAt;
+
+        return {
+          compliant: configOk && deployedOk,
+          runtime: rt,
+          reason: !configOk
+            ? 'scope config still on ' + rt + ' (' + c.verdict + ')'
+            : (!deployedOk
+                ? 'config is on ' + rt + ' but the ACTIVE deployment predates the change — deploy to finish'
+                : 'active deployment runs ' + rt)
+        };
+
+  - id: gate_compliant
+    type: decider
+    plugin_type: conditional
+    name: "Compliant?"
+    config:
+      expression: "steps.gate_check.outputs.compliant == true"
+
+  - id: comment_confirm
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Compliant"
+    inputs:
+      reason: "${{ steps.gate_check.outputs.reason }}"
+      item_id: "${{ steps.gate_start.outputs.action_item_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ inputs.item_id }}"
+      author: "agent:runtime-lifecycle"
+      content: "✅ Verified: ${{ inputs.reason }}."
+
+  - id: reopen_item
+    type: module
+    plugin_type: np-action-item-update
+    name: "Reopen: Not Yet Compliant"
+    inputs:
+      item_id: "${{ steps.gate_start.outputs.action_item_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ inputs.item_id }}"
+      action: reopen
+      actor: "agent:runtime-lifecycle"
+
+  - id: comment_reopen_reason
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Reopen Reason"
+    inputs:
+      reason: "${{ steps.gate_check.outputs.reason }}"
+      item_id: "${{ steps.gate_start.outputs.action_item_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ inputs.item_id }}"
+      author: "agent:runtime-lifecycle"
+      content: "🔁 Reopened — not yet compliant: ${{ inputs.reason }}."
+
+  # ── Comment → bot filter, ack, AI answer (fact-grounded, no egress) ─────
+  - id: comment_guard
+    type: module
+    plugin_type: code-exec
+    name: "Comment Guard: Bot + Item Check"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      event: "${{ $item }}"
+    config:
+      code: |
+        var ev = inputs.event || {};
+        var item = ev.actionItem || {};
+        var meta = item.metadata || {};
+        var author = String(ev.userEmail || 'unknown');
+        var a = author.toLowerCase();
+        var isBot = a.indexOf('agent:') === 0 || a.indexOf('executor:') === 0;
+        var hasItem = item.id ? true : false;
+        return {
+          proceed: hasItem && !isBot,
+          is_bot: isBot,
+          has_item: hasItem,
+          action_item_id: item.id || null,
+          author: author,
+          scope_id: meta.scope_id || null,
+          item_title: item.title || '',
+          item_description: item.description || '',
+          item_metadata: meta
+        };
+
+  - id: is_actionable
+    type: decider
+    plugin_type: conditional
+    name: "Actionable Comment?"
+    config:
+      expression: "steps.comment_guard.outputs.proceed == true"
+
+  - id: log_skip_comment
+    type: module
+    plugin_type: log
+    name: "Skip: Bot Author or No Item"
+    config:
+      level: info
+      message: "Skipping comment on ${{ steps.comment_guard.outputs.action_item_id }} — is_bot=${{ steps.comment_guard.outputs.is_bot }} has_item=${{ steps.comment_guard.outputs.has_item }}."
+
+  - id: fetch_comments
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Comments"
+    inputs:
+      item_id: "${{ steps.comment_guard.outputs.action_item_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/governance/action_item/${{ inputs.item_id }}/comments"
+      failOnHttpError: false
+
+  # Reply cap + latest-comment extraction (the trigger's audit event does
+  # NOT carry the comment body — only fetch_comments does). Also skips when
+  # the last comment is already from an agent/executor (a race: our own
+  # reply, or another bot, answered after the triggering event) — same
+  # anti-recursion guard as the cost suite's wf8.
+  - id: analyze_thread
+    type: module
+    plugin_type: code-exec
+    name: "Reply Cap + Latest Comment"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      comments_body: "${{ steps.fetch_comments.outputs.body }}"
+      max_replies: "${{ vars.RUNTIME_QA_MAX_REPLIES || '3' }}"
+    config:
+      code: |
+        function isBot(a) {
+          a = String(a || '').toLowerCase();
+          return a.indexOf('agent:') === 0 || a.indexOf('executor:') === 0;
+        }
+        var body = inputs.comments_body || {};
+        var list = body.results || body.comments || (Array.isArray(body) ? body : []);
+        var max = Number(inputs.max_replies) > 0 ? Number(inputs.max_replies) : 3;
+        var ours = 0;
+        for (var i = 0; i < list.length; i++) {
+          var author = String((list[i] || {}).author || (list[i] || {}).created_by || '');
+          if (author === 'agent:runtime-lifecycle') ours++;
+        }
+        var last = list.length > 0 ? (list[list.length - 1] || {}) : {};
+        var lastAuthor = String(last.author || last.created_by || '');
+        var underCap = ours < max;
+        return {
+          proceed: underCap && list.length > 0 && !isBot(lastAuthor),
+          under_cap: underCap,
+          count: ours,
+          max_replies: max,
+          question: String(last.content || last.text || '').slice(0, 1200),
+          question_author: lastAuthor
+        };
+
+  - id: thread_ok
+    type: decider
+    plugin_type: conditional
+    name: "Under Cap And Answerable?"
+    config:
+      expression: "steps.analyze_thread.outputs.proceed == true"
+
+  - id: log_over_cap
+    type: module
+    plugin_type: log
+    name: "Skip: Cap Reached or Nothing To Answer"
+    config:
+      level: info
+      message: "Skipping AI answer on ${{ steps.comment_guard.outputs.action_item_id }} — replies=${{ steps.analyze_thread.outputs.count }}/${{ steps.analyze_thread.outputs.max_replies }}."
+
+  - id: post_ack
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Ack: Reply Incoming"
+    inputs:
+      author_asked: "${{ steps.comment_guard.outputs.author }}"
+      item_id: "${{ steps.comment_guard.outputs.action_item_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ inputs.item_id }}"
+      author: "agent:runtime-lifecycle"
+      content: "👀 Taking a look at the comment from ${{ inputs.author_asked }} — if this needs an answer it lands here in a couple of minutes."
+
+  - id: fetch_scope_qa
+    type: module
+    plugin_type: np-api-call
+    name: "Get Scope (Q&A)"
+    inputs:
+      scope_id: "${{ steps.comment_guard.outputs.scope_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/scope/${{ inputs.scope_id }}"
+      failOnHttpError: false
+
+  - id: fetch_catalog_qa
+    type: module
+    plugin_type: np-api-call
+    name: "Get Runtime Catalog (Q&A)"
+    # DECLARED inputs: np-api-call's execute() does `cfg = {...config,
+    # ...ctx.inputs}` (inputs override config) — a step with no `inputs:`
+    # map falls back to its predecessor's raw output as `ctx.inputs`.
+    # fetch_scope_qa (the predecessor here) is ALSO np-api-call, so
+    # without this its `{status, body, headers}` response would clobber
+    # this step's own REQUEST headers and undici throws "fetch failed" —
+    # exactly the live E2E finding on wf-r4's fetch_scope.
+    inputs:
+      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
+      failOnHttpError: false
+
+  - id: build_qa_context
+    type: module
+    plugin_type: code-exec
+    name: "Build Scope Facts + Catalog Row"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      scope: "${{ steps.fetch_scope_qa.outputs.body }}"
+      catalog: "${{ steps.fetch_catalog_qa.outputs.body }}"
+    config:
+      code: |
+        var scope = inputs.scope || {};
+        var cat = (inputs.catalog || {}).runtimes || [];
+        var rt = ((scope.capabilities || {}).serverless_runtime || {}).id || '';
+        var entry = null;
+        for (var i = 0; i < cat.length; i++) if (cat[i].id === rt) { entry = cat[i]; break; }
+        return {
+          catalog_row: entry,
+          scope_facts: {
+            id: scope.id || null,
+            name: scope.name || '',
+            application_id: scope.application_id || null,
+            environment: (scope.dimensions || {}).environment || '',
+            runtime: rt
+          }
+        };
+
+  # DECLARED inputs, mandatory: prompts below reference `inputs.*` only —
+  # `steps.*` templates resolve activity-side as the literal string
+  # "undefined" in this plugin's config (CLAUDE.md). No tools/allowedHosts:
+  # the answer is grounded ONLY in the facts passed in, no egress.
+  - id: ai_answer
+    type: module
+    plugin_type: claude-code-agent
+    name: "AI Thread Answer"
+    inputs:
+      item_title: "${{ steps.comment_guard.outputs.item_title }}"
+      item_description: "${{ steps.comment_guard.outputs.item_description }}"
+      item_metadata: "${{ steps.comment_guard.outputs.item_metadata }}"
+      catalog_row: "${{ steps.build_qa_context.outputs.catalog_row }}"
+      scope_facts: "${{ steps.build_qa_context.outputs.scope_facts }}"
+      question: "${{ steps.analyze_thread.outputs.question }}"
+      question_author: "${{ steps.analyze_thread.outputs.question_author }}"
+    config:
+      maxIterations: 4
+      systemPrompt: |
+        You are the Lambda runtime lifecycle analyst who opened this action
+        item. Someone commented on its thread; answer using ONLY the facts
+        given below — the item, the scope's current facts, and the catalog
+        row for its runtime. No tools and no network access are configured
+        for this step: never claim to have fetched or checked anything live.
+
+        Answer in the language the comment was written in. One short
+        Markdown comment: a direct answer first, then at most a few
+        supporting bullets grounded in the provided facts. No headings, no
+        sign-off.
+      userPrompt: |
+        Action item: ${{ inputs.item_title }}
+
+        Item description (as posted):
+        ${{ inputs.item_description }}
+
+        Item metadata: ${{ inputs.item_metadata }}
+
+        Scope facts: ${{ inputs.scope_facts }}
+
+        Catalog row for the scope's current runtime: ${{ inputs.catalog_row }}
+
+        LAST comment (by ${{ inputs.question_author }} — answer this):
+        ${{ inputs.question }}
+      outputSchema:
+        type: object
+        required: [answer]
+        properties:
+          answer:
+            type: string
+            description: "The Markdown comment to post in reply"
+
+  - id: post_answer
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Post Answer"
+    inputs:
+      text: "${{ steps.ai_answer.outputs.answer }}"
+      item_id: "${{ steps.comment_guard.outputs.action_item_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ inputs.item_id }}"
+      author: "agent:runtime-lifecycle"
+      content: "${{ inputs.text }}"
+
+connections:
+  - { id: c1,  from: trigger,            to: start_apply,          source_port: onSuggestionAccepted }
+
+  - { id: c2,  from: trigger,            to: gate_start,           source_port: onResolved }
+  - { id: c3,  from: gate_start,         to: gate_fetch_scope }
+  - { id: c4,  from: gate_fetch_scope,   to: gate_fetch_deployments }
+  - { id: c5,  from: gate_fetch_deployments, to: gate_fetch_catalog }
+  - { id: c6,  from: gate_fetch_catalog, to: gate_check }
+  - { id: c7,  from: gate_check,         to: gate_compliant }
+  - { id: c8,  from: gate_compliant,     to: comment_confirm,      source_port: "true" }
+  - { id: c9,  from: gate_compliant,     to: reopen_item,          source_port: "false" }
+  - { id: c10, from: reopen_item,        to: comment_reopen_reason }
+
+  - { id: c11, from: trigger,            to: comment_guard,        source_port: onCommentAdded }
+  - { id: c12, from: comment_guard,      to: is_actionable }
+  - { id: c13, from: is_actionable,      to: fetch_comments,       source_port: "true" }
+  - { id: c14, from: is_actionable,      to: log_skip_comment,     source_port: "false" }
+  - { id: c15, from: fetch_comments,     to: analyze_thread }
+  - { id: c16, from: analyze_thread,     to: thread_ok }
+  - { id: c17, from: thread_ok,          to: post_ack,             source_port: "true" }
+  - { id: c18, from: thread_ok,          to: log_over_cap,         source_port: "false" }
+  - { id: c19, from: post_ack,           to: fetch_scope_qa }
+  - { id: c20, from: fetch_scope_qa,     to: fetch_catalog_qa }
+  - { id: c21, from: fetch_catalog_qa,   to: build_qa_context }
+  - { id: c22, from: build_qa_context,   to: ai_answer }
+  - { id: c23, from: ai_answer,          to: post_answer }
