@@ -1,29 +1,45 @@
 # Weekly AWS Lambda runtime catalog sync.
 #
 # Scrapes the AWS Lambda runtime support/deprecation tables (agent fetch +
-# extract), validates the result strictly, diffs it against the current
-# `lambda_runtimes` org metadata instance, and PATCHes only when the catalog
-# actually changed (keeps the metadata row's updated_at — and the lake
-# history built on it — meaningful). A scrape that fails validation raises a
-# find-or-comment-or-create alert action item instead of writing bad data.
+# extract), validates the result strictly, PRECOMPUTES a migration `target`
+# for every runtime (the smallest supported same-language version jump that
+# exits deprecation), diffs the result against the current `lambda_runtimes`
+# org metadata instance, and PATCHes only when the catalog actually changed
+# (keeps the metadata row's updated_at — and the lake history built on it —
+# meaningful).
+#
+# A scrape that FAILS validation does NOT touch the existing catalog: the
+# execution FAILS with a clear error (logged + surfaced in execution
+# history) so a bad scrape is visible without ever writing corrupt data.
+# (There are no "alert" action items — those never existed in nullplatform.)
+#
+# Target precompute (owner-decided, 2026-07-21): the migration target used to
+# be derived on the fly by the scanner (wf-r2). It now lives HERE and is
+# STORED per runtime, so every downstream reader (the scanner's lake query,
+# wf-r3/wf-r4) reads one canonical `target` instead of re-deriving it.
+# `target` = the minimum SUPPORTED runtime of the same language whose own
+# deprecation is outside the 180-day horizon (or the highest supported one if
+# all are inside it); `null` when no supported same-language successor exists
+# (e.g. go1.x). Because `target` is part of each runtime row, change detection
+# picks it up naturally (it compares row content).
 #
 # Lake-format contract: catalog `runtimes[].id` MUST be the verbatim AWS
 # runtime identifier (e.g. "nodejs20.x", not "Node.js 20") — the lake joins
 # core_entities_scope.capabilities.serverless_runtime.id against this table
 # on equal strings. `validate` enforces the id shape.
 #
-# Per-org configuration (config entries on folder /runtime-lifecycle):
+# Per-org configuration (config entries on folder /action-items/runtime-lifecycle):
 #   NP_API_KEY (secret)                    — NP API key
 #   NP_ORGANIZATION_ID (var)               — organization id
-#   RUNTIME_LIFECYCLE_CATEGORY_SLUG (var)  — action item category slug (engineering)
 id: runtime_catalog_sync
 name: "Runtime Lifecycle — Catalog Sync"
 description: >
   Weekly (Sun 06:00, also manual): scrapes the AWS Lambda runtime
-  support/deprecation catalog, validates it, and upserts the org's
-  `lambda_runtimes` metadata instance only when the catalog changed.
-  Bad scrapes raise an alert action item instead of writing.
-path: "/runtime-lifecycle"
+  support/deprecation catalog, validates it, precomputes each runtime's
+  migration target, and upserts the org's `lambda_runtimes` metadata
+  instance only when the catalog changed. A scrape that fails validation
+  fails the execution instead of writing.
+path: "/action-items/runtime-lifecycle"
 semantic_version: 1.0.0
 
 inputs:
@@ -195,6 +211,36 @@ steps:
           var m = id.match(/^([a-z]+)([0-9]+(?:\.[0-9]+)?)/);
           return m ? { language: m[1], version: m[2] } : { language: id, version: '' };
         }
+        // verNum + pickTarget: MOVED here verbatim from wf-r2's old diff step
+        // (owner-decided 2026-07-21) so the migration target is computed and
+        // STORED once, not re-derived per-scan. pickTarget = the smallest
+        // SUPPORTED same-language version above the current one whose own
+        // deprecation is outside the 180-day horizon (else the highest such
+        // version); null when no supported same-language successor exists.
+        function verNum(v) {
+          var p = String(v).split('.');
+          var a = Number(String(p[0] || '').replace(/[^0-9]/g, '')) || 0;
+          var b = Number(String(p[1] || '').replace(/[^0-9]/g, '')) || 0;
+          return a * 1000 + b;
+        }
+        function pickTarget(currentId, runtimes, todayMs) {
+          var cur = parseRuntime(currentId);
+          var HORIZON = 180 * 86400000;
+          var cands = [];
+          for (var i = 0; i < (runtimes || []).length; i++) {
+            var r = runtimes[i];
+            if (r.status !== 'supported') continue;
+            var p = parseRuntime(r.id);
+            if (p.language !== cur.language) continue;
+            if (verNum(p.version) <= verNum(cur.version)) continue;
+            cands.push({ id: r.id, v: verNum(p.version), dep: r.deprecation_date ? Date.parse(r.deprecation_date) : null });
+          }
+          cands.sort(function (a, b) { return a.v - b.v; });
+          for (var j = 0; j < cands.length; j++) {
+            if (cands[j].dep === null || cands[j].dep - todayMs > HORIZON) return cands[j].id;
+          }
+          return cands.length ? cands[cands.length - 1].id : null;
+        }
         function normalizeRuntime(r) {
           var p = parseRuntime(r.id);
           return {
@@ -205,10 +251,35 @@ steps:
             deprecation_date: r.deprecation_date || null,
             block_function_create: r.block_function_create || null,
             block_function_update: r.block_function_update || null,
-            os: r.os || null
+            os: r.os || null,
+            target: r.target === undefined ? null : r.target
           };
         }
-        var normalizedRts = rts.map(normalizeRuntime);
+        // Add the precomputed `target` to every row. pickTarget needs the
+        // WHOLE (normalized) runtime set, so it runs over `base` after the
+        // per-row normalize. `today` governs the horizon cut — the same
+        // migration target the scanner used to compute at scan time, now
+        // frozen into the catalog at sync time.
+        var today = Date.now();
+        function withTargets(base) {
+          var out2 = [];
+          for (var i = 0; i < base.length; i++) {
+            var r = base[i];
+            out2.push({
+              id: r.id,
+              language: r.language,
+              version: r.version,
+              status: r.status,
+              deprecation_date: r.deprecation_date,
+              block_function_create: r.block_function_create,
+              block_function_update: r.block_function_update,
+              os: r.os,
+              target: pickTarget(r.id, base, today)
+            });
+          }
+          return out2;
+        }
+        var normalizedRts = withTargets(rts.map(normalizeRuntime));
         var dep = normalizedRts.filter(function (r) { return r.status === 'deprecated'; }).length;
         out.ok = true;
         out.catalog = {
@@ -220,15 +291,19 @@ steps:
         };
 
         // ── Change detection vs the current instance ──────────────────
-        // Deep-equal on runtimes (sorted by id, normalized the SAME way as
-        // the new catalog — the current instance is re-derived too, so
-        // stale/inconsistent historical writes don't cause a false diff)
-        // and source_urls (sorted), IGNORING scraped_at and the counts — a
-        // metadata write should only happen when the catalog content
-        // actually changed.
+        // Deep-equal on runtimes (sorted by id, both sides normalized) and
+        // source_urls (sorted), IGNORING scraped_at and the counts. The
+        // STORED side keeps its stored `target` AS-IS (normalize preserves
+        // it; missing → null) while the new side carries the freshly
+        // computed one — so a catalog that predates targets, or whose
+        // targets went stale as the horizon advanced, correctly reads as
+        // CHANGED and gets rewritten. Re-deriving targets on the stored
+        // side here would mask exactly those diffs (live migration bug,
+        // 2026-07-21: v4's first run read `unchanged` and never wrote
+        // targets).
         function byId(a, b) { return String(a.id).localeCompare(String(b.id)); }
         var currentOk = inputs.current_status === 200 && inputs.current && Array.isArray(inputs.current.runtimes);
-        var curRuntimes = currentOk ? inputs.current.runtimes.map(normalizeRuntime).sort(byId) : [];
+        var curRuntimes = currentOk ? inputs.current.runtimes.map(normalizeRuntime).slice().sort(byId) : [];
         var newRuntimes = normalizedRts.slice().sort(byId);
         var curUrls = currentOk ? (inputs.current.source_urls || []).slice().sort() : [];
         var newUrls = (out.catalog.source_urls || []).slice().sort();
@@ -324,77 +399,24 @@ steps:
         deprecated_count: "${{ inputs.catalog.deprecated_count }}"
         reason: "dry_run"
 
-  # ── Bad scrape: find-or-comment-or-create alert ────────────────────
-  - id: find_alert
+  # ── Bad scrape: fail the execution, never touch the catalog ─────────
+  # A scrape that fails validation must NOT write. Rather than raising an
+  # (non-existent) "alert" action item, we FAIL the execution here: the
+  # thrown error is logged and surfaced in the execution history, and the
+  # existing `lambda_runtimes` instance is left exactly as-is.
+  - id: fail_invalid
     type: module
-    plugin_type: np-action-item-find
-    name: "Find Existing Alert"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
-      status:
-        - open
-      metadataKey: alert_key
-      metadataValue: runtime-catalog-scrape
-
-  - id: alert_missing
-    type: decider
-    plugin_type: conditional
-    name: "No Live Alert Yet?"
-    config:
-      expression: "steps.find_alert.outputs.count == 0"
-
-  - id: create_alert
-    type: module
-    plugin_type: np-action-item-create
-    name: "Create Alert Item"
-    error_handling:
-      retry_policy:
-        max_attempts: 3
-        initial_interval: "2s"
-        backoff_strategy: exponential
-        jitter: 0.3
+    plugin_type: code-exec
+    metadata: { fanOutPerItem: false }
+    name: "Fail: Invalid Scrape"
     inputs:
       reason: "${{ steps.validate.outputs.reason }}"
     config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      categorySlug: "${{ vars.RUNTIME_LIFECYCLE_CATEGORY_SLUG }}"
-      createdBy: "agent:runtime-lifecycle"
-      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
-      title: "Lambda runtime catalog scrape failed validation"
-      priority: high
-      description: "The weekly AWS Lambda runtime catalog scrape failed validation: ${{ inputs.reason }}"
-      labels:
-        workflow_type: "lambda-runtime"
-      metadata:
-        alert_key: "runtime-catalog-scrape"
-
-  - id: comment_alert
-    type: module
-    plugin_type: np-action-item-add-comment
-    name: "Comment Existing Alert"
-    inputs:
-      reason: "${{ steps.validate.outputs.reason }}"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      actionItemId: "${{ steps.find_alert.outputs.firstMatch.id }}"
-      author: "agent:runtime-lifecycle"
-      content: "Scrape still failing validation: ${{ inputs.reason }}"
-
-  - id: stash_invalid
-    type: module
-    plugin_type: set-variable
-    name: "Stash Result: invalid"
-    join_strategy: any
-    inputs:
-      reason: "${{ steps.validate.outputs.reason }}"
-    config:
-      path: result
-      value:
-        applied: false
-        supported_count: null
-        deprecated_count: null
-        reason: "${{ inputs.reason }}"
+      code: |
+        log.error('Lambda runtime catalog scrape failed validation — catalog NOT updated', {
+          reason: inputs.reason
+        });
+        throw new Error('Runtime catalog scrape failed validation: ' + inputs.reason);
 
   - id: summary
     type: module
@@ -415,21 +437,15 @@ connections:
   - { id: c4,  from: read_current,  to: validate }
   - { id: c5,  from: validate,      to: is_valid }
   - { id: c6,  from: is_valid,      to: has_changes,    source_port: "true" }
-  - { id: c7,  from: is_valid,      to: find_alert,     source_port: "false" }
+  - { id: c7,  from: is_valid,      to: fail_invalid,   source_port: "false" }
   - { id: c8,  from: has_changes,   to: dry_run_check,  source_port: "true" }
   - { id: c9,  from: has_changes,   to: stash_unchanged, source_port: "false" }
   - { id: c10, from: dry_run_check, to: stash_dry_run,  source_port: "true" }
   - { id: c11, from: dry_run_check, to: write_metadata, source_port: "false" }
   - { id: c12, from: write_metadata, to: stash_applied }
-  - { id: c13, from: find_alert,    to: alert_missing }
-  - { id: c14, from: alert_missing, to: create_alert,   source_port: "true" }
-  - { id: c15, from: alert_missing, to: comment_alert,  source_port: "false" }
-  - { id: c16, from: create_alert,  to: stash_invalid }
-  - { id: c17, from: comment_alert, to: stash_invalid }
   - { id: c18, from: stash_applied,   to: summary }
   - { id: c19, from: stash_unchanged, to: summary }
   - { id: c20, from: stash_dry_run,   to: summary }
-  - { id: c21, from: stash_invalid,   to: summary }
 
 outputs:
   applied: "${{ steps.summary.outputs.applied }}"

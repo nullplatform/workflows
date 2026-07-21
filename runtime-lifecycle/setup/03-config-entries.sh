@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Upserts the config entries the runtime-lifecycle workflows read, at engine
-# path /runtime-lifecycle. Re-running rotates values in place (the engine's
-# POST /workflows/config is an upsert by name+path).
+# path /action-items/runtime-lifecycle. Re-running rotates values in place
+# (the engine's POST /workflows/config is an upsert by name+path).
 #
 # Also upserts the DEPLOY_* family at /deploy — wf-r4 reuses the shared
 # `progressive_deploy` sub-workflow, which reads its window/traffic/gate
@@ -82,12 +82,11 @@ put() { # name value secret(true|false) path
   fi
 }
 
-echo "Upserting config entries on /runtime-lifecycle:"
-put NP_ORGANIZATION_ID              "$ORG_ID"      false "/runtime-lifecycle"
-put RUNTIME_LIFECYCLE_CATEGORY_SLUG "$CATEGORY"    false "/runtime-lifecycle"
-put RUNTIME_WARN_DAYS               "$WARN_DAYS"   false "/runtime-lifecycle"
-put RUNTIME_TARGET_HORIZON_DAYS     "$HORIZON_DAYS" false "/runtime-lifecycle"
-put RUNTIME_QA_MAX_REPLIES          "$QA_MAX_REPLIES" false "/runtime-lifecycle"
+echo "Upserting config entries on /action-items/runtime-lifecycle:"
+put NP_ORGANIZATION_ID              "$ORG_ID"      false "/action-items/runtime-lifecycle"
+put RUNTIME_LIFECYCLE_CATEGORY_SLUG "$CATEGORY"    false "/action-items/runtime-lifecycle"
+put RUNTIME_WARN_DAYS               "$WARN_DAYS"   false "/action-items/runtime-lifecycle"
+put RUNTIME_QA_MAX_REPLIES          "$QA_MAX_REPLIES" false "/action-items/runtime-lifecycle"
 
 echo "Upserting config entries on /deploy (progressive_deploy sub-workflow):"
 put DEPLOY_WINDOW_START            "$WINDOW_START"   false "/deploy"
