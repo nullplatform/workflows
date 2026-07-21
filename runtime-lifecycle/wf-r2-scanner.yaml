@@ -1,4 +1,4 @@
-# Lambda Runtime Deprecation Scanner — lake-first weekly scan, FLAT writes.
+# Lambda Runtime Deprecation Scanner — lake-first DAILY scan, FLAT writes.
 #
 # REDESIGN v3 (owner-decided, 2026-07-21): detection is ONE lake query and
 # every write is now a FLAT per-item `np-api-call` pass on THIS workflow —
@@ -10,8 +10,22 @@
 # active-serverless scope set, the `lambda_runtimes` catalog, and any live
 # lambda-runtime action item) but still fanned out to wf-r2b. v3 folds
 # wf-r2b's pure classification/build logic into the `diff` step (VERBATIM
-# copies of parseRuntime/verNum/classify/pickTarget + the item/suggestion
-# builders) and does the API writes here as flat forEach passes.
+# copies of classify + the item/suggestion builders) and does the API writes
+# here as flat forEach passes.
+#
+# CATALOG FROM THE LAKE (owner-decided v4, 2026-07-21): the scanner no longer
+# reads the `lambda_runtimes` metadata instance over the API (the old
+# read_catalog + catalog_guard steps are GONE). Instead `lake_detect` JOINs
+# the catalog (core_entities_metadata FINAL, the lambda_runtimes instance)
+# and emits, per scope row, the catalog fields `diff` needs — runtime status,
+# the three deprecation dates, AND the precomputed migration `target` (frozen
+# into the catalog by wf-r1). `diff` builds every item/suggestion body from
+# those row columns and no longer derives a target itself (pickTarget moved to
+# wf-r1). Catalog-sanity guard: the query also returns a scalar `catalog_count`
+# (runtimes in the lambda_runtimes instance) on every row; if rows come back
+# but `catalog_count` is 0 (the instance is missing/empty — wf-r1 never ran),
+# `diff` ABORTS with reason `catalog_missing` rather than silently scanning 0
+# and NEVER creates an item with null dates from a JOIN that silently missed.
 #
 # Idempotency (the lake has sync lag — it PREfilters, the live API CONFIRMS):
 # `lake_detect` returns each scope's `existing_item_id` as of the snapshot,
@@ -39,8 +53,17 @@
 # landed with this change — the forEach path previously bypassed the retry
 # wrapper). The NON-idempotent POSTs (create_item, create_suggestion) do NOT
 # retry: a lost-ack 5xx retry would create a duplicate, and a missed create
-# self-heals on the next weekly run (the lake anti-join + find-before-create
+# self-heals on the next daily run (the lake anti-join + find-before-create
 # guard), so idempotency wins over availability there.
+#
+# Cadence (owner-decided, 2026-07-21): this scanner runs DAILY at 07:00
+# (~13s live over the full org), one hour before the daily closer (wf-r5,
+# 08:00). The daily cadence is what makes the no-reopen resolution model
+# work: wf-r3's resolve gate never reopens a resolved item (the platform API
+# forbids reopen from `resolved`) — instead a resolution that turns out
+# non-compliant is simply re-detected here and a NEW item is opened the next
+# morning. A weekly scan would leave a bad resolve unaddressed for up to a
+# week; daily shrinks that self-heal window to <24h.
 #
 # Engine gaps this file works around (all still true for v3, verified against
 # the shipped engine before writing this):
@@ -64,24 +87,26 @@
 #    split a batch — the `diff`/`filter_confirmed`/`zip_ids` code-exec steps
 #    partition into separate arrays and each action gets its OWN forEach pass.
 #
-# Per-org configuration (config entries on folder /runtime-lifecycle):
+# Per-org configuration (config entries on folder /action-items/runtime-lifecycle):
 #   NP_API_KEY (secret)                    — NP API key
 #   NP_ORGANIZATION_ID (var)               — organization id
 #   RUNTIME_WARN_DAYS (var)                — days-to-deprecation "expiring"
 #                                            threshold (default 31). SINGLE
-#                                            source: both the lake query below
-#                                            and `diff`'s classify() read it,
-#                                            so they never disagree.
+#                                            source: `diff`'s classify() reads
+#                                            it (the lake query returns the raw
+#                                            catalog dates; classify applies
+#                                            the window), so they never disagree.
 #   RUNTIME_LIFECYCLE_CATEGORY_SLUG (var)  — action-item category slug
 id: runtime_deprecation_scanner
 name: "Runtime Deprecation Scanner"
 description: >
-  Weekly job (Mondays 07:00, also manual) that detects active serverless
-  scopes on a deprecated or soon-to-deprecate Lambda runtime via ONE lake
-  query, classifies each against any live action item, then creates the
-  action items + migration suggestions and bumps stale priorities via flat
-  per-item API passes — all on this workflow, no sub-workflow fan-out.
-path: "/runtime-lifecycle"
+  Daily job (07:00, also manual) that detects active serverless scopes on a
+  deprecated or soon-to-deprecate Lambda runtime via ONE lake query,
+  classifies each against any live action item, then creates the action
+  items + migration suggestions and bumps stale priorities via flat per-item
+  API passes — all on this workflow, no sub-workflow fan-out. The catalog
+  (status/dates/target) is JOINed from the lake, not read over the API.
+path: "/action-items/runtime-lifecycle"
 semantic_version: 3.0.0
 
 inputs:
@@ -112,76 +137,33 @@ steps:
   - id: start_cron
     type: trigger
     plugin_type: cron
-    name: "Weekly Monday 07:00"
+    name: "Daily 07:00"
     config:
-      schedule: "0 7 * * 1"
+      schedule: "0 7 * * *"
       timezone: "America/Argentina/Buenos_Aires"
 
-  # ── Read the catalog ONCE, before touching a single scope ─────────────
-  - id: read_catalog
-    type: module
-    plugin_type: np-api-call
-    name: "Read Runtime Catalog"
-    # Reached from either trigger.
-    join_strategy: any
-    # retry_policy carried for parity with the retired wf-r2b's read_catalog,
-    # but it is best-effort and effectively inert here: the normal step path
-    # only retries THROWN errors, and np-api-call never throws (it returns a
-    # {status:'failure'} on network error). failOnHttpError stays false (a 404
-    # is the valid "empty catalog" case). The catalog_guard below is the real
-    # safety net — an unreadable catalog yields ok:false and stops the sweep.
-    error_handling:
-      retry_policy:
-        max_attempts: 3
-        initial_interval: "2s"
-        backoff_strategy: exponential
-        jitter: 0.3
-    # DECLARED inputs (CLAUDE.md np-api-call shield rule): np-api-call's
-    # execute() does `cfg = {...config, ...ctx.inputs}` — a step with no
-    # `inputs:` map falls back to the predecessor's raw output object as
-    # ctx.inputs, which clobbers request fields. Shielded here for
-    # consistency even though this step's only predecessors are triggers.
-    inputs:
-      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      method: GET
-      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
-      # 404 (instance never seeded) is a valid "empty catalog" case, not a
-      # hard error — the guard below handles it uniformly.
-      failOnHttpError: false
-
-  - id: catalog_guard
-    type: module
-    plugin_type: code-exec
-    name: "Guard: Catalog Has Runtimes?"
-    # Aggregate step: NEVER dispatch per upstream item (single response).
-    metadata: { fanOutPerItem: false }
-    inputs:
-      status: "${{ steps.read_catalog.outputs.status }}"
-      body: "${{ steps.read_catalog.outputs.body }}"
-    config:
-      code: |
-        var body = inputs.body || {};
-        var runtimes = Array.isArray(body.runtimes) ? body.runtimes : [];
-        if (inputs.status !== 200 || runtimes.length === 0) {
-          return { ok: false, catalog: null, reason: 'empty catalog — run catalog-sync first' };
-        }
-        return { ok: true, catalog: body, reason: null };
-
-  # Deciders run in-sandbox (ports always known) — safe to wire.
-  - id: catalog_ok
-    type: decider
-    plugin_type: conditional
-    name: "Catalog Has Runtimes?"
-    config:
-      expression: "steps.catalog_guard.outputs.ok == true"
-
-  # ── ONE lake query: every active serverless scope whose runtime is ────
-  # deprecated OR expiring within RUNTIME_WARN_DAYS, joined against the
-  # lambda_runtimes catalog (org metadata) and any live lambda-runtime
-  # action item. Verified live against a demo organization (org <org-id>),
-  # 2026-07-21. All verified via
+  # ── ONE lake query: the ACTIONABLE candidates only, joined against the ──
+  # lambda_runtimes catalog (org metadata) and any live lambda-runtime action
+  # item. The candidate filter is IN THE QUERY (lake-first principle: the query
+  # returns only actionable rows, never the whole active-serverless set) —
+  # a scope is returned only when its runtime is `deprecated` OR expiring
+  # within RUNTIME_WARN_DAYS. Per row the query emits the catalog `status`, the
+  # three deprecation dates AND the precomputed migration `target` (frozen by
+  # wf-r1) so `diff` builds every body from row columns and never reads the
+  # catalog over the API.
+  #
+  # Catalog-missing detection WITHOUT unbounding the row set: a filtered query
+  # collapses "catalog missing" and "genuinely nothing deprecated" to the same
+  # zero rows. So the query carries a scalar `catalog_count` (runtimes in the
+  # lambda_runtimes instance) on every row AND `UNION ALL`s a single SENTINEL
+  # row (`is_sentinel = 1`, all other columns empty) that also carries
+  # `catalog_count`. The sentinel is ALWAYS present, so `diff` can read
+  # `catalog_count` even when there are zero real candidates: catalog_count 0
+  # → abort catalog_missing; > 0 → proceed. `diff` skips the sentinel row when
+  # building candidates. This keeps detection to ONE query and never returns
+  # more than the actionable candidates (+1 sentinel).
+  #
+  # Verified live against a demo organization (org <org-id>), 2026-07-21, via
   # ~/workspace/null/np-claude-skills/src/skills/np-lake/scripts/ch_query.sh
   # (read-only).
   #
@@ -203,18 +185,23 @@ steps:
   #    breaks the join (empty `cat.*` columns, no error) because ClickHouse
   #    resolves the join key against the array-join alias instead of the
   #    subquery alias.
+  #  - The UNION ALL sentinel branch must produce the SAME column list and
+  #    types as the main branch — id-like columns are `toString(...)` in the
+  #    main branch so the sentinel's empty strings match their type.
   - id: lake_detect
     type: module
     plugin_type: np-lake-query
-    name: "Deprecated/Expiring Serverless Scopes (lake)"
+    name: "Deprecated/Expiring Serverless Scopes + Catalog (lake)"
+    # Reached from either trigger.
+    join_strategy: any
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
         SELECT
-          s.id AS scope_id,
+          toString(s.id) AS scope_id,
           s.nrn AS scope_nrn,
           s.name AS scope_name,
-          s.application_id AS application_id,
+          toString(s.application_id) AS application_id,
           a.app_name AS application_name,
           JSONExtractString(s.capabilities, 'serverless_runtime', 'id') AS runtime,
           coalesce(dims.environment, 'development') AS environment,
@@ -222,9 +209,18 @@ steps:
           cat.deprecation_date AS deprecation_date,
           cat.block_function_create AS block_function_create,
           cat.block_function_update AS block_function_update,
+          cat.target AS target,
+          (
+            SELECT count()
+            FROM core_entities_metadata AS m FINAL
+            ARRAY JOIN JSONExtractArrayRaw(coalesce(m.data, ''), 'runtimes') AS mrt
+            WHERE m.entity = 'organization' AND m.metadata_type = 'lambda_runtimes'
+              AND m.id = '${{ vars.NP_ORGANIZATION_ID }}' AND m._deleted = 0
+          ) AS catalog_count,
           ai.action_item_id AS existing_item_id,
           ai.priority AS existing_priority,
-          ai.status AS existing_status
+          ai.status AS existing_status,
+          0 AS is_sentinel
         FROM core_entities_scope AS s FINAL
         JOIN core_entities_application AS a FINAL
           ON s.application_id = a.app_id AND a._deleted = 0
@@ -239,7 +235,8 @@ steps:
             JSONExtractString(rt, 'status') AS status,
             JSONExtractString(rt, 'deprecation_date') AS deprecation_date,
             JSONExtractString(rt, 'block_function_create') AS block_function_create,
-            JSONExtractString(rt, 'block_function_update') AS block_function_update
+            JSONExtractString(rt, 'block_function_update') AS block_function_update,
+            JSONExtractString(rt, 'target') AS target
           FROM core_entities_metadata FINAL
           ARRAY JOIN JSONExtractArrayRaw(coalesce(data, ''), 'runtimes') AS rt
           WHERE entity = 'organization' AND metadata_type = 'lambda_runtimes'
@@ -262,20 +259,40 @@ steps:
             cat.status = 'deprecated'
             OR (cat.deprecation_date != '' AND toDate(cat.deprecation_date) <= today() + ${{ vars.RUNTIME_WARN_DAYS || 31 }})
           )
+        UNION ALL
+        SELECT
+          '' AS scope_id, '' AS scope_nrn, '' AS scope_name, '' AS application_id,
+          '' AS application_name, '' AS runtime, '' AS environment,
+          '' AS catalog_status, '' AS deprecation_date, '' AS block_function_create,
+          '' AS block_function_update, '' AS target,
+          (
+            SELECT count()
+            FROM core_entities_metadata AS m FINAL
+            ARRAY JOIN JSONExtractArrayRaw(coalesce(m.data, ''), 'runtimes') AS mrt
+            WHERE m.entity = 'organization' AND m.metadata_type = 'lambda_runtimes'
+              AND m.id = '${{ vars.NP_ORGANIZATION_ID }}' AND m._deleted = 0
+          ) AS catalog_count,
+          '' AS existing_item_id, '' AS existing_priority, '' AS existing_status,
+          1 AS is_sentinel
         LIMIT 5000
 
   # ── Classify + build EVERYTHING (pure, ONE call over the lake result) ──
-  # This step folds wf-r2b's classify/build_item/pickTarget VERBATIM. It
-  # partitions the lake rows into:
+  # This step folds wf-r2b's classify/build_item VERBATIM. It reads the
+  # catalog fields (status/dates/target) straight off each lake row — there is
+  # NO catalog input and NO pickTarget here anymore (wf-r1 precomputes the
+  # target; the lake query joins it). It partitions the lake rows into:
   #   - find_requests[] + create_plan[] (index-aligned): CREATE candidates
   #     (lake shows no live item). find_requests[i] is the live find-before-
   #     create GET; create_plan[i] carries the FULL item POST body and the
-  #     suggestion body (or null when there is no migration target).
+  #     suggestion body (or null when the row has no migration `target`).
   #   - bump_requests[]: existing live items whose priority must rise
   #     (deprecated but not yet critical) or that `force` re-touches.
+  # Catalog-sanity guard: the query returns a scalar `catalog_count` on every
+  # row; if rows come back but that count is 0 (the lambda_runtimes instance
+  # is missing/empty), diff ABORTS with catalog_missing and writes nothing —
+  # never an item with null dates from a JOIN that silently missed.
   # Everything a downstream np-api-call needs is baked here so no later step
-  # re-derives anything; per-item payloads stay SMALL (the catalog is read
-  # ONCE at workflow scope and never rides per item — Temporal 2MB cap).
+  # re-derives anything; per-item payloads stay SMALL.
   - id: diff
     type: module
     plugin_type: code-exec
@@ -283,34 +300,21 @@ steps:
     metadata: { fanOutPerItem: false }
     inputs:
       rows: "${{ steps.lake_detect.outputs.rows }}"
-      catalog: "${{ steps.catalog_guard.outputs.catalog }}"
       force: "${{ workflow.inputs.force }}"
-      # SINGLE source for the "expiring" window — same var the lake query
-      # uses (reconciles the old wf-r2b hardcoded-31 vs lake-var mismatch).
+      # SINGLE source for the "expiring" window — classify() applies it to the
+      # raw catalog dates the lake row carries.
       warn_days: "${{ vars.RUNTIME_WARN_DAYS }}"
       category_slug: "${{ vars.RUNTIME_LIFECYCLE_CATEGORY_SLUG }}"
       org_nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
     config:
       code: |
-        // ── VERBATIM shared helpers (copied from the retired wf-r2b —
-        // workflow steps can't import, duplication is the convention) ──
-        function parseRuntime(id) {
-          id = String(id || '');
-          if (id.indexOf('provided') === 0) {
-            return { language: 'provided', version: id.split('.').slice(1).join('.') };
-          }
-          var m = id.match(/^([a-z]+)([0-9]+(?:\.[0-9]+)?)/);
-          return m ? { language: m[1], version: m[2] } : { language: id, version: '' };
-        }
-        function verNum(v) {
-          var p = String(v).split('.');
-          var a = Number(String(p[0] || '').replace(/[^0-9]/g, '')) || 0;
-          var b = Number(String(p[1] || '').replace(/[^0-9]/g, '')) || 0;
-          return a * 1000 + b;
-        }
+        // ── VERBATIM classify (copied from the retired wf-r2b — workflow
+        // steps can't import, duplication is the convention). `entry` is built
+        // from the lake row's own catalog columns; the migration `target` is
+        // read straight off the row (wf-r1 precomputed it), so parseRuntime/
+        // verNum/pickTarget no longer live here.
         // classify: identical to wf-r2b's, EXCEPT the expiring window is
-        // `warnDays` (from RUNTIME_WARN_DAYS) instead of a hardcoded 31 — so
-        // the diff and the lake query agree on exactly one threshold.
+        // `warnDays` (from RUNTIME_WARN_DAYS) instead of a hardcoded 31.
         function classify(entry, todayMs, warnDays) {
           if (!entry) return { verdict: 'unknown_runtime' };
           var dep = entry.deprecation_date ? Date.parse(entry.deprecation_date) : null;
@@ -321,24 +325,6 @@ steps:
             return { verdict: 'expiring', priority: 'high', deprecation_ms: dep };
           }
           return { verdict: 'ok' };
-        }
-        function pickTarget(currentId, runtimes, todayMs) {
-          var cur = parseRuntime(currentId);
-          var HORIZON = 180 * 86400000;
-          var cands = [];
-          for (var i = 0; i < (runtimes || []).length; i++) {
-            var r = runtimes[i];
-            if (r.status !== 'supported') continue;
-            var p = parseRuntime(r.id);
-            if (p.language !== cur.language) continue;
-            if (verNum(p.version) <= verNum(cur.version)) continue;
-            cands.push({ id: r.id, v: verNum(p.version), dep: r.deprecation_date ? Date.parse(r.deprecation_date) : null });
-          }
-          cands.sort(function (a, b) { return a.v - b.v; });
-          for (var j = 0; j < cands.length; j++) {
-            if (cands[j].dep === null || cands[j].dep - todayMs > HORIZON) return cands[j].id;
-          }
-          return cands.length ? cands[cands.length - 1].id : null;
         }
         function fmt(d) { return d ? String(d) : '—'; }
 
@@ -507,13 +493,37 @@ steps:
         // triggers a bump (matches the retired wf-r2b's decide semantics).
         var LIVE = { open: 1, deferred: 1, pending_deferral: 1, pending_verification: 1, pending_rejection: 1 };
         var MAX_FANOUT = 200;
-        var rows = inputs.rows || [];
-        var runtimes = (inputs.catalog || {}).runtimes || [];
+        var allRows = inputs.rows || [];
         var force = inputs.force === true || String(inputs.force) === 'true';
         var warnDays = Number(inputs.warn_days) || 31;
         var categorySlug = inputs.category_slug;
         var orgNrn = inputs.org_nrn;
         var today = Date.now();
+
+        // Catalog-sanity guard: every returned row (including the ALWAYS-present
+        // sentinel row the query UNION ALLs in) carries the scalar
+        // `catalog_count` (runtimes in the lambda_runtimes instance). If it is
+        // 0, the catalog is missing/empty (wf-r1 never ran) — ABORT rather than
+        // silently scan 0 and never create items with null dates. The sentinel
+        // guarantees catalog_count is readable even with zero real candidates.
+        var catalogCount = allRows.length ? Number(allRows[0].catalog_count || 0) : 0;
+        if (allRows.length > 0 && !(catalogCount > 0)) {
+          return {
+            catalog_missing: true,
+            reason: 'catalog_missing — run catalog-sync first',
+            find_requests: [], create_plan: [], bump_requests: [],
+            total_candidates: 0, create_planned: 0, bump: 0, prefiltered: 0,
+            truncated: false, force: force
+          };
+        }
+
+        // Drop the sentinel row (it only carries catalog_count; it is not a
+        // scope to process).
+        var rows = [];
+        for (var si = 0; si < allRows.length; si++) {
+          if (Number(allRows[si].is_sentinel) === 1) continue;
+          rows.push(allRows[si]);
+        }
 
         var findRequests = [];
         var createPlan = [];
@@ -523,15 +533,25 @@ steps:
         for (var i = 0; i < rows.length; i++) {
           var row = rows[i] || {};
           var rt = row.runtime;
-          var entry = null;
-          for (var k = 0; k < runtimes.length; k++) if (runtimes[k].id === rt) { entry = runtimes[k]; break; }
+          // `entry` comes from the lake row's OWN catalog columns (the query
+          // JOINed the lambda_runtimes catalog). An unmatched join leaves
+          // catalog_status '' (empty string) → entry null → unknown_runtime.
+          var entry = row.catalog_status ? {
+            id: rt,
+            status: row.catalog_status,
+            deprecation_date: row.deprecation_date || null,
+            block_function_create: row.block_function_create || null,
+            block_function_update: row.block_function_update || null
+          } : null;
           var c = classify(entry, today, warnDays);
-          // The lake pre-filters to deprecated/expiring rows, but classify is
-          // the source of truth (it may say 'ok'/'unknown' if the var or the
-          // catalog dates shifted). Anything not actionable is prefiltered.
+          // classify is the source of truth: the query returns ALL active
+          // serverless scopes, so the `ok`/unknown ones are prefiltered here.
           if (c.verdict !== 'deprecated' && c.verdict !== 'expiring') { counts.prefiltered++; continue; }
 
-          var target = pickTarget(rt, runtimes, today);
+          // Migration target: read straight off the row (wf-r1 precomputed it).
+          // Empty string / missing → null (no supported successor → item, no
+          // suggestion).
+          var target = row.target || null;
           var hasLiveExisting = !!row.existing_item_id && LIVE[row.existing_status] === 1;
           var deprecatedNow = c.verdict === 'deprecated';
 
@@ -585,6 +605,8 @@ steps:
         }
 
         return {
+          catalog_missing: false,
+          reason: null,
           find_requests: findRequests,
           create_plan: createPlan,
           bump_requests: bumpRequests,
@@ -704,8 +726,8 @@ steps:
     # NO retry_policy: POST is NOT idempotent. A lost-ack 5xx (server created
     # the item but the response never arrived) would, on retry, create a
     # DUPLICATE. Idempotency > availability here: a missed create self-heals
-    # next Monday (the lake anti-join no longer sees a live item, and the
-    # find-before-create guard re-confirms), whereas a duplicate does not.
+    # on the next daily run (the lake anti-join no longer sees a live item,
+    # and the find-before-create guard re-confirms), whereas a duplicate does not.
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       failOnHttpError: true
@@ -818,13 +840,12 @@ steps:
     plugin_type: code-exec
     name: "Build Summary"
     metadata: { fanOutPerItem: false }
-    # Reached either from bump_priority (catalog ok, the whole chain ran —
-    # even over zero rows) or directly from catalog_ok:false (empty catalog).
-    # Exactly one path fires per run.
-    join_strategy: any
+    # Always reached from bump_priority — the whole chain runs even over zero
+    # rows or a catalog_missing abort (diff emits empty request arrays, so
+    # every write pass is a clean no-op).
     inputs:
-      catalog_ok: "${{ steps.catalog_guard.outputs.ok }}"
-      reason: "${{ steps.catalog_guard.outputs.reason }}"
+      catalog_missing: "${{ steps.diff.outputs.catalog_missing }}"
+      reason: "${{ steps.diff.outputs.reason }}"
       total_candidates: "${{ steps.diff.outputs.total_candidates }}"
       create_planned: "${{ steps.diff.outputs.create_planned }}"
       bump_planned: "${{ steps.diff.outputs.bump }}"
@@ -840,7 +861,7 @@ steps:
       bump_results: "${{ steps.bump_priority.outputs.items }}"
     config:
       code: |
-        var catalogOk = inputs.catalog_ok === true;
+        var catalogOk = inputs.catalog_missing !== true;
 
         // Suggestions: index-align create_suggestion results against the
         // requests that drove them. Success is `{status, body, headers}` with
@@ -897,12 +918,8 @@ steps:
       message: "Runtime deprecation scan: ${{ steps.summary.outputs.scopes_scanned }} candidates (${{ steps.summary.outputs.candidates_create }} create, ${{ steps.summary.outputs.candidates_bump }} bump, ${{ steps.summary.outputs.prefiltered }} prefiltered) — created ${{ steps.summary.outputs.created }} (suggestions ${{ steps.summary.outputs.suggestion_created }}), bumped ${{ steps.summary.outputs.bumped }}, skipped on re-verify ${{ steps.summary.outputs.skipped_existing }}. Failures: find ${{ steps.summary.outputs.find_failed }}, create ${{ steps.summary.outputs.create_failed }}, suggestion ${{ steps.summary.outputs.suggestion_failed }}, bump ${{ steps.summary.outputs.bump_failed }}. (catalog_ok=${{ steps.summary.outputs.catalog_ok }}, reason=${{ steps.summary.outputs.reason }}, truncated=${{ steps.summary.outputs.truncated }})"
 
 connections:
-  - { id: c1,  from: start_manual,      to: read_catalog }
-  - { id: c2,  from: start_cron,        to: read_catalog }
-  - { id: c3,  from: read_catalog,      to: catalog_guard }
-  - { id: c4,  from: catalog_guard,     to: catalog_ok }
-  - { id: c5,  from: catalog_ok,        to: lake_detect,       source_port: "true" }
-  - { id: c6,  from: catalog_ok,        to: summary,           source_port: "false" }
+  - { id: c1,  from: start_manual,      to: lake_detect }
+  - { id: c2,  from: start_cron,        to: lake_detect }
   - { id: c7,  from: lake_detect,       to: diff }
   - { id: c8,  from: diff,              to: find_existing }
   - { id: c9,  from: find_existing,     to: filter_confirmed }
