@@ -1,48 +1,125 @@
-# Lambda Runtime Deprecation Scanner — weekly streaming scan over active
-# serverless scopes.
+# Lambda Runtime Deprecation Scanner — lake-first DAILY scan, FLAT writes.
 #
-# Reads the `lambda_runtimes` org catalog ONCE, then streams every active
-# `serverless` scope (paginated) and dispatches the per-scope analysis
-# sub-workflow (wf-r2b) for each, passing the SAME catalog object to every
-# call. wf-r2b classifies the scope's runtime and ensures an idempotent
-# Engineering action item. This workflow only aggregates: it never talks to
-# the action-item API directly.
+# REDESIGN v3 (owner-decided, 2026-07-21): detection is ONE lake query and
+# every write is now a FLAT per-item `np-api-call` pass on THIS workflow —
+# there is no per-scope sub-workflow child anymore (`wf-r2b-analyze-scope`
+# is retired/deleted). The old design streamed ~162 active serverless scopes
+# through a per-scope sub-workflow (~5s/scope × 162 ≈ 30min of Temporal
+# choreography every week, almost all of it `ok`); v2 already collapsed
+# detection into `lake_detect` (one ClickHouse round-trip joining the
+# active-serverless scope set, the `lambda_runtimes` catalog, and any live
+# lambda-runtime action item) but still fanned out to wf-r2b. v3 folds
+# wf-r2b's pure classification/build logic into the `diff` step (VERBATIM
+# copies of classify + the item/suggestion builders) and does the API writes
+# here as flat forEach passes.
 #
-# Streaming-pagination pattern (CLAUDE.md § Workflow Authoring): four
-# explicit nodes — `fetch_scopes` (np-entity-paginated-fetch, mode: stream)
-# → `analyze_scope` (sub-workflow, one call per scope) → `acc_results`
-# (set-variable accumulator into `variables.results`) → `summary` (code-exec
-# reading `variables.results`, never `$items`, since the `:done` envelope is
-# empty).
+# CATALOG FROM THE LAKE (owner-decided v4, 2026-07-21): the scanner no longer
+# reads the `lambda_runtimes` metadata instance over the API (the old
+# read_catalog + catalog_guard steps are GONE). Instead `lake_detect` JOINs
+# the catalog (core_entities_metadata FINAL, the lambda_runtimes instance)
+# and emits, per scope row, the catalog fields `diff` needs — runtime status,
+# the three deprecation dates, AND the precomputed migration `target` (frozen
+# into the catalog by wf-r1). `diff` builds every item/suggestion body from
+# those row columns and no longer derives a target itself (pickTarget moved to
+# wf-r1). Catalog-sanity guard: the query also returns a scalar `catalog_count`
+# (runtimes in the lambda_runtimes instance) on every row; if rows come back
+# but `catalog_count` is 0 (the instance is missing/empty — wf-r1 never ran),
+# `diff` ABORTS with reason `catalog_missing` rather than silently scanning 0
+# and NEVER creates an item with null dates from a JOIN that silently missed.
 #
-# Guard: if the catalog is missing or has zero runtimes, the scan stops
-# before fetching a single scope (catalog-sync must run first).
+# Idempotency (the lake has sync lag — it PREfilters, the live API CONFIRMS):
+# `lake_detect` returns each scope's `existing_item_id` as of the snapshot,
+# but an item created since the snapshot won't be in it. So for every CREATE
+# candidate we do a live find-before-create (`find_existing`) and drop any
+# whose live find turns up a live item (`filter_confirmed`). On a find that
+# ERRORS we drop the row too (skip, not create): a missed create is caught
+# by next week's run, whereas creating blind risks a duplicate.
 #
-# Per-org configuration (config entries on folder /runtime-lifecycle):
-#   NP_API_KEY (secret)         — NP API key
-#   NP_ORGANIZATION_ID (var)    — organization id
+# Flat-write mechanism (`forEach.spreadItem`, engine capability landed
+# 2026-07-21, commit 9526c4d): each write pass iterates an array of request
+# objects shaped `{path, method, body|query}`; `spreadItem: true` merges those
+# keys into the per-iteration `np-api-call` inputs (which override config,
+# since the plugin computes `cfg = {...config, ...ctx.inputs}`), so one
+# generic `np-api-call` step fully parameterizes itself per item. The static
+# shields (apiKey, failOnHttpError) stay in config; the dynamic request rides
+# on the item.
+#
+# Write passes are hardened, not fire-and-forget: every write step sets
+# `failOnHttpError: true` (a >=400 becomes a per-iteration FAILURE — 5xx
+# `retryable: true`, 4xx `retryable: false`). Per-iteration retry is applied
+# ONLY to the idempotent reads/updates — find_existing (GET) and bump_priority
+# (PATCH) carry `error_handling.retry_policy` (3 attempts, exponential backoff
+# + jitter), which the forEach coordinator now honors PER ITERATION (engine fix
+# landed with this change — the forEach path previously bypassed the retry
+# wrapper). The NON-idempotent POSTs (create_item, create_suggestion) do NOT
+# retry: a lost-ack 5xx retry would create a duplicate, and a missed create
+# self-heals on the next daily run (the lake anti-join + find-before-create
+# guard), so idempotency wins over availability there.
+#
+# Cadence (owner-decided, 2026-07-21): this scanner runs DAILY at 07:00
+# (~13s live over the full org), one hour before the daily closer (wf-r5,
+# 08:00). The daily cadence is what makes the no-reopen resolution model
+# work: wf-r3's resolve gate never reopens a resolved item (the platform API
+# forbids reopen from `resolved`) — instead a resolution that turns out
+# non-compliant is simply re-detected here and a NEW item is opened the next
+# morning. A weekly scan would leave a bad resolve unaddressed for up to a
+# week; daily shrinks that self-heal window to <24h.
+#
+# Engine gaps this file works around (all still true for v3, verified against
+# the shipped engine before writing this):
+#  - forEach has NO `error_handling.fallback_step` — only its own absorption.
+#    In `parallel` mode a hard child failure (network error, a 4xx, or a 5xx
+#    whose retries are exhausted) is ABSORBED as a `{}` slot in the results
+#    array, in the SAME position as its input (forEach preserves order). So
+#    every write pass is FOLLOWED by a pure `code-exec` that detects failures
+#    INDEX-ALIGNED, treating BOTH shapes as that pass's failure (belt and
+#    suspenders): the `{}` absorbed slot AND, should failOnHttpError ever be
+#    false, a `{status>=400}` response slot — a create/suggest with no
+#    `body.id`, a find/bump whose slot has no 2xx `status`. They route to the
+#    summary's failure buckets — no failure is silently lost, but none aborts
+#    the sweep either.
+#  - `code-exec` can only ever emit ONE wrapped output object — it can NOT
+#    become an items[]-producer for a filtered subset. That is exactly why the
+#    native items[]-fan-out + `fallback_step` pattern is unavailable here and
+#    `forEach.expression` (reading the filtered array out of the prior step's
+#    `outputs`) is used instead.
+#  - deciders evaluate `items[0]` only, so a decider must never be used to
+#    split a batch — the `diff`/`filter_confirmed`/`zip_ids` code-exec steps
+#    partition into separate arrays and each action gets its OWN forEach pass.
+#
+# Per-org configuration (config entries on folder /action-items/runtime-lifecycle):
+#   NP_API_KEY (secret)                    — NP API key
+#   NP_ORGANIZATION_ID (var)               — organization id
+#   RUNTIME_WARN_DAYS (var)                — days-to-deprecation "expiring"
+#                                            threshold (default 31). SINGLE
+#                                            source: `diff`'s classify() reads
+#                                            it (the lake query returns the raw
+#                                            catalog dates; classify applies
+#                                            the window), so they never disagree.
+#   RUNTIME_LIFECYCLE_CATEGORY_SLUG (var)  — action-item category slug
 id: runtime_deprecation_scanner
 name: "Runtime Deprecation Scanner"
 description: >
-  Weekly job (Mondays 07:00, also manual) that streams active serverless
-  scopes, classifies each Lambda runtime against the lambda_runtimes
-  catalog, and ensures an Engineering action item per genuine finding via
-  the per-scope analysis sub-workflow.
-path: "/runtime-lifecycle"
-semantic_version: 1.0.0
+  Daily job (07:00, also manual) that detects active serverless scopes on a
+  deprecated or soon-to-deprecate Lambda runtime via ONE lake query,
+  classifies each against any live action item, then creates the action
+  items + migration suggestions and bumps stale priorities via flat per-item
+  API passes — all on this workflow, no sub-workflow fan-out. The catalog
+  (status/dates/target) is JOINed from the lake, not read over the API.
+path: "/action-items/runtime-lifecycle"
+semantic_version: 3.0.0
 
 inputs:
   force:
     type: boolean
     required: false
     description: >
-      Forwarded to the per-scope analysis sub-workflow: refresh a live item
-      even when its priority already matches the freshly computed one —
-      useful for a manual recalibration re-run.
-
-variables:
-  results:
-    initialValue: []
+      Recalibration re-run: refresh a live item even when its priority
+      already matches the freshly computed one. Widens the bump set — a scope
+      whose live item the diff would otherwise `skip` becomes a bump
+      candidate so its priority is re-PATCHed. This is a refresh, NOT a
+      bypass: it never duplicates an item on the create path (find-before-
+      create still guards it) and never lowers a priority.
 
 steps:
   - id: start_manual
@@ -50,7 +127,7 @@ steps:
     plugin_type: manual
     name: "Run Scan Now"
     config:
-      description: "Streams active serverless scopes and classifies each Lambda runtime against the catalog."
+      description: "Detects deprecated/expiring Lambda runtimes via one lake query and writes items/suggestions/bumps directly."
       inputs:
         force:
           type: boolean
@@ -60,204 +137,776 @@ steps:
   - id: start_cron
     type: trigger
     plugin_type: cron
-    name: "Weekly Monday 07:00"
+    name: "Daily 07:00"
     config:
-      schedule: "0 7 * * 1"
+      schedule: "0 7 * * *"
       timezone: "America/Argentina/Buenos_Aires"
 
-  # ── Read the catalog ONCE, before touching a single scope ─────────────
-  - id: read_catalog
+  # ── ONE lake query: the ACTIONABLE candidates only, joined against the ──
+  # lambda_runtimes catalog (org metadata) and any live lambda-runtime action
+  # item. The candidate filter is IN THE QUERY (lake-first principle: the query
+  # returns only actionable rows, never the whole active-serverless set) —
+  # a scope is returned only when its runtime is `deprecated` OR expiring
+  # within RUNTIME_WARN_DAYS. Per row the query emits the catalog `status`, the
+  # three deprecation dates AND the precomputed migration `target` (frozen by
+  # wf-r1) so `diff` builds every body from row columns and never reads the
+  # catalog over the API.
+  #
+  # Catalog-missing detection WITHOUT unbounding the row set: a filtered query
+  # collapses "catalog missing" and "genuinely nothing deprecated" to the same
+  # zero rows. So the query carries a scalar `catalog_count` (runtimes in the
+  # lambda_runtimes instance) on every row AND `UNION ALL`s a single SENTINEL
+  # row (`is_sentinel = 1`, all other columns empty) that also carries
+  # `catalog_count`. The sentinel is ALWAYS present, so `diff` can read
+  # `catalog_count` even when there are zero real candidates: catalog_count 0
+  # → abort catalog_missing; > 0 → proceed. `diff` skips the sentinel row when
+  # building candidates. This keeps detection to ONE query and never returns
+  # more than the actionable candidates (+1 sentinel).
+  #
+  # Verified live against kwik-e-mart (org 1255165411), 2026-07-21, via
+  # ~/workspace/null/np-claude-skills/src/skills/np-lake/scripts/ch_query.sh
+  # (read-only).
+  #
+  # Gotchas hit while validating this query live (kept as comments so the
+  # next author doesn't rediscover them the hard way):
+  #  - `core_entities_metadata` carries TWO rows for
+  #    (entity='organization', metadata_type='lambda_runtimes') per org:
+  #    the actual instance (id = the org id) AND the metadata SPECIFICATION
+  #    itself (id = a uuid, `data` is NULL). The catalog subquery filters
+  #    `id = '<org id>'` — without it you silently join against a row with
+  #    no `data` and every `cat.*` column comes back empty (no error).
+  #  - Aliasing a SELECT column `id` inside a subquery that also filters
+  #    `WHERE id = ...` on that same source table silently returns ZERO
+  #    rows (no error) — ClickHouse resolves the WHERE against the alias,
+  #    not the source column. Every extracted id-like column below is
+  #    aliased away from the bare name `id` (`runtime_id`, `scope_id`, …).
+  #  - The `ARRAY JOIN ... AS rt` alias must differ from the OUTER query's
+  #    alias for the same subquery (`cat`) — reusing `rt` for both silently
+  #    breaks the join (empty `cat.*` columns, no error) because ClickHouse
+  #    resolves the join key against the array-join alias instead of the
+  #    subquery alias.
+  #  - The UNION ALL sentinel branch must produce the SAME column list and
+  #    types as the main branch — id-like columns are `toString(...)` in the
+  #    main branch so the sentinel's empty strings match their type.
+  - id: lake_detect
     type: module
-    plugin_type: np-api-call
-    name: "Read Runtime Catalog"
+    plugin_type: np-lake-query
+    name: "Deprecated/Expiring Serverless Scopes + Catalog (lake)"
     # Reached from either trigger.
     join_strategy: any
-    # DECLARED inputs: np-api-call's execute() does `cfg = {...config,
-    # ...ctx.inputs}` (inputs override config) — a step with no `inputs:`
-    # map falls back to the predecessor's raw output object as
-    # `ctx.inputs`, which clobbers request fields (e.g. `headers`) when
-    # chained after another np-api-call step (live E2E finding on wf-r4's
-    # fetch_scope). Shielded here too for consistency even though this
-    # step's only predecessors are triggers.
-    inputs:
-      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
-      method: GET
-      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
-      # 404 (instance never seeded) is a valid "empty catalog" case, not a
-      # hard error — the guard below handles it uniformly.
-      failOnHttpError: false
+      sql: |
+        SELECT
+          toString(s.id) AS scope_id,
+          s.nrn AS scope_nrn,
+          s.name AS scope_name,
+          toString(s.application_id) AS application_id,
+          a.app_name AS application_name,
+          JSONExtractString(s.capabilities, 'serverless_runtime', 'id') AS runtime,
+          coalesce(dims.environment, 'development') AS environment,
+          cat.status AS catalog_status,
+          cat.deprecation_date AS deprecation_date,
+          cat.block_function_create AS block_function_create,
+          cat.block_function_update AS block_function_update,
+          cat.target AS target,
+          (
+            SELECT count()
+            FROM core_entities_metadata AS m FINAL
+            ARRAY JOIN JSONExtractArrayRaw(coalesce(m.data, ''), 'runtimes') AS mrt
+            WHERE m.entity = 'organization' AND m.metadata_type = 'lambda_runtimes'
+              AND m.id = '${{ vars.NP_ORGANIZATION_ID }}' AND m._deleted = 0
+          ) AS catalog_count,
+          ai.action_item_id AS existing_item_id,
+          ai.priority AS existing_priority,
+          ai.status AS existing_status,
+          0 AS is_sentinel
+        FROM core_entities_scope AS s FINAL
+        JOIN core_entities_application AS a FINAL
+          ON s.application_id = a.app_id AND a._deleted = 0
+        LEFT JOIN (
+          SELECT scope_id, value_slug AS environment
+          FROM core_entities_scope_dimension FINAL
+          WHERE _deleted = 0 AND dimension_slug = 'environment'
+        ) AS dims ON dims.scope_id = s.id
+        LEFT JOIN (
+          SELECT
+            JSONExtractString(rt, 'id') AS runtime_id,
+            JSONExtractString(rt, 'status') AS status,
+            JSONExtractString(rt, 'deprecation_date') AS deprecation_date,
+            JSONExtractString(rt, 'block_function_create') AS block_function_create,
+            JSONExtractString(rt, 'block_function_update') AS block_function_update,
+            JSONExtractString(rt, 'target') AS target
+          FROM core_entities_metadata FINAL
+          ARRAY JOIN JSONExtractArrayRaw(coalesce(data, ''), 'runtimes') AS rt
+          WHERE entity = 'organization' AND metadata_type = 'lambda_runtimes'
+            AND id = '${{ vars.NP_ORGANIZATION_ID }}' AND _deleted = 0
+        ) AS cat ON cat.runtime_id = JSONExtractString(s.capabilities, 'serverless_runtime', 'id')
+        LEFT JOIN (
+          SELECT
+            JSONExtractString(metadata, 'scope_id') AS scope_id,
+            action_item_id, priority, status,
+            row_number() OVER (
+              PARTITION BY JSONExtractString(metadata, 'scope_id')
+              ORDER BY (status IN ('open', 'deferred', 'pending_deferral', 'pending_verification', 'pending_rejection')) DESC, updated_at DESC
+            ) AS rn
+          FROM governance_action_items_action_items FINAL
+          WHERE _deleted = 0 AND JSONExtractString(labels, 'workflow_type') = 'lambda-runtime'
+        ) AS ai ON ai.scope_id = toString(s.id) AND ai.rn = 1
+        WHERE s._deleted = 0 AND s.type = 'serverless' AND s.status = 'active'
+          AND s.nrn LIKE 'organization=${{ vars.NP_ORGANIZATION_ID }}%'
+          AND (
+            cat.status = 'deprecated'
+            OR (cat.deprecation_date != '' AND toDate(cat.deprecation_date) <= today() + ${{ vars.RUNTIME_WARN_DAYS || 31 }})
+          )
+        UNION ALL
+        SELECT
+          '' AS scope_id, '' AS scope_nrn, '' AS scope_name, '' AS application_id,
+          '' AS application_name, '' AS runtime, '' AS environment,
+          '' AS catalog_status, '' AS deprecation_date, '' AS block_function_create,
+          '' AS block_function_update, '' AS target,
+          (
+            SELECT count()
+            FROM core_entities_metadata AS m FINAL
+            ARRAY JOIN JSONExtractArrayRaw(coalesce(m.data, ''), 'runtimes') AS mrt
+            WHERE m.entity = 'organization' AND m.metadata_type = 'lambda_runtimes'
+              AND m.id = '${{ vars.NP_ORGANIZATION_ID }}' AND m._deleted = 0
+          ) AS catalog_count,
+          '' AS existing_item_id, '' AS existing_priority, '' AS existing_status,
+          1 AS is_sentinel
+        LIMIT 5000
 
-  - id: catalog_guard
+  # ── Classify + build EVERYTHING (pure, ONE call over the lake result) ──
+  # This step folds wf-r2b's classify/build_item VERBATIM. It reads the
+  # catalog fields (status/dates/target) straight off each lake row — there is
+  # NO catalog input and NO pickTarget here anymore (wf-r1 precomputes the
+  # target; the lake query joins it). It partitions the lake rows into:
+  #   - find_requests[] + create_plan[] (index-aligned): CREATE candidates
+  #     (lake shows no live item). find_requests[i] is the live find-before-
+  #     create GET; create_plan[i] carries the FULL item POST body and the
+  #     suggestion body (or null when the row has no migration `target`).
+  #   - bump_requests[]: existing live items whose priority must rise
+  #     (deprecated but not yet critical) or that `force` re-touches.
+  # Catalog-sanity guard: the query returns a scalar `catalog_count` on every
+  # row; if rows come back but that count is 0 (the lambda_runtimes instance
+  # is missing/empty), diff ABORTS with catalog_missing and writes nothing —
+  # never an item with null dates from a JOIN that silently missed.
+  # Everything a downstream np-api-call needs is baked here so no later step
+  # re-derives anything; per-item payloads stay SMALL.
+  - id: diff
     type: module
     plugin_type: code-exec
-    name: "Guard: Catalog Has Runtimes?"
-    # Aggregate step: NEVER dispatch per upstream item (single response).
+    name: "Classify + Build Item/Suggestion/Bump Bodies"
     metadata: { fanOutPerItem: false }
     inputs:
-      status: "${{ steps.read_catalog.outputs.status }}"
-      body: "${{ steps.read_catalog.outputs.body }}"
-    config:
-      code: |
-        var body = inputs.body || {};
-        var runtimes = Array.isArray(body.runtimes) ? body.runtimes : [];
-        if (inputs.status !== 200 || runtimes.length === 0) {
-          return { ok: false, catalog: null, reason: 'empty catalog — run catalog-sync first' };
-        }
-        return { ok: true, catalog: body, reason: null };
-
-  # Deciders run in-sandbox (ports always known) — safe to wire.
-  - id: catalog_ok
-    type: decider
-    plugin_type: conditional
-    name: "Catalog Has Runtimes?"
-    config:
-      expression: "steps.catalog_guard.outputs.ok == true"
-
-  # ── One page per invocation; downstream fans out per scope in that page ─
-  - id: fetch_scopes
-    type: module
-    plugin_type: np-entity-paginated-fetch
-    name: "List Active Serverless Scopes"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      entity: scope
-      filters:
-        nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
-        type: serverless
-        status: active
-      limit: 100
-      mode: stream
-
-  # Per-scope analysis: SAME catalog object on every call (read once above).
-  #
-  # Failure isolation (review finding): a persistent child failure (5xx
-  # after retries, a code-exec throw inside wf-r2b) must NOT kill the whole
-  # sweep — without `fallback_step` it propagates as a terminal
-  # WorkflowStepFailedError and every remaining scope AND every later page
-  # never process until next Monday. `analyze_scope_failed` catches it,
-  # stashes an `analysis_failed` verdict, and re-enters the pagination loop
-  # so the sweep continues past the failed scope/page.
-  - id: analyze_scope
-    type: module
-    plugin_type: sub-workflow
-    name: "Analyze Scope"
-    error_handling:
-      fallback_step: analyze_scope_failed
-    config:
-      # PER-ORG id of "Runtime Lifecycle — Analyze Scope"; patched by
-      # setup/04-upload-workflows.mjs on upload.
-      workflowId: runtime_lifecycle_analyze_scope
-      waitForCompletion: true
-    inputs:
-      scope: "${{ $item }}"
-      catalog: "${{ steps.catalog_guard.outputs.catalog }}"
+      rows: "${{ steps.lake_detect.outputs.rows }}"
       force: "${{ workflow.inputs.force }}"
-
-  # Accumulator: appends this page's per-scope outputs into a workflow
-  # variable. Runs once per page (set-variable defaults to executeMode='all').
-  - id: acc_results
-    type: module
-    plugin_type: set-variable
-    name: "Accumulate Scope Results"
-    metadata: { flipPorts: true }
-    config:
-      path: results
-      value: "${{ concat(variables.results, $items) }}"
-
-  # ── failure lane (fallback_step target) ──────────────────────────────────
-  # NOT connected via a normal edge — the engine routes here only via
-  # `error_handling.fallback_step` on `analyze_scope` above (terminal
-  # failure after retries). `steps.fetch_scopes.outputs.items` is still
-  # THIS page's scope list at the moment the fallback fires (fetch_scopes
-  # has not been asked for the next page yet), so it's the best-effort
-  # source for which scopes were in flight — exact per-scope attribution
-  # isn't available (the engine discards the whole batch's aggregated
-  # results on any single item's failure, see workflow-runner.ts fan-out
-  # dispatch). Mirrors wf-r5-closer.yaml's verify_item_failed exactly.
-  - id: analyze_scope_failed
-    type: module
-    plugin_type: code-exec
-    name: "Stash Result: analysis_failed (child failure)"
-    metadata: { fanOutPerItem: false }
-    inputs:
-      error_message: "${{ steps.analyze_scope.error.message }}"
-      error_code: "${{ steps.analyze_scope.error.code }}"
-      page_items: "${{ steps.fetch_scopes.outputs.items }}"
+      # SINGLE source for the "expiring" window — classify() applies it to the
+      # raw catalog dates the lake row carries.
+      warn_days: "${{ vars.RUNTIME_WARN_DAYS }}"
+      category_slug: "${{ vars.RUNTIME_LIFECYCLE_CATEGORY_SLUG }}"
+      org_nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
     config:
       code: |
-        var items = inputs.page_items || [];
-        var ids = [];
-        for (var i = 0; i < items.length; i++) {
-          var it = items[i] || {};
-          if (it.id) ids.push(it.id);
+        // ── VERBATIM classify (copied from the retired wf-r2b — workflow
+        // steps can't import, duplication is the convention). `entry` is built
+        // from the lake row's own catalog columns; the migration `target` is
+        // read straight off the row (wf-r1 precomputed it), so parseRuntime/
+        // verNum/pickTarget no longer live here.
+        // classify: identical to wf-r2b's, EXCEPT the expiring window is
+        // `warnDays` (from RUNTIME_WARN_DAYS) instead of a hardcoded 31.
+        function classify(entry, todayMs, warnDays) {
+          if (!entry) return { verdict: 'unknown_runtime' };
+          var dep = entry.deprecation_date ? Date.parse(entry.deprecation_date) : null;
+          if (entry.status === 'deprecated' || (dep !== null && dep <= todayMs)) {
+            return { verdict: 'deprecated', priority: 'critical', deprecation_ms: dep };
+          }
+          if (dep !== null && dep - todayMs <= warnDays * 86400000) {
+            return { verdict: 'expiring', priority: 'high', deprecation_ms: dep };
+          }
+          return { verdict: 'ok' };
         }
+        function fmt(d) { return d ? String(d) : '—'; }
+
+        // Builds the FULL action-item POST body (wf-r2b build_item, verbatim
+        // content) reading dates from the catalog `entry` and nrn/names from
+        // the lake row. category_slug/created_by are baked here since the
+        // sandbox can't resolve config-entry vars itself.
+        function buildItemBody(row, entry, c, target, categorySlug) {
+          var rt = row.runtime;
+          var scopeName = row.scope_name || '';
+          var appName = row.application_name || '';
+          var env = String(row.environment || 'development').toLowerCase();
+          var verdict = c.verdict;
+          var hasTarget = !!target;
+          var depDate = entry ? entry.deprecation_date : null;
+          var blockCreate = entry ? entry.block_function_create : null;
+          var blockUpdate = entry ? entry.block_function_update : null;
+
+          var title = 'Lambda runtime ' + rt + ' ' +
+            (verdict === 'deprecated' ? 'is deprecated' : 'deprecates on ' + fmt(depDate)) +
+            ' — ' + appName + '/' + scopeName;
+
+          var dateTable = [
+            '| date | value |',
+            '|---|---|',
+            '| Deprecation | ' + fmt(depDate) + ' |',
+            '| Block function create | ' + fmt(blockCreate) + ' |',
+            '| Block function update | ' + fmt(blockUpdate) + ' |'
+          ].join('\n');
+
+          var consequenceLine = 'After **block function update**, you will not be able to update this ' +
+            'function\'s configuration or code at all — **not even to ship a fix** — until the runtime ' +
+            'is upgraded.';
+
+          var descLines = [
+            '## Lambda runtime lifecycle',
+            '',
+            'Scope **' + scopeName + '** (application **' + appName + '**, environment **' + env + '**) ' +
+              'is running AWS Lambda runtime **' + rt + '**, which is ' +
+              (verdict === 'deprecated' ? '**already deprecated**' : '**deprecating soon**') + '.',
+            '',
+            dateTable,
+            '',
+            consequenceLine
+          ];
+          if (hasTarget) {
+            descLines.push('');
+            descLines.push('Recommended migration target: **' + target + '**.');
+          } else {
+            descLines.push('');
+            descLines.push('No supported successor runtime was found in the catalog for this language — manual migration required.');
+          }
+
+          return {
+            nrn: row.scope_nrn,
+            title: title,
+            created_by: 'agent:runtime-lifecycle',
+            category_slug: categorySlug,
+            description: descLines.join('\n'),
+            priority: c.priority,
+            metadata: {
+              runtime_item: true,
+              scope_id: String(row.scope_id),
+              application_id: String(row.application_id || ''),
+              environment: env,
+              current_runtime: rt,
+              target_runtime: target,
+              deprecation_date: depDate,
+              block_function_update: blockUpdate
+            },
+            labels: { workflow_type: 'lambda-runtime' }
+          };
+        }
+
+        // Builds the suggestion POST body (wf-r2b build_item suggestion
+        // branch, verbatim). Only called when a target exists.
+        function buildSuggestionBody(row, entry, c, target) {
+          var rt = row.runtime;
+          var scopeName = row.scope_name || '';
+          var env = String(row.environment || 'development').toLowerCase();
+          var isProd = env === 'production';
+          var verdict = c.verdict;
+          var depDate = entry ? entry.deprecation_date : null;
+          var blockCreate = entry ? entry.block_function_create : null;
+          var blockUpdate = entry ? entry.block_function_update : null;
+
+          var dateTable = [
+            '| date | value |',
+            '|---|---|',
+            '| Deprecation | ' + fmt(depDate) + ' |',
+            '| Block function create | ' + fmt(blockCreate) + ' |',
+            '| Block function update | ' + fmt(blockUpdate) + ' |'
+          ].join('\n');
+
+          var choiceLine = isProd
+            ? '**Production policy:** approving this suggestion only applies the runtime configuration ' +
+              'change — it never triggers a deploy; the change ships with your next regular deployment.'
+            : '**Your choice on approve:** deploy now, ship with the next deploy, or schedule it at a specific time.';
+
+          var suggestion = {
+            created_by: 'agent:runtime-lifecycle',
+            owner: 'executor:runtime-lifecycle-applier',
+            description: [
+              '**Migrate ' + scopeName + '** — runtime **' + rt + ' → ' + target + '**',
+              '',
+              'Why: ' + (verdict === 'deprecated'
+                ? 'the current runtime is already deprecated.'
+                : 'the current runtime deprecates on ' + fmt(depDate) + '.'),
+              '',
+              dateTable,
+              '',
+              choiceLine
+            ].join('\n'),
+            metadata: {
+              action_type: 'runtime_upgrade',
+              scope_id: String(row.scope_id),
+              from_runtime: rt,
+              to_runtime: target
+            }
+          };
+          if (isProd) {
+            suggestion.user_metadata_config = {
+              type: 'object',
+              properties: {
+                deploy_timing: {
+                  type: 'string',
+                  title: 'How to apply',
+                  oneOf: [{ const: 'apply-only', title: 'Apply runtime config only (ships with the next regular deploy)' }],
+                  default: 'apply-only'
+                }
+              }
+            };
+            suggestion.user_metadata = { deploy_timing: 'apply-only' };
+          } else {
+            suggestion.user_metadata_config = {
+              type: 'object',
+              properties: {
+                deploy_timing: {
+                  type: 'string',
+                  title: 'How to apply',
+                  oneOf: [
+                    { const: 'deploy-now', title: 'Deploy now' },
+                    { const: 'next-deploy', title: 'With the next deploy' },
+                    { const: 'scheduled', title: 'Schedule (set time below)' }
+                  ],
+                  default: 'deploy-now'
+                },
+                deploy_at: {
+                  type: 'string',
+                  title: 'Scheduled time (optional)',
+                  description: 'ISO-8601 timestamp, e.g. 2026-07-25T14:00:00Z. Leave blank to deploy immediately.',
+                  default: ''
+                }
+              }
+            };
+            suggestion.user_metadata = { deploy_timing: 'deploy-now', deploy_at: '' };
+          }
+          return suggestion;
+        }
+
+        // ── main ──
+        // "Live" = every ActionItemStatus that is not resolved/rejected/
+        // closed. The lake's row_number join prefers a live item but falls
+        // back to the most-recent non-live one, so a row can carry a
+        // resolved item's id — only a LIVE existing item blocks a create or
+        // triggers a bump (matches the retired wf-r2b's decide semantics).
+        var LIVE = { open: 1, deferred: 1, pending_deferral: 1, pending_verification: 1, pending_rejection: 1 };
+        var MAX_FANOUT = 200;
+        var allRows = inputs.rows || [];
+        var force = inputs.force === true || String(inputs.force) === 'true';
+        var warnDays = Number(inputs.warn_days) || 31;
+        var categorySlug = inputs.category_slug;
+        var orgNrn = inputs.org_nrn;
+        var today = Date.now();
+
+        // Catalog-sanity guard: every returned row (including the ALWAYS-present
+        // sentinel row the query UNION ALLs in) carries the scalar
+        // `catalog_count` (runtimes in the lambda_runtimes instance). If it is
+        // 0, the catalog is missing/empty (wf-r1 never ran) — ABORT rather than
+        // silently scan 0 and never create items with null dates. The sentinel
+        // guarantees catalog_count is readable even with zero real candidates.
+        var catalogCount = allRows.length ? Number(allRows[0].catalog_count || 0) : 0;
+        if (allRows.length > 0 && !(catalogCount > 0)) {
+          return {
+            catalog_missing: true,
+            reason: 'catalog_missing — run catalog-sync first',
+            find_requests: [], create_plan: [], bump_requests: [],
+            total_candidates: 0, create_planned: 0, bump: 0, prefiltered: 0,
+            truncated: false, force: force
+          };
+        }
+
+        // Drop the sentinel row (it only carries catalog_count; it is not a
+        // scope to process).
+        var rows = [];
+        for (var si = 0; si < allRows.length; si++) {
+          if (Number(allRows[si].is_sentinel) === 1) continue;
+          rows.push(allRows[si]);
+        }
+
+        var findRequests = [];
+        var createPlan = [];
+        var bumpRequests = [];
+        var counts = { create_planned: 0, bump: 0, prefiltered: 0 };
+
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i] || {};
+          var rt = row.runtime;
+          // `entry` comes from the lake row's OWN catalog columns (the query
+          // JOINed the lambda_runtimes catalog). An unmatched join leaves
+          // catalog_status '' (empty string) → entry null → unknown_runtime.
+          var entry = row.catalog_status ? {
+            id: rt,
+            status: row.catalog_status,
+            deprecation_date: row.deprecation_date || null,
+            block_function_create: row.block_function_create || null,
+            block_function_update: row.block_function_update || null
+          } : null;
+          var c = classify(entry, today, warnDays);
+          // classify is the source of truth: the query returns ALL active
+          // serverless scopes, so the `ok`/unknown ones are prefiltered here.
+          if (c.verdict !== 'deprecated' && c.verdict !== 'expiring') { counts.prefiltered++; continue; }
+
+          // Migration target: read straight off the row (wf-r1 precomputed it).
+          // Empty string / missing → null (no supported successor → item, no
+          // suggestion).
+          var target = row.target || null;
+          var hasLiveExisting = !!row.existing_item_id && LIVE[row.existing_status] === 1;
+          var deprecatedNow = c.verdict === 'deprecated';
+
+          if (hasLiveExisting) {
+            var mustBump = deprecatedNow && row.existing_priority !== 'critical';
+            if (mustBump || force) {
+              var toPriority = deprecatedNow ? 'critical' : 'high';
+              bumpRequests.push({
+                path: '/governance/action_item/' + row.existing_item_id,
+                method: 'PATCH',
+                body: { priority: toPriority }
+              });
+              counts.bump++;
+            } else {
+              counts.prefiltered++;
+            }
+            continue;
+          }
+
+          // CREATE candidate: find-before-create GET (index-aligned with the
+          // create_plan entry it guards).
+          counts.create_planned++;
+          findRequests.push({
+            path: '/governance/action_item',
+            method: 'GET',
+            query: {
+              nrn: orgNrn,
+              'metadata.scope_id': String(row.scope_id),
+              'labels.workflow_type': 'lambda-runtime',
+              limit: 50
+            }
+          });
+          createPlan.push({
+            scope_id: String(row.scope_id),
+            has_target: !!target,
+            item_body: buildItemBody(row, entry, c, target, categorySlug),
+            suggestion_body: target ? buildSuggestionBody(row, entry, c, target) : null
+          });
+        }
+
+        // Fan-out safety cap on the CREATE set (find/create_plan kept aligned).
+        // create_planned above stays the FULL count so the summary reports
+        // honestly; only the dispatched slice is truncated.
+        var truncated = createPlan.length > MAX_FANOUT;
+        if (truncated) {
+          log.warn('diff: create set exceeds the fan-out safety cap — truncating', {
+            create_planned: createPlan.length, cap: MAX_FANOUT, dropped: createPlan.length - MAX_FANOUT
+          });
+          createPlan = createPlan.slice(0, MAX_FANOUT);
+          findRequests = findRequests.slice(0, MAX_FANOUT);
+        }
+
         return {
-          scope_id: null,
-          verdict: 'analysis_failed',
-          priority: null,
-          item_id: null,
-          target_runtime: null,
-          error_code: inputs.error_code || 'UNKNOWN',
-          error_message: String(inputs.error_message || 'analyze_scope failed'),
-          affected_scope_ids: ids
+          catalog_missing: false,
+          reason: null,
+          find_requests: findRequests,
+          create_plan: createPlan,
+          bump_requests: bumpRequests,
+          total_candidates: rows.length,
+          create_planned: counts.create_planned,
+          bump: counts.bump,
+          prefiltered: counts.prefiltered,
+          truncated: truncated,
+          force: force
         };
 
-  # DEDICATED single-predecessor accumulator for the failure lane (CLAUDE.md
-  # § Join strategy: mixing a completed edge and a never-settled edge into
-  # ONE downstream node deadlocks under the default `all` strategy — and
-  # `acc_results` already has its own single edge from `analyze_scope`,
-  # whose stale `items` from a PRIOR successful page would otherwise get
-  # pulled into every subsequent page's accumulation if this shared the
-  # same node). Same accumulator VARIABLE (`variables.results`), separate
-  # NODE.
-  - id: acc_results_failed
+  # ── Find-before-create pass (race guard) ──────────────────────────────
+  # forEach over diff.find_requests. `spreadItem` merges each request's
+  # `{path, method, query}` onto the per-iteration np-api-call inputs. GET
+  # only; failOnHttpError:false so a 4xx/5xx returns a visible response
+  # instead of aborting — filter_confirmed treats any non-200 find as
+  # "couldn't confirm" and skips that create (see its code).
+  - id: find_existing
     type: module
-    plugin_type: set-variable
-    name: "Accumulate Scope Results (failure lane)"
-    metadata: { flipPorts: true }
+    plugin_type: np-api-call
+    name: "Find Existing Item (per create candidate)"
+    # `failOnHttpError: true` makes a >=400 find a real per-iteration FAILURE:
+    # a 5xx is `retryable: true` and a 4xx is `retryable: false`. The forEach
+    # coordinator honors `error_handling.retry_policy` PER ITERATION, so a
+    # transient 5xx is retried (exponential backoff + jitter) before it
+    # settles. After retries are exhausted (or on a 4xx / network error) the
+    # iteration is ABSORBED in parallel mode as a `{}` slot, in the SAME
+    # position as its input. filter_confirmed treats a `{}` slot (or any
+    # non-200 response) as "couldn't confirm" and SKIPS that create — a missed
+    # create is caught next week, whereas creating blind risks a duplicate.
     config:
-      path: results
-      value: "${{ concat(variables.results, $items) }}"
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      # Placeholder so validateConfig() (path is required at configure() time,
+      # before per-item inputs merge) passes; overridden per item by the
+      # spread `path`.
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.diff.outputs.find_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
 
+  # ── Confirm the create set against the live finds ─────────────────────
+  # Zip diff.create_plan × find_existing results by index (forEach preserves
+  # order). Drop a create when the live find turned up a LIVE item (the item
+  # was created since the lake snapshot — skipped_existing) OR the find
+  # errored (couldn't confirm — find_failed; skip beats risking a dup).
+  # Emits the confirmed create POST requests + the index-aligned suggestion
+  # plan for zip_ids.
+  - id: filter_confirmed
+    type: module
+    plugin_type: code-exec
+    name: "Confirm Creates (drop live/failed finds)"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      plan: "${{ steps.diff.outputs.create_plan }}"
+      finds: "${{ steps.find_existing.outputs.items }}"
+    config:
+      code: |
+        // "Live" = every ActionItemStatus that is not resolved/rejected/
+        // closed (the list endpoint's status filter is ignored server-side,
+        // so this client-side filter is the only one that applies).
+        var LIVE = { open: 1, deferred: 1, pending_deferral: 1, pending_verification: 1, pending_rejection: 1 };
+        var plan = inputs.plan || [];
+        var finds = inputs.finds || [];
+        var createRequests = [];
+        var suggestionPlan = [];
+        var skipped_existing = 0;
+        var find_failed = 0;
+        for (var i = 0; i < plan.length; i++) {
+          var f = finds[i];
+          // Two failure shapes, both handled (belt and suspenders): with
+          // failOnHttpError:true a >=400 (or network error, or a 5xx whose
+          // retries are exhausted) is absorbed as `{}`; were it ever false, an
+          // HTTP error would arrive as `{status>=400}`. Either way there is no
+          // confirmable 200 results array -> we could not confirm -> skip
+          // (find_failed). A missed create is caught next week; a blind create
+          // risks a duplicate.
+          var body = f && f.body;
+          var status = f && f.status;
+          if (!f || status !== 200 || !body) { find_failed++; continue; }
+          var results = Array.isArray(body.results) ? body.results : [];
+          var hasLive = false;
+          for (var j = 0; j < results.length; j++) {
+            var it = results[j] || {};
+            if (LIVE[it.status] === 1) { hasLive = true; break; }
+          }
+          if (hasLive) { skipped_existing++; continue; }
+          // Confirmed create.
+          createRequests.push({ path: '/governance/action_item', method: 'POST', body: plan[i].item_body });
+          suggestionPlan.push(plan[i].has_target ? plan[i].suggestion_body : null);
+        }
+        return {
+          create_requests: createRequests,
+          suggestion_plan: suggestionPlan,
+          create_confirmed: createRequests.length,
+          skipped_existing: skipped_existing,
+          find_failed: find_failed
+        };
+
+  # ── Create the confirmed action items ─────────────────────────────────
+  - id: create_item
+    type: module
+    plugin_type: np-api-call
+    name: "Create Action Item (per confirmed candidate)"
+    # `failOnHttpError: true`: a >=400 create is a real per-iteration failure,
+    # absorbed as a `{}` slot (parallel mode); zip_ids detects it by the
+    # missing `body.id` and buckets it as create_failed.
+    # NO retry_policy: POST is NOT idempotent. A lost-ack 5xx (server created
+    # the item but the response never arrived) would, on retry, create a
+    # DUPLICATE. Idempotency > availability here: a missed create self-heals
+    # on the next daily run (the lake anti-join no longer sees a live item,
+    # and the find-before-create guard re-confirms), whereas a duplicate does not.
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    forEach:
+      expression: "${{ steps.filter_confirmed.outputs.create_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── Pair new item ids with suggestion bodies ──────────────────────────
+  # Zip filter_confirmed.suggestion_plan × create_item results by index. A
+  # create absorbed as `{}` (or a non-2xx with no body.id) is a create_failed
+  # and drops its suggestion. A confirmed create with no target (go1.x-style)
+  # counts as created but emits no suggestion.
+  - id: zip_ids
+    type: module
+    plugin_type: code-exec
+    name: "Zip New Item IDs → Suggestion Requests"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      suggestion_plan: "${{ steps.filter_confirmed.outputs.suggestion_plan }}"
+      creates: "${{ steps.create_item.outputs.items }}"
+    config:
+      code: |
+        var plan = inputs.suggestion_plan || [];
+        var creates = inputs.creates || [];
+        var suggestionRequests = [];
+        var created = 0;
+        var create_failed = 0;
+        for (var i = 0; i < plan.length; i++) {
+          var cr = creates[i];
+          // A successful create is `{status, body, headers}` (spread into the
+          // slot); its `body.id` is the new item id. A failure — absorbed `{}`
+          // (a >=400 or network error; POSTs are NOT retried, so this is one
+          // attempt) OR a `{status>=400}` slot if failOnHttpError were false —
+          // has no `body.id`. Both count as create_failed.
+          var id = cr && cr.body && cr.body.id;
+          if (!id) { create_failed++; continue; }
+          created++;
+          if (plan[i]) {
+            suggestionRequests.push({
+              path: '/governance/action_item/' + id + '/suggestions',
+              method: 'POST',
+              body: plan[i]
+            });
+          }
+        }
+        return {
+          suggestion_requests: suggestionRequests,
+          created: created,
+          create_failed: create_failed
+        };
+
+  # ── Create the migration suggestions ──────────────────────────────────
+  - id: create_suggestion
+    type: module
+    plugin_type: np-api-call
+    name: "Create Migration Suggestion (per new item)"
+    # `failOnHttpError: true`: a >=400 suggestion POST is a real per-iteration
+    # failure, absorbed as `{}` (parallel mode); summary detects it by the
+    # missing `body.id` and buckets it as suggestion_failed.
+    # NO retry_policy: POST is NOT idempotent — a lost-ack 5xx retry would
+    # attach a duplicate suggestion. A missed suggestion is re-created on a
+    # later run once the item is re-evaluated; a duplicate is not undone.
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    forEach:
+      expression: "${{ steps.zip_ids.outputs.suggestion_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── Bump stale priorities (existing live items) ───────────────────────
+  - id: bump_priority
+    type: module
+    plugin_type: np-api-call
+    name: "Bump Priority (per stale item)"
+    # `failOnHttpError: true`: a 5xx PATCH is retryable (retried per
+    # error_handling.retry_policy), a 4xx is not. A bump that still fails after
+    # retries is absorbed as `{}` (parallel mode); summary detects it by the
+    # absent/`>=400` status and buckets it as bump_failed.
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.diff.outputs.bump_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── Summary: counts + index-aligned failure buckets per pass ──────────
+  # No silent caps: every pass's failures are attributed by index alignment
+  # against the request array that drove it (forEach preserves order; a
+  # failed slot is `{}` / non-2xx — see the header note on the engine gap).
   - id: summary
     type: module
     plugin_type: code-exec
     name: "Build Summary"
-    # Aggregate step: NEVER dispatch per upstream item.
     metadata: { fanOutPerItem: false }
-    # Reached either from fetch_scopes:done (catalog ok) or directly from
-    # catalog_ok:false (empty catalog) — exactly one path fires per run.
-    join_strategy: any
+    # Always reached from bump_priority — the whole chain runs even over zero
+    # rows or a catalog_missing abort (diff emits empty request arrays, so
+    # every write pass is a clean no-op).
     inputs:
-      results: "${{ variables.results }}"
-      catalog_ok: "${{ steps.catalog_guard.outputs.ok }}"
-      reason: "${{ steps.catalog_guard.outputs.reason }}"
+      catalog_missing: "${{ steps.diff.outputs.catalog_missing }}"
+      reason: "${{ steps.diff.outputs.reason }}"
+      total_candidates: "${{ steps.diff.outputs.total_candidates }}"
+      create_planned: "${{ steps.diff.outputs.create_planned }}"
+      bump_planned: "${{ steps.diff.outputs.bump }}"
+      prefiltered: "${{ steps.diff.outputs.prefiltered }}"
+      truncated: "${{ steps.diff.outputs.truncated }}"
+      skipped_existing: "${{ steps.filter_confirmed.outputs.skipped_existing }}"
+      find_failed: "${{ steps.filter_confirmed.outputs.find_failed }}"
+      created: "${{ steps.zip_ids.outputs.created }}"
+      create_failed: "${{ steps.zip_ids.outputs.create_failed }}"
+      suggestion_requests: "${{ steps.zip_ids.outputs.suggestion_requests }}"
+      suggestion_results: "${{ steps.create_suggestion.outputs.items }}"
+      bump_requests: "${{ steps.diff.outputs.bump_requests }}"
+      bump_results: "${{ steps.bump_priority.outputs.items }}"
     config:
       code: |
-        var results = inputs.results || [];
-        var counts = { ok: 0, unknown_runtime: 0, skipped_existing: 0, priority_bumped: 0, created: 0, analysis_failed: 0, other: 0 };
-        for (var i = 0; i < results.length; i++) {
-          // Live engine wraps each fan-out item as {outputs, _childExecutionId};
-          // the E2E harness stubs return the outputs flat. Accept both.
-          var r = (results[i] || {}).outputs || results[i] || {};
-          var v = String(r.verdict || 'other');
-          if (counts[v] === undefined) v = 'other';
-          counts[v]++;
+        var catalogOk = inputs.catalog_missing !== true;
+
+        // Suggestions: index-align create_suggestion results against the
+        // requests that drove them. Success is `{status, body, headers}` with
+        // a `body.id`; a failure — absorbed `{}` (a >=400 or network error;
+        // POSTs are NOT retried) or a `{status>=400}` slot were failOnHttpError
+        // false — has no `body.id`. Both shapes count as suggestion_failed.
+        var sreq = inputs.suggestion_requests || [];
+        var sres = inputs.suggestion_results || [];
+        var suggestion_created = 0, suggestion_failed = 0;
+        for (var i = 0; i < sreq.length; i++) {
+          var sr = sres[i];
+          if (sr && sr.body && sr.body.id) suggestion_created++;
+          else suggestion_failed++;
         }
-        var catalogOk = inputs.catalog_ok === true;
+
+        // Bumps: a PATCH slot with a 2xx status is a success; both failure
+        // shapes are a failure — `{}` (absorbed: failOnHttpError:true after
+        // retries / 4xx / network) or an explicit `{status>=400}` slot were
+        // failOnHttpError false.
+        var breq = inputs.bump_requests || [];
+        var bres = inputs.bump_results || [];
+        var bumped = 0, bump_failed = 0;
+        for (var j = 0; j < breq.length; j++) {
+          var br = bres[j];
+          var st = br && br.status;
+          if (st && Number(st) < 400) bumped++;
+          else bump_failed++;
+        }
+
         return {
           catalog_ok: catalogOk,
           reason: catalogOk ? null : inputs.reason,
-          scopes_scanned: results.length,
-          ok: counts.ok,
-          unknown_runtime: counts.unknown_runtime,
-          skipped_existing: counts.skipped_existing,
-          priority_bumped: counts.priority_bumped,
-          created: counts.created,
-          analysis_failed: counts.analysis_failed,
-          other: counts.other
+          scopes_scanned: Number(inputs.total_candidates) || 0,
+          candidates_create: Number(inputs.create_planned) || 0,
+          candidates_bump: Number(inputs.bump_planned) || 0,
+          prefiltered: Number(inputs.prefiltered) || 0,
+          truncated: inputs.truncated === true,
+          skipped_existing: Number(inputs.skipped_existing) || 0,
+          find_failed: Number(inputs.find_failed) || 0,
+          created: Number(inputs.created) || 0,
+          create_failed: Number(inputs.create_failed) || 0,
+          suggestion_created: suggestion_created,
+          suggestion_failed: suggestion_failed,
+          bumped: bumped,
+          bump_failed: bump_failed
         };
 
   - id: log_done
@@ -266,42 +915,34 @@ steps:
     name: "Scan Complete"
     config:
       level: info
-      message: "Runtime deprecation scan: ${{ steps.summary.outputs.scopes_scanned }} scopes scanned — created ${{ steps.summary.outputs.created }}, priority bumped ${{ steps.summary.outputs.priority_bumped }}, skipped (existing) ${{ steps.summary.outputs.skipped_existing }}, ok ${{ steps.summary.outputs.ok }}, unknown runtime ${{ steps.summary.outputs.unknown_runtime }}, analysis failed ${{ steps.summary.outputs.analysis_failed }}. (catalog_ok=${{ steps.summary.outputs.catalog_ok }}, reason=${{ steps.summary.outputs.reason }})"
+      message: "Runtime deprecation scan: ${{ steps.summary.outputs.scopes_scanned }} candidates (${{ steps.summary.outputs.candidates_create }} create, ${{ steps.summary.outputs.candidates_bump }} bump, ${{ steps.summary.outputs.prefiltered }} prefiltered) — created ${{ steps.summary.outputs.created }} (suggestions ${{ steps.summary.outputs.suggestion_created }}), bumped ${{ steps.summary.outputs.bumped }}, skipped on re-verify ${{ steps.summary.outputs.skipped_existing }}. Failures: find ${{ steps.summary.outputs.find_failed }}, create ${{ steps.summary.outputs.create_failed }}, suggestion ${{ steps.summary.outputs.suggestion_failed }}, bump ${{ steps.summary.outputs.bump_failed }}. (catalog_ok=${{ steps.summary.outputs.catalog_ok }}, reason=${{ steps.summary.outputs.reason }}, truncated=${{ steps.summary.outputs.truncated }})"
 
 connections:
-  - { id: c1,  from: start_manual,  to: read_catalog }
-  - { id: c2,  from: start_cron,    to: read_catalog }
-  - { id: c3,  from: read_catalog,  to: catalog_guard }
-  - { id: c4,  from: catalog_guard, to: catalog_ok }
-  - { id: c5,  from: catalog_ok,    to: fetch_scopes,   source_port: "true" }
-  - { id: c6,  from: catalog_ok,    to: summary,        source_port: "false" }
-  # fetch_scopes streams: `loop` port → analyze_scope (per-page items fan out).
-  - { id: c7,  from: fetch_scopes,  to: analyze_scope,  source_port: loop }
-  - { id: c8,  from: analyze_scope, to: acc_results }
-  # Declared so the graph knows analyze_scope_failed exists / is not an
-  # entry point; permanently false — only ever reached via
-  # error_handling.fallback_step on analyze_scope above (CLAUDE.md §
-  # Deciders/ports convention).
-  - { id: c8f, from: analyze_scope,        to: analyze_scope_failed, condition: "false" }
-  - { id: c8g, from: analyze_scope_failed, to: acc_results_failed }
-  # Failure lane also re-enters fetch_scopes:callback so a page-level
-  # failure doesn't stop later pages from being fetched.
-  - { id: c8h, from: acc_results_failed,   to: fetch_scopes, target_port: callback }
-  # acc_results loops back into fetch_scopes:callback (reentry port) to pull
-  # the next page. The engine soft-resets fetch_scopes' join state on each
-  # reentry-edge settle so it can re-fire.
-  - { id: c9,  from: acc_results,   to: fetch_scopes,   target_port: callback }
-  # When fetch_scopes detects the last page, it activates `done`.
-  - { id: c10, from: fetch_scopes,  to: summary,        source_port: done }
-  - { id: c11, from: summary,       to: log_done }
+  - { id: c1,  from: start_manual,      to: lake_detect }
+  - { id: c2,  from: start_cron,        to: lake_detect }
+  - { id: c7,  from: lake_detect,       to: diff }
+  - { id: c8,  from: diff,              to: find_existing }
+  - { id: c9,  from: find_existing,     to: filter_confirmed }
+  - { id: c10, from: filter_confirmed,  to: create_item }
+  - { id: c11, from: create_item,       to: zip_ids }
+  - { id: c12, from: zip_ids,           to: create_suggestion }
+  - { id: c13, from: create_suggestion, to: bump_priority }
+  - { id: c14, from: bump_priority,     to: summary }
+  - { id: c15, from: summary,           to: log_done }
 
 outputs:
-  catalog_ok:        "${{ steps.summary.outputs.catalog_ok }}"
-  reason:             "${{ steps.summary.outputs.reason }}"
-  scopes_scanned:     "${{ steps.summary.outputs.scopes_scanned }}"
-  ok:                 "${{ steps.summary.outputs.ok }}"
-  unknown_runtime:    "${{ steps.summary.outputs.unknown_runtime }}"
-  analysis_failed:    "${{ steps.summary.outputs.analysis_failed }}"
-  skipped_existing:   "${{ steps.summary.outputs.skipped_existing }}"
-  priority_bumped:    "${{ steps.summary.outputs.priority_bumped }}"
-  created:            "${{ steps.summary.outputs.created }}"
+  catalog_ok:          "${{ steps.summary.outputs.catalog_ok }}"
+  reason:              "${{ steps.summary.outputs.reason }}"
+  scopes_scanned:      "${{ steps.summary.outputs.scopes_scanned }}"
+  candidates_create:   "${{ steps.summary.outputs.candidates_create }}"
+  candidates_bump:     "${{ steps.summary.outputs.candidates_bump }}"
+  prefiltered:         "${{ steps.summary.outputs.prefiltered }}"
+  skipped_existing:    "${{ steps.summary.outputs.skipped_existing }}"
+  find_failed:         "${{ steps.summary.outputs.find_failed }}"
+  created:             "${{ steps.summary.outputs.created }}"
+  create_failed:       "${{ steps.summary.outputs.create_failed }}"
+  suggestion_created:  "${{ steps.summary.outputs.suggestion_created }}"
+  suggestion_failed:   "${{ steps.summary.outputs.suggestion_failed }}"
+  bumped:              "${{ steps.summary.outputs.bumped }}"
+  bump_failed:         "${{ steps.summary.outputs.bump_failed }}"
+  truncated:           "${{ steps.summary.outputs.truncated }}"

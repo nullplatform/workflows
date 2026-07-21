@@ -1,19 +1,24 @@
 # Runtime Lifecycle — Apply an accepted migration suggestion.
 #
-# Started by the (not-yet-built) events router on suggestion accept
-# (fire-and-forget). Loads the item + suggestion + scope + the LIVE
-# lambda_runtimes catalog, re-validates the target against the catalog
-# (it may have gone stale since the suggestion was created), patches the
-# scope's serverless runtime, stamps the action item with
-# `runtime_patched_at` (used by the wf-r5b compliance gate), and — outside
-# production, and only when the accept-form asked for it — kicks off a
-# real deploy via the shared `progressive_deploy` sub-workflow.
+# Started by the events router (wf-r3) on suggestion accept (fire-and-forget).
+# v4 (owner-decided, 2026-07-21) is deliberately minimal: "it should be just
+# the runtime change and then run the deployment sub-workflow that already
+# exists." It loads the item + suggestion + scope, patches the scope's
+# serverless runtime to the suggestion's target, stamps the action item with
+# `runtime_patched_at` (used by wf-r5's closer and wf-r3's resolve gate), and
+# — outside production, and only when the accept-form asked for it — kicks off
+# a real deploy via the shared `progressive_deploy` sub-workflow.
 #
-# v1 scope (deliberately simple): no rightsizing-command-style comment
-# channel. `scheduled` timing waits once for `deploy_at` (an ISO
-# timestamp) via a single signal-wait with `onTimeout: continue`; an
-# empty or past `deploy_at` is treated as deploy-now. `deploy-now` /
-# `next-deploy` / `apply-only` never wait.
+# There is NO live-catalog re-validation anymore (the old fetch_catalog +
+# compute_plan "target still supported?" check is GONE): the scanner already
+# validated the target against the catalog at suggestion time, and a target
+# that went stale between then and apply self-heals — the next daily scan
+# re-evaluates the scope. compute_plan now only builds the runtime patch.
+#
+# `scheduled` timing waits once for `deploy_at` (an ISO timestamp) via a
+# single signal-wait with `onTimeout: continue`; an empty or past `deploy_at`
+# is treated as deploy-now. `deploy-now` / `next-deploy` / `apply-only` never
+# wait.
 #
 # Production hard gate (enforced in compute_plan, not just the accept
 # form): production scopes ALWAYS resolve to apply-only regardless of
@@ -28,11 +33,11 @@
 id: runtime_lifecycle_apply
 name: "Runtime Lifecycle — Apply"
 description: >
-  Applies an accepted Lambda runtime migration suggestion: re-validates
-  the target against the live catalog, patches the scope's
-  serverless_runtime, stamps runtime_patched_at on the item, and
-  optionally deploys (never in production).
-path: "/runtime-lifecycle"
+  Applies an accepted Lambda runtime migration suggestion: patches the
+  scope's serverless_runtime to the target, stamps runtime_patched_at on
+  the item, and — outside production — optionally deploys via the shared
+  progressive_deploy sub-workflow.
+path: "/action-items/runtime-lifecycle"
 semantic_version: 1.0.0
 
 inputs:
@@ -69,7 +74,7 @@ steps:
           type: string
           required: true
 
-  # ── Load item + suggestion + scope + LIVE catalog ───────────────────────
+  # ── Load item + suggestion + scope ──────────────────────────────────────
   # Every fetch step below routes failure to its OWN dedicated
   # resolve_fetch_*_failure node (see the shape note further down — a
   # SHARED resolve node across multiple fallback_step sources can never
@@ -126,25 +131,10 @@ steps:
       method: GET
       path: "/scope/${{ inputs.scope_id }}"
 
-  # LIVE catalog — the target must still be `supported` at apply time; it
-  # may have deprecated further since the suggestion was created.
-  - id: fetch_catalog
-    type: module
-    plugin_type: np-api-call
-    name: "Get Live Runtime Catalog"
-    error_handling:
-      fallback_step: resolve_fetch_catalog_failure
-    inputs:
-      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      method: GET
-      path: "/metadata/organization/${{ inputs.org_id }}/lambda_runtimes"
-
-  # ── Compute the plan (pure function of item + suggestion + scope + catalog) ──
-  # Throws when the target is no longer supported per the live catalog or
-  # the scope is already on the target — both routed to resolve_failure
-  # via error_handling.fallback_step below (no scope PATCH happens).
+  # ── Compute the plan (pure function of item + suggestion + scope) ────────
+  # v4: builds ONLY the runtime patch — no live-catalog re-validation. Throws
+  # only when there is no target to apply (routed to resolve_failure via
+  # error_handling.fallback_step below, so no scope PATCH happens).
   - id: compute_plan
     type: module
     plugin_type: code-exec
@@ -155,14 +145,12 @@ steps:
       item: "${{ steps.fetch_item.outputs.actionItem }}"
       suggestion: "${{ steps.fetch_suggestion.outputs.body }}"
       scope: "${{ steps.fetch_scope.outputs.body }}"
-      catalog: "${{ steps.fetch_catalog.outputs.body }}"
     config:
       code: |
         var item = inputs.item || {};
         var sug = inputs.suggestion || {};
         var meta = item.metadata || {};
         var smeta = sug.metadata || {};
-        var cat = (inputs.catalog || {}).runtimes || [];
         var scope = inputs.scope || {};
         var caps = scope.capabilities || {};
         var current = ((caps.serverless_runtime) || {}).id || '';
@@ -171,11 +159,8 @@ steps:
         var envProd = String(meta.environment || '').toLowerCase() === 'production';
         // production hard gate — server-side, regardless of what the form says
         if (envProd && timing !== 'apply-only') { log.warn('prod scope: forcing apply-only (was ' + timing + ')'); timing = 'apply-only'; }
-        // target must still be supported per the live catalog
-        var entry = null;
-        for (var i = 0; i < cat.length; i++) if (cat[i].id === target) { entry = cat[i]; break; }
-        if (!entry || entry.status !== 'supported') throw new Error('target runtime ' + target + ' is not supported per current catalog — rerun the scanner');
-        if (current === target) throw new Error('scope already on ' + target + ' — nothing to apply');
+        // no target = nothing to apply (e.g. a go1.x-style item with no successor)
+        if (!target) throw new Error('no migration target on the suggestion/item — nothing to apply');
         var srt = {};
         for (var k in caps.serverless_runtime) srt[k] = caps.serverless_runtime[k];
         srt.id = target;
@@ -600,7 +585,7 @@ steps:
         from_runtime: "${{ inputs.fr }}"
         to_runtime: "${{ inputs.tr }}"
 
-  # ── compute_plan failure (target unsupported / already on target) ───────
+  # ── compute_plan failure (no migration target on the suggestion) ────────
   # NOT connected via a normal edge — the engine routes to this step via
   # `error_handling.fallback_step` on compute_plan. Single predecessor
   # (the declared, permanently-false edge below) so this can never mix a
@@ -617,7 +602,7 @@ steps:
       author: "agent:runtime-lifecycle-applier"
       content: "🚫 Could not compute a migration plan: ${{ inputs.errmsg }}"
 
-  # ── fetch_* failure (item/suggestion/scope/catalog lookup) ──────────────
+  # ── fetch_* failure (item/suggestion/scope lookup) ──────────────────────
   # FOUR dedicated single-predecessor resolve nodes, one per fetch step —
   # NOT one shared node. A shared node fed by multiple fallback_step
   # sources cannot ever become ready: the engine's fallback dispatch marks
@@ -667,18 +652,6 @@ steps:
       author: "agent:runtime-lifecycle-applier"
       content: "🚫 Could not load the scope needed to plan this migration: ${{ inputs.errmsg }}"
 
-  - id: resolve_fetch_catalog_failure
-    type: module
-    plugin_type: np-action-item-add-comment
-    name: "Comment: Fetch Catalog Failed"
-    inputs:
-      errmsg: "${{ steps.fetch_catalog.error.message }}"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      actionItemId: "${{ workflow.inputs.action_item_id }}"
-      author: "agent:runtime-lifecycle-applier"
-      content: "🚫 Could not load the runtime catalog needed to plan this migration: ${{ inputs.errmsg }}"
-
   - id: mark_suggestion_failed
     type: module
     plugin_type: np-action-item-suggestion-update
@@ -700,7 +673,7 @@ steps:
       # Null-safe member access (expression/evaluator.ts): a step that
       # never ran is simply absent from `steps.*`, so this OR-chain is
       # safe — at most one of the five ever has `.error.message` set.
-      errmsg: "${{ steps.compute_plan.error.message || steps.fetch_item.error.message || steps.fetch_suggestion.error.message || steps.fetch_scope.error.message || steps.fetch_catalog.error.message || 'unknown error computing the migration plan' }}"
+      errmsg: "${{ steps.compute_plan.error.message || steps.fetch_item.error.message || steps.fetch_suggestion.error.message || steps.fetch_scope.error.message || 'unknown error computing the migration plan' }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       actionItemId: "${{ workflow.inputs.action_item_id }}"
@@ -739,8 +712,7 @@ connections:
   - { id: c1,  from: start,                     to: fetch_item }
   - { id: c2,  from: fetch_item,                to: fetch_suggestion }
   - { id: c3,  from: fetch_suggestion,          to: fetch_scope }
-  - { id: c4,  from: fetch_scope,               to: fetch_catalog }
-  - { id: c5,  from: fetch_catalog,             to: compute_plan }
+  - { id: c5,  from: fetch_scope,               to: compute_plan }
   - { id: c6,  from: compute_plan,              to: patch_scope }
   # Declared so the graph knows resolve_failure exists / is not an entry
   # point; permanently false — only ever reached via fallback_step.
@@ -751,7 +723,6 @@ connections:
   - { id: c0a, from: fetch_item,                to: resolve_fetch_item_failure,       condition: "false" }
   - { id: c0b, from: fetch_suggestion,          to: resolve_fetch_suggestion_failure, condition: "false" }
   - { id: c0c, from: fetch_scope,               to: resolve_fetch_scope_failure,      condition: "false" }
-  - { id: c0d, from: fetch_catalog,             to: resolve_fetch_catalog_failure,    condition: "false" }
   - { id: c7,  from: patch_scope,               to: check_patch }
   - { id: c8,  from: check_patch,               to: patch_ok }
   - { id: c9,  from: patch_ok,                  to: comment_patch_blocked, source_port: "false" }
@@ -786,7 +757,6 @@ connections:
   - { id: c37b, from: resolve_fetch_item_failure,        to: mark_suggestion_failed }
   - { id: c37c, from: resolve_fetch_suggestion_failure,  to: mark_suggestion_failed }
   - { id: c37d, from: resolve_fetch_scope_failure,       to: mark_suggestion_failed }
-  - { id: c37e, from: resolve_fetch_catalog_failure,     to: mark_suggestion_failed }
   - { id: c38, from: mark_suggestion_failed,    to: stash_compute_failed }
   - { id: c39, from: stash_compute_failed,      to: summary }
 
