@@ -216,6 +216,17 @@ async function main() {
     const rev =
       typeof body.revision === 'object' ? (body.revision?.revision ?? '?') : (body.revision ?? '?');
     console.log(`${existing ? 'revised' : 'created'} ${key} → ${wfId} (rev ${rev})`);
+    // A revision PUT does NOT move the workflow ENTITY in the folder tree —
+    // its `path` is fixed at create time (live finding 2026-07-21: the v4
+    // /action-items move left every entity under the old folder). Converge it.
+    if (existing && typeof def.path === 'string') {
+      const pres = await fetch(`${API_BASE}/workflows/definitions/${wfId}`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ path: def.path }),
+      });
+      if (!pres.ok) console.log(`  WARN: entity path converge failed (${pres.status})`);
+    }
     await writeFile(STATE_FILE, JSON.stringify(state, null, 2));
   }
 
