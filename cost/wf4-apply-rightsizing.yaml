@@ -200,7 +200,7 @@ steps:
         if (patchBody === null) {
           setIf(res, 'cpu_millicores', recCpu) || setIf(res, 'cpu_request_millicores', recCpu) || setIf(res, 'cpu', recCpu / 1000);
           setIf(res, 'memory_in_mb', recMem) || setIf(res, 'memory_request_mb', recMem) || setIf(res, 'memory', recMem);
-          // Nullplatform K8s profile shape (validated live on a demo organization):
+          // Nullplatform K8s profile shape (validated live on a demo org):
           // {cpu_profile, memory_in_gb, local_storage_in_gb}. CPU is DERIVED
           // from the profile (kubernetes_processor.millicores = -1), so the
           // only right-sizable field is memory_in_gb — rounded UP to the next

@@ -109,7 +109,7 @@ steps:
   #   still_open       : anything else (leave open, zero side effects).
   # NB: timestamps are compared with parseDateTimeBestEffort (the lake stores
   # them stringly in mismatched formats) — see the ACCEPTED TRADEOFF header.
-  # Verified live against a demo organization (org <org-id>), 2026-07-21, via
+  # Verified live against a demo organization, 2026-07-21, via
   # ~/workspace/null/np-claude-skills/src/skills/np-lake/scripts/ch_query.sh
   # (read-only).
   #

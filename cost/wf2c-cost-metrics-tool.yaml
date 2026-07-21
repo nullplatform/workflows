@@ -129,7 +129,7 @@ steps:
       agent_selector:
         nrn: "${{ vars.COST_AGENT_NRN || 'organization=0' }}"
         tags:
-          cluster: "${{ vars.COST_AGENT_CLUSTER || 'my-cluster' }}"
+          cluster: "${{ vars.COST_AGENT_CLUSTER || 'runtime' }}"
       # The script exits 3 with {"error": …} on oversized results — surface
       # that JSON to the model instead of failing the tool call.
       fail_on_nonzero_exit: false

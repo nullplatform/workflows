@@ -395,9 +395,8 @@ steps:
       # PER-ORG id of the loaded "AMI Drift — Ensure Action Item" workflow.
       # Sub-workflow resolution is by workflow id (slugs do NOT resolve —
       # regressed once on republish, 2026-07-16). When loading this set into
-      # an org, upload ensure-drift-action-item.yaml first and set this to the
-      # workflow id it returns (looks like `wf_...`).
-      workflowId: "__ENSURE_ACTION_ITEM_WORKFLOW_ID__"
+      # another org, update this to that org's ensure workflow id.
+      workflowId: __ENSURE_ACTION_ITEM_WORKFLOW_ID__
       waitForCompletion: true
 
   - id: summary
