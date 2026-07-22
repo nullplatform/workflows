@@ -11,5 +11,6 @@
   "devDependencies": {
     "@nullplatform/workflow-kit": "^0.1.0",
     "vitest": "^2.1.9"
-  }
+  },
+  "license": "Apache-2.0"
 }
