@@ -119,6 +119,14 @@ steps:
     type: module
     plugin_type: code-exec
     name: "Compute New Spec & Mode"
+    # A compute-plan failure is a business/policy outcome ("nothing to
+    # right-size", "couldn't locate fields", unknown provider shape) — it must
+    # NOT poison-pill the execution with a bare "Execution failed". Route it to
+    # a dedicated node that notifies the user on the item and recommends
+    # applying by hand. Declared as a condition:false edge below (never
+    # traversed on success; the fallback arrives as a FAILED edge).
+    error_handling:
+      fallback_step: notify_manual
     inputs:
       item:       "${{ steps.fetch_item.outputs.actionItem }}"
       suggestion: "${{ steps.fetch_suggestion.outputs.body }}"
@@ -175,23 +183,34 @@ steps:
         var res = spec.resources || spec;
         var patchBody = null;
 
-        // CUSTOM scopes: the dev-configured request lives in scope
-        // CAPABILITIES, not requested_spec. Verified PATCH shape:
-        // {capabilities: {cpu_millicores: INT, ram_memory: INT}} with
-        // platform constraints cpu >= 100 mc, ram >= 128 MB (below → 400
-        // with the misleading "The id is not valid for a scope").
+        // Capability-based scopes (custom AND web_pool_k8s): the dev-configured
+        // request lives in scope CAPABILITIES. The READ path differs by type —
+        // custom exposes `cpu_millicores` / `ram_memory`; web_pool_k8s exposes
+        // `kubernetes_processor.millicores` and `memory.memory_in_gb` — but the
+        // WRITE is always `{capabilities: {cpu_millicores, ram_memory}}` (mc/MB,
+        // validated live → 204; platform mins cpu >= 100 mc, ram >= 128 MB).
         var caps = scope.capabilities || {};
-        if (Number(caps.cpu_millicores) > 0 || Number(caps.ram_memory) > 0) {
+        var kproc = caps.kubernetes_processor || {};
+        var capMem = caps.memory || {};
+        var curCpuCfg = Number(caps.cpu_millicores) > 0 ? Number(caps.cpu_millicores)
+          : Number(kproc.millicores) > 0 ? Number(kproc.millicores) : 0;
+        var curMemCfg = Number(caps.ram_memory) > 0 ? Number(caps.ram_memory)
+          : Number(capMem.memory_in_gb) > 0 ? Number(capMem.memory_in_gb) * 1024 : 0;
+        if (curCpuCfg > 0 || curMemCfg > 0) {
           var newCpu = Math.max(recCpu, 100);
           var newMem = Math.max(recMem, 128);
           if (newCpu !== recCpu || newMem !== recMem) {
             log.warn('Clamped recommendation to platform minimums', { rec_cpu: recCpu, rec_mem: recMem, clamped_cpu: newCpu, clamped_mem: newMem });
           }
-          var curCpuCfg = Number(caps.cpu_millicores) || 0;
-          var curMemCfg = Number(caps.ram_memory) || 0;
-          if ((curCpuCfg > 0 && newCpu < curCpuCfg) || (curMemCfg > 0 && newMem < curMemCfg)) {
-            patchBody = { capabilities: { cpu_millicores: newCpu, ram_memory: newMem } };
-            applied.push('capabilities.cpu_millicores:' + newCpu, 'capabilities.ram_memory:' + newMem);
+          // MINIMAL patch: include ONLY the dimension(s) that actually go DOWN.
+          // A no-op or profile-derived field in the payload can wake a platform
+          // policy — keeping the patch to the changed dimension avoids that and
+          // is the whole point of "change only that attribute".
+          var newCaps = {};
+          if (curCpuCfg > 0 && newCpu < curCpuCfg) { newCaps.cpu_millicores = newCpu; applied.push('capabilities.cpu_millicores:' + newCpu); }
+          if (curMemCfg > 0 && newMem < curMemCfg) { newCaps.ram_memory = newMem; applied.push('capabilities.ram_memory:' + newMem); }
+          if (applied.length > 0) {
+            patchBody = { capabilities: newCaps };
           } else {
             throw new Error('Nothing to right-size: recommended ' + newCpu + 'mc/' + newMem + 'MB is not below the configured ' + curCpuCfg + 'mc/' + curMemCfg + 'MB');
           }
@@ -233,6 +252,41 @@ steps:
           recommended_cpu_request_mc: recCpu,
           recommended_mem_request_mb: recMem
         };
+
+  # ── compute_plan failure path: notify + recommend manual apply ──────────
+  # Reached ONLY via compute_plan.error_handling.fallback_step (a single FAILED
+  # edge). Dedicated single-predecessor nodes so the default `all` join is
+  # satisfied by that one terminal edge (see CLAUDE.md join rules).
+  - id: notify_manual
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Notify: Manual Apply Needed"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: |
+        ⚠️ I couldn't apply this right-sizing automatically — nothing was changed.
+        Reason: ${{ steps.compute_plan.error.message }}
+
+        Please apply it by hand on scope "${{ steps.fetch_scope.outputs.body.name }}" (Settings → Compute) with the recommended requests:
+          • CPU: ${{ steps.fetch_suggestion.outputs.body.metadata.recommended_cpu_request_mc }}mc
+          • Memory: ${{ steps.fetch_suggestion.outputs.body.metadata.recommended_mem_request_mb }}MB
+
+        Once applied, you can close this item.
+
+  - id: mark_failed_compute
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Failed (needs manual apply)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      executionResult:
+        success: false
+        message: "Automatic apply not possible — see the item comment and apply manually."
 
   - id: is_apply_only
     type: decider
@@ -768,6 +822,11 @@ connections:
   - { id: c3,  from: fetch_suggestion,  to: fetch_scope }
   - { id: c4,  from: fetch_scope,       to: compute_plan }
   - { id: c5,  from: compute_plan,      to: is_apply_only }
+  # Declared (condition:false → never traversed on success) so the graph knows
+  # the compute_plan→notify_manual edge exists; compute_plan's
+  # error_handling.fallback_step routes here on a business/policy failure.
+  - { id: c5f, from: compute_plan,      to: notify_manual, condition: "false" }
+  - { id: c5g, from: notify_manual,     to: mark_failed_compute }
   # Mode A: apply-only
   - { id: c6,  from: is_apply_only,     to: patch_scope_only,    source_port: "true" }
   - { id: c6b, from: patch_scope_only,  to: check_patch_only }
