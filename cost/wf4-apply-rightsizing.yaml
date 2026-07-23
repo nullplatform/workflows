@@ -119,6 +119,14 @@ steps:
     type: module
     plugin_type: code-exec
     name: "Compute New Spec & Mode"
+    # A compute-plan failure is a business/policy outcome ("nothing to
+    # right-size", "couldn't locate fields", unknown provider shape) — it must
+    # NOT poison-pill the execution with a bare "Execution failed". Route it to
+    # a dedicated node that notifies the user on the item and recommends
+    # applying by hand. Declared as a condition:false edge below (never
+    # traversed on success; the fallback arrives as a FAILED edge).
+    error_handling:
+      fallback_step: notify_manual
     inputs:
       item:       "${{ steps.fetch_item.outputs.actionItem }}"
       suggestion: "${{ steps.fetch_suggestion.outputs.body }}"
@@ -233,6 +241,41 @@ steps:
           recommended_cpu_request_mc: recCpu,
           recommended_mem_request_mb: recMem
         };
+
+  # ── compute_plan failure path: notify + recommend manual apply ──────────
+  # Reached ONLY via compute_plan.error_handling.fallback_step (a single FAILED
+  # edge). Dedicated single-predecessor nodes so the default `all` join is
+  # satisfied by that one terminal edge (see CLAUDE.md join rules).
+  - id: notify_manual
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Notify: Manual Apply Needed"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:rightsizing-applier"
+      content: |
+        ⚠️ I couldn't apply this right-sizing automatically — nothing was changed.
+        Reason: ${{ steps.compute_plan.error.message }}
+
+        Please apply it by hand on scope "${{ steps.fetch_scope.outputs.body.name }}" (Settings → Compute) with the recommended requests:
+          • CPU: ${{ steps.fetch_suggestion.outputs.body.metadata.recommended_cpu_request_mc }}mc
+          • Memory: ${{ steps.fetch_suggestion.outputs.body.metadata.recommended_mem_request_mb }}MB
+
+        Once applied, you can close this item.
+
+  - id: mark_failed_compute
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Suggestion Failed (needs manual apply)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      executionResult:
+        success: false
+        message: "Automatic apply not possible — see the item comment and apply manually."
 
   - id: is_apply_only
     type: decider
@@ -768,6 +811,11 @@ connections:
   - { id: c3,  from: fetch_suggestion,  to: fetch_scope }
   - { id: c4,  from: fetch_scope,       to: compute_plan }
   - { id: c5,  from: compute_plan,      to: is_apply_only }
+  # Declared (condition:false → never traversed on success) so the graph knows
+  # the compute_plan→notify_manual edge exists; compute_plan's
+  # error_handling.fallback_step routes here on a business/policy failure.
+  - { id: c5f, from: compute_plan,      to: notify_manual, condition: "false" }
+  - { id: c5g, from: notify_manual,     to: mark_failed_compute }
   # Mode A: apply-only
   - { id: c6,  from: is_apply_only,     to: patch_scope_only,    source_port: "true" }
   - { id: c6b, from: patch_scope_only,  to: check_patch_only }
