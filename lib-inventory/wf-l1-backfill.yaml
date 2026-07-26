@@ -1,0 +1,285 @@
+# Library inventory — backfill.
+#
+# Finds every live asset that has no dependency record yet and hands each
+# BUILD to `wf-l0-scan-build`, one sub-execution per build. This workflow owns
+# the question "what still needs scanning"; it knows nothing about GitHub,
+# manifests or the resolution ladder — that all lives in wf-l0, which the
+# per-release path invokes too.
+#
+#   fetch_targets ── lake: live assets with no record yet
+#     └─ scan_builds ── sub-workflow × N   (wf-l0-scan-build)
+#          └─ summarize ── coverage, fails below threshold
+#
+# WHY FAN OUT INSTEAD OF BATCHING: repository trees and manifest bodies travel
+# through execution state, and the sandbox input boundary is 1 MB. Running the
+# pipeline in THIS execution meant ~103 KB of state per build against that
+# boundary — twelve builds died with `input exceeds sandbox boundary limit of
+# 1048576 bytes` and fifty died earlier still with Temporal's
+# `GrpcMessageTooLarge` (both measured live, 2026-07-26). A sub-execution per
+# build makes the limit per build, and the fan-out restores the throughput the
+# cap took away.
+#
+# CONVERGENCE: an asset is pinned to an immutable commit, so its dependencies
+# can never change — once scanned it never needs rescanning. The lake query
+# therefore only ever returns work that is genuinely outstanding, which makes a
+# plain cron enough to chew through a whole organization with no loop and no
+# cursor: each run takes the next LIB_MAX_BUILDS, a failed batch simply
+# reappears next tick, and once everything is covered the same cron becomes the
+# reconciler that picks up new releases.
+#
+# Detection scope: `vars.LIB_SCAN_NRN_PREFIX` (config entry, REQUIRED) prefix-
+# matches the application NRN. `organization=<org>` = whole org; a deeper NRN
+# stages the rollout.
+#
+# Per-org configuration (config entries on folder /lib-inventory):
+#   NP_API_KEY               (secret) org credential for the lake query
+#   LIB_SCAN_NRN_PREFIX      detection scope, prefix-matched against the app NRN
+#   LIB_MAX_BUILDS           builds per run — the fan-out width
+#   LIB_MIN_COVERAGE_PCT     run fails below this % of assets written
+# wf-l0 additionally needs GITHUB_TOKEN and LIB_INTERNAL_PATTERNS; they are
+# read there, not here.
+
+id: lib_inventory_backfill
+name: "Library Inventory — Backfill"
+description: >
+  Finds the live assets that carry no dependency record yet and scans the
+  builds they came from, one sub-execution per build, until the organization
+  is covered.
+path: "/lib-inventory"
+semantic_version: 3.0.0
+
+# NOTE: config entries are referenced as `${{ vars.X }}` DIRECTLY in the step
+# configs below, never through a workflow `variable`. Resolving them in a
+# variable's `initialValue` only started working in engine revision f7e0fea;
+# the direct form also runs against an engine that predates it.
+
+inputs:
+  dry_run:
+    type: boolean
+    required: false
+    description: >
+      Scan and summarise, but write nothing. Use it to check coverage and the
+      resolved repository paths before touching any metadata. Forwarded to
+      every sub-execution.
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Backfill Now"
+    config:
+      description: "Scans the next batch of unscanned live assets and writes their dependency metadata."
+      inputs:
+        dry_run:
+          type: boolean
+          required: false
+          description: "Scan and summarise without writing metadata"
+
+  # ── ONE lake query: every live asset that still has no record ────────────
+  # `live` is the set of (build, asset name) pairs reachable from an ACTIVE
+  # deployment — that is what "currently deployed" means; the build table alone
+  # would also return builds never released or long superseded.
+  #
+  # `groupUniqArray`, not `groupArray`: a release with several active
+  # deployments (one per scope) would otherwise repeat every asset once per
+  # scope — that is how a 6,733-asset backfill silently becomes 40,718.
+  # What is actually RUNNING: a scope points at ONE asset by name, so the other
+  # assets of the same build were produced but nobody executes them. Measured on
+  # a real org: 6,733 assets in these builds, only 2,863 referenced by a scope.
+  # Scanning the rest would be 57% more metadata writes — the dominant cost —
+  # for artifacts that answer no question this workflow is asked.
+  #
+  # NOTE: the query must START with WITH/SELECT. The lake validator decides
+  # "read-only" from the opening token, so a leading `--` comment is rejected
+  # with "Only read-only SQL statements are allowed" (hit live, 2026-07-26).
+  - id: fetch_targets
+    type: module
+    plugin_type: np-lake-query
+    name: "Live Assets Without A Record (lake)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      sql: |
+        WITH live AS (
+          SELECT DISTINCT r.build_id AS build_id, s.asset_name AS asset_name
+          FROM core_entities_deployment AS d FINAL
+          INNER JOIN core_entities_release AS r FINAL ON r.id = d.release_id
+          INNER JOIN core_entities_scope   AS s FINAL ON s.id = d.scope_id
+          WHERE d.status_in_scope = 'active' AND s.asset_name != ''
+        ),
+        live_builds AS (SELECT DISTINCT build_id FROM live),
+        -- Which assets ALREADY carry a `dependencies` record. Anything in here
+        -- is done forever: the record names an immutable commit.
+        existing AS (
+          SELECT toInt32OrZero(m.id) AS asset_id
+          FROM core_entities_metadata AS m
+          WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies' AND m.data IS NOT NULL
+        )
+        SELECT
+          toString(a.app_id)   AS app_id,
+          a.app_name           AS app_name,
+          a.repository_url     AS repository_url,
+          toString(b.id)       AS build_id,
+          b.commit             AS commit,
+          toJSONString(groupUniqArray((x.id, x.name, x.type))) AS assets_json
+        FROM live_builds AS lb
+        INNER JOIN core_entities_build       AS b FINAL ON b.id = lb.build_id
+        INNER JOIN core_entities_application AS a FINAL ON a.app_id = b.app_id
+        INNER JOIN core_entities_asset       AS x FINAL ON x.build_id = b.id
+        INNER JOIN live                      AS l        ON l.build_id = x.build_id
+                                                        AND l.asset_name = x.name
+        WHERE a.nrn LIKE concat('${{ vars.LIB_SCAN_NRN_PREFIX }}', '%')
+          AND x.id NOT IN (SELECT asset_id FROM existing)
+        GROUP BY a.app_id, a.app_name, a.repository_url, b.id, b.commit
+        ORDER BY b.id
+        LIMIT ${{ vars.LIB_MAX_BUILDS }}
+
+  # ── One sub-execution per build ──────────────────────────────────────────
+  # `spreadItem` makes each lake row's columns the child's inputs directly, and
+  # wf-l0 declares them one by one — the SELECT aliases above and that `inputs:`
+  # block are the two halves of the contract.
+  #
+  # It has to be spread rather than a field-by-field `${{ $item.x }}` mapping:
+  # a step with an explicit `forEach` resolves its `inputs` ONCE, before the
+  # first iteration (`workflow-runner.ts`, the `feScope` block), so `$item` is
+  # not in scope there and every child would receive nulls. The named binding
+  # `row` carries the same row for anything that wants it whole.
+  #
+  # A build whose sub-execution fails leaves its assets without a record, so
+  # the next run picks them up again unchanged. Nothing has to be rolled back.
+  - id: scan_builds
+    type: module
+    plugin_type: sub-workflow
+    name: "Scan Each Build"
+    forEach:
+      expression: "${{ steps.fetch_targets.outputs.rows }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      # 20 children in flight. Each build is exactly 2 GitHub calls (one tree,
+      # one batched GraphQL), so 20 concurrent builds is 40 in-flight requests
+      # against a 5,000/h budget — the ceiling here is Temporal child-execution
+      # throughput, not GitHub. Measured: 50 builds in 147s at 8.
+      maxConcurrency: 20
+    inputs:
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      # PER-ORG id of "Library Inventory — Scan Build"; patched by
+      # setup/03-upload-workflows.mjs on upload.
+      workflowId: lib_inventory_scan_build
+      # Pinned to `prod`, NOT the default `latest`: uploading a wf-l0 revision
+      # would otherwise put it in front of live traffic the moment it lands,
+      # with no activation step in between.
+      alias: prod
+      waitForCompletion: true
+
+  - id: summarize
+    type: module
+    plugin_type: code-exec
+    name: "Coverage Summary (fails below threshold)"
+    # Aggregate step: one call with the whole batch, never once per build.
+    metadata: { fanOutPerItem: false }
+    inputs:
+      results: "${{ steps.scan_builds.outputs.items }}"
+      planned: "${{ steps.fetch_targets.outputs.rows }}"
+      minCoveragePct: "${{ vars.LIB_MIN_COVERAGE_PCT }}"
+      dryRun: "${{ workflow.inputs.dry_run }}"
+    config:
+      code: |
+        // A sub-execution that failed outright is absorbed by `forEach` as an
+        // EMPTY slot. Its assets simply keep their missing record and reappear
+        // in the next run's lake query, so the only thing to do here is count
+        // it against coverage rather than hide it.
+        //
+        // `r.outputs || r`: the Temporal executor used to hand a child's
+        // outputs back one level too deep (`{ outputs: {...} }`) while the
+        // local executor unwrapped them — fixed in the engine, unwrapped here
+        // too so this runs against a worker from either side of that deploy.
+        const results = (inputs.results || [])
+          .map((r) => (r && typeof r === 'object' && r.outputs ? r.outputs : r))
+          .filter((r) => r && r.build_id);
+        const planned = inputs.planned || [];
+
+        const merge = (into, from) => {
+          for (const [k, v] of Object.entries(from || {})) into[k] = (into[k] || 0) + v;
+          return into;
+        };
+
+        const byStatus = {};
+        const byLanguage = {};
+        const levels = {};
+        let scanned = 0;
+        let written = 0;
+        let stored = 0;
+        let dropped = 0;
+        for (const r of results) {
+          scanned += r.assets_scanned || 0;
+          written += r.assets_written || 0;
+          stored += r.dependencies_stored || 0;
+          dropped += r.transitive_external_dropped || 0;
+          merge(byStatus, r.by_status);
+          merge(byLanguage, r.by_language);
+          merge(levels, r.match_levels);
+        }
+
+        // TWO coverages, and the run is judged on the WORSE of them.
+        //
+        // Asset coverage alone is measured over builds that reported back, so
+        // it says nothing about the ones that did not — six builds whose
+        // sub-executions all returned nothing gave 0/0, which read as 100% and
+        // passed the threshold (live, 2026-07-26). That silent success is the
+        // exact failure this design exists to prevent, so a build the lake
+        // asked for and that produced no result counts as a MISS, whatever
+        // killed it. Being wrong in that direction costs nothing: its assets
+        // keep no record, so the next run simply asks for them again.
+        const pct = (n, d) => (d === 0 ? 100 : Math.round((n / d) * 1000) / 10);
+        const buildCoverage = pct(results.length, planned.length);
+        const assetCoverage = inputs.dryRun ? 100 : pct(written, scanned);
+        const coverage = Math.min(buildCoverage, assetCoverage);
+
+        const summary = {
+          dry_run: inputs.dryRun === true,
+          builds_planned: planned.length,
+          builds_scanned: results.length,
+          builds_failed: planned.length - results.length,
+          assets_scanned: scanned,
+          assets_written: written,
+          coverage_pct: coverage,
+          build_coverage_pct: buildCoverage,
+          asset_coverage_pct: assetCoverage,
+          by_status: byStatus,
+          by_language: byLanguage,
+          match_levels: levels,
+          dependencies_stored: stored,
+          transitive_external_dropped: dropped,
+        };
+        log.info('backfill summary', summary);
+
+        const min = Number(inputs.minCoveragePct);
+        if (Number.isFinite(min) && coverage < min) {
+          throw new Error(
+            `coverage ${coverage}% is below the ${min}% threshold — ` +
+              `${results.length}/${planned.length} builds reported ` +
+              `(${buildCoverage}%) and ${written}/${scanned} of their assets ` +
+              `were written (${assetCoverage}%). ` +
+              `See by_status: ${JSON.stringify(byStatus)}`,
+          );
+        }
+        return summary;
+
+connections:
+  - { id: c1, from: start_manual, to: fetch_targets }
+  - { id: c2, from: fetch_targets, to: scan_builds }
+  - { id: c3, from: scan_builds, to: summarize }
+
+outputs:
+  builds_planned: "${{ steps.summarize.outputs.builds_planned }}"
+  builds_scanned: "${{ steps.summarize.outputs.builds_scanned }}"
+  builds_failed: "${{ steps.summarize.outputs.builds_failed }}"
+  assets_scanned: "${{ steps.summarize.outputs.assets_scanned }}"
+  assets_written: "${{ steps.summarize.outputs.assets_written }}"
+  coverage_pct: "${{ steps.summarize.outputs.coverage_pct }}"
+  build_coverage_pct: "${{ steps.summarize.outputs.build_coverage_pct }}"
+  asset_coverage_pct: "${{ steps.summarize.outputs.asset_coverage_pct }}"
+  by_status: "${{ steps.summarize.outputs.by_status }}"
+  by_language: "${{ steps.summarize.outputs.by_language }}"
+  match_levels: "${{ steps.summarize.outputs.match_levels }}"

@@ -1,0 +1,178 @@
+# Library inventory — scan on release.
+#
+# Keeps the inventory current without waiting for the backfill: NP posts an
+# audit notification when a release is created, this workflow looks the release
+# up in the lake, and hands its build to the SAME `wf-l0-scan-build` the
+# backfill uses.
+#
+#   on_release_audit ── webhook (NP audit channel)
+#     └─ extract_release ─── pure: the release id out of the notification
+#          └─ fetch_build ── lake: the build + assets, read from OUR side
+#               └─ scan_build ── sub-workflow (wf-l0-scan-build)
+#                    └─ report
+#
+# THE PAYLOAD IS A POKE, NOT A SOURCE OF TRUTH. All this workflow takes from
+# the inbound body is a release id; every fact it acts on — which build, which
+# commit, which assets — is re-read from the lake with the org's own
+# credential. A forged or replayed POST can therefore only cost one wasted
+# lake query: it cannot name a build, cannot name a commit, and cannot reach
+# another organization (the webhook token resolves to exactly one).
+#
+# WHY NO NEW TRIGGER PLUGIN: the `webhook` trigger is already the sanctioned
+# generic ingress — passive, storage-routed, one opaque token per registration
+# that resolves to a single org, and any API replica can serve it. The NP
+# notification channel is ordinary per-org configuration, created by
+# `setup/04-release-channel.mjs` against the URL this trigger publishes. A
+# bespoke `np-release-trigger` would have added a plugin whose entire job is
+# to create that one channel.
+#
+# WHY IT IS NOT STRICTLY REQUIRED: an asset is pinned to an immutable commit,
+# so wf-l1's lake query only ever returns work still outstanding — a cron on
+# the backfill converges on its own and would eventually pick up every new
+# release. This workflow is the difference between "within the hour" and
+# "within seconds", not between working and not.
+#
+# Per-org configuration (config entries on folder /lib-inventory):
+#   NP_API_KEY   (secret) org credential for the lake query
+# wf-l0 needs GITHUB_TOKEN and LIB_INTERNAL_PATTERNS; they are read there.
+
+id: lib_inventory_on_release
+name: "Library Inventory — On Release"
+description: >
+  Scans a release's build as soon as NP audits its creation, so the asset's
+  dependency metadata exists before anyone asks for it. The audit payload is
+  only a poke — the build, commit and assets are re-read from the lake.
+path: "/lib-inventory"
+semantic_version: 1.0.0
+
+steps:
+  - id: on_release_audit
+    type: trigger
+    plugin_type: webhook
+    name: "Release Created (NP audit)"
+    config:
+      path: "/lib-inventory/release"
+      method: POST
+      mode: start
+
+  - id: extract_release
+    type: module
+    plugin_type: code-exec
+    name: "Read The Release Id"
+    inputs:
+      body: "${{ steps.on_release_audit.outputs.body }}"
+    config:
+      code: |
+        // The ONLY thing taken from the payload. NP's audit shape is
+        // `{ source: 'audit', notification: { entity, entity_id, method, ... } }`;
+        // the flat forms are accepted so a manual curl can drive this too.
+        const body = inputs.body || {};
+        const n = body.notification || body;
+        const releaseId = String(n.entity_id || n.release_id || body.release_id || '').trim();
+        const entity = String(n.entity || 'release');
+
+        if (!releaseId || !/^[0-9]+$/.test(releaseId)) {
+          // Loud, not silent: a channel wired to the wrong entity would
+          // otherwise look like a workflow that runs and finds nothing.
+          throw new Error(
+            `no numeric release id in the notification (entity=${entity}) — ` +
+              'check the notification channel filters',
+          );
+        }
+        log.info(`release ${releaseId} created`, { entity });
+        return { release_id: releaseId };
+
+  # ── Re-read the truth from our own side ──────────────────────────────────
+  # No deployment filter here, unlike the backfill: a release exists precisely
+  # because its build is about to run somewhere, and the asset is immutable, so
+  # scanning it now is work the backfill would have done later anyway.
+  #
+  # `existing` still guards it — a release re-created for an already-scanned
+  # build (or a duplicate audit delivery) must not POST a metadata record that
+  # is already there; the API answers 400 to a create-over-existing.
+  - id: fetch_build
+    type: module
+    plugin_type: np-lake-query
+    name: "Release's Build And Assets (lake)"
+    inputs:
+      releaseId: "${{ steps.extract_release.outputs.release_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      sql: |
+        WITH existing AS (
+          SELECT toInt32OrZero(m.id) AS asset_id
+          FROM core_entities_metadata AS m
+          WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies' AND m.data IS NOT NULL
+        )
+        SELECT
+          toString(a.app_id)   AS app_id,
+          a.app_name           AS app_name,
+          a.repository_url     AS repository_url,
+          toString(b.id)       AS build_id,
+          b.commit             AS commit,
+          toJSONString(groupUniqArray((x.id, x.name, x.type))) AS assets_json
+        FROM core_entities_release AS r FINAL
+        INNER JOIN core_entities_build       AS b FINAL ON b.id = r.build_id
+        INNER JOIN core_entities_application AS a FINAL ON a.app_id = b.app_id
+        INNER JOIN core_entities_asset       AS x FINAL ON x.build_id = b.id
+        WHERE r.id = ${{ inputs.releaseId }}
+          AND x.id NOT IN (SELECT asset_id FROM existing)
+        GROUP BY a.app_id, a.app_name, a.repository_url, b.id, b.commit
+
+  # One row in practice (a release names one build), but the fan-out costs
+  # nothing and keeps this identical to the backfill's call.
+  - id: scan_build
+    type: module
+    plugin_type: sub-workflow
+    name: "Scan The Build"
+    forEach:
+      expression: "${{ steps.fetch_build.outputs.rows }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 4
+    config:
+      # PER-ORG id of "Library Inventory — Scan Build"; patched by
+      # setup/03-upload-workflows.mjs on upload.
+      workflowId: lib_inventory_scan_build
+      alias: prod
+      waitForCompletion: true
+
+  - id: report
+    type: module
+    plugin_type: code-exec
+    name: "Report"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      results: "${{ steps.scan_build.outputs.items }}"
+      releaseId: "${{ steps.extract_release.outputs.release_id }}"
+    config:
+      code: |
+        // `r.outputs || r`: the Temporal executor used to hand a child's
+        // outputs back one level too deep. Fixed in the engine; unwrapped here
+        // too so this runs against a worker from either side of that deploy.
+        const results = (inputs.results || [])
+          .map((r) => (r && typeof r === 'object' && r.outputs ? r.outputs : r))
+          .filter((r) => r && r.build_id);
+
+        const summary = {
+          release_id: inputs.releaseId,
+          // Zero is the NORMAL outcome for a re-delivered audit or a build
+          // whose assets were already scanned — the lake query excluded them.
+          builds_scanned: results.length,
+          assets_written: results.reduce((s, r) => s + (r.assets_written || 0), 0),
+          dependencies_stored: results.reduce((s, r) => s + (r.dependencies_stored || 0), 0),
+        };
+        log.info('release scanned', summary);
+        return summary;
+
+connections:
+  - { id: c1, from: on_release_audit, to: extract_release }
+  - { id: c2, from: extract_release, to: fetch_build }
+  - { id: c3, from: fetch_build, to: scan_build }
+  - { id: c4, from: scan_build, to: report }
+
+outputs:
+  release_id: "${{ steps.report.outputs.release_id }}"
+  builds_scanned: "${{ steps.report.outputs.builds_scanned }}"
+  assets_written: "${{ steps.report.outputs.assets_written }}"
