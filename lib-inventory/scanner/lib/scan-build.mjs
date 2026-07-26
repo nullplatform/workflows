@@ -168,11 +168,11 @@ export async function scanBuild(build, gh, opts) {
       if (text == null) continue;
       const readConfig = CONFIG_READERS[m.ecosystem];
       if (readConfig) {
-        for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+        for (const [k, v] of Object.entries(readConfig(text, m.path, texts))) {
           manifestConfig[`${m.ecosystem}.${k}`] = v;
         }
       }
-      for (const d of PARSERS[m.ecosystem](text, m.path)) {
+      for (const d of PARSERS[m.ecosystem](text, m.path, texts)) {
         const key = `${d.ecosystem} ${d.name} ${d.version}`;
         if (seen.has(key)) continue;
         seen.add(key);

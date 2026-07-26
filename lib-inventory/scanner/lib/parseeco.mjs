@@ -40,11 +40,15 @@ export function parseEcosystem(resolutions, ecosystem, opts) {
           // Last manifest wins on a collision. An asset with several manifests
           // of one ecosystem is a monorepo subtree; the deepest one is listed
           // last and is the more specific statement.
-          for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+          for (const [k, v] of Object.entries(readConfig(text, m.path, r.texts))) {
             config[`${ecosystem}.${k}`] = v;
           }
         }
-        for (const d of parse(text, m.path)) {
+        // The whole repository's fetched manifests, so a parser can resolve a
+        // SIBLING file without a network call. Maven needs it: a module pom
+        // inherits its `<properties>` from a parent pom that, in a monorepo of
+        // lambdas, sits at the repository root and has already been fetched.
+        for (const d of parse(text, m.path, r.texts)) {
           const key = `${d.ecosystem} ${d.name} ${d.version}`;
           if (seen.has(key)) continue;
           seen.add(key);
