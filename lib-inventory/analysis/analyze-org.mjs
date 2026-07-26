@@ -158,12 +158,18 @@ bar('0. GitHub token');
 
 // ── 1. Backfill universe ───────────────────────────────────────────────────
 bar('1. Backfill universe (what is actually deployed)');
+// A DELETED scope is not deployed, but its deployments keep
+// `status_in_scope = 'active'` in the lake — counting them overstates the
+// backfill and, worse, fills the inventory with builds nothing runs. Measured
+// on one org: 37% of the "live" assets. `!= 'deleted'` rather than
+// `= 'active'` so a status added later keeps flowing in.
 const LIVE_BUILDS = `
   WITH live_builds AS (
     SELECT DISTINCT r.build_id AS build_id
     FROM core_entities_deployment AS d FINAL
     INNER JOIN core_entities_release AS r FINAL ON r.id = d.release_id
-    WHERE d.status_in_scope = 'active'
+    INNER JOIN core_entities_scope   AS s FINAL ON s.id = d.scope_id
+    WHERE d.status_in_scope = 'active' AND s.status != 'deleted'
   )`;
 
 const universe = (

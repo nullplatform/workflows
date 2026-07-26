@@ -8,7 +8,15 @@ curl -s -X POST https://api.nullplatform.com/data/lake/query \
   -d '{"query": "… FORMAT JSONEachRow"}'
 ```
 
-Two things that will bite you if nobody says them first:
+Three things that will bite you if nobody says them first:
+
+- **A deleted scope still looks deployed.** Its deployments keep
+  `status_in_scope = 'active'` in the lake, so the "what is live" CTE has to
+  carry `AND s.status != 'deleted'` or it reports on builds nothing runs — 37%
+  of one organization's live assets, and every asset it had on a two-major-old
+  library. `!= 'deleted'` and not `= 'active'`: a status added later must keep
+  flowing in, since an asset wrongly INCLUDED costs one scan while one wrongly
+  EXCLUDED is invisible.
 
 - **`m.data` is `Nullable(String)`.** `JSONExtractArrayRaw` refuses a nullable
   argument (`Nested type Array(String) cannot be inside Nullable type`), so every
@@ -164,6 +172,7 @@ WITH live AS (
   INNER JOIN customers_lake.core_entities_release AS r FINAL ON r.id = d.release_id
   INNER JOIN customers_lake.core_entities_scope   AS s FINAL ON s.id = d.scope_id
   WHERE d.status_in_scope = 'active' AND s.asset_name != ''
+    AND s.status != 'deleted'
 ),
 existing AS (
   SELECT toInt32OrZero(m.id) AS asset_id
@@ -201,3 +210,111 @@ GROUP BY cfg, node_engine, go_version
 ORDER BY assets DESC
 FORMAT JSONEachRow
 ```
+
+---
+
+## 6. Namespace → application → scope → version of one library
+
+The question a platform team actually asks. **The scope is the unit, not the
+asset**: a scope points at ONE asset of ONE build, so `dev` and `prod` of the
+same application legitimately run different commits and therefore different
+library versions — collapsing to the asset would hide exactly that.
+
+`namespace` is not a column anywhere; it is a segment of the scope's NRN, so it
+has to be pulled out of the string and joined to `core_entities_namespace`.
+
+```sql
+WITH
+live AS (
+  SELECT s.name AS scope_name, s.nrn AS scope_nrn, s.application_id AS app_id,
+         s.asset_name AS asset_name, r.build_id AS build_id
+  FROM customers_lake.core_entities_deployment AS d FINAL
+  INNER JOIN customers_lake.core_entities_release AS r FINAL ON r.id = d.release_id
+  INNER JOIN customers_lake.core_entities_scope   AS s FINAL ON s.id = d.scope_id
+  WHERE d.status_in_scope = 'active' AND s.asset_name != ''
+    AND s.status != 'deleted'
+),
+inv AS (
+  SELECT toInt64OrZero(m.id)                                       AS asset_id,
+         JSONExtractString(assumeNotNull(m.data), 'status')         AS status,
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
+  FROM customers_lake.core_entities_metadata AS m FINAL
+  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
+    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+),
+hit AS (
+  SELECT asset_id,
+    anyIf(JSONExtractString(d, 'version'),
+          JSONExtractString(d, 'name') = 'github.com/acme/goala/utel/v2') AS v2,
+    anyIf(JSONExtractString(d, 'version'),
+          JSONExtractString(d, 'name') = 'github.com/acme/goala/utel')    AS v1,
+    anyIf(JSONExtractBool(d, 'direct'),
+          JSONExtractString(d, 'name') LIKE 'github.com/acme/goala/utel%') AS is_direct
+  FROM inv ARRAY JOIN deps AS d
+  GROUP BY asset_id
+)
+SELECT ns.namespace_name AS namespace,
+       a.app_name        AS application,
+       l.scope_name      AS scope,
+       multiIf(h.v2 != '', 'v2', h.v1 != '', 'v1', '-')                   AS major,
+       coalesce(nullIf(h.v2, ''), nullIf(h.v1, ''), 'no usa la lib')      AS version,
+       h.is_direct       AS direct
+FROM live AS l
+INNER JOIN customers_lake.core_entities_asset AS x FINAL
+        ON x.build_id = l.build_id AND x.name = l.asset_name
+INNER JOIN inv AS i ON i.asset_id = x.id
+LEFT  JOIN hit AS h ON h.asset_id = x.id
+INNER JOIN customers_lake.core_entities_application AS a FINAL ON a.app_id = l.app_id
+-- `namespace=<id>` lives inside the NRN string; there is no namespace column.
+LEFT  JOIN customers_lake.core_entities_namespace AS ns FINAL
+       ON toString(ns.namespace_id) =
+          splitByChar('=', arrayFilter(p -> p LIKE 'namespace=%',
+                                       splitByChar(':', l.scope_nrn))[1])[2]
+WHERE i.status = 'ok' AND major = 'v1'
+ORDER BY namespace, application, scope
+FORMAT JSONEachRow
+```
+
+Drop the `major = 'v1'` filter for the full picture, or set it to `'-'` for the
+scopes that do not use the library at all.
+
+---
+
+## 7. Everything one scope depends on
+
+```sql
+WITH
+live AS (
+  SELECT s.asset_name AS asset_name, r.build_id AS build_id
+  FROM customers_lake.core_entities_deployment AS d FINAL
+  INNER JOIN customers_lake.core_entities_release AS r FINAL ON r.id = d.release_id
+  INNER JOIN customers_lake.core_entities_scope   AS s FINAL ON s.id = d.scope_id
+  WHERE d.status_in_scope = 'active' AND s.asset_name != ''
+    AND s.status != 'deleted'
+    AND s.name = '<SCOPE_NAME>'
+),
+inv AS (
+  SELECT toInt64OrZero(m.id)                                       AS asset_id,
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
+  FROM customers_lake.core_entities_metadata AS m FINAL
+  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
+    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+)
+SELECT JSONExtractString(d, 'name')    AS library,
+       JSONExtractString(d, 'version') AS version,
+       JSONExtractBool(d, 'internal')  AS internal,
+       JSONExtractBool(d, 'direct')    AS direct
+FROM live AS l
+INNER JOIN customers_lake.core_entities_asset AS x FINAL
+        ON x.build_id = l.build_id AND x.name = l.asset_name
+INNER JOIN inv AS i ON i.asset_id = x.id
+ARRAY JOIN i.deps AS d
+ORDER BY internal DESC, direct DESC, library
+FORMAT JSONEachRow
+```
+
+This list is SHORT on purpose and it is not a bill of materials. Transitive
+EXTERNAL dependencies are deliberately not stored — they were 87% of the volume
+and nobody chose them. What is here is what somebody declared, plus every
+internal library however it arrived. `transitive_external_dropped` on the record
+says how many were left out.

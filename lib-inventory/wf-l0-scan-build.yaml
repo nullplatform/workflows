@@ -128,6 +128,17 @@ steps:
           build_id: "${{ workflow.inputs.build_id }}"
           commit: "${{ workflow.inputs.commit }}"
           assets_json: "${{ workflow.inputs.assets_json }}"
+    error_handling:
+      # A sandbox the platform could not hand out right now (capacity, a
+      # transport blip) is transient and now reports itself as retryable — this
+      # is what turns a lost sub-execution into a two-second pause. Nothing
+      # else in these steps is retryable: they are pure computation, so a
+      # genuine failure fails identically on every attempt.
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       code: |
         // >>> GENERATED plan_tree_fetches — do not edit by hand (build-workflow.mjs)
@@ -393,8 +404,18 @@ steps:
       - body.tree[].path
       - body.truncated
     error_handling:
+      # GitHub's PRIMARY rate limit answers 403 with `x-ratelimit-remaining: 0`
+      # and a reset timestamp — not 429. The engine now reads those headers and
+      # waits as long as the SERVER said (up to an hour) instead of the
+      # interval below, so a limit hit mid-run parks that one build for the
+      # real window and then carries on. The 2s interval still covers the
+      # ordinary 5xx blip.
+      #
+      # 4 attempts because a GitHub window is ten minutes: three waits cover
+      # half an hour of exhaustion. Anything longer is not this run's problem —
+      # the assets keep no record and the next round asks for them again.
       retry_policy:
-        max_attempts: 3
+        max_attempts: 4
         initial_interval: "2s"
         backoff_strategy: exponential
         jitter: 0.3
@@ -412,6 +433,17 @@ steps:
     inputs:
       plans: "${{ steps.plan_tree_fetches.outputs.plans }}"
       treeResults: "${{ steps.fetch_trees.outputs.items }}"
+    error_handling:
+      # A sandbox the platform could not hand out right now (capacity, a
+      # transport blip) is transient and now reports itself as retryable — this
+      # is what turns a lost sub-execution into a two-second pause. Nothing
+      # else in these steps is retryable: they are pure computation, so a
+      # genuine failure fails identically on every attempt.
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       code: |
         // >>> GENERATED plan_manifest_fetches — do not edit by hand (build-workflow.mjs)
@@ -657,8 +689,10 @@ steps:
       - statusCode
       - body.data.repository
     error_handling:
+      # Same rate-limit handling as the tree fetch above: the wait comes from
+      # GitHub's own reset header, not from this interval.
       retry_policy:
-        max_attempts: 3
+        max_attempts: 4
         initial_interval: "2s"
         backoff_strategy: exponential
         jitter: 0.3
@@ -676,6 +710,17 @@ steps:
     inputs:
       plans: "${{ steps.plan_manifest_fetches.outputs.plans }}"
       manifestResults: "${{ steps.fetch_manifests.outputs.items }}"
+    error_handling:
+      # A sandbox the platform could not hand out right now (capacity, a
+      # transport blip) is transient and now reports itself as retryable — this
+      # is what turns a lost sub-execution into a two-second pause. Nothing
+      # else in these steps is retryable: they are pure computation, so a
+      # genuine failure fails identically on every attempt.
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       code: |
         // >>> GENERATED resolve_assets — do not edit by hand (build-workflow.mjs)
@@ -994,6 +1039,17 @@ steps:
     inputs:
       resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
       internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    error_handling:
+      # A sandbox the platform could not hand out right now (capacity, a
+      # transport blip) is transient and now reports itself as retryable — this
+      # is what turns a lost sub-execution into a two-second pause. Nothing
+      # else in these steps is retryable: they are pure computation, so a
+      # genuine failure fails identically on every attempt.
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       code: |
         // >>> GENERATED parse_go — do not edit by hand (build-workflow.mjs)
@@ -1356,6 +1412,17 @@ steps:
     inputs:
       resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
       internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    error_handling:
+      # A sandbox the platform could not hand out right now (capacity, a
+      # transport blip) is transient and now reports itself as retryable — this
+      # is what turns a lost sub-execution into a two-second pause. Nothing
+      # else in these steps is retryable: they are pure computation, so a
+      # genuine failure fails identically on every attempt.
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       code: |
         // >>> GENERATED parse_node — do not edit by hand (build-workflow.mjs)
@@ -1729,6 +1796,17 @@ steps:
         - "${{ steps.parse_node.outputs.parsed }}"
       unscannable: "${{ steps.plan_tree_fetches.outputs.unscannable }}"
       failed: "${{ steps.plan_manifest_fetches.outputs.failed }}"
+    error_handling:
+      # A sandbox the platform could not hand out right now (capacity, a
+      # transport blip) is transient and now reports itself as retryable — this
+      # is what turns a lost sub-execution into a two-second pause. Nothing
+      # else in these steps is retryable: they are pure computation, so a
+      # genuine failure fails identically on every attempt.
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       code: |
         // >>> GENERATED build_payloads — do not edit by hand (build-workflow.mjs)
@@ -2066,6 +2144,12 @@ steps:
       dryRun: "${{ workflow.inputs.dry_run }}"
       buildId: "${{ workflow.inputs.build_id }}"
     name: "Build Result"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       code: |
         const scanned = inputs.scanned || [];
