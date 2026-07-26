@@ -11,6 +11,8 @@
  * the per-build split exists to solve. See `parsePackageJson`.
  */
 const parsed = parseEcosystem(inputs.resolutions || [], 'node', {
+  parse: parsePackageJson,
+  readConfig: packageJsonConfig,
   internalPatterns: compileInternalPatterns(inputs.internalPatterns),
   keepTransitiveExternal: inputs.keepTransitiveExternal === true,
 });

@@ -30,8 +30,10 @@ const STEPS = {
   plan_tree_fetches: ['manifests', 'blobs', 'plan', 'steps/plan-tree-fetches'],
   plan_manifest_fetches: ['manifests', 'blobs', 'plan', 'steps/plan-manifest-fetches'],
   resolve_assets: ['manifests', 'resolve', 'blobs', 'resolveplans', 'steps/resolve-assets'],
-  parse_go: ['manifests', 'parsers', 'parseeco', 'steps/parse-go'],
-  parse_node: ['manifests', 'parsers', 'parseeco', 'steps/parse-node'],
+  parse_go: ['manifests', 'parsers-go', 'parseeco', 'steps/parse-go'],
+  parse_node: ['manifests', 'parsers-node', 'parseeco', 'steps/parse-node'],
+  parse_maven: ['manifests', 'parsers-maven', 'parseeco', 'steps/parse-maven'],
+  parse_python: ['manifests', 'parsers-python', 'parseeco', 'steps/parse-python'],
   build_payloads: ['manifests', 'payload', 'buildpay', 'steps/build-payloads'],
 };
 
@@ -73,6 +75,35 @@ for (const [stepId, modules] of Object.entries(STEPS)) {
     new AsyncFunction('inputs', 'log', 'console', body);
   } catch (err) {
     console.error(`FAILED: ${stepId} body does not compile — ${err.message}`);
+    process.exit(1);
+  }
+
+  // Compiling is not enough. The inliner strips `import` lines, so a body that
+  // uses a name from a module NOT in its list still parses fine and throws
+  // ReferenceError on its first real execution — which is after an upload, an
+  // alias repoint and a live run. This evaluates the declarations (everything
+  // up to the step's own logic, which needs `inputs`) so an unresolved name
+  // fails here instead.
+  // Compiling is not enough, and neither is checking the declarations: a name
+  // the step uses lives BELOW them, so the only check that sees it is running
+  // the body. It is run on EMPTY inputs — every step here is pure and returns
+  // an empty result for empty input, so this doubles as a smoke test. Without
+  // it a step that references a module missing from its list parses fine and
+  // throws ReferenceError on its first live run, which is after an upload, an
+  // alias repoint and a wait.
+  try {
+    // AWAITED: an AsyncFunction REJECTS rather than throwing, so an un-awaited
+    // call sails past this catch and surfaces as an unhandled rejection that
+    // kills the process with no diagnostic.
+    await new AsyncFunction('inputs', 'log', 'console', body)(
+      {},
+      { info() {}, warn() {}, error() {} },
+      console,
+    );
+  } catch (err) {
+    console.error(`FAILED: ${stepId} does not run on empty inputs`);
+    console.error(`  ${err.message}`);
+    console.error(`  modules: ${modules.join(' + ')}`);
     process.exit(1);
   }
 

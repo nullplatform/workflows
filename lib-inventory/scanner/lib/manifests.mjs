@@ -34,7 +34,7 @@ const NAME_SUFFIXES = [
 ];
 
 /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-export const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+export const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
 
 export function manifestLang(basename) {
   if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];

@@ -1,5 +1,3 @@
-import { CONFIG_READERS, PARSERS } from './parsers.mjs';
-
 /**
  * STEP 4 — parse the manifests of ONE ecosystem.
  *
@@ -11,11 +9,17 @@ import { CONFIG_READERS, PARSERS } from './parsers.mjs';
  * `go` directive, the package manager) — runtime statements that answer
  * "which assets still declare node 16", a question no dependency array can.
  * Keys are prefixed with the ecosystem so two manifests never collide.
+ *
+ * The parser is PASSED IN rather than looked up in a registry. Importing the
+ * registry would drag every ecosystem's parser into every parse step's inlined
+ * bundle — the Maven step carrying the Go and Python parsers it never calls —
+ * which is exactly the "each step gets only what it uses" property the module
+ * split exists to preserve. It went from 780 lines a step back to ~300.
  */
 export function parseEcosystem(resolutions, ecosystem, opts) {
-  const parse = PARSERS[ecosystem];
-  if (!parse) throw new Error(`no parser registered for ecosystem "${ecosystem}"`);
-  const readConfig = CONFIG_READERS[ecosystem];
+  const parse = opts.parse;
+  if (!parse) throw new Error(`no parser passed for ecosystem "${ecosystem}"`);
+  const readConfig = opts.readConfig;
   const keepAll = opts.keepTransitiveExternal === true;
   const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
 
@@ -36,9 +40,11 @@ export function parseEcosystem(resolutions, ecosystem, opts) {
           // Last manifest wins on a collision. An asset with several manifests
           // of one ecosystem is a monorepo subtree; the deepest one is listed
           // last and is the more specific statement.
-          for (const [k, v] of Object.entries(readConfig(text))) config[`${ecosystem}.${k}`] = v;
+          for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+            config[`${ecosystem}.${k}`] = v;
+          }
         }
-        for (const d of parse(text)) {
+        for (const d of parse(text, m.path)) {
           const key = `${d.ecosystem} ${d.name} ${d.version}`;
           if (seen.has(key)) continue;
           seen.add(key);

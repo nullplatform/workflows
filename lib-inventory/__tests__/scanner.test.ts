@@ -16,7 +16,11 @@ import {
   normalizeName,
   parseGoMod,
   parsePackageJson,
+  parsePomXml,
+  parsePython,
   parseRepoUrl,
+  pomConfig,
+  pythonConfig,
   resolveAsset,
   scanBuild,
 } from '../scanner/scanner.mjs';
@@ -131,6 +135,132 @@ describe('parsePackageJson', () => {
     // One malformed manifest in a monorepo must not fail the whole build's scan.
     expect(parsePackageJson('{ not json')).toEqual([]);
     expect(parsePackageJson('null')).toEqual([]);
+  });
+});
+
+describe('parsePomXml', () => {
+  const POM = `<project>
+  <groupId>com.acme</groupId><artifactId>svc</artifactId><version>2.1.0</version>
+  <parent><groupId>com.acme</groupId><artifactId>platform</artifactId><version>7.0</version></parent>
+  <properties><java.version>17</java.version><lib.version>3.4.5</lib.version></properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>org.x</groupId><artifactId>bom-dep</artifactId><version>9.9</version></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>com.acme</groupId><artifactId>common</artifactId><version>\${lib.version}</version></dependency>
+    <dependency><groupId>org.x</groupId><artifactId>bom-dep</artifactId></dependency>
+    <dependency><groupId>junit</groupId><artifactId>junit</artifactId><version>4.13</version><scope>test</scope></dependency>
+    <dependency><groupId>un</groupId><artifactId>resolved</artifactId><version>\${from.parent}</version></dependency>
+  </dependencies>
+</project>`;
+
+  it('names a dependency by its full coordinate, not the artifactId', () => {
+    // `common`, `core`, `model` collide across organizations; only
+    // `groupId:artifactId` makes "is this internal" answerable.
+    const deps = parsePomXml(POM);
+    expect(deps.map((d: { name: string }) => d.name)).toContain('com.acme:common');
+  });
+
+  it('resolves ${property} from the pom own properties', () => {
+    const dep = parsePomXml(POM).find((d: { name: string }) => d.name === 'com.acme:common');
+    expect(dep).toMatchObject({ version: '3.4.5' });
+  });
+
+  it('fills a missing version from dependencyManagement, which is not itself a dependency', () => {
+    const deps = parsePomXml(POM);
+    expect(deps.find((d: { name: string }) => d.name === 'org.x:bom-dep')).toMatchObject({
+      version: '9.9',
+    });
+    // The management block declares nothing on its own — one entry, not two.
+    expect(deps.filter((d: { name: string }) => d.name === 'org.x:bom-dep')).toHaveLength(1);
+  });
+
+  it('keeps an unresolvable version VERBATIM rather than guessing', () => {
+    // It came from a parent POM, which resolving would mean running Maven.
+    // `\${from.parent}` in the record reads as obviously unresolved; a
+    // substituted guess would not.
+    expect(parsePomXml(POM).find((d: { name: string }) => d.name === 'un:resolved')).toMatchObject({
+      version: '${from.parent}',
+    });
+  });
+
+  it('separates test scope from what the artifact ships', () => {
+    expect(parsePomXml(POM).find((d: { name: string }) => d.name === 'junit:junit')).toMatchObject({
+      dev: true,
+      scope: 'test',
+    });
+  });
+
+  it('does not inventory a commented-out dependency', () => {
+    const deps = parsePomXml(
+      '<project><dependencies><!--<dependency><groupId>g</groupId><artifactId>a</artifactId></dependency>--></dependencies></project>',
+    );
+    expect(deps).toEqual([]);
+  });
+
+  it('records the Java it targets — the JVM engines.node', () => {
+    expect(pomConfig(POM)).toMatchObject({
+      artifactId: 'svc',
+      version: '2.1.0',
+      parent: 'com.acme:platform:7.0',
+      'java.version': '17',
+    });
+  });
+});
+
+describe('parsePython', () => {
+  it('reads requirements.txt, dropping markers but keeping the requirement', () => {
+    const deps = parsePython(
+      '# comment\nDjango==4.2.1\nboto3>=1.0 ; python_version<"3.9"\n-r other.txt\nrequests[security]==2.0',
+      'a/requirements.txt',
+    );
+    expect(deps.map((d: { name: string }) => d.name)).toEqual(['Django', 'boto3', 'requests']);
+    expect(deps[1]).toMatchObject({ version: '>=1.0' });
+  });
+
+  it('treats a path requirement as in-repo code, keeping the path as its identity', () => {
+    // Running `-e ./local` through the package-name regex produced a
+    // dependency literally called ".".
+    const deps = parsePython('-e ./local\n../shared', 'a/requirements.txt');
+    expect(deps).toEqual([
+      { name: './local', version: '', direct: true, ecosystem: 'python', local: true },
+      { name: '../shared', version: '', direct: true, ecosystem: 'python', local: true },
+    ]);
+  });
+
+  it('reads PEP 621 pyproject.toml', () => {
+    const deps = parsePython(
+      '[project]\nname = "svc"\nrequires-python = ">=3.11"\ndependencies = ["fastapi>=0.100", "pydantic==2.1"]\n',
+      'x/pyproject.toml',
+    );
+    expect(deps.map((d: { name: string }) => d.name)).toEqual(['fastapi', 'pydantic']);
+  });
+
+  it('reads Poetry, and never reports the INTERPRETER as a library', () => {
+    const deps = parsePython(
+      '[tool.poetry.dependencies]\npython = "^3.11"\nrequests = "^2.31"\nshared = { path = "../shared" }\n[tool.poetry.group.dev.dependencies]\npytest = "^7"\n',
+      'y/pyproject.toml',
+    );
+    expect(deps.map((d: { name: string }) => d.name)).toEqual(['requests', 'shared', 'pytest']);
+    expect(deps.find((d: { name: string }) => d.name === 'shared')).toMatchObject({ local: true });
+    expect(deps.find((d: { name: string }) => d.name === 'pytest')).toMatchObject({ dev: true });
+  });
+
+  it('says when a requirements.txt is pip-compiled, since its direct flags over-report', () => {
+    // A compiled file lists the whole closure. Saying so beats silently
+    // mixing declarations with resolved transitives.
+    expect(pythonConfig('django==4.2\n    # via -r req.in\n', 'a/requirements.txt')).toMatchObject({
+      requirements_compiled: 'true',
+    });
+    expect(pythonConfig('django==4.2\n', 'a/requirements.txt')).toEqual({});
+  });
+
+  it('records the interpreter a pyproject targets', () => {
+    expect(
+      pythonConfig('[project]\nrequires-python = ">=3.11"\n', 'x/pyproject.toml'),
+    ).toMatchObject({
+      'requires-python': '>=3.11',
+    });
   });
 });
 
@@ -264,10 +394,14 @@ require (
   });
 
   it('records lang_unsupported when a manifest exists but has no parser yet', async () => {
-    const gh = fakeGh({ 'lambdas/go/get-toggles-aws-lambda/pom.xml': '<project/>' });
+    // Gradle is DETECTED and not parsed — the record says so rather than
+    // reporting an empty dependency list as if the asset had none.
+    const gh = fakeGh({
+      'lambdas/go/get-toggles-aws-lambda/build.gradle': 'plugins { id "java" }',
+    });
     const [row] = await scanBuild(build(), gh, { internalPatterns: INTERNAL, now: NOW });
     expect(row.data.status).toBe('lang_unsupported');
-    expect(row.data.languages).toEqual(['java-maven']);
+    expect(row.data.languages).toEqual(['java-gradle']);
   });
 
   it('records unresolved rather than attaching the asset to an arbitrary directory', async () => {
@@ -309,11 +443,11 @@ require (
   it('says which languages went unparsed when coverage is partial', async () => {
     const gh = fakeGh({
       'lambdas/go/get-toggles-aws-lambda/go.mod': GO_MOD,
-      'lambdas/go/get-toggles-aws-lambda/scripts/requirements.txt': 'boto3==1.0.0',
+      'lambdas/go/get-toggles-aws-lambda/gradle/build.gradle': 'plugins { id "java" }',
     });
     const [row] = await scanBuild(build(), gh, { internalPatterns: INTERNAL, now: NOW });
     expect(row.data.status).toBe('ok');
-    expect(row.data.status_detail).toContain('python');
+    expect(row.data.status_detail).toContain('java-gradle');
   });
 
   it('parses every enabled ecosystem an asset carries, not just the first', async () => {
