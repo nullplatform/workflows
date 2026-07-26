@@ -160,8 +160,18 @@ steps:
         -- is done forever: the record names an immutable commit.
         existing AS (
           SELECT toInt32OrZero(m.id) AS asset_id
-          FROM core_entities_metadata AS m
-          WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies' AND m.data IS NOT NULL
+          FROM core_entities_metadata AS m FINAL
+          WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
+            AND m.data IS NOT NULL
+            -- FINAL and `_deleted = 0`, both load-bearing. Without them a
+            -- DELETED record still counts as present, so the asset is excluded
+            -- from the backfill FOREVER — deleting a record to force a rescan
+            -- silently does nothing. Found live 2026-07-26: 341 assets stranded
+            -- that way, including every Java one, after the records were
+            -- deliberately deleted so the new Maven parser would re-read them.
+            -- Without FINAL the ReplacingMergeTree can also return a superseded
+            -- version of the row.
+            AND m._deleted = 0
         )
         SELECT
           toString(a.app_id)   AS app_id,
