@@ -6,9 +6,10 @@
 # manifests or the resolution ladder — that all lives in wf-l0, which the
 # per-release path invokes too.
 #
-#   fetch_targets ── lake: live assets with no record yet
-#     └─ scan_builds ── sub-workflow × N   (wf-l0-scan-build)
-#          └─ summarize ── coverage, fails below threshold
+#   nightly (04:00) ─┐
+#   start_manual ────┴─ fetch_targets ── lake: live assets with no record yet
+#                         └─ scan_builds ── sub-workflow × N (wf-l0-scan-build)
+#                              └─ summarize ── coverage, fails below threshold
 #
 # WHY FAN OUT INSTEAD OF BATCHING: repository trees and manifest bodies travel
 # through execution state, and the sandbox input boundary is 1 MB. Running the
@@ -30,6 +31,9 @@
 # Detection scope: `vars.LIB_SCAN_NRN_PREFIX` (config entry, REQUIRED) prefix-
 # matches the application NRN. `organization=<org>` = whole org; a deeper NRN
 # stages the rollout.
+#
+# `wf-l2-on-release` owns latency; this owns completeness. It must trend to
+# ZERO rows — the count it finds is the health signal for the listener.
 #
 # Per-org configuration (config entries on folder /lib-inventory):
 #   NP_API_KEY               (secret) org credential for the lake query
@@ -75,6 +79,39 @@ steps:
           required: false
           description: "Scan and summarise without writing metadata"
 
+  # ── The reconciler ───────────────────────────────────────────────────────
+  # `wf-l2-on-release` owns LATENCY — a new release is scanned within seconds.
+  # This owns COMPLETENESS, which is a different job, because the listener is a
+  # best effort and cannot cover:
+  #
+  #   - A scan that FAILED. The release event already fired and there is no
+  #     second one. Measured live: E2B capacity killed sub-executions, and a
+  #     GitHub rate-limit window outlasts the retry budget. Those assets keep no
+  #     record and nothing asks for them again.
+  #   - A delivery that never arrived. Delete the notification channel, rotate
+  #     the webhook token by re-activating the alias, revoke the grant, or lose
+  #     the POST — the listener stops and NOTHING SAYS SO.
+  #   - Live set changes with no new release: a rollback to an older release, a
+  #     new scope pointing at a build that already existed.
+  #
+  # IT MUST TREND TO ZERO ROWS, and that is the point: the count is the health
+  # signal. A run that scans nothing means the listener is keeping up. A run
+  # that suddenly finds two hundred means something upstream broke, and this is
+  # what surfaces it.
+  #
+  # Once a day at 04:00 is deliberate. It is not competing with the listener on
+  # latency and it must not compete with it for the worker — a backfill in
+  # flight is exactly what stretched one live release scan from 13s to 18
+  # minutes (measured 2026-07-26). Query cost is ~3.8s, flat, and grows with
+  # what is MISSING rather than with the size of the organization.
+  - id: nightly
+    type: trigger
+    plugin_type: cron
+    name: "Daily 04:00"
+    config:
+      schedule: "0 4 * * *"
+      timezone: "America/Argentina/Buenos_Aires"
+
   # ── ONE lake query: every live asset that still has no record ────────────
   # `live` is the set of (build, asset name) pairs reachable from an ACTIVE
   # deployment — that is what "currently deployed" means; the build table alone
@@ -96,6 +133,9 @@ steps:
     type: module
     plugin_type: np-lake-query
     name: "Live Assets Without A Record (lake)"
+    # Two entry points — the manual button and the nightly tick. `any`, because
+    # the default `all` would wait for the trigger that did not fire.
+    join_strategy: any
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
@@ -299,6 +339,7 @@ steps:
 
 connections:
   - { id: c1, from: start_manual, to: fetch_targets }
+  - { id: c1b, from: nightly, to: fetch_targets }
   - { id: c2, from: fetch_targets, to: scan_builds }
   - { id: c3, from: scan_builds, to: summarize }
 
