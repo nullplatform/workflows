@@ -292,9 +292,13 @@ steps:
         let written = 0;
         let stored = 0;
         let dropped = 0;
+        let attempted = 0;
+        let failures = 0;
         for (const r of results) {
           scanned += r.assets_scanned || 0;
           written += r.assets_written || 0;
+          attempted += r.assets_write_attempted || 0;
+          failures += Number(r.write_failures || 0);
           stored += r.dependencies_stored || 0;
           dropped += r.transitive_external_dropped || 0;
           merge(byStatus, r.by_status);
@@ -324,6 +328,10 @@ steps:
           builds_failed: planned.length - results.length,
           assets_scanned: scanned,
           assets_written: written,
+          // A rejected write leaves the step `completed` — `forEach` absorbs it
+          // — so these are what turn "the run looked fine" into a number.
+          assets_write_attempted: attempted,
+          write_failures: failures,
           coverage_pct: coverage,
           build_coverage_pct: buildCoverage,
           asset_coverage_pct: assetCoverage,
@@ -359,6 +367,7 @@ outputs:
   builds_failed: "${{ steps.summarize.outputs.builds_failed }}"
   assets_scanned: "${{ steps.summarize.outputs.assets_scanned }}"
   assets_written: "${{ steps.summarize.outputs.assets_written }}"
+  write_failures: "${{ steps.summarize.outputs.write_failures }}"
   coverage_pct: "${{ steps.summarize.outputs.coverage_pct }}"
   build_coverage_pct: "${{ steps.summarize.outputs.build_coverage_pct }}"
   asset_coverage_pct: "${{ steps.summarize.outputs.asset_coverage_pct }}"
