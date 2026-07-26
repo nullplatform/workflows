@@ -81,6 +81,45 @@ function expand(value, props, depth = 0) {
 }
 
 /**
+ * Properties inherited from a parent POM that lives IN THE SAME REPOSITORY.
+ *
+ * Not an exception to "no reactor resolution" so much as the free part of it.
+ * Every manifest in the repository is already fetched — rung L2 needs to read
+ * artifact names — so a module pom whose parent sits at the repository root can
+ * have its `${...}` resolved with no network call and no build. That is the
+ * ordinary shape of a monorepo of lambdas, and it is where the unresolved
+ * versions actually were: a real asset came back with three of six versions
+ * still `${the reference organization.accounts.core.version}`, all of them defined one directory up.
+ *
+ * Matched on the parent's `artifactId`, walking up to three levels. A parent
+ * NOT in the repository stays unresolved, verbatim, exactly as before.
+ *
+ * The child's own properties win — this only fills gaps.
+ */
+function parentProperties(xml, siblings, depth = 0) {
+  if (!siblings || depth >= 3) return {};
+  const head = xml.split(/<dependencies\s*>/)[0] ?? xml;
+  const parent = /<parent\s*>[\s\S]*?<\/parent\s*>/.exec(head);
+  if (!parent) return {};
+  const wanted = tagValue(parent[0], 'artifactId');
+  if (!wanted) return {};
+
+  for (const [path, candidate] of Object.entries(siblings)) {
+    if (!path.endsWith('pom.xml') || typeof candidate !== 'string') continue;
+    const candidateXml = stripXmlComments(candidate);
+    const candidateHead = candidateXml.split(/<dependencies\s*>/)[0] ?? candidateXml;
+    const own = candidateHead.replace(/<parent\s*>[\s\S]*?<\/parent\s*>/g, '');
+    if (tagValue(own, 'artifactId') !== wanted) continue;
+    // Found it. Its own parent may define more, so recurse before merging.
+    return {
+      ...parentProperties(candidateXml, siblings, depth + 1),
+      ...pomProperties(candidateXml),
+    };
+  }
+  return {};
+}
+
+/**
  * Parse a `pom.xml`.
  *
  * The dependency NAME is `groupId:artifactId` — Maven's own coordinate, and the
@@ -92,9 +131,9 @@ function expand(value, props, depth = 0) {
  * something the deployed artifact ships, and conflating the two makes any
  * "who is exposed" question unanswerable.
  */
-export function parsePomXml(text) {
+export function parsePomXml(text, _path = '', siblings = undefined) {
   const xml = stripXmlComments(text);
-  const props = pomProperties(xml);
+  const props = { ...parentProperties(xml, siblings), ...pomProperties(xml) };
 
   // Versions pinned in <dependencyManagement> fill in for dependencies that
   // omit one. The management blocks themselves are NOT dependencies.
@@ -142,9 +181,9 @@ export function parsePomXml(text) {
  * equivalent of `engines.node` — the runtime-deprecation question, which no
  * dependency list answers.
  */
-export function pomConfig(text) {
+export function pomConfig(text, _path = '', siblings = undefined) {
   const xml = stripXmlComments(text);
-  const props = pomProperties(xml);
+  const props = { ...parentProperties(xml, siblings), ...pomProperties(xml) };
   const cfg = {};
   const head = xml.split(/<dependencies\s*>/)[0] ?? xml;
   const parent = /<parent\s*>[\s\S]*?<\/parent\s*>/.exec(head);

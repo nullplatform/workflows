@@ -1277,11 +1277,15 @@ steps:
                   // Last manifest wins on a collision. An asset with several manifests
                   // of one ecosystem is a monorepo subtree; the deepest one is listed
                   // last and is the more specific statement.
-                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                  for (const [k, v] of Object.entries(readConfig(text, m.path, r.texts))) {
                     config[`${ecosystem}.${k}`] = v;
                   }
                 }
-                for (const d of parse(text, m.path)) {
+                // The whole repository's fetched manifests, so a parser can resolve a
+                // SIBLING file without a network call. Maven needs it: a module pom
+                // inherits its `<properties>` from a parent pom that, in a monorepo of
+                // lambdas, sits at the repository root and has already been fetched.
+                for (const d of parse(text, m.path, r.texts)) {
                   const key = `${d.ecosystem} ${d.name} ${d.version}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
@@ -1575,11 +1579,15 @@ steps:
                   // Last manifest wins on a collision. An asset with several manifests
                   // of one ecosystem is a monorepo subtree; the deepest one is listed
                   // last and is the more specific statement.
-                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                  for (const [k, v] of Object.entries(readConfig(text, m.path, r.texts))) {
                     config[`${ecosystem}.${k}`] = v;
                   }
                 }
-                for (const d of parse(text, m.path)) {
+                // The whole repository's fetched manifests, so a parser can resolve a
+                // SIBLING file without a network call. Maven needs it: a module pom
+                // inherits its `<properties>` from a parent pom that, in a monorepo of
+                // lambdas, sits at the repository root and has already been fetched.
+                for (const d of parse(text, m.path, r.texts)) {
                   const key = `${d.ecosystem} ${d.name} ${d.version}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
@@ -1806,6 +1814,45 @@ steps:
         }
 
         /**
+         * Properties inherited from a parent POM that lives IN THE SAME REPOSITORY.
+         *
+         * Not an exception to "no reactor resolution" so much as the free part of it.
+         * Every manifest in the repository is already fetched — rung L2 needs to read
+         * artifact names — so a module pom whose parent sits at the repository root can
+         * have its `${...}` resolved with no network call and no build. That is the
+         * ordinary shape of a monorepo of lambdas, and it is where the unresolved
+         * versions actually were: a real asset came back with three of six versions
+         * still `${the reference organization.accounts.core.version}`, all of them defined one directory up.
+         *
+         * Matched on the parent's `artifactId`, walking up to three levels. A parent
+         * NOT in the repository stays unresolved, verbatim, exactly as before.
+         *
+         * The child's own properties win — this only fills gaps.
+         */
+        function parentProperties(xml, siblings, depth = 0) {
+          if (!siblings || depth >= 3) return {};
+          const head = xml.split(/<dependencies\s*>/)[0] ?? xml;
+          const parent = /<parent\s*>[\s\S]*?<\/parent\s*>/.exec(head);
+          if (!parent) return {};
+          const wanted = tagValue(parent[0], 'artifactId');
+          if (!wanted) return {};
+
+          for (const [path, candidate] of Object.entries(siblings)) {
+            if (!path.endsWith('pom.xml') || typeof candidate !== 'string') continue;
+            const candidateXml = stripXmlComments(candidate);
+            const candidateHead = candidateXml.split(/<dependencies\s*>/)[0] ?? candidateXml;
+            const own = candidateHead.replace(/<parent\s*>[\s\S]*?<\/parent\s*>/g, '');
+            if (tagValue(own, 'artifactId') !== wanted) continue;
+            // Found it. Its own parent may define more, so recurse before merging.
+            return {
+              ...parentProperties(candidateXml, siblings, depth + 1),
+              ...pomProperties(candidateXml),
+            };
+          }
+          return {};
+        }
+
+        /**
          * Parse a `pom.xml`.
          *
          * The dependency NAME is `groupId:artifactId` — Maven's own coordinate, and the
@@ -1817,9 +1864,9 @@ steps:
          * something the deployed artifact ships, and conflating the two makes any
          * "who is exposed" question unanswerable.
          */
-        function parsePomXml(text) {
+        function parsePomXml(text, _path = '', siblings = undefined) {
           const xml = stripXmlComments(text);
-          const props = pomProperties(xml);
+          const props = { ...parentProperties(xml, siblings), ...pomProperties(xml) };
 
           // Versions pinned in <dependencyManagement> fill in for dependencies that
           // omit one. The management blocks themselves are NOT dependencies.
@@ -1867,9 +1914,9 @@ steps:
          * equivalent of `engines.node` — the runtime-deprecation question, which no
          * dependency list answers.
          */
-        function pomConfig(text) {
+        function pomConfig(text, _path = '', siblings = undefined) {
           const xml = stripXmlComments(text);
-          const props = pomProperties(xml);
+          const props = { ...parentProperties(xml, siblings), ...pomProperties(xml) };
           const cfg = {};
           const head = xml.split(/<dependencies\s*>/)[0] ?? xml;
           const parent = /<parent\s*>[\s\S]*?<\/parent\s*>/.exec(head);
@@ -1942,11 +1989,15 @@ steps:
                   // Last manifest wins on a collision. An asset with several manifests
                   // of one ecosystem is a monorepo subtree; the deepest one is listed
                   // last and is the more specific statement.
-                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                  for (const [k, v] of Object.entries(readConfig(text, m.path, r.texts))) {
                     config[`${ecosystem}.${k}`] = v;
                   }
                 }
-                for (const d of parse(text, m.path)) {
+                // The whole repository's fetched manifests, so a parser can resolve a
+                // SIBLING file without a network call. Maven needs it: a module pom
+                // inherits its `<properties>` from a parent pom that, in a monorepo of
+                // lambdas, sits at the repository root and has already been fetched.
+                for (const d of parse(text, m.path, r.texts)) {
                   const key = `${d.ecosystem} ${d.name} ${d.version}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
@@ -2369,11 +2420,15 @@ steps:
                   // Last manifest wins on a collision. An asset with several manifests
                   // of one ecosystem is a monorepo subtree; the deepest one is listed
                   // last and is the more specific statement.
-                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                  for (const [k, v] of Object.entries(readConfig(text, m.path, r.texts))) {
                     config[`${ecosystem}.${k}`] = v;
                   }
                 }
-                for (const d of parse(text, m.path)) {
+                // The whole repository's fetched manifests, so a parser can resolve a
+                // SIBLING file without a network call. Maven needs it: a module pom
+                // inherits its `<properties>` from a parent pom that, in a monorepo of
+                // lambdas, sits at the repository root and has already been fetched.
+                for (const d of parse(text, m.path, r.texts)) {
                   const key = `${d.ecosystem} ${d.name} ${d.version}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
