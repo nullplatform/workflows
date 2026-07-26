@@ -10,8 +10,10 @@
 #          └─ plan_manifest_fetches ── pure
 #               └─ fetch_manifests ──── http-request  ◄── GitHub
 #                    └─ resolve_assets ── pure  (the ladder)
-#                         ├─ parse_go ──── pure  (one step per ecosystem)
-#                         └─ parse_node ── pure
+#                         ├─ parse_go ────── pure  (one step per ecosystem)
+#                         ├─ parse_node ──── pure
+#                         ├─ parse_maven ─── pure
+#                         └─ parse_python ── pure
 #                              └─ build_payloads ── pure
 #                                   └─ write_metadata ── np-api-call
 #                                        └─ result
@@ -178,7 +180,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -483,7 +485,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -760,7 +762,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1089,7 +1091,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1140,6 +1142,14 @@ steps:
           if (!Array.isArray(list)) return [];
           return list.map((p) => new RegExp(p));
         }
+
+        /**
+         * Go (`go.mod`) dependency parsing.
+         *
+         * The only ecosystem here that states TRANSITIVITY in the manifest itself, via
+         * the `// indirect` marker `go mod tidy` writes — which is why Go gets
+         * transitive internals for free and every other parser has to say it cannot.
+         */
 
         /**
          * Parse a `go.mod`. Returns direct and indirect requirements with the exact
@@ -1210,73 +1220,6 @@ steps:
         }
 
         /**
-         * Dependency blocks of a `package.json`, in the order they are merged. A name
-         * declared twice keeps its FIRST scope — `dependencies` outranks
-         * `devDependencies`, which is what a duplicate almost always means.
-         */
-        const NODE_BLOCKS = [
-          ['dependencies', { dev: false, optional: false }],
-          ['peerDependencies', { dev: false, optional: false, peer: true }],
-          ['optionalDependencies', { dev: false, optional: true }],
-          ['devDependencies', { dev: true, optional: false }],
-        ];
-
-        /** Specifiers that point at code in this repository rather than a registry. */
-        const NODE_LOCAL_SPEC = /^(file:|link:|workspace:|portal:)/;
-
-        /**
-         * Parse a `package.json`.
-         *
-         * DIRECT DEPENDENCIES ONLY, and that is a real limitation rather than an
-         * oversight: npm states transitivity in the LOCKFILE, and lockfiles are the
-         * one artifact large enough to reintroduce the size problem the whole
-         * per-build split exists to solve (megabyte `package-lock.json` files are
-         * ordinary). Go is the exception here, not the rule — `go.mod` carries
-         * `// indirect` inline, so it gets transitive internals for free.
-         *
-         * `version` is the DECLARED RANGE (`^1.2.3`, `workspace:*`, a git URL), not a
-         * resolved version. Nothing is installed or resolved, so a range is the honest
-         * answer; a consumer asking "who is behind" has to compare ranges, not points.
-         *
-         * Workspace/file/link specifiers are in-repo code, not consumed libraries —
-         * same treatment as Go's `replace` to a path: kept, flagged `local`, excluded
-         * from the counts.
-         */
-        function parsePackageJson(text) {
-          let pkg;
-          try {
-            pkg = JSON.parse(String(text));
-          } catch {
-            // A package.json that does not parse is not a dependency list. Returning
-            // nothing lets the asset fall through to `no_manifest`/partial coverage
-            // instead of failing the whole build's scan.
-            return [];
-          }
-          if (pkg === null || typeof pkg !== 'object') return [];
-
-          const deps = [];
-          const seen = new Set();
-          for (const [block, flags] of NODE_BLOCKS) {
-            const entry = pkg[block];
-            if (entry === null || typeof entry !== 'object') continue;
-            for (const [name, spec] of Object.entries(entry)) {
-              if (seen.has(name)) continue;
-              seen.add(name);
-              const version = typeof spec === 'string' ? spec : '';
-              deps.push({
-                name,
-                version,
-                direct: true,
-                ecosystem: 'node',
-                local: NODE_LOCAL_SPEC.test(version),
-                ...flags,
-              });
-            }
-          }
-          return deps;
-        }
-
-        /**
          * What a `go.mod` declares about ITSELF — the language version the module is
          * built against, and the pinned toolchain when there is one.
          */
@@ -1293,47 +1236,6 @@ steps:
         }
 
         /**
-         * What a `package.json` declares about ITSELF.
-         *
-         * Separate from the dependency list on purpose: `engines.node` is a RUNTIME
-         * statement, not a library one, and it answers a different question — "which
-         * assets still declare node 16" is the node equivalent of the lambda-runtime
-         * deprecation sweep, and it is invisible in a dependency array.
-         */
-        function packageJsonConfig(text) {
-          let pkg;
-          try {
-            pkg = JSON.parse(String(text));
-          } catch {
-            return {};
-          }
-          if (pkg === null || typeof pkg !== 'object') return {};
-          const cfg = {};
-          if (typeof pkg.name === 'string') cfg.name = pkg.name;
-          if (typeof pkg.version === 'string') cfg.version = pkg.version;
-          if (typeof pkg.type === 'string') cfg.type = pkg.type;
-          if (typeof pkg.packageManager === 'string') cfg.packageManager = pkg.packageManager;
-          if (pkg.engines !== null && typeof pkg.engines === 'object') {
-            for (const [k, v] of Object.entries(pkg.engines)) {
-              if (typeof v === 'string') cfg[`engines.${k}`] = v;
-            }
-          }
-          // A workspaces field is the difference between "an app" and "a monorepo
-          // root", which is exactly what an L4 match cannot tell you on its own.
-          if (Array.isArray(pkg.workspaces)) cfg.workspaces = String(pkg.workspaces.length);
-          return cfg;
-        }
-
-        /**
-         * Ecosystem -> self-declaration reader. Optional: an ecosystem with no entry
-         * simply contributes nothing to `manifest_config`.
-         */
-        const CONFIG_READERS = { go: goModConfig, node: packageJsonConfig };
-
-        /** Ecosystem -> manifest parser. Adding one here is what enables a parse step. */
-        const PARSERS = { go: parseGoMod, node: parsePackageJson };
-
-        /**
          * STEP 4 — parse the manifests of ONE ecosystem.
          *
          * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
@@ -1344,11 +1246,17 @@ steps:
          * `go` directive, the package manager) — runtime statements that answer
          * "which assets still declare node 16", a question no dependency array can.
          * Keys are prefixed with the ecosystem so two manifests never collide.
+         *
+         * The parser is PASSED IN rather than looked up in a registry. Importing the
+         * registry would drag every ecosystem's parser into every parse step's inlined
+         * bundle — the Maven step carrying the Go and Python parsers it never calls —
+         * which is exactly the "each step gets only what it uses" property the module
+         * split exists to preserve. It went from 780 lines a step back to ~300.
          */
         function parseEcosystem(resolutions, ecosystem, opts) {
-          const parse = PARSERS[ecosystem];
-          if (!parse) throw new Error(`no parser registered for ecosystem "${ecosystem}"`);
-          const readConfig = CONFIG_READERS[ecosystem];
+          const parse = opts.parse;
+          if (!parse) throw new Error(`no parser passed for ecosystem "${ecosystem}"`);
+          const readConfig = opts.readConfig;
           const keepAll = opts.keepTransitiveExternal === true;
           const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
 
@@ -1369,9 +1277,11 @@ steps:
                   // Last manifest wins on a collision. An asset with several manifests
                   // of one ecosystem is a monorepo subtree; the deepest one is listed
                   // last and is the more specific statement.
-                  for (const [k, v] of Object.entries(readConfig(text))) config[`${ecosystem}.${k}`] = v;
+                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                    config[`${ecosystem}.${k}`] = v;
+                  }
                 }
-                for (const d of parse(text)) {
+                for (const d of parse(text, m.path)) {
                   const key = `${d.ecosystem} ${d.name} ${d.version}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
@@ -1398,6 +1308,8 @@ steps:
          * the `// indirect` marker `go mod tidy` writes.
          */
         const parsed = parseEcosystem(inputs.resolutions || [], 'go', {
+          parse: parseGoMod,
+          readConfig: goModConfig,
           internalPatterns: compileInternalPatterns(inputs.internalPatterns),
           keepTransitiveExternal: inputs.keepTransitiveExternal === true,
         });
@@ -1462,7 +1374,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1515,72 +1427,12 @@ steps:
         }
 
         /**
-         * Parse a `go.mod`. Returns direct and indirect requirements with the exact
-         * version Go resolved — no `go.sum`, toolchain or module download needed.
+         * Node (`package.json`) dependency parsing.
          *
-         * Modules redirected by a `replace` to a filesystem path are in-repo code, not
-         * consumed libraries — they carry a placeholder version
-         * (`v0.0.0-00010101000000-000000000000`) and would otherwise pollute the
-         * inventory. They are kept, flagged `local: true`, and excluded from the
-         * counts, so "which module does this asset share code with" stays answerable.
+         * DIRECT DEPENDENCIES ONLY. npm states transitivity in the LOCKFILE, and
+         * lockfiles are the one artifact large enough to reintroduce the payload
+         * problem the per-build split exists to solve.
          */
-        function parseGoMod(text) {
-          const lines = String(text).split('\n');
-
-          const localModules = new Set();
-          let inReplace = false;
-          for (const raw of lines) {
-            const line = raw.trim();
-            if (!line || line.startsWith('//')) continue;
-            if (/^replace\s*\($/.test(line)) {
-              inReplace = true;
-              continue;
-            }
-            if (inReplace && line === ')') {
-              inReplace = false;
-              continue;
-            }
-
-            let body = null;
-            if (inReplace) body = line;
-            else if (line.startsWith('replace ')) body = line.slice('replace '.length).trim();
-            if (!body) continue;
-
-            const m = /^(\S+)(?:\s+v\S+)?\s*=>\s*(\S+)/.exec(body);
-            if (m && /^(\.{1,2}\/|\/)/.test(m[2])) localModules.add(m[1]);
-          }
-
-          const deps = [];
-          let inBlock = false;
-          for (const raw of lines) {
-            const line = raw.trim();
-            if (!line || line.startsWith('//')) continue;
-            if (/^require\s*\($/.test(line)) {
-              inBlock = true;
-              continue;
-            }
-            if (inBlock && line === ')') {
-              inBlock = false;
-              continue;
-            }
-
-            let body = null;
-            if (inBlock) body = line;
-            else if (line.startsWith('require ')) body = line.slice('require '.length).trim();
-            if (!body) continue;
-
-            const m = /^(\S+)\s+(v\S+)(\s*\/\/\s*indirect)?/.exec(body);
-            if (!m) continue;
-            deps.push({
-              name: m[1],
-              version: m[2],
-              direct: !m[3],
-              ecosystem: 'go',
-              local: localModules.has(m[1]),
-            });
-          }
-          return deps;
-        }
 
         /**
          * Dependency blocks of a `package.json`, in the order they are merged. A name
@@ -1650,22 +1502,6 @@ steps:
         }
 
         /**
-         * What a `go.mod` declares about ITSELF — the language version the module is
-         * built against, and the pinned toolchain when there is one.
-         */
-        function goModConfig(text) {
-          const cfg = {};
-          for (const raw of String(text).split('\n')) {
-            const line = raw.trim();
-            const go = /^go\s+(\S+)/.exec(line);
-            if (go) cfg.go = go[1];
-            const tc = /^toolchain\s+(\S+)/.exec(line);
-            if (tc) cfg.toolchain = tc[1];
-          }
-          return cfg;
-        }
-
-        /**
          * What a `package.json` declares about ITSELF.
          *
          * Separate from the dependency list on purpose: `engines.node` is a RUNTIME
@@ -1698,15 +1534,6 @@ steps:
         }
 
         /**
-         * Ecosystem -> self-declaration reader. Optional: an ecosystem with no entry
-         * simply contributes nothing to `manifest_config`.
-         */
-        const CONFIG_READERS = { go: goModConfig, node: packageJsonConfig };
-
-        /** Ecosystem -> manifest parser. Adding one here is what enables a parse step. */
-        const PARSERS = { go: parseGoMod, node: parsePackageJson };
-
-        /**
          * STEP 4 — parse the manifests of ONE ecosystem.
          *
          * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
@@ -1717,11 +1544,17 @@ steps:
          * `go` directive, the package manager) — runtime statements that answer
          * "which assets still declare node 16", a question no dependency array can.
          * Keys are prefixed with the ecosystem so two manifests never collide.
+         *
+         * The parser is PASSED IN rather than looked up in a registry. Importing the
+         * registry would drag every ecosystem's parser into every parse step's inlined
+         * bundle — the Maven step carrying the Go and Python parsers it never calls —
+         * which is exactly the "each step gets only what it uses" property the module
+         * split exists to preserve. It went from 780 lines a step back to ~300.
          */
         function parseEcosystem(resolutions, ecosystem, opts) {
-          const parse = PARSERS[ecosystem];
-          if (!parse) throw new Error(`no parser registered for ecosystem "${ecosystem}"`);
-          const readConfig = CONFIG_READERS[ecosystem];
+          const parse = opts.parse;
+          if (!parse) throw new Error(`no parser passed for ecosystem "${ecosystem}"`);
+          const readConfig = opts.readConfig;
           const keepAll = opts.keepTransitiveExternal === true;
           const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
 
@@ -1742,9 +1575,11 @@ steps:
                   // Last manifest wins on a collision. An asset with several manifests
                   // of one ecosystem is a monorepo subtree; the deepest one is listed
                   // last and is the more specific statement.
-                  for (const [k, v] of Object.entries(readConfig(text))) config[`${ecosystem}.${k}`] = v;
+                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                    config[`${ecosystem}.${k}`] = v;
+                  }
                 }
-                for (const d of parse(text)) {
+                for (const d of parse(text, m.path)) {
                   const key = `${d.ecosystem} ${d.name} ${d.version}`;
                   if (seen.has(key)) continue;
                   seen.add(key);
@@ -1775,12 +1610,806 @@ steps:
          * the per-build split exists to solve. See `parsePackageJson`.
          */
         const parsed = parseEcosystem(inputs.resolutions || [], 'node', {
+          parse: parsePackageJson,
+          readConfig: packageJsonConfig,
           internalPatterns: compileInternalPatterns(inputs.internalPatterns),
           keepTransitiveExternal: inputs.keepTransitiveExternal === true,
         });
         log.info(`parsed node for ${Object.keys(parsed).length} assets`);
         return { parsed };
         // <<< END parse_node
+
+  - id: parse_maven
+    type: module
+    plugin_type: code-exec
+    name: "Parse Maven Dependencies"
+    inputs:
+      resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      code: |
+        // >>> GENERATED parse_maven — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /**
+         * Maven (`pom.xml`) dependency parsing.
+         *
+         * WITHOUT RESOLVING THE REACTOR, and that limit is the whole design. A real
+         * Maven resolution walks parent POMs, imported BOMs and the local repository;
+         * doing that means either running Maven (we never build) or fetching and
+         * chasing artifacts across the network from a sandbox. What a single `pom.xml`
+         * states about itself is available for free and answers the question this
+         * inventory is asked: which libraries did somebody declare, at which version.
+         *
+         * Three things it does resolve, because they live in the same file and skipping
+         * them would silently mislabel most versions:
+         *   - `${property}` from that pom's own `<properties>`
+         *   - `${project.version}` / `${revision}`-style self references
+         *   - a version omitted from `<dependencies>` but pinned in
+         *     `<dependencyManagement>`
+         *
+         * A version that still cannot be resolved (it came from a parent POM) is kept
+         * VERBATIM — `${spring.version}` reaches the record as written. That reads as
+         * obviously unresolved, which is the honest outcome; substituting a guess would
+         * not be.
+         */
+
+        /** Strip comments so a commented-out `<dependency>` is not inventoried. */
+        function stripXmlComments(xml) {
+          return String(xml).replace(/<!--[\s\S]*?-->/g, '');
+        }
+
+        function tagValue(block, tag) {
+          const m = new RegExp(`<${tag}\\s*>([\\s\\S]*?)</${tag}\\s*>`).exec(block);
+          return m ? m[1].trim() : null;
+        }
+
+        /** Every `<dependency>…</dependency>` block inside `xml`. */
+        function dependencyBlocks(xml) {
+          return xml.match(/<dependency\s*>[\s\S]*?<\/dependency\s*>/g) ?? [];
+        }
+
+        /** The `<dependencyManagement>` section, which pins versions but declares nothing. */
+        function managementSection(xml) {
+          const m = /<dependencyManagement\s*>[\s\S]*?<\/dependencyManagement\s*>/.exec(xml);
+          return m ? m[0] : '';
+        }
+
+        /**
+         * `<properties>` as a flat map, plus the self-referential values Maven exposes
+         * on every project (`project.version` and friends).
+         */
+        function pomProperties(xml) {
+          const props = {};
+          const section = /<properties\s*>([\s\S]*?)<\/properties\s*>/.exec(xml);
+          if (section) {
+            const entry = /<([A-Za-z0-9_.\-]+)\s*>([\s\S]*?)<\/\1\s*>/g;
+            let m = entry.exec(section[1]);
+            while (m !== null) {
+              props[m[1]] = m[2].trim();
+              m = entry.exec(section[1]);
+            }
+          }
+          // The project's own coordinates, minus anything inside <dependency> or
+          // <parent>: `<version>` appears in all three and the first match wins.
+          const head = xml.split(/<dependencies\s*>/)[0] ?? xml;
+          const own = head.replace(/<parent\s*>[\s\S]*?<\/parent\s*>/g, '');
+          const version = tagValue(own, 'version');
+          if (version) {
+            props['project.version'] = version;
+            props.version = props.version ?? version;
+          }
+          const groupId = tagValue(own, 'groupId');
+          if (groupId) props['project.groupId'] = groupId;
+          return props;
+        }
+
+        /** Expand `${…}` against `props`, leaving anything unknown verbatim. */
+        function expand(value, props, depth = 0) {
+          if (value === null || depth > 5) return value;
+          return value.replace(/\$\{([^}]+)\}/g, (whole, key) => {
+            const found = props[key];
+            return found === undefined ? whole : expand(found, props, depth + 1);
+          });
+        }
+
+        /**
+         * Parse a `pom.xml`.
+         *
+         * The dependency NAME is `groupId:artifactId` — Maven's own coordinate, and the
+         * only form in which "is this internal" is answerable, since an artifactId
+         * alone (`common`, `core`, `model`) collides across organizations.
+         *
+         * `<scope>test</scope>` maps to `dev: true` and `provided`/`runtime` are kept
+         * verbatim in `scope`: a test-only dependency is a real declaration but not
+         * something the deployed artifact ships, and conflating the two makes any
+         * "who is exposed" question unanswerable.
+         */
+        function parsePomXml(text) {
+          const xml = stripXmlComments(text);
+          const props = pomProperties(xml);
+
+          // Versions pinned in <dependencyManagement> fill in for dependencies that
+          // omit one. The management blocks themselves are NOT dependencies.
+          const management = managementSection(xml);
+          const managed = {};
+          for (const block of dependencyBlocks(management)) {
+            const groupId = expand(tagValue(block, 'groupId'), props);
+            const artifactId = expand(tagValue(block, 'artifactId'), props);
+            const version = expand(tagValue(block, 'version'), props);
+            if (groupId && artifactId && version) managed[`${groupId}:${artifactId}`] = version;
+          }
+
+          const declared = xml.replace(management, '');
+          const deps = [];
+          const seen = new Set();
+          for (const block of dependencyBlocks(declared)) {
+            const groupId = expand(tagValue(block, 'groupId'), props);
+            const artifactId = expand(tagValue(block, 'artifactId'), props);
+            if (!groupId || !artifactId) continue;
+            const name = `${groupId}:${artifactId}`;
+            if (seen.has(name)) continue;
+            seen.add(name);
+
+            const scope = (tagValue(block, 'scope') ?? 'compile').toLowerCase();
+            const version = expand(tagValue(block, 'version'), props) ?? managed[name] ?? '';
+            deps.push({
+              name,
+              version,
+              direct: true,
+              ecosystem: 'java-maven',
+              // `<systemPath>` dependencies point at a file on the build machine —
+              // in-repo code, not a consumed library, same as Go's `replace` to a path.
+              local: /<systemPath\s*>/.test(block),
+              dev: scope === 'test',
+              optional: tagValue(block, 'optional') === 'true',
+              scope,
+            });
+          }
+          return deps;
+        }
+
+        /**
+         * What a `pom.xml` declares about ITSELF: its coordinates, its parent, and the
+         * Java it targets. `maven.compiler.release` / `java.version` is the JVM
+         * equivalent of `engines.node` — the runtime-deprecation question, which no
+         * dependency list answers.
+         */
+        function pomConfig(text) {
+          const xml = stripXmlComments(text);
+          const props = pomProperties(xml);
+          const cfg = {};
+          const head = xml.split(/<dependencies\s*>/)[0] ?? xml;
+          const parent = /<parent\s*>[\s\S]*?<\/parent\s*>/.exec(head);
+          const own = head.replace(/<parent\s*>[\s\S]*?<\/parent\s*>/g, '');
+
+          const artifactId = tagValue(own, 'artifactId');
+          if (artifactId) cfg.artifactId = artifactId;
+          const groupId = tagValue(own, 'groupId') ?? (parent ? tagValue(parent[0], 'groupId') : null);
+          if (groupId) cfg.groupId = groupId;
+          const version = tagValue(own, 'version');
+          if (version) cfg.version = expand(version, props);
+          if (parent) {
+            const pg = tagValue(parent[0], 'groupId');
+            const pa = tagValue(parent[0], 'artifactId');
+            const pv = tagValue(parent[0], 'version');
+            if (pg && pa) cfg.parent = `${pg}:${pa}${pv ? `:${pv}` : ''}`;
+          }
+          for (const key of [
+            'java.version',
+            'maven.compiler.release',
+            'maven.compiler.source',
+            'maven.compiler.target',
+            'kotlin.version',
+            'spring-boot.version',
+          ]) {
+            if (props[key] !== undefined) cfg[key] = expand(props[key], props);
+          }
+          return cfg;
+        }
+
+        /**
+         * STEP 4 — parse the manifests of ONE ecosystem.
+         *
+         * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
+         * canvas feeding `build_payloads`, not another branch inside a growing blob.
+         * Returns `{ [asset_id]: { dependencies, transitive_external_dropped, config } }`.
+         *
+         * `config` is what the manifests declare about THEMSELVES (`engines.node`, the
+         * `go` directive, the package manager) — runtime statements that answer
+         * "which assets still declare node 16", a question no dependency array can.
+         * Keys are prefixed with the ecosystem so two manifests never collide.
+         *
+         * The parser is PASSED IN rather than looked up in a registry. Importing the
+         * registry would drag every ecosystem's parser into every parse step's inlined
+         * bundle — the Maven step carrying the Go and Python parsers it never calls —
+         * which is exactly the "each step gets only what it uses" property the module
+         * split exists to preserve. It went from 780 lines a step back to ~300.
+         */
+        function parseEcosystem(resolutions, ecosystem, opts) {
+          const parse = opts.parse;
+          if (!parse) throw new Error(`no parser passed for ecosystem "${ecosystem}"`);
+          const readConfig = opts.readConfig;
+          const keepAll = opts.keepTransitiveExternal === true;
+          const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
+
+          const out = {};
+          for (const r of resolutions) {
+            for (const asset of r.assets) {
+              const mine = asset.manifests.filter((m) => m.ecosystem === ecosystem);
+              if (!mine.length) continue;
+
+              const seen = new Set();
+              const deps = [];
+              const config = {};
+              let dropped = 0;
+              for (const m of mine) {
+                const text = r.texts[m.path];
+                if (text == null) continue;
+                if (readConfig) {
+                  // Last manifest wins on a collision. An asset with several manifests
+                  // of one ecosystem is a monorepo subtree; the deepest one is listed
+                  // last and is the more specific statement.
+                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                    config[`${ecosystem}.${k}`] = v;
+                  }
+                }
+                for (const d of parse(text, m.path)) {
+                  const key = `${d.ecosystem} ${d.name} ${d.version}`;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const internal = isInternal(d.name);
+                  if (!keepAll && !d.direct && !internal && !d.local) {
+                    dropped += 1;
+                    continue;
+                  }
+                  deps.push({ local: false, ...d, internal });
+                }
+              }
+              out[asset.asset_id] = { dependencies: deps, transitive_external_dropped: dropped, config };
+            }
+          }
+          return out;
+        }
+
+        /**
+         * STEP `parse_maven` — extract dependencies from the `pom.xml` files.
+         * No network.
+         *
+         * Direct declarations only, and no reactor resolution: a real Maven resolve
+         * walks parent POMs and imported BOMs, which means either running Maven (we
+         * never build) or chasing artifacts across the network from a sandbox. A
+         * version that comes from a parent POM reaches the record verbatim as
+         * `${some.version}` — obviously unresolved, rather than a guess.
+         */
+        const parsed = parseEcosystem(inputs.resolutions || [], 'java-maven', {
+          parse: parsePomXml,
+          readConfig: pomConfig,
+          internalPatterns: compileInternalPatterns(inputs.internalPatterns),
+          keepTransitiveExternal: inputs.keepTransitiveExternal === true,
+        });
+        log.info(`parsed java-maven for ${Object.keys(parsed).length} assets`);
+        return { parsed };
+        // <<< END parse_maven
+
+  - id: parse_python
+    type: module
+    plugin_type: code-exec
+    name: "Parse Python Dependencies"
+    inputs:
+      resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      code: |
+        // >>> GENERATED parse_python — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /**
+         * Python dependency parsing.
+         *
+         * Python declares dependencies in at least three unrelated files, so unlike Go
+         * or Node this parser dispatches on the FILENAME. All three are handled because
+         * a repository routinely has more than one — a `pyproject.toml` for the package
+         * and a `requirements.txt` for the deployment.
+         *
+         * DIRECT DEPENDENCIES ONLY, same reasoning as Node: transitivity lives in a
+         * lock file (`poetry.lock`, `requirements.txt` compiled by pip-tools) and those
+         * are large enough to reintroduce the payload problem the per-build split
+         * exists to solve. A hand-written `requirements.txt` is a direct declaration; a
+         * pip-compiled one lists the closure and will over-report as direct. That is
+         * visible in the data rather than hidden: such files carry `# via …` comment
+         * lines, so `requirements_compiled` is recorded in `manifest_config`.
+         */
+
+        /** `name[extra1,extra2] >= 1.2 ; marker` → the name and the specifier. */
+        const REQUIREMENT = /^([A-Za-z0-9._-]+)\s*(\[[^\]]*\])?\s*(.*)$/;
+
+        /** Specifiers that mean "code in this repository", not a published package. */
+        const LOCAL_PREFIX = /^(-e\s|\.|\.\.|\/|file:)/;
+
+        /**
+         * Parse a `requirements.txt`.
+         *
+         * Environment markers (`; python_version < "3.9"`) are dropped from the version
+         * but the requirement is kept: it IS declared, and which interpreter selects it
+         * is a different question from which libraries this asset can pull in.
+         */
+        function parseRequirementsTxt(text) {
+          const deps = [];
+          const seen = new Set();
+          for (const raw of String(text).split('\n')) {
+            let line = raw.trim();
+            if (!line || line.startsWith('#')) continue;
+            // `-r other.txt` / `-c constraints.txt` point at another file, which the
+            // scan will have fetched on its own if it is a recognised manifest.
+            if (/^-{1,2}(r|c|requirement|constraint)\b/.test(line)) continue;
+            if (/^-{1,2}(i|index-url|extra-index-url|f|find-links|no-|hash)/.test(line)) continue;
+
+            const local = LOCAL_PREFIX.test(line);
+            if (line.startsWith('-e ')) line = line.slice(3).trim();
+            // Drop an inline comment and any environment marker.
+            line = line.split('#')[0].split(';')[0].trim();
+            if (!line) continue;
+
+            // A path requirement (`-e ./svc`, `../shared`, `file:...`) has no package
+            // name to extract — the path IS the identity. Running it through the
+            // name regex yielded a dependency literally called ".".
+            if (local) {
+              if (seen.has(line.toLowerCase())) continue;
+              seen.add(line.toLowerCase());
+              deps.push({ name: line, version: '', direct: true, ecosystem: 'python', local: true });
+              continue;
+            }
+
+            const m = REQUIREMENT.exec(line);
+            if (!m) continue;
+            const name = m[1];
+            if (seen.has(name.toLowerCase())) continue;
+            seen.add(name.toLowerCase());
+            deps.push({
+              name,
+              version: (m[3] ?? '').trim(),
+              direct: true,
+              ecosystem: 'python',
+              local,
+            });
+          }
+          return deps;
+        }
+
+        /** The body of a `[section]` in a TOML file, up to the next section header. */
+        function tomlSection(text, header) {
+          const re = new RegExp(`^\\[${header.replace(/[.[\]]/g, '\\$&')}\\]\\s*$`, 'm');
+          const start = re.exec(text);
+          if (!start) return null;
+          const rest = text.slice(start.index + start[0].length);
+          const next = /^\[[^\]]+\]\s*$/m.exec(rest);
+          return next ? rest.slice(0, next.index) : rest;
+        }
+
+        /** Entries of a TOML array-of-strings assigned to `key`. */
+        function tomlStringArray(section, key) {
+          const re = new RegExp(`^\\s*${key}\\s*=\\s*\\[([\\s\\S]*?)\\]`, 'm');
+          const m = re.exec(section);
+          if (!m) return [];
+          return (m[1].match(/(['"])((?:\\.|(?!\1).)*)\1/g) ?? []).map((q) => q.slice(1, -1));
+        }
+
+        /**
+         * Parse a `pyproject.toml`.
+         *
+         * Covers the two shapes in the wild: PEP 621 (`[project] dependencies = [...]`)
+         * and Poetry (`[tool.poetry.dependencies]` as key/value). Poetry's `python`
+         * entry is the INTERPRETER, not a library — it is excluded here and surfaces
+         * through `manifest_config` instead, where the runtime question belongs.
+         */
+        function parsePyProjectToml(text) {
+          const src = String(text);
+          const deps = [];
+          const seen = new Set();
+          const push = (name, version, extra = {}) => {
+            const key = name.toLowerCase();
+            if (!name || seen.has(key)) return;
+            seen.add(key);
+            deps.push({ name, version, direct: true, ecosystem: 'python', local: false, ...extra });
+          };
+
+          // PEP 621
+          const project = tomlSection(src, 'project');
+          if (project) {
+            for (const entry of tomlStringArray(project, 'dependencies')) {
+              const m = REQUIREMENT.exec(entry.split(';')[0].trim());
+              if (m) push(m[1], (m[3] ?? '').trim());
+            }
+          }
+          // PEP 621 optional groups: `[project.optional-dependencies]`
+          const optional = tomlSection(src, 'project.optional-dependencies');
+          if (optional) {
+            const arrays = optional.match(/^\s*[A-Za-z0-9_-]+\s*=\s*\[[\s\S]*?\]/gm) ?? [];
+            for (const arr of arrays) {
+              for (const entry of tomlStringArray(arr, '[A-Za-z0-9_-]+')) {
+                const m = REQUIREMENT.exec(entry.split(';')[0].trim());
+                if (m) push(m[1], (m[3] ?? '').trim(), { optional: true });
+              }
+            }
+          }
+
+          // Poetry
+          for (const [header, flags] of [
+            ['tool.poetry.dependencies', {}],
+            ['tool.poetry.dev-dependencies', { dev: true }],
+            ['tool.poetry.group.dev.dependencies', { dev: true }],
+          ]) {
+            const section = tomlSection(src, header);
+            if (!section) continue;
+            const entry = /^\s*([A-Za-z0-9._-]+)\s*=\s*(.+)$/gm;
+            let m = entry.exec(section);
+            while (m !== null) {
+              const name = m[1];
+              const rawValue = m[2].trim();
+              if (name.toLowerCase() !== 'python') {
+                const quoted = /^(['"])((?:\\.|(?!\1).)*)\1/.exec(rawValue);
+                // An inline table (`{ path = "../shared" }`) is in-repo code; a
+                // `{ version = "^1.2" }` table still carries a version.
+                const version = quoted
+                  ? quoted[2]
+                  : (/version\s*=\s*['"]([^'"]+)['"]/.exec(rawValue)?.[1] ?? '');
+                push(name, version, {
+                  ...flags,
+                  ...(/(path|url)\s*=/.test(rawValue) ? { local: true } : {}),
+                });
+              }
+              m = entry.exec(section);
+            }
+          }
+
+          return deps;
+        }
+
+        /** `Pipfile` — `[packages]` / `[dev-packages]`, TOML like Poetry's. */
+        function parsePipfile(text) {
+          const src = String(text);
+          const deps = [];
+          const seen = new Set();
+          for (const [header, flags] of [
+            ['packages', {}],
+            ['dev-packages', { dev: true }],
+          ]) {
+            const section = tomlSection(src, header);
+            if (!section) continue;
+            const entry = /^\s*"?([A-Za-z0-9._-]+)"?\s*=\s*(.+)$/gm;
+            let m = entry.exec(section);
+            while (m !== null) {
+              const name = m[1];
+              const key = name.toLowerCase();
+              if (!seen.has(key)) {
+                seen.add(key);
+                const rawValue = m[2].trim();
+                const quoted = /^(['"])((?:\\.|(?!\1).)*)\1/.exec(rawValue);
+                const version = quoted
+                  ? quoted[2]
+                  : (/version\s*=\s*['"]([^'"]+)['"]/.exec(rawValue)?.[1] ?? '');
+                deps.push({
+                  name,
+                  version: version === '*' ? '' : version,
+                  direct: true,
+                  ecosystem: 'python',
+                  local: /(path|file)\s*=/.test(rawValue),
+                  ...flags,
+                });
+              }
+              m = entry.exec(section);
+            }
+          }
+          return deps;
+        }
+
+        /** Dispatch on the manifest filename — Python has three, unrelated in shape. */
+        function parsePython(text, path = '') {
+          const file = path.slice(path.lastIndexOf('/') + 1);
+          if (file === 'pyproject.toml') return parsePyProjectToml(text);
+          if (file === 'Pipfile') return parsePipfile(text);
+          return parseRequirementsTxt(text);
+        }
+
+        /**
+         * What a Python manifest declares about ITSELF — chiefly the interpreter it
+         * targets, which is the runtime-deprecation question and is invisible in a
+         * dependency list.
+         */
+        function pythonConfig(text, path = '') {
+          const file = path.slice(path.lastIndexOf('/') + 1);
+          const src = String(text);
+          const cfg = {};
+
+          if (file === 'pyproject.toml') {
+            const project = tomlSection(src, 'project');
+            const requires = /^\s*requires-python\s*=\s*['"]([^'"]+)['"]/m.exec(project ?? src);
+            if (requires) cfg['requires-python'] = requires[1];
+            const name = /^\s*name\s*=\s*['"]([^'"]+)['"]/m.exec(project ?? '');
+            if (name) cfg.name = name[1];
+            const poetry = tomlSection(src, 'tool.poetry.dependencies');
+            const poetryPython = poetry ? /^\s*python\s*=\s*['"]([^'"]+)['"]/m.exec(poetry) : null;
+            if (poetryPython) cfg['requires-python'] = cfg['requires-python'] ?? poetryPython[1];
+            return cfg;
+          }
+
+          if (file === 'requirements.txt') {
+            // A pip-compiled file lists the whole closure, so its "direct" flags
+            // over-report. It is recognisable by the `# via …` provenance comments
+            // pip-tools writes, and saying so beats silently mixing the two.
+            if (/^\s*#\s+via\s/m.test(src)) cfg.requirements_compiled = 'true';
+          }
+          return cfg;
+        }
+
+        /**
+         * STEP 4 — parse the manifests of ONE ecosystem.
+         *
+         * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
+         * canvas feeding `build_payloads`, not another branch inside a growing blob.
+         * Returns `{ [asset_id]: { dependencies, transitive_external_dropped, config } }`.
+         *
+         * `config` is what the manifests declare about THEMSELVES (`engines.node`, the
+         * `go` directive, the package manager) — runtime statements that answer
+         * "which assets still declare node 16", a question no dependency array can.
+         * Keys are prefixed with the ecosystem so two manifests never collide.
+         *
+         * The parser is PASSED IN rather than looked up in a registry. Importing the
+         * registry would drag every ecosystem's parser into every parse step's inlined
+         * bundle — the Maven step carrying the Go and Python parsers it never calls —
+         * which is exactly the "each step gets only what it uses" property the module
+         * split exists to preserve. It went from 780 lines a step back to ~300.
+         */
+        function parseEcosystem(resolutions, ecosystem, opts) {
+          const parse = opts.parse;
+          if (!parse) throw new Error(`no parser passed for ecosystem "${ecosystem}"`);
+          const readConfig = opts.readConfig;
+          const keepAll = opts.keepTransitiveExternal === true;
+          const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
+
+          const out = {};
+          for (const r of resolutions) {
+            for (const asset of r.assets) {
+              const mine = asset.manifests.filter((m) => m.ecosystem === ecosystem);
+              if (!mine.length) continue;
+
+              const seen = new Set();
+              const deps = [];
+              const config = {};
+              let dropped = 0;
+              for (const m of mine) {
+                const text = r.texts[m.path];
+                if (text == null) continue;
+                if (readConfig) {
+                  // Last manifest wins on a collision. An asset with several manifests
+                  // of one ecosystem is a monorepo subtree; the deepest one is listed
+                  // last and is the more specific statement.
+                  for (const [k, v] of Object.entries(readConfig(text, m.path))) {
+                    config[`${ecosystem}.${k}`] = v;
+                  }
+                }
+                for (const d of parse(text, m.path)) {
+                  const key = `${d.ecosystem} ${d.name} ${d.version}`;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const internal = isInternal(d.name);
+                  if (!keepAll && !d.direct && !internal && !d.local) {
+                    dropped += 1;
+                    continue;
+                  }
+                  deps.push({ local: false, ...d, internal });
+                }
+              }
+              out[asset.asset_id] = { dependencies: deps, transitive_external_dropped: dropped, config };
+            }
+          }
+          return out;
+        }
+
+        /**
+         * STEP `parse_python` — extract dependencies from the Python manifests.
+         * No network.
+         *
+         * Python declares them in three unrelated files (`requirements.txt`,
+         * `pyproject.toml`, `Pipfile`), so this is the one ecosystem whose parser
+         * dispatches on the filename. Direct declarations only — transitivity lives in
+         * a lock file, and lock files are the artifact large enough to reintroduce the
+         * payload problem the per-build split exists to solve.
+         */
+        const parsed = parseEcosystem(inputs.resolutions || [], 'python', {
+          parse: parsePython,
+          readConfig: pythonConfig,
+          internalPatterns: compileInternalPatterns(inputs.internalPatterns),
+          keepTransitiveExternal: inputs.keepTransitiveExternal === true,
+        });
+        log.info(`parsed python for ${Object.keys(parsed).length} assets`);
+        return { parsed };
+        // <<< END parse_python
 
   - id: build_payloads
     type: module
@@ -1794,6 +2423,8 @@ steps:
       parsed:
         - "${{ steps.parse_go.outputs.parsed }}"
         - "${{ steps.parse_node.outputs.parsed }}"
+        - "${{ steps.parse_maven.outputs.parsed }}"
+        - "${{ steps.parse_python.outputs.parsed }}"
       unscannable: "${{ steps.plan_tree_fetches.outputs.unscannable }}"
       failed: "${{ steps.plan_manifest_fetches.outputs.failed }}"
     error_handling:
@@ -1846,7 +2477,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -2194,8 +2825,12 @@ connections:
   - { id: c5, from: fetch_manifests, to: resolve_assets }
   - { id: c6, from: resolve_assets, to: parse_go }
   - { id: c6b, from: resolve_assets, to: parse_node }
+  - { id: c6c, from: resolve_assets, to: parse_maven }
+  - { id: c6d, from: resolve_assets, to: parse_python }
   - { id: c7, from: parse_go, to: build_payloads }
   - { id: c7b, from: parse_node, to: build_payloads }
+  - { id: c7c, from: parse_maven, to: build_payloads }
+  - { id: c7d, from: parse_python, to: build_payloads }
   - { id: c8, from: build_payloads, to: write_metadata, condition: "workflow.inputs.dry_run != true" }
   - { id: c9, from: build_payloads, to: result, condition: "workflow.inputs.dry_run == true" }
   - { id: c10, from: write_metadata, to: result }

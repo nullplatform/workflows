@@ -1,6 +1,6 @@
 import { SUPPORTED_ECOSYSTEMS, normalizeName, parseRepoUrl } from './manifests.mjs';
-import { CONFIG_READERS, PARSERS } from './parsers.mjs';
 import { payload } from './payload.mjs';
+import { CONFIG_READERS, PARSERS } from './registry.mjs';
 import { declaredName, indexTree, manifestsUnder, resolveAsset } from './resolve.mjs';
 
 /**
@@ -168,11 +168,11 @@ export async function scanBuild(build, gh, opts) {
       if (text == null) continue;
       const readConfig = CONFIG_READERS[m.ecosystem];
       if (readConfig) {
-        for (const [k, v] of Object.entries(readConfig(text))) {
+        for (const [k, v] of Object.entries(readConfig(text, m.path))) {
           manifestConfig[`${m.ecosystem}.${k}`] = v;
         }
       }
-      for (const d of PARSERS[m.ecosystem](text)) {
+      for (const d of PARSERS[m.ecosystem](text, m.path)) {
         const key = `${d.ecosystem} ${d.name} ${d.version}`;
         if (seen.has(key)) continue;
         seen.add(key);

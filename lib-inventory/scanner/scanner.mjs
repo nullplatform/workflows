@@ -15,7 +15,15 @@
  */
 
 export * from './lib/manifests.mjs';
-export * from './lib/parsers.mjs';
+
+// One module per technology. Adding an ecosystem is a new `parsers-<x>.mjs`,
+// a line in `registry.mjs`, a step beside the others on the canvas — and
+// nothing at all inside an existing parser.
+export * from './lib/parsers-go.mjs';
+export * from './lib/parsers-node.mjs';
+export * from './lib/parsers-maven.mjs';
+export * from './lib/parsers-python.mjs';
+export * from './lib/registry.mjs';
 export * from './lib/resolve.mjs';
 export * from './lib/payload.mjs';
 export * from './lib/blobs.mjs';

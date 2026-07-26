@@ -7,6 +7,8 @@
  * the `// indirect` marker `go mod tidy` writes.
  */
 const parsed = parseEcosystem(inputs.resolutions || [], 'go', {
+  parse: parseGoMod,
+  readConfig: goModConfig,
   internalPatterns: compileInternalPatterns(inputs.internalPatterns),
   keepTransitiveExternal: inputs.keepTransitiveExternal === true,
 });
