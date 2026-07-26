@@ -198,6 +198,49 @@ describe('parsePomXml', () => {
     expect(deps).toEqual([]);
   });
 
+  it('resolves ${property} from a parent POM in the SAME repository', () => {
+    // Not an exception to "no reactor resolution" — the free part of it. Every
+    // manifest in the repository is already fetched (rung L2 reads artifact
+    // names), so a module pom whose parent sits at the root resolves with no
+    // network call and no build. A real asset came back with three of six
+    // versions still `${the reference organization.accounts.core.version}`, every one of them defined
+    // one directory up.
+    const child = `<project>
+  <parent><groupId>com.acme</groupId><artifactId>platform</artifactId><version>1.0</version></parent>
+  <artifactId>svc</artifactId>
+  <dependencies>
+    <dependency><groupId>com.acme</groupId><artifactId>core</artifactId><version>\${core.version}</version></dependency>
+  </dependencies>
+</project>`;
+    const parent = `<project>
+  <artifactId>platform</artifactId>
+  <properties><core.version>4.2.0</core.version></properties>
+</project>`;
+
+    // Without the sibling it stays verbatim — the documented behaviour.
+    expect(parsePomXml(child)[0]).toMatchObject({ version: '${core.version}' });
+    // With it, resolved.
+    expect(parsePomXml(child, 'svc/pom.xml', { 'pom.xml': parent })[0]).toMatchObject({
+      version: '4.2.0',
+    });
+  });
+
+  it('leaves a parent that is NOT in the repository unresolved', () => {
+    const child = `<project>
+  <parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>3.2.0</version></parent>
+  <dependencies>
+    <dependency><groupId>g</groupId><artifactId>a</artifactId><version>\${spring.version}</version></dependency>
+  </dependencies>
+</project>`;
+    expect(
+      parsePomXml(child, 'pom.xml', {
+        'other/pom.xml': '<project><artifactId>x</artifactId></project>',
+      })[0],
+    ).toMatchObject({
+      version: '${spring.version}',
+    });
+  });
+
   it('records the Java it targets — the JVM engines.node', () => {
     expect(pomConfig(POM)).toMatchObject({
       artifactId: 'svc',
