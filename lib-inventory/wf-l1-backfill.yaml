@@ -105,6 +105,15 @@ steps:
           INNER JOIN core_entities_release AS r FINAL ON r.id = d.release_id
           INNER JOIN core_entities_scope   AS s FINAL ON s.id = d.scope_id
           WHERE d.status_in_scope = 'active' AND s.asset_name != ''
+            -- A DELETED scope is not deployed. Its deployments keep
+            -- `status_in_scope = 'active'` in the lake, so without this the
+            -- inventory scans builds nothing runs any more: 37% of one org's
+            -- "live" assets and every asset it had on a two-major-old library
+            -- (measured 2026-07-26). `!= 'deleted'` rather than `= 'active'`
+            -- on purpose — a status added later must keep flowing in, because
+            -- an asset wrongly INCLUDED costs one scan while one wrongly
+            -- EXCLUDED is invisible.
+            AND s.status != 'deleted'
         ),
         live_builds AS (SELECT DISTINCT build_id FROM live),
         -- Which assets ALREADY carry a `dependencies` record. Anything in here
@@ -155,13 +164,35 @@ steps:
       itemVariable: row
       spreadItem: true
       parallel: true
-      # 20 children in flight. Each build is exactly 2 GitHub calls (one tree,
-      # one batched GraphQL), so 20 concurrent builds is 40 in-flight requests
-      # against a 5,000/h budget — the ceiling here is Temporal child-execution
-      # throughput, not GitHub. Measured: 50 builds in 147s at 8.
-      maxConcurrency: 20
+      # GitHub is not the ceiling — each build is 2 calls against a 5,000/h
+      # budget. The WORKER is. Every build is a sub-execution of eleven steps,
+      # and the deployment's placement binding forces even the pure-computation
+      # `code-exec` steps into a microVM, so one build costs eight remote
+      # dispatches. At 20 in flight (times two organizations backfilling at
+      # once) the steps still ran in 0.5-2.7s but waited 24-83s BETWEEN steps:
+      # queue time, not work. Measured live 2026-07-26.
+      #
+      # 6 keeps the pipeline saturated without starving the shared worker that
+      # every other workflow in the platform also uses. Raise it only with the
+      # between-step gap in hand, not the step durations.
+      maxConcurrency: 6
     inputs:
       dry_run: "${{ workflow.inputs.dry_run }}"
+    error_handling:
+      # RETRIED PER ITERATION, not for the whole fan-out: `forEach` applies the
+      # policy to each build independently, so one child dying on a capacity
+      # blip is retried while the other nineteen keep going.
+      #
+      # This is the second line of defence, not the first — wf-l0's own steps
+      # retry a transient sandbox internally. It exists for whatever kills a
+      # child outright, and it is cheap because a re-run of a build whose
+      # assets were already written finds nothing left to write: the lake query
+      # that selected it excluded records that exist.
+      retry_policy:
+        max_attempts: 2
+        initial_interval: "10s"
+        backoff_strategy: exponential
+        jitter: 0.3
     config:
       # PER-ORG id of "Library Inventory — Scan Build"; patched by
       # setup/03-upload-workflows.mjs on upload.
