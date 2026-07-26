@@ -1,46 +1,57 @@
-# Library inventory — backfill
+# Library inventory — backfill.
 #
-# Populates the `dependencies` metadata of every ASSET that is currently live
-# (i.e. reachable from a deployment with status_in_scope = 'active'), by reading
-# the application's repository at the exact commit its build was made from.
+# Finds every live asset that has no dependency record yet and hands each
+# BUILD to `wf-l0-scan-build`, one sub-execution per build. This workflow owns
+# the question "what still needs scanning"; it knows nothing about GitHub,
+# manifests or the resolution ladder — that all lives in wf-l0, which the
+# per-release path invokes too.
+#
+#   fetch_targets ── lake: live assets with no record yet
+#     └─ scan_builds ── sub-workflow × N   (wf-l0-scan-build)
+#          └─ summarize ── coverage, fails below threshold
+#
+# WHY FAN OUT INSTEAD OF BATCHING: repository trees and manifest bodies travel
+# through execution state, and the sandbox input boundary is 1 MB. Running the
+# pipeline in THIS execution meant ~103 KB of state per build against that
+# boundary — twelve builds died with `input exceeds sandbox boundary limit of
+# 1048576 bytes` and fifty died earlier still with Temporal's
+# `GrpcMessageTooLarge` (both measured live, 2026-07-26). A sub-execution per
+# build makes the limit per build, and the fan-out restores the throughput the
+# cap took away.
+#
+# CONVERGENCE: an asset is pinned to an immutable commit, so its dependencies
+# can never change — once scanned it never needs rescanning. The lake query
+# therefore only ever returns work that is genuinely outstanding, which makes a
+# plain cron enough to chew through a whole organization with no loop and no
+# cursor: each run takes the next LIB_MAX_BUILDS, a failed batch simply
+# reappears next tick, and once everything is covered the same cron becomes the
+# reconciler that picks up new releases.
 #
 # Detection scope: `vars.LIB_SCAN_NRN_PREFIX` (config entry, REQUIRED) prefix-
-# matches the application NRN. Set it to `organization=<org>` for the whole org
-# or to a deeper NRN (account / namespace / application) for a staged rollout.
-# It starts pinned to a single application on purpose.
-#
-# EVERY in-scope asset gets a metadata record, including the ones that could not
-# be scanned (`status` carries the reason). An asset with no record was never
-# visited by this workflow — that distinction is the whole point, and it makes
-# coverage a lake query instead of an act of faith.
+# matches the application NRN. `organization=<org>` = whole org; a deeper NRN
+# stages the rollout.
 #
 # Per-org configuration (config entries on folder /lib-inventory):
-#   NP_API_KEY               (secret) org credential for lake + metadata writes
-#   GITHUB_TOKEN             (secret) PAT with read access to the repositories
+#   NP_API_KEY               (secret) org credential for the lake query
 #   LIB_SCAN_NRN_PREFIX      detection scope, prefix-matched against the app NRN
-#   LIB_INTERNAL_PATTERNS    JSON array of regex sources marking a dep internal
-#   LIB_MAX_BUILDS           cap on builds per run (batching guard)
+#   LIB_MAX_BUILDS           builds per run — the fan-out width
 #   LIB_MIN_COVERAGE_PCT     run fails below this % of assets written
-#
-# The scanner body of the `scan` step is GENERATED from scanner/scanner.mjs +
-# scanner/driver.mjs. Never edit it in place — run:
-#   node workflows/lib-inventory/scripts/build-workflow.mjs
+# wf-l0 additionally needs GITHUB_TOKEN and LIB_INTERNAL_PATTERNS; they are
+# read there, not here.
 
 id: lib_inventory_backfill
 name: "Library Inventory — Backfill"
 description: >
-  Resolves each live asset to a subtree of its application's repository at the
-  build's commit, extracts the dependency manifests found there, and writes one
-  `dependencies` metadata record per asset — including for assets that could
-  not be scanned, so coverage is always measurable.
+  Finds the live assets that carry no dependency record yet and scans the
+  builds they came from, one sub-execution per build, until the organization
+  is covered.
 path: "/lib-inventory"
-semantic_version: 1.0.0
+semantic_version: 3.0.0
 
 # NOTE: config entries are referenced as `${{ vars.X }}` DIRECTLY in the step
-# configs below, never through a workflow `variable`. A variable's
-# `initialValue` does NOT resolve config-entry templates — the raw
-# `${{ vars.LIB_MAX_BUILDS }}` string reaches the step and, in the lake query,
-# came back as a ClickHouse SYNTAX_ERROR (verified live, 2026-07-26).
+# configs below, never through a workflow `variable`. Resolving them in a
+# variable's `initialValue` only started working in engine revision f7e0fea;
+# the direct form also runs against an engine that predates it.
 
 inputs:
   dry_run:
@@ -48,7 +59,8 @@ inputs:
     required: false
     description: >
       Scan and summarise, but write nothing. Use it to check coverage and the
-      resolved repository paths before touching any metadata.
+      resolved repository paths before touching any metadata. Forwarded to
+      every sub-execution.
 
 steps:
   - id: start_manual
@@ -56,36 +68,51 @@ steps:
     plugin_type: manual
     name: "Run Backfill Now"
     config:
-      description: "Scans every live asset in scope and writes its dependency metadata."
+      description: "Scans the next batch of unscanned live assets and writes their dependency metadata."
       inputs:
         dry_run:
           type: boolean
           required: false
           description: "Scan and summarise without writing metadata"
 
-  # ── ONE lake query: every asset that is actually live ────────────────────
-  # `live_builds` is the set of builds reachable from an ACTIVE deployment —
-  # that is what "currently deployed" means; the build table alone would also
-  # return builds that were never released or long superseded.
-  #
-  # `assets` is emitted as a JSON STRING (not a ClickHouse tuple array) so the
-  # nested type never has to survive the plugin boundary; the scanner parses it.
+  # ── ONE lake query: every live asset that still has no record ────────────
+  # `live` is the set of (build, asset name) pairs reachable from an ACTIVE
+  # deployment — that is what "currently deployed" means; the build table alone
+  # would also return builds never released or long superseded.
   #
   # `groupUniqArray`, not `groupArray`: a release with several active
   # deployments (one per scope) would otherwise repeat every asset once per
   # scope — that is how a 6,733-asset backfill silently becomes 40,718.
+  # What is actually RUNNING: a scope points at ONE asset by name, so the other
+  # assets of the same build were produced but nobody executes them. Measured on
+  # a real org: 6,733 assets in these builds, only 2,863 referenced by a scope.
+  # Scanning the rest would be 57% more metadata writes — the dominant cost —
+  # for artifacts that answer no question this workflow is asked.
+  #
+  # NOTE: the query must START with WITH/SELECT. The lake validator decides
+  # "read-only" from the opening token, so a leading `--` comment is rejected
+  # with "Only read-only SQL statements are allowed" (hit live, 2026-07-26).
   - id: fetch_targets
     type: module
     plugin_type: np-lake-query
-    name: "Live Assets In Scope (lake)"
+    name: "Live Assets Without A Record (lake)"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
-        WITH live_builds AS (
-          SELECT DISTINCT r.build_id AS build_id
+        WITH live AS (
+          SELECT DISTINCT r.build_id AS build_id, s.asset_name AS asset_name
           FROM core_entities_deployment AS d FINAL
           INNER JOIN core_entities_release AS r FINAL ON r.id = d.release_id
-          WHERE d.status_in_scope = 'active'
+          INNER JOIN core_entities_scope   AS s FINAL ON s.id = d.scope_id
+          WHERE d.status_in_scope = 'active' AND s.asset_name != ''
+        ),
+        live_builds AS (SELECT DISTINCT build_id FROM live),
+        -- Which assets ALREADY carry a `dependencies` record. Anything in here
+        -- is done forever: the record names an immutable commit.
+        existing AS (
+          SELECT toInt32OrZero(m.id) AS asset_id
+          FROM core_entities_metadata AS m
+          WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies' AND m.data IS NOT NULL
         )
         SELECT
           toString(a.app_id)   AS app_id,
@@ -98,770 +125,161 @@ steps:
         INNER JOIN core_entities_build       AS b FINAL ON b.id = lb.build_id
         INNER JOIN core_entities_application AS a FINAL ON a.app_id = b.app_id
         INNER JOIN core_entities_asset       AS x FINAL ON x.build_id = b.id
+        INNER JOIN live                      AS l        ON l.build_id = x.build_id
+                                                        AND l.asset_name = x.name
         WHERE a.nrn LIKE concat('${{ vars.LIB_SCAN_NRN_PREFIX }}', '%')
+          AND x.id NOT IN (SELECT asset_id FROM existing)
         GROUP BY a.app_id, a.app_name, a.repository_url, b.id, b.commit
         ORDER BY b.id
         LIMIT ${{ vars.LIB_MAX_BUILDS }}
 
-  # ── Scan: 1 REST tree + 1 batched GraphQL blob request per build ─────────
-  # `network.allowedHosts` sends this step to an isolated sandbox with egress
-  # locked to GitHub and nothing else.
-  - id: scan
-    type: module
-    plugin_type: code-exec
-    name: "Resolve Assets To Repo Subtrees And Extract Dependencies"
-    inputs:
-      builds: "${{ steps.fetch_targets.outputs.rows }}"
-      githubToken: "${{ secrets.GITHUB_TOKEN }}"
-      internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
-      concurrency: 6
-    config:
-      network:
-        allowedHosts:
-          - api.github.com
-      code: |
-        // >>> GENERATED: scanner (build-workflow.mjs) — do not edit by hand
-        /**
-         * Library inventory scanner.
-         *
-         * Resolves each NP asset to a subtree of its application's repository (at the
-         * exact commit the build was made from), extracts the dependency manifests
-         * found there, and emits one `dependencies` metadata payload per asset.
-         *
-         * This file is the source of truth for the scanning logic. It is inlined into
-         * the `scan` step of `wf-l1-backfill.yaml` — keep the two in sync (there is no
-         * include mechanism for `code-exec`; see `scripts/sync-scanner.mjs`).
-         *
-         * Design doc: docs/superpowers/specs/2026-07-25-library-inventory-design.md
-         *
-         * Contract: pure except for the injected `gh` transport, so the same code runs
-         * under `code-exec` (sandboxed, egress locked to api.github.com) and locally
-         * against the real API in tests.
-         */
-
-        const SCANNER_VERSION = 'lib-inventory/1.0.0';
-
-        /** Manifest filename -> ecosystem. */
-        const MANIFEST_LANGS = {
-          'go.mod': 'go',
-          'package.json': 'node',
-          'pom.xml': 'java-maven',
-          'build.gradle': 'java-gradle',
-          'build.gradle.kts': 'java-gradle',
-          'requirements.txt': 'python',
-          'pyproject.toml': 'python',
-          Pipfile: 'python',
-          Gemfile: 'ruby',
-          'Cargo.toml': 'rust',
-          'composer.json': 'php',
-          'pubspec.yaml': 'dart',
-        };
-
-        /**
-         * Asset-name suffixes that describe the deployment shape rather than the code,
-         * stripped before the L3 normalized comparison.
-         */
-        const NAME_SUFFIXES = [
-          '-aws-lambda', '-aws-uks', '-lambda', '-service', '-local',
-          '-docker-image', '-image', '-asset', '-app', '-api',
-        ];
-
-        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go']);
-
-        function manifestLang(basename) {
-          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
-          if (basename.endsWith('.csproj')) return 'dotnet';
-          return null;
-        }
-
-        function normalizeName(name) {
-          let s = String(name).toLowerCase();
-          for (let changed = true; changed; ) {
-            changed = false;
-            for (const suf of NAME_SUFFIXES) {
-              if (s.endsWith(suf)) {
-                s = s.slice(0, -suf.length);
-                changed = true;
-              }
-            }
-          }
-          return s.replace(/[^a-z0-9]/g, '');
-        }
-
-        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
-        function parseRepoUrl(url) {
-          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
-          return m ? { owner: m[1], repo: m[2] } : null;
-        }
-
-        // ---------------------------------------------------------------- parsers ---
-
-        /**
-         * Parse a `go.mod`. Returns direct and indirect requirements with the exact
-         * version Go resolved — no `go.sum`, toolchain or module download needed.
-         *
-         * Modules redirected by a `replace` to a filesystem path are in-repo code, not
-         * consumed libraries — they carry a placeholder version
-         * (`v0.0.0-00010101000000-000000000000`) and would otherwise pollute the
-         * inventory. They are kept, flagged `local: true`, and excluded from the
-         * counts, so "which module does this asset share code with" stays answerable.
-         */
-        function parseGoMod(text) {
-          const lines = String(text).split('\n');
-
-          const localModules = new Set();
-          let inReplace = false;
-          for (const raw of lines) {
-            const line = raw.trim();
-            if (!line || line.startsWith('//')) continue;
-            if (/^replace\s*\($/.test(line)) { inReplace = true; continue; }
-            if (inReplace && line === ')') { inReplace = false; continue; }
-
-            let body = null;
-            if (inReplace) body = line;
-            else if (line.startsWith('replace ')) body = line.slice('replace '.length).trim();
-            if (!body) continue;
-
-            const m = /^(\S+)(?:\s+v\S+)?\s*=>\s*(\S+)/.exec(body);
-            if (m && /^(\.{1,2}\/|\/)/.test(m[2])) localModules.add(m[1]);
-          }
-
-          const deps = [];
-          let inBlock = false;
-          for (const raw of lines) {
-            const line = raw.trim();
-            if (!line || line.startsWith('//')) continue;
-            if (/^require\s*\($/.test(line)) { inBlock = true; continue; }
-            if (inBlock && line === ')') { inBlock = false; continue; }
-
-            let body = null;
-            if (inBlock) body = line;
-            else if (line.startsWith('require ')) body = line.slice('require '.length).trim();
-            if (!body) continue;
-
-            const m = /^(\S+)\s+(v\S+)(\s*\/\/\s*indirect)?/.exec(body);
-            if (!m) continue;
-            deps.push({
-              name: m[1],
-              version: m[2],
-              direct: !m[3],
-              ecosystem: 'go',
-              local: localModules.has(m[1]),
-            });
-          }
-          return deps;
-        }
-
-        const PARSERS = { go: parseGoMod };
-
-        // -------------------------------------------------------------- resolution ---
-
-        /**
-         * Build the lookup structures a repo tree needs to answer "which subtree is
-         * this asset?".
-         */
-        function indexTree(paths) {
-          const manifests = new Map(); // path -> ecosystem
-          const dirs = new Set(['']);
-          for (const p of paths) {
-            const slash = p.lastIndexOf('/');
-            if (slash >= 0) {
-              // register every ancestor directory
-              let d = p.slice(0, slash);
-              while (d) {
-                dirs.add(d);
-                const i = d.lastIndexOf('/');
-                d = i < 0 ? '' : d.slice(0, i);
-              }
-            }
-            const lang = manifestLang(slash >= 0 ? p.slice(slash + 1) : p);
-            if (lang) manifests.set(p, lang);
-          }
-
-          const manifestDirs = new Set([...manifests.keys()].map((p) => {
-            const i = p.lastIndexOf('/');
-            return i < 0 ? '' : p.slice(0, i);
-          }));
-
-          const hasManifestUnder = (dir) => {
-            if (!dir) return manifests.size > 0;
-            const prefix = `${dir}/`;
-            for (const p of manifests.keys()) if (p.startsWith(prefix)) return true;
-            return false;
-          };
-
-          // basename -> candidate dirs, best first.
-          // TIE-BREAK: a directory that actually contains a manifest wins; among those
-          // the shallowest wins. Without this, `migrations` matches
-          // `migrations/src/main/resources/db/migrations` instead of `migrations/`.
-          const rank = (a, b) => {
-            const ma = hasManifestUnder(a), mb = hasManifestUnder(b);
-            if (ma !== mb) return ma ? -1 : 1;
-            const da = a.split('/').length, db = b.split('/').length;
-            if (da !== db) return da - db;
-            return a.length - b.length;
-          };
-          const byBase = new Map();
-          const byNorm = new Map();
-          for (const d of dirs) {
-            if (!d) continue;
-            const base = d.slice(d.lastIndexOf('/') + 1);
-            if (!byBase.has(base)) byBase.set(base, []);
-            byBase.get(base).push(d);
-            const n = normalizeName(base);
-            if (!byNorm.has(n)) byNorm.set(n, []);
-            byNorm.get(n).push(d);
-          }
-          for (const list of byBase.values()) list.sort(rank);
-          for (const list of byNorm.values()) list.sort(rank);
-
-          return { manifests, manifestDirs, byBase, byNorm, hasManifestUnder };
-        }
-
-        /**
-         * Module name declared *inside* a manifest, for the L2 rung. Maven's
-         * `<artifactId>` is the case that matters: an artifact named `<project>-model`
-         * lives in `modules/model/`, so the directory name never matches.
-         */
-        function declaredName(ecosystem, text) {
-          try {
-            if (ecosystem === 'java-maven') {
-              const body = String(text).replace(/<parent>[\s\S]*?<\/parent>/g, '');
-              const m = /<artifactId>\s*([^<]+?)\s*<\/artifactId>/.exec(body);
-              return m ? m[1] : null;
-            }
-            if (ecosystem === 'node') {
-              const n = JSON.parse(text).name;
-              return typeof n === 'string' ? n : null;
-            }
-            if (ecosystem === 'go') {
-              const m = /^module\s+(\S+)/m.exec(String(text));
-              return m ? m[1].split('/').pop() : null;
-            }
-          } catch {
-            /* a malformed manifest simply does not contribute an L2 candidate */
-          }
-          return null;
-        }
-
-        /**
-         * Resolve one asset name to a repository subtree.
-         * Returns `{ level, dir }`, or null when nothing matched (rung L5).
-         */
-        function resolveAsset(assetName, idx, declaredIndex) {
-          const exact = idx.byBase.get(assetName);
-          if (exact && exact.length) return { level: 'L1', dir: exact[0] };
-
-          if (declaredIndex) {
-            const d = declaredIndex.get(assetName) || declaredIndex.get(normalizeName(assetName));
-            if (d) return { level: 'L2', dir: d };
-          }
-
-          const norm = idx.byNorm.get(normalizeName(assetName));
-          if (norm && norm.length) return { level: 'L3', dir: norm[0] };
-
-          if (idx.manifestDirs.size === 1) {
-            return { level: 'L4', dir: [...idx.manifestDirs][0] };
-          }
-          return null;
-        }
-
-        /** Manifests living inside (or at) a subtree, nearest first. */
-        function manifestsUnder(idx, dir) {
-          const prefix = dir ? `${dir}/` : '';
-          const out = [];
-          for (const [path, ecosystem] of idx.manifests) {
-            if (dir === '' || path.startsWith(prefix)) out.push({ path, ecosystem });
-          }
-          out.sort((a, b) => a.path.split('/').length - b.path.split('/').length
-            || a.path.localeCompare(b.path));
-          return out;
-        }
-
-        // ------------------------------------------------------------------ scan ---
-
-        const EMPTY_COUNTS = {
-          total_count: 0, direct_count: 0, internal_count: 0, local_count: 0,
-          transitive_external_dropped: 0,
-        };
-
-        function payload(fields) {
-          return {
-            status: 'ok',
-            status_detail: null,
-            primary_language: null,
-            languages: [],
-            repository_url: null,
-            repository_path: null,
-            commit: null,
-            match_level: null,
-            manifests: [],
-            dependencies: [],
-            ...EMPTY_COUNTS,
-            scanned_at: fields.scanned_at,
-            scanner_version: SCANNER_VERSION,
-            ...fields,
-          };
-        }
-
-        /**
-         * Scan one build.
-         *
-         * @param {object}   build  `{ app_id, app_name, repository_url, build_id, commit, assets: [{id,name,type}] }`
-         * @param {object}   gh     transport: `{ tree(owner,repo,ref), blobs(owner,repo,ref,paths) }`
-         * @param {object}   opts   `{ internalPatterns: RegExp[], now: string, maxManifestsPerAsset?: number }`
-         * @returns {Promise<Array<{asset_id:number, asset_name:string, build_id:number, app_id:number, data:object}>>}
-         */
-        async function scanBuild(build, gh, opts) {
-          const now = opts.now;
-          const assets = build.assets || [];
-          const base = { repository_url: build.repository_url || null, commit: build.commit || null, scanned_at: now };
-
-          const fail = (status, detail) => assets.map((a) => ({
-            asset_id: a.id,
-            asset_name: a.name,
-            build_id: build.build_id,
-            app_id: build.app_id,
-            data: payload({ ...base, status, status_detail: detail }),
-          }));
-
-          const repo = parseRepoUrl(build.repository_url);
-          if (!repo) {
-            return fail('repo_missing', build.repository_url
-              ? `repository_url is not a GitHub URL: ${build.repository_url}`
-              : 'application has no repository_url configured');
-          }
-
-          let paths;
-          try {
-            paths = await gh.tree(repo.owner, repo.repo, build.commit);
-          } catch (err) {
-            return fail('repo_unreachable', `could not read ${repo.owner}/${repo.repo}@${build.commit}: ${err.message}`);
-          }
-
-          const idx = indexTree(paths);
-
-          // L1/L3/L4 first; only build the (expensive) L2 index if something needs it.
-          const first = assets.map((a) => ({ asset: a, hit: resolveAsset(a.name, idx, null) }));
-          let declaredIndex = null;
-          if (first.some((r) => !r.hit)) {
-            declaredIndex = new Map();
-            const named = [...idx.manifests].filter(([, eco]) => ['java-maven', 'node', 'go'].includes(eco));
-            if (named.length) {
-              const texts = await gh.blobs(repo.owner, repo.repo, build.commit, named.map(([p]) => p));
-              for (const [path, ecosystem] of named) {
-                const n = declaredName(ecosystem, texts[path] || '');
-                if (!n) continue;
-                const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
-                if (!declaredIndex.has(n)) declaredIndex.set(n, dir);
-                const nn = normalizeName(n);
-                if (!declaredIndex.has(nn)) declaredIndex.set(nn, dir);
-              }
-            }
-            for (const r of first) if (!r.hit) r.hit = resolveAsset(r.asset.name, idx, declaredIndex);
-          }
-
-          // Collect every manifest we must read, across all assets, then fetch once.
-          const cap = opts.maxManifestsPerAsset ?? 8;
-          const perAsset = new Map();
-          const wanted = new Set();
-          for (const { asset, hit } of first) {
-            if (!hit) continue;
-            const found = manifestsUnder(idx, hit.dir).slice(0, cap);
-            perAsset.set(asset.id, found);
-            for (const m of found) if (SUPPORTED_ECOSYSTEMS.has(m.ecosystem)) wanted.add(m.path);
-          }
-          let texts = {};
-          if (wanted.size) {
-            try {
-              texts = await gh.blobs(repo.owner, repo.repo, build.commit, [...wanted]);
-            } catch (err) {
-              return fail('repo_unreachable', `could not read manifests from ${repo.owner}/${repo.repo}: ${err.message}`);
-            }
-          }
-
-          const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
-
-          return first.map(({ asset, hit }) => {
-            const row = {
-              asset_id: asset.id,
-              asset_name: asset.name,
-              build_id: build.build_id,
-              app_id: build.app_id,
-            };
-            if (!hit) {
-              row.data = payload({
-                ...base,
-                status: 'unresolved',
-                status_detail: `no directory in ${repo.owner}/${repo.repo} matches asset name "${asset.name}"`,
-              });
-              return row;
-            }
-
-            const found = perAsset.get(asset.id) || [];
-            const languages = [...new Set(found.map((m) => m.ecosystem))].sort();
-            const common = {
-              ...base,
-              repository_path: hit.dir,
-              match_level: hit.level,
-              languages,
-              primary_language: languages[0] ?? null,
-              manifests: found.map((m) => ({ path: m.path, language: m.ecosystem })),
-            };
-
-            if (!found.length) {
-              row.data = payload({
-                ...common,
-                status: 'no_manifest',
-                status_detail: `resolved to "${hit.dir}" (${hit.level}) but it contains no dependency manifest`,
-              });
-              return row;
-            }
-
-            const parseable = found.filter((m) => SUPPORTED_ECOSYSTEMS.has(m.ecosystem));
-            if (!parseable.length) {
-              row.data = payload({
-                ...common,
-                status: 'lang_unsupported',
-                status_detail: `manifests found (${languages.join(', ')}) but no parser is enabled for them yet`,
-              });
-              return row;
-            }
-
-            // What we keep, and why this is an INVENTORY and not an SBOM: transitive
-            // *external* dependencies are 87% of the volume and nobody configured them
-            // — they are whatever the module graph resolved. Dropping them takes the
-            // payload from ~12 KB to ~2 KB per asset.
-            // Transitive *internal* ones are kept regardless: an internal package
-            // arrived indirectly on 292 assets, and 58 were still on another's v1 line —
-            // exactly the migrations we are here to see. The `direct` flag survives on every
-            // row so the dashboard can still separate "you declared this" from "this
-            // reached you through something else" — only the first is a bump the owning
-            // team can make on its own.
-            const keepAll = opts.keepTransitiveExternal === true;
-            const seen = new Set();
-            const dependencies = [];
-            let dropped = 0;
-            for (const m of parseable) {
-              const text = texts[m.path];
-              if (text == null) continue;
-              for (const d of PARSERS[m.ecosystem](text)) {
-                const key = `${d.ecosystem} ${d.name} ${d.version}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                const internal = isInternal(d.name);
-                if (!keepAll && !d.direct && !internal && !d.local) { dropped += 1; continue; }
-                dependencies.push({ local: false, ...d, internal });
-              }
-            }
-
-            // Partial coverage is still `ok`, but say so: a Go+Node container reports
-            // only its Go half today and the detail line is how you find out.
-            const unparsed = languages.filter((l) => !SUPPORTED_ECOSYSTEMS.has(l));
-            row.data = payload({
-              ...common,
-              status: 'ok',
-              status_detail: unparsed.length ? `not parsed yet: ${unparsed.join(', ')}` : null,
-              dependencies,
-              // Counts describe consumed libraries; in-repo `replace` targets are code
-              // this asset ships, not a library it depends on.
-              total_count: dependencies.filter((d) => !d.local).length,
-              direct_count: dependencies.filter((d) => d.direct && !d.local).length,
-              internal_count: dependencies.filter((d) => d.internal && !d.local).length,
-              local_count: dependencies.filter((d) => d.local).length,
-              // Not a silent truncation: how much SBOM tail we deliberately did not store.
-              transitive_external_dropped: dropped,
-            });
-            return row;
-          });
-        }
-
-        // ------------------------------------------------------------- transport ---
-
-        /**
-         * GitHub transport over REST (tree) + GraphQL (batched blobs).
-         * One tree request plus one GraphQL request per ~60 manifests.
-         */
-        function makeGitHubTransport(token, fetchImpl = fetch) {
-          const headers = {
-            Authorization: `Bearer ${token}`,
-            Accept: 'application/vnd.github+json',
-            'User-Agent': 'np-lib-inventory',
-          };
-
-          async function tree(owner, repo, ref) {
-            const refs = [ref, 'main', 'master'].filter(Boolean);
-            let lastErr = 'no ref tried';
-            for (const r of refs) {
-              const res = await fetchImpl(
-                `https://api.github.com/repos/${owner}/${repo}/git/trees/${r}?recursive=1`,
-                { headers },
-              );
-              if (res.status === 200) {
-                const body = await res.json();
-                if (body.truncated) {
-                  throw new Error(`tree for ${owner}/${repo}@${r} is truncated (>100k entries)`);
-                }
-                return body.tree.filter((n) => n.type === 'blob').map((n) => n.path);
-              }
-              lastErr = `HTTP ${res.status}`;
-              if (res.status === 401 || res.status === 403) break; // auth problems will not fix themselves
-            }
-            throw new Error(lastErr);
-          }
-
-          async function blobs(owner, repo, ref, paths) {
-            const out = {};
-            for (let i = 0; i < paths.length; i += 60) {
-              const chunk = paths.slice(i, i + 60);
-              const aliases = chunk
-                .map((p, j) => `    f${j}: object(expression: ${JSON.stringify(`${ref}:${p}`)}) { ... on Blob { text } }`)
-                .join('\n');
-              const query = `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(repo)}) {\n${aliases}\n} }`;
-              const res = await fetchImpl('https://api.github.com/graphql', {
-                method: 'POST',
-                headers: { ...headers, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query }),
-              });
-              if (res.status !== 200) throw new Error(`graphql HTTP ${res.status}`);
-              const body = await res.json();
-              if (body.errors?.length) throw new Error(`graphql: ${body.errors[0].message}`);
-              const repoNode = body.data?.repository;
-              if (!repoNode) throw new Error('graphql: repository not visible to this token');
-              chunk.forEach((p, j) => {
-                const node = repoNode[`f${j}`];
-                if (node && typeof node.text === 'string') out[p] = node.text;
-              });
-            }
-            return out;
-          }
-
-          return { tree, blobs };
-        }
-
-        /**
-         * Compile the configured internal-library patterns once.
-         * Accepts an array or the JSON string a config entry delivers (entries are
-         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
-         */
-        function compileInternalPatterns(patterns) {
-          let list = patterns;
-          if (typeof list === 'string') {
-            const raw = list.trim();
-            if (!raw) return [];
-            try {
-              list = JSON.parse(raw);
-            } catch {
-              // Tolerate a bare comma-separated list so a mis-typed entry still works.
-              list = raw.split(',').map((s) => s.trim()).filter(Boolean);
-            }
-          }
-          if (!Array.isArray(list)) return [];
-          return list.map((p) => new RegExp(p));
-        }
-
-        // ----------------------------------------------------------- driver ---
-        /**
-         * `code-exec` body for the `scan` step of wf-l1-backfill.
-         *
-         * Appended after scanner.mjs (with its `export` keywords stripped) by
-         * `scripts/build-workflow.mjs`. Everything dynamic arrives via `inputs`;
-         * expressions are NOT interpolated into a code-exec body.
-         *
-         * inputs:
-         *   builds            [{app_id, app_name, repository_url, build_id, commit, assets_json}]
-         *   githubToken       PAT with read access to the applications' repositories
-         *   internalPatterns  regex sources marking a dependency as internal
-         *   concurrency       builds scanned in parallel (default 6)
-         *   keepTransitiveExternal  set true to store the full SBOM instead
-         *
-         * returns an OBJECT (code-exec wraps a bare array as `{result: [...]}`, which
-         * would hide these behind `outputs.result`):
-         *   rows            one entry per asset, with the metadata payload
-         *   write_requests  the same rows shaped as np-api-call forEach items
-         *                   (`spreadItem: true` merges `path`/`body` into its config)
-         *   by_status       tally, so the step log alone answers "did this go well?"
-         */
-
-        const builds = (inputs.builds || []).map((b) => ({
-          ...b,
-          // The lake hands `assets` over as a JSON string so a ClickHouse tuple array
-          // never has to survive the plugin boundary.
-          assets: (typeof b.assets_json === 'string' ? JSON.parse(b.assets_json) : b.assets_json || [])
-            .map((a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2] } : a)),
-        }));
-
-        if (!inputs.githubToken) {
-          throw new Error('githubToken is empty — set the GITHUB_TOKEN config entry on /lib-inventory');
-        }
-
-        const gh = makeGitHubTransport(inputs.githubToken);
-        const internalPatterns = compileInternalPatterns(inputs.internalPatterns || []);
-        const now = new Date().toISOString();
-        const opts = {
-          internalPatterns,
-          now,
-          keepTransitiveExternal: inputs.keepTransitiveExternal === true,
-        };
-
-        const concurrency = Math.max(1, Number(inputs.concurrency) || 6);
-        const rows = [];
-        let cursor = 0;
-
-        async function worker() {
-          for (;;) {
-            const i = cursor++;
-            if (i >= builds.length) return;
-            const build = builds[i];
-            try {
-              rows.push(...(await scanBuild(build, gh, opts)));
-            } catch (err) {
-              // A build that blows up in an unexpected way must still produce a row per
-              // asset — a missing row is indistinguishable from "never scanned", which
-              // is precisely the silent failure this workflow exists to avoid.
-              log.error(`scan failed for build ${build.build_id}: ${err.message}`);
-              for (const a of build.assets) {
-                rows.push({
-                  asset_id: a.id,
-                  asset_name: a.name,
-                  build_id: build.build_id,
-                  app_id: build.app_id,
-                  data: {
-                    status: 'repo_unreachable',
-                    status_detail: `scanner error: ${err.message}`,
-                    primary_language: null,
-                    languages: [],
-                    repository_url: build.repository_url || null,
-                    repository_path: null,
-                    commit: build.commit || null,
-                    match_level: null,
-                    manifests: [],
-                    dependencies: [],
-                    total_count: 0,
-                    direct_count: 0,
-                    internal_count: 0,
-                    local_count: 0,
-                    transitive_external_dropped: 0,
-                    scanned_at: now,
-                    scanner_version: SCANNER_VERSION,
-                  },
-                });
-              }
-            }
-          }
-        }
-
-        await Promise.all(Array.from({ length: Math.min(concurrency, builds.length) }, worker));
-
-        const byStatus = {};
-        for (const r of rows) byStatus[r.data.status] = (byStatus[r.data.status] || 0) + 1;
-        log.info(`scanned ${builds.length} builds -> ${rows.length} assets`, byStatus);
-
-        return {
-          rows,
-          write_requests: rows.map((r) => ({
-            path: `/metadata/asset/${r.asset_id}/dependencies`,
-            body: r.data,
-          })),
-          by_status: byStatus,
-        };
-
-        // <<< END GENERATED
-
-  # ── Write one metadata record per asset ──────────────────────────────────
-  # POST /metadata/asset/{id}/dependencies is an upsert; re-running the backfill
-  # is idempotent and simply refreshes `scanned_at`.
+  # ── One sub-execution per build ──────────────────────────────────────────
+  # `spreadItem` makes each lake row's columns the child's inputs directly, and
+  # wf-l0 declares them one by one — the SELECT aliases above and that `inputs:`
+  # block are the two halves of the contract.
   #
-  # `failOnHttpError: true` makes a >=400 a real per-iteration failure so a
-  # transient 5xx is retried. An iteration that still fails is absorbed as an
-  # empty slot and shows up as a coverage gap in `summarize` — the asset keeps
-  # whatever record it had, which is honest, rather than a half-written one.
-  - id: write_metadata
+  # It has to be spread rather than a field-by-field `${{ $item.x }}` mapping:
+  # a step with an explicit `forEach` resolves its `inputs` ONCE, before the
+  # first iteration (`workflow-runner.ts`, the `feScope` block), so `$item` is
+  # not in scope there and every child would receive nulls. The named binding
+  # `row` carries the same row for anything that wants it whole.
+  #
+  # A build whose sub-execution fails leaves its assets without a record, so
+  # the next run picks them up again unchanged. Nothing has to be rolled back.
+  - id: scan_builds
     type: module
-    plugin_type: np-api-call
-    name: "Write Asset Dependencies Metadata"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      failOnHttpError: true
-      method: POST
-      # Placeholder: validateConfig() runs before per-item inputs merge.
-      path: "/metadata/asset/0/dependencies"
-    error_handling:
-      retry_policy:
-        max_attempts: 3
-        initial_interval: "2s"
-        backoff_strategy: exponential
-        jitter: 0.3
+    plugin_type: sub-workflow
+    name: "Scan Each Build"
     forEach:
-      expression: "${{ steps.scan.outputs.write_requests }}"
-      itemVariable: item
+      expression: "${{ steps.fetch_targets.outputs.rows }}"
+      itemVariable: row
       spreadItem: true
       parallel: true
-      maxConcurrency: 8
+      # 20 children in flight. Each build is exactly 2 GitHub calls (one tree,
+      # one batched GraphQL), so 20 concurrent builds is 40 in-flight requests
+      # against a 5,000/h budget — the ceiling here is Temporal child-execution
+      # throughput, not GitHub. Measured: 50 builds in 147s at 8.
+      maxConcurrency: 20
+    inputs:
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      # PER-ORG id of "Library Inventory — Scan Build"; patched by
+      # setup/03-upload-workflows.mjs on upload.
+      workflowId: lib_inventory_scan_build
+      # Pinned to `prod`, NOT the default `latest`: uploading a wf-l0 revision
+      # would otherwise put it in front of live traffic the moment it lands,
+      # with no activation step in between.
+      alias: prod
+      waitForCompletion: true
 
   - id: summarize
     type: module
     plugin_type: code-exec
     name: "Coverage Summary (fails below threshold)"
-    # Reached either from `scan` (dry run) or from `write_metadata`. The default
-    # `all` join would wait forever on the branch that was never traversed:
-    # a `condition: false` edge is not reliably marked skipped.
-    join_strategy: any
+    # Aggregate step: one call with the whole batch, never once per build.
+    metadata: { fanOutPerItem: false }
     inputs:
-      scanned: "${{ steps.scan.outputs.rows }}"
-      written: "${{ steps.write_metadata.outputs.items }}"
+      results: "${{ steps.scan_builds.outputs.items }}"
+      planned: "${{ steps.fetch_targets.outputs.rows }}"
       minCoveragePct: "${{ vars.LIB_MIN_COVERAGE_PCT }}"
       dryRun: "${{ workflow.inputs.dry_run }}"
     config:
       code: |
-        const scanned = inputs.scanned || [];
-        const written = inputs.written || [];
+        // A sub-execution that failed outright is absorbed by `forEach` as an
+        // EMPTY slot. Its assets simply keep their missing record and reappear
+        // in the next run's lake query, so the only thing to do here is count
+        // it against coverage rather than hide it.
+        //
+        // `r.outputs || r`: the Temporal executor used to hand a child's
+        // outputs back one level too deep (`{ outputs: {...} }`) while the
+        // local executor unwrapped them — fixed in the engine, unwrapped here
+        // too so this runs against a worker from either side of that deploy.
+        const results = (inputs.results || [])
+          .map((r) => (r && typeof r === 'object' && r.outputs ? r.outputs : r))
+          .filter((r) => r && r.build_id);
+        const planned = inputs.planned || [];
+
+        const merge = (into, from) => {
+          for (const [k, v] of Object.entries(from || {})) into[k] = (into[k] || 0) + v;
+          return into;
+        };
 
         const byStatus = {};
-        for (const r of scanned) byStatus[r.data.status] = (byStatus[r.data.status] || 0) + 1;
+        const byLanguage = {};
+        const levels = {};
+        let scanned = 0;
+        let written = 0;
+        let stored = 0;
+        let dropped = 0;
+        for (const r of results) {
+          scanned += r.assets_scanned || 0;
+          written += r.assets_written || 0;
+          stored += r.dependencies_stored || 0;
+          dropped += r.transitive_external_dropped || 0;
+          merge(byStatus, r.by_status);
+          merge(byLanguage, r.by_language);
+          merge(levels, r.match_levels);
+        }
 
-        // A forEach iteration that exhausted its retries is absorbed as an empty
-        // slot. Counting those as writes would report full coverage on a run
-        // that wrote nothing.
-        const ok = written.filter((w) => w && Object.keys(w).length > 0).length;
-        const attempted = inputs.dryRun ? 0 : scanned.length;
-        const coverage = attempted === 0 ? 100 : Math.round((ok / attempted) * 1000) / 10;
-
-        const languages = {};
-        for (const r of scanned) for (const l of r.data.languages || []) languages[l] = (languages[l] || 0) + 1;
+        // TWO coverages, and the run is judged on the WORSE of them.
+        //
+        // Asset coverage alone is measured over builds that reported back, so
+        // it says nothing about the ones that did not — six builds whose
+        // sub-executions all returned nothing gave 0/0, which read as 100% and
+        // passed the threshold (live, 2026-07-26). That silent success is the
+        // exact failure this design exists to prevent, so a build the lake
+        // asked for and that produced no result counts as a MISS, whatever
+        // killed it. Being wrong in that direction costs nothing: its assets
+        // keep no record, so the next run simply asks for them again.
+        const pct = (n, d) => (d === 0 ? 100 : Math.round((n / d) * 1000) / 10);
+        const buildCoverage = pct(results.length, planned.length);
+        const assetCoverage = inputs.dryRun ? 100 : pct(written, scanned);
+        const coverage = Math.min(buildCoverage, assetCoverage);
 
         const summary = {
           dry_run: inputs.dryRun === true,
-          assets_scanned: scanned.length,
-          assets_written: ok,
+          builds_planned: planned.length,
+          builds_scanned: results.length,
+          builds_failed: planned.length - results.length,
+          assets_scanned: scanned,
+          assets_written: written,
           coverage_pct: coverage,
+          build_coverage_pct: buildCoverage,
+          asset_coverage_pct: assetCoverage,
           by_status: byStatus,
-          by_language: languages,
-          dependencies_stored: scanned.reduce((s, r) => s + (r.data.total_count || 0), 0),
-          transitive_external_dropped: scanned.reduce((s, r) => s + (r.data.transitive_external_dropped || 0), 0),
+          by_language: byLanguage,
+          match_levels: levels,
+          dependencies_stored: stored,
+          transitive_external_dropped: dropped,
         };
         log.info('backfill summary', summary);
 
         const min = Number(inputs.minCoveragePct);
-        if (!inputs.dryRun && Number.isFinite(min) && coverage < min) {
+        if (Number.isFinite(min) && coverage < min) {
           throw new Error(
             `coverage ${coverage}% is below the ${min}% threshold — ` +
-            `${ok}/${attempted} assets written. See by_status: ${JSON.stringify(byStatus)}`,
+              `${results.length}/${planned.length} builds reported ` +
+              `(${buildCoverage}%) and ${written}/${scanned} of their assets ` +
+              `were written (${assetCoverage}%). ` +
+              `See by_status: ${JSON.stringify(byStatus)}`,
           );
         }
         return summary;
 
 connections:
-  - from: start_manual
-    to: fetch_targets
-  - from: fetch_targets
-    to: scan
-  - from: scan
-    to: write_metadata
-    condition: "workflow.inputs.dry_run != true"
-  - from: scan
-    to: summarize
-    condition: "workflow.inputs.dry_run == true"
-  - from: write_metadata
-    to: summarize
+  - { id: c1, from: start_manual, to: fetch_targets }
+  - { id: c2, from: fetch_targets, to: scan_builds }
+  - { id: c3, from: scan_builds, to: summarize }
+
+outputs:
+  builds_planned: "${{ steps.summarize.outputs.builds_planned }}"
+  builds_scanned: "${{ steps.summarize.outputs.builds_scanned }}"
+  builds_failed: "${{ steps.summarize.outputs.builds_failed }}"
+  assets_scanned: "${{ steps.summarize.outputs.assets_scanned }}"
+  assets_written: "${{ steps.summarize.outputs.assets_written }}"
+  coverage_pct: "${{ steps.summarize.outputs.coverage_pct }}"
+  build_coverage_pct: "${{ steps.summarize.outputs.build_coverage_pct }}"
+  asset_coverage_pct: "${{ steps.summarize.outputs.asset_coverage_pct }}"
+  by_status: "${{ steps.summarize.outputs.by_status }}"
+  by_language: "${{ steps.summarize.outputs.by_language }}"
+  match_levels: "${{ steps.summarize.outputs.match_levels }}"

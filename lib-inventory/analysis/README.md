@@ -3,11 +3,11 @@
 Every default in this suite came from measuring **one** organization. None of
 them are portable by assumption:
 
-- "asset name == directory name" resolved 99.4% of the reference org's assets. That is a
-  property of how one organization's repositories are laid out, not a law.
+- "asset name == directory name" resolved 99.4% of the reference organization's assets. That is a
+  property of how the reference organization's repositories are laid out, not a law.
 - "go only" is right where 279 of 375 deployed repos are Go. Somewhere else the
   same choice would cover a quarter of the fleet.
-- An internal-library pattern derived from one org is meaningless in another.
+- `^github\.com/acme/` is meaningless anywhere but the reference organization.
 - Even the shape of the backfill — 376 apps, 1,772 builds, 6,733 assets — set
   the batching and threshold defaults.
 
@@ -16,7 +16,7 @@ it**. It is read-only: the lake and the GitHub API, no NP writes, no clones, no
 builds.
 
 ```bash
-NP_API_KEY=… GITHUB_TOKEN=… node lib-inventory/analysis/analyze-org.mjs \
+NP_API_KEY=… GITHUB_TOKEN=… node workflows/lib-inventory/analysis/analyze-org.mjs \
   [--sample 40] [--json report.json]
 ```
 
@@ -66,25 +66,25 @@ Add those by hand. Getting this wrong is not fatal — nothing breaks — but th
 inventory becomes a list of everyone else's libraries instead of yours, and
 `internal_count` stops meaning anything.
 
-## Reference baseline, for comparison
+## the reference organization baseline, for comparison
 
-Measured 2026-07-26 on the reference organization. If a new org's numbers look wildly
+Measured 2026-07-26 (org `<ORG_ID>`). If a new org's numbers look wildly
 different, that is information, not a bug.
 
-| | reference org |
+| | the reference organization |
 |---|---|
 | apps / builds / assets (live) | 375 / 1,772 / 6,733 |
 | ecosystems by repo | go 279, python 93, java-maven 24, node 24, dotnet 1, php 1 |
 | repos with no manifest | 8 |
 | ladder | L1 476, L2 2, L3 0, L4 1, **L5 0** (of 479) |
-| internal patterns | `["^github\\.com/YOUR-ORG/"]` |
+| internal patterns | `["^github\\.com/acme/"]` |
 | expected statuses (go-only) | ~82% `ok`, ~18% `lang_unsupported` |
 | dependency split | 87.4% transitive-external (dropped), 6.0% direct-external, 4.0% direct-internal, 2.6% transitive-internal |
 
 ## Then, and only then
 
 ```bash
-cd lib-inventory/setup
+cd workflows/lib-inventory/setup
 ./01-metadata-spec.sh   --env-file <env>
 ./02-config-entries.sh  --env-file <env> --scope-nrn <narrow NRN> --internal-patterns '<from section 4>'
 ```

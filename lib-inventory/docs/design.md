@@ -1,8 +1,8 @@
 # Library Inventory — design
 
 **Date:** 2026-07-26
-**Status:** increment 1 implemented and running in production, scoped to one application
-**Implementation:** [`lib-inventory/`](../../../lib-inventory/)
+**Status:** increment 1 implemented and live on the reference organization (scoped to one application)
+**Implementation:** [`workflows/lib-inventory/`](../../../workflows/lib-inventory/)
 
 ## Goal
 
@@ -35,7 +35,7 @@ docs list only application / build / namespace.
 
 ## Evidence base
 
-Every number below was measured against a reference organization, not assumed.
+Every number below was measured against the reference organization (org `<ORG_ID>`), not assumed.
 
 - 558 applications; 481 `active`; **376 with an ACTIVE deployment** — the last
   is the backfill universe: **1,772 builds, 6,733 assets**.
@@ -58,10 +58,10 @@ Every number below was measured against a reference organization, not assumed.
 Two rules take it from 98.5% to 100%:
 
 1. **Ambiguity tie-break.** Several directories can share a basename; prefer the
-   one containing a manifest, then the shallowest. Without it a `migrations` asset binds to
-   `migrations/src/main/resources/db/migrations`.
+   one containing a manifest, then the shallowest. Without it `acme-exchange`'s
+   `migrations` asset binds to `migrations/src/main/resources/db/migrations`.
 2. **The whole subtree.** Collect every manifest under the matched directory.
-   one observed repository has a single container asset containing
+   `acme-scoreboard` has a single container asset containing
    `frontend/`, `scanner/` and `social_scrapers/` — three manifests, two
    languages, one asset. `languages` is therefore an array.
 
@@ -112,9 +112,8 @@ is a consequence of the direct dependencies rather than a fact about them. It is
 still **counted** in `transitive_external_dropped`, so the omission is visible.
 
 Transitive internal is kept because "direct only" would erase the signal: 292
-assets reached an internal package indirectly and 58 were still on the v1 line
-of another — that in-flight major migration is precisely what this system
-exists to see. The extra cost over
+assets reach `goala/uenv` indirectly, 58 reach `goala/utel` v1 — that v1→v2
+migration is precisely what this system exists to see. The extra cost over
 direct-only is 0.3 KB per asset.
 
 `direct` is preserved on every dependency, because only a direct dependency is a
@@ -133,7 +132,7 @@ Per build: **2 requests.**
    measured at 6 `go.mod` in 0.71s, cost 1 point.
 
 Pinning to the build's commit SHA makes the record reproducible: it describes
-the code that was actually built, not today's `main`. A full 1,772-build backfill is
+the code that was actually built, not today's `main`. Full the reference organization backfill is
 ~3,544 GitHub requests (a PAT allows 5,000/h; a GitHub App 15,000/h).
 
 Nothing runs a build. For maven that caps us at `pom.xml` plus statically
@@ -198,7 +197,8 @@ Three landed as comments in the YAML so they are not rediscovered:
 
 ## Verified result
 
-Verified in production, scoped to a single application:
+Live on the reference organization, application `1412378069` (feature-flagging), definition
+`wf_cObsaIM0_ftF`:
 
 ```
 assets_scanned: 24   assets_written: 24   coverage_pct: 100
@@ -207,8 +207,8 @@ dependencies_stored: 183   transitive_external_dropped: 1554
 ```
 
 Queryable from the lake, and already showing drift inside a single application:
-one internal framework at v1.4.0 on 5 assets against v1.6.0 on 15, and another
-in three versions at once.
+`lambda-go` v1.4.0 on 5 assets against v1.6.0 on 15; `goala/utel/v2` in three
+versions.
 
 The wider dry run (60 apps / 653 assets) gives the shape of the org: 82.1% `ok`,
 17.8% `lang_unsupported` (74 maven, 40 python, 2 node), 1 `no_manifest`, and
@@ -220,7 +220,7 @@ zero `unresolved` or `repo_unreachable`.
    is one run instead of `LIB_MAX_BUILDS`-sized manual passes.
 2. **Near-real-time** — an `audit` notification channel filtered to
    `entity=release, method=POST` pointed at a webhook trigger, so a release
-   refreshes its own assets. `audit`-sourced channels already work, so no
+   refreshes its own assets. the reference organization already runs `audit`-sourced channels, so no
    new plugin is needed.
 3. **More ecosystems** — maven and python first by asset count. Read the lockfile
    / POM hierarchy to classify, still store only direct + internal.
@@ -232,9 +232,9 @@ zero `unresolved` or `repo_unreachable`.
 
 ## Open issues
 
-- The GitHub token first provisioned for the rollout **could see zero
+- The the reference organization `GITHUB_TOKEN` in `.env.the reference organization` (`ecanizal-the reference organization`) **can see zero
   repositories** — `/user/repos` returns an empty list and the target repo 404s.
-  A personal PAT was used as a stopgap; a GitHub App or machine token has to
-  replace it before any real rollout.
-- Applications with an empty `repository_url` in NP are unscannable until it is
-  set; the analysis script counts them up front.
+  The live run uses Gabriel's personal PAT as a stopgap; a GitHub App or machine
+  token has to replace it before any real rollout.
+- 9 sampled applications have an empty `repository_url` in NP and are
+  unscannable until it is set.

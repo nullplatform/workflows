@@ -9,7 +9,7 @@
 # Never touches any instance data.
 #
 # Usage:
-#   ./01-metadata-spec.sh --env-file ../../../.env.<org>
+#   ./01-metadata-spec.sh --env-file ../../../.env.the reference organization
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../cost/setup/lib.sh
@@ -45,7 +45,16 @@ SPEC=$(jq -n --arg nrn "organization=$ORG_ID" '{
         direct:    {type:"boolean"},
         internal:  {type:"boolean"},
         local:     {type:"boolean"},
+        dev:       {type:"boolean"},
+        optional:  {type:"boolean"},
+        peer:      {type:"boolean"},
         ecosystem: {type:"string"} } } },
+      # What the manifests declare about THEMSELVES rather than about their
+      # dependencies: `node.engines.node`, `go.go`, `node.packageManager`.
+      # A flat string map, keys prefixed by ecosystem — "which assets still
+      # declare node 16" is a runtime question no dependency array answers,
+      # and a fixed property list here would have to change per ecosystem.
+      manifest_config: { type: "object", additionalProperties: {type:"string"} },
       total_count:    { type: "number" },
       direct_count:   { type: "number" },
       internal_count: { type: "number" },

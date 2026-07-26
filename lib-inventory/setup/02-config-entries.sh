@@ -13,9 +13,9 @@
 # re-run — GET is checked first so this can't clobber a live secret.
 #
 # Usage:
-#   ./02-config-entries.sh --env-file ../../../.env.<org> \
+#   ./02-config-entries.sh --env-file ../../../.env.the reference organization \
 #     [--scope-nrn organization=X:account=Y:namespace=Z:application=W] \
-#     [--internal-patterns '["^github\\.com/YOUR-ORG/"]'] \
+#     [--internal-patterns '["^github\\.com/acme/"]'] \
 #     [--max-builds 50] [--min-coverage 95] [--github-token ghp_…]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,7 +54,7 @@ mint_token
 [[ -n "$INTERNAL_PATTERNS" ]] || {
   echo "ERROR: --internal-patterns is required — without it every dependency" >&2
   echo "       looks external and the inventory keeps only direct deps." >&2
-  echo "       Example: --internal-patterns '[\"^github\\\\.com/YOUR-ORG/\"]'" >&2
+  echo "       Example: --internal-patterns '[\"^github\\\\.com/acme/\"]'" >&2
   exit 1
 }
 

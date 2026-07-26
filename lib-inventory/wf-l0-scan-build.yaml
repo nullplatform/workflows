@@ -1,0 +1,2130 @@
+# Library inventory — scan ONE build.
+#
+# The scanner. Everything that knows how to turn a repository into dependency
+# metadata lives here and NOWHERE else: the backfill (wf-l1) and the
+# per-release path both invoke this workflow rather than carrying their own
+# copy of the pipeline.
+#
+#   plan_tree_fetches ─────── pure
+#     └─ fetch_trees ───────── http-request  ◄── GitHub
+#          └─ plan_manifest_fetches ── pure
+#               └─ fetch_manifests ──── http-request  ◄── GitHub
+#                    └─ resolve_assets ── pure  (the ladder)
+#                         ├─ parse_go ──── pure  (one step per ecosystem)
+#                         └─ parse_node ── pure
+#                              └─ build_payloads ── pure
+#                                   └─ write_metadata ── np-api-call
+#                                        └─ result
+#
+# Every GitHub call is an `http-request` — the plugin the platform already
+# audits as remote-safe and can route through an egress pool, so that traffic
+# leaves from the pool's IPs rather than the engine's. Every other step is pure
+# computation with NO network at all.
+#
+# ONE BUILD PER EXECUTION — this is not an aesthetic choice. Repository trees
+# and manifest bodies travel through execution state, and the sandbox input
+# boundary is 1 MB (`input exceeds sandbox boundary limit of 1048576 bytes`,
+# hit live on 2026-07-26 at twelve builds). Batching them into one execution
+# capped the backfill at ~6 builds a run; scoping the pipeline to one build
+# makes that limit per sub-execution, where ~103 KB of state has two orders of
+# magnitude of headroom. The cost is one Temporal execution per build, which is
+# what buys the parallelism back.
+#
+# EVERY asset handed to this workflow gets a metadata record, including ones
+# that could not be scanned (`status` carries the reason). An asset with NO
+# record was never visited — that distinction is the whole design, and it makes
+# coverage a lake query instead of an act of faith.
+#
+# Per-org configuration (config entries on folder /lib-inventory):
+#   NP_API_KEY               (secret) org credential for the metadata writes
+#   GITHUB_TOKEN             (secret) PAT with read access to the repositories
+#   LIB_INTERNAL_PATTERNS    JSON array of regex sources marking a dep internal
+#
+# The `code:` bodies of the pure steps are GENERATED from scanner/. Never edit
+# them in place — run:
+#   node workflows/lib-inventory/scripts/build-workflow.mjs
+
+id: lib_inventory_scan_build
+name: "Library Inventory — Scan Build"
+description: >
+  Resolves each asset of one build to a subtree of its application's repository
+  at that build's commit, extracts the dependency manifests found there, and
+  writes one `dependencies` metadata record per asset — including for assets
+  that could not be scanned, so coverage is always measurable.
+path: "/lib-inventory"
+semantic_version: 1.0.0
+
+inputs:
+  app_id:
+    type: string
+    required: true
+    description: "NP application id the build belongs to."
+  app_name:
+    type: string
+    required: false
+    description: "Application name. Diagnostics only — never used for resolution."
+  repository_url:
+    type: string
+    required: false
+    description: >
+      The application's repository. Empty or non-GitHub is not an error: every
+      asset is recorded with status `repo_missing`.
+  build_id:
+    type: string
+    required: true
+    description: "NP build id. Stored on the record so a scan is traceable."
+  commit:
+    type: string
+    required: true
+    description: >
+      The commit the build was made from. Read verbatim, with NO fallback to a
+      branch — reading `main` when the commit is gone would silently describe
+      different code than the one that shipped.
+  assets_json:
+    type: string
+    required: true
+    description: >
+      The build's assets. Named after the lake column both callers select it
+      from (`toJSONString(groupUniqArray((id, name, type)))`), so a lake row can
+      be forwarded whole with no unpacking. A real `[{id, name, type}]` array is
+      accepted just as well.
+  dry_run:
+    type: boolean
+    required: false
+    description: "Scan and report, but write no metadata."
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Scan This Build"
+    config:
+      description: >
+        Scans one build (normally invoked by the backfill or the release
+        listener). Running it by hand is the fastest way to debug a single
+        repository's resolution.
+      inputs:
+        app_id: { type: string, required: true }
+        app_name: { type: string, required: false }
+        repository_url: { type: string, required: false }
+        build_id: { type: string, required: true }
+        commit: { type: string, required: true }
+        assets_json: { type: string, required: true }
+        dry_run: { type: boolean, required: false }
+
+  - id: plan_tree_fetches
+    type: module
+    plugin_type: code-exec
+    name: "Plan Repository Tree Fetches"
+    inputs:
+      # The pipeline is array-shaped end to end (it was written for batches),
+      # so one build is simply a one-row batch. Keeping that shape is what lets
+      # the SAME generated step bodies serve the backfill and the per-release
+      # path — the fan-out lives in the caller, never in the scanner.
+      rows:
+        - app_id: "${{ workflow.inputs.app_id }}"
+          app_name: "${{ workflow.inputs.app_name }}"
+          repository_url: "${{ workflow.inputs.repository_url }}"
+          build_id: "${{ workflow.inputs.build_id }}"
+          commit: "${{ workflow.inputs.commit }}"
+          assets_json: "${{ workflow.inputs.assets_json }}"
+    config:
+      code: |
+        // >>> GENERATED plan_tree_fetches — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /** One GraphQL query aliasing every manifest blob at a commit — 1 request, cost 1. */
+        function buildBlobQuery(owner, repo, ref, paths) {
+          const aliases = paths
+            .map(
+              (p, i) =>
+                `    f${i}: object(expression: ${JSON.stringify(`${ref}:${p}`)}) { ... on Blob { text } }`,
+            )
+            .join('\n');
+          return (
+            `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(repo)}) {\n` +
+            `${aliases}\n  } }`
+          );
+        }
+
+        /** Map a GraphQL blob response back onto the manifest paths that produced it. */
+        function readBlobResponse(manifests, result) {
+          const node = result?.body?.data?.repository;
+          const texts = {};
+          if (!node) return texts;
+          manifests.forEach((p, i) => {
+            const t = node[`f${i}`]?.text;
+            if (typeof t === 'string') texts[p] = t;
+          });
+          return texts;
+        }
+
+        /** Max manifests fetched per repository. Bounds a pathological monorepo. */
+        const MAX_MANIFESTS_PER_REPO = 120;
+
+        /**
+         * STEP 1 — turn lake rows into GitHub tree requests.
+         *
+         * Emits `requests` (index-aligned with `plans`, consumed by the `http-request`
+         * forEach) and `unscannable` for builds that can never be fetched. Note the
+         * request carries ONLY a url: the credential lives in the http-request step's
+         * own config as `${{ secrets.GITHUB_TOKEN }}`, so it never passes through a
+         * `code-exec` output and never reaches the execution state.
+         */
+        function planTreeFetches(builds) {
+          const requests = [];
+          const plans = [];
+          const unscannable = [];
+          for (const build of builds) {
+            const repo = parseRepoUrl(build.repository_url);
+            if (!repo) {
+              unscannable.push({
+                build,
+                status: 'repo_missing',
+                status_detail: build.repository_url
+                  ? `repository_url is not a GitHub URL: ${build.repository_url}`
+                  : 'application has no repository_url configured',
+              });
+              continue;
+            }
+            // Pinned to the build's commit, with no fallback to a branch: reading
+            // `main` when the commit is gone would silently describe DIFFERENT code
+            // than the one that shipped. A missing commit is `repo_unreachable`.
+            requests.push({
+              url:
+                `https://api.github.com/repos/${repo.owner}/${repo.repo}` +
+                `/git/trees/${encodeURIComponent(build.commit)}?recursive=1`,
+            });
+            plans.push({ ...build, owner: repo.owner, repo: repo.repo });
+          }
+          return { requests, plans, unscannable };
+        }
+
+        /**
+         * STEP 2 — from the fetched trees, list every manifest and build one batched
+         * GraphQL request per repository.
+         *
+         * `treeResults[i]` is the http-request result for `plans[i]`. A forEach
+         * iteration that exhausted its retries is absorbed as an EMPTY slot in the same
+         * position — that empty slot is the signal for `repo_unreachable`, which is why
+         * the arrays must stay index-aligned.
+         */
+        function planManifestFetches(plans, treeResults) {
+          const requests = [];
+          const kept = [];
+          const failed = [];
+
+          plans.forEach((plan, i) => {
+            const res = treeResults?.[i];
+            const paths = res?.body?.tree;
+            if (!res || !Array.isArray(paths)) {
+              failed.push({
+                build: plan,
+                status: 'repo_unreachable',
+                status_detail:
+                  `could not read the tree of ${plan.owner}/${plan.repo}@${plan.commit}` +
+                  (res?.statusCode ? ` (HTTP ${res.statusCode})` : ' (request failed)'),
+              });
+              return;
+            }
+            if (res.body.truncated === true) {
+              failed.push({
+                build: plan,
+                status: 'repo_unreachable',
+                status_detail: `the tree of ${plan.owner}/${plan.repo} is truncated (>100k entries)`,
+              });
+              return;
+            }
+
+            // `output_projection` trims each entry to its `path`, so accept both the
+            // projected string form and the raw GitHub object.
+            const files = paths
+              .map((p) => (typeof p === 'string' ? p : p?.path))
+              .filter((p) => typeof p === 'string');
+            const manifests = files
+              .filter((p) => manifestLang(p.slice(p.lastIndexOf('/') + 1)) !== null)
+              .slice(0, MAX_MANIFESTS_PER_REPO);
+
+            kept.push({ ...plan, files, manifests });
+            requests.push({
+              url: 'https://api.github.com/graphql',
+              method: 'POST',
+              body: { query: buildBlobQuery(plan.owner, plan.repo, plan.commit, manifests) },
+            });
+          });
+
+          return { requests, plans: kept, failed };
+        }
+
+        /**
+         * STEP `plan_tree_fetches` — lake rows → GitHub tree requests. No network.
+         *
+         * The request carries only a `url`. The credential stays in the http-request
+         * step's own config as `${{ secrets.GITHUB_TOKEN }}`, so it never passes
+         * through a code-exec output and never lands in the execution state.
+         */
+        const builds = (inputs.rows || []).map((r) => ({
+          app_id: r.app_id,
+          app_name: r.app_name,
+          repository_url: r.repository_url,
+          build_id: r.build_id,
+          commit: r.commit,
+          assets: (typeof r.assets_json === 'string' ? JSON.parse(r.assets_json) : r.assets_json || []).map(
+            (a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2] } : a),
+          ),
+        }));
+
+        const { requests, plans, unscannable } = planTreeFetches(builds);
+        log.info(`planned ${requests.length} tree fetches`, { unscannable: unscannable.length });
+        return { requests, plans, unscannable };
+        // <<< END plan_tree_fetches
+
+  # ── GitHub call #1 ───────────────────────────────────────────────────────
+  # The credential lives HERE, in the step config — not in the forEach item.
+  # A `code-exec` that built the header would put the token in its output, and
+  # step outputs are recorded into execution state.
+  #
+  # `output_projection` trims each tree entry to its bare `path` BEFORE the
+  # result is size-capped and recorded. GitHub returns mode/type/sha/size per
+  # entry; keeping all of it would roughly triple what the state carries.
+  #
+  # A >=400 fails the iteration, which `forEach` absorbs as an EMPTY slot in the
+  # same position. That empty slot is exactly how the next step recognises
+  # `repo_unreachable`, so the arrays must stay index-aligned.
+  - id: fetch_trees
+    type: module
+    plugin_type: http-request
+    name: "Fetch Repository Trees (GitHub)"
+    config:
+      method: GET
+      url: "https://api.github.com/"
+      headers:
+        Authorization: "Bearer ${{ secrets.GITHUB_TOKEN }}"
+        Accept: "application/vnd.github+json"
+        User-Agent: "np-lib-inventory"
+    output_projection:
+      - statusCode
+      - body.tree[].path
+      - body.truncated
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.plan_tree_fetches.outputs.requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 10
+
+  - id: plan_manifest_fetches
+    type: module
+    plugin_type: code-exec
+    name: "Plan Manifest Fetches"
+    inputs:
+      plans: "${{ steps.plan_tree_fetches.outputs.plans }}"
+      treeResults: "${{ steps.fetch_trees.outputs.items }}"
+    config:
+      code: |
+        // >>> GENERATED plan_manifest_fetches — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /** One GraphQL query aliasing every manifest blob at a commit — 1 request, cost 1. */
+        function buildBlobQuery(owner, repo, ref, paths) {
+          const aliases = paths
+            .map(
+              (p, i) =>
+                `    f${i}: object(expression: ${JSON.stringify(`${ref}:${p}`)}) { ... on Blob { text } }`,
+            )
+            .join('\n');
+          return (
+            `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(repo)}) {\n` +
+            `${aliases}\n  } }`
+          );
+        }
+
+        /** Map a GraphQL blob response back onto the manifest paths that produced it. */
+        function readBlobResponse(manifests, result) {
+          const node = result?.body?.data?.repository;
+          const texts = {};
+          if (!node) return texts;
+          manifests.forEach((p, i) => {
+            const t = node[`f${i}`]?.text;
+            if (typeof t === 'string') texts[p] = t;
+          });
+          return texts;
+        }
+
+        /** Max manifests fetched per repository. Bounds a pathological monorepo. */
+        const MAX_MANIFESTS_PER_REPO = 120;
+
+        /**
+         * STEP 1 — turn lake rows into GitHub tree requests.
+         *
+         * Emits `requests` (index-aligned with `plans`, consumed by the `http-request`
+         * forEach) and `unscannable` for builds that can never be fetched. Note the
+         * request carries ONLY a url: the credential lives in the http-request step's
+         * own config as `${{ secrets.GITHUB_TOKEN }}`, so it never passes through a
+         * `code-exec` output and never reaches the execution state.
+         */
+        function planTreeFetches(builds) {
+          const requests = [];
+          const plans = [];
+          const unscannable = [];
+          for (const build of builds) {
+            const repo = parseRepoUrl(build.repository_url);
+            if (!repo) {
+              unscannable.push({
+                build,
+                status: 'repo_missing',
+                status_detail: build.repository_url
+                  ? `repository_url is not a GitHub URL: ${build.repository_url}`
+                  : 'application has no repository_url configured',
+              });
+              continue;
+            }
+            // Pinned to the build's commit, with no fallback to a branch: reading
+            // `main` when the commit is gone would silently describe DIFFERENT code
+            // than the one that shipped. A missing commit is `repo_unreachable`.
+            requests.push({
+              url:
+                `https://api.github.com/repos/${repo.owner}/${repo.repo}` +
+                `/git/trees/${encodeURIComponent(build.commit)}?recursive=1`,
+            });
+            plans.push({ ...build, owner: repo.owner, repo: repo.repo });
+          }
+          return { requests, plans, unscannable };
+        }
+
+        /**
+         * STEP 2 — from the fetched trees, list every manifest and build one batched
+         * GraphQL request per repository.
+         *
+         * `treeResults[i]` is the http-request result for `plans[i]`. A forEach
+         * iteration that exhausted its retries is absorbed as an EMPTY slot in the same
+         * position — that empty slot is the signal for `repo_unreachable`, which is why
+         * the arrays must stay index-aligned.
+         */
+        function planManifestFetches(plans, treeResults) {
+          const requests = [];
+          const kept = [];
+          const failed = [];
+
+          plans.forEach((plan, i) => {
+            const res = treeResults?.[i];
+            const paths = res?.body?.tree;
+            if (!res || !Array.isArray(paths)) {
+              failed.push({
+                build: plan,
+                status: 'repo_unreachable',
+                status_detail:
+                  `could not read the tree of ${plan.owner}/${plan.repo}@${plan.commit}` +
+                  (res?.statusCode ? ` (HTTP ${res.statusCode})` : ' (request failed)'),
+              });
+              return;
+            }
+            if (res.body.truncated === true) {
+              failed.push({
+                build: plan,
+                status: 'repo_unreachable',
+                status_detail: `the tree of ${plan.owner}/${plan.repo} is truncated (>100k entries)`,
+              });
+              return;
+            }
+
+            // `output_projection` trims each entry to its `path`, so accept both the
+            // projected string form and the raw GitHub object.
+            const files = paths
+              .map((p) => (typeof p === 'string' ? p : p?.path))
+              .filter((p) => typeof p === 'string');
+            const manifests = files
+              .filter((p) => manifestLang(p.slice(p.lastIndexOf('/') + 1)) !== null)
+              .slice(0, MAX_MANIFESTS_PER_REPO);
+
+            kept.push({ ...plan, files, manifests });
+            requests.push({
+              url: 'https://api.github.com/graphql',
+              method: 'POST',
+              body: { query: buildBlobQuery(plan.owner, plan.repo, plan.commit, manifests) },
+            });
+          });
+
+          return { requests, plans: kept, failed };
+        }
+
+        /**
+         * STEP `plan_manifest_fetches` — trees → one batched GraphQL request per repo.
+         * No network.
+         *
+         * Every manifest in the repository is fetched, not just the ones a resolved
+         * asset needs: rung L2 has to read an artifact's DECLARED name, so fetching
+         * everything once is one round trip instead of resolve-miss-refetch.
+         */
+        const { requests, plans, failed } = planManifestFetches(inputs.plans || [], inputs.treeResults || []);
+        log.info(`planned ${requests.length} manifest fetches`, { unreachable: failed.length });
+        return { requests, plans, failed };
+        // <<< END plan_manifest_fetches
+
+  # ── GitHub call #2 ───────────────────────────────────────────────────────
+  # One GraphQL query per repository, aliasing every manifest blob at the
+  # build's commit: N files for 1 request and 1 rate-limit point.
+  - id: fetch_manifests
+    type: module
+    plugin_type: http-request
+    name: "Fetch Dependency Manifests (GitHub GraphQL)"
+    config:
+      method: POST
+      url: "https://api.github.com/graphql"
+      headers:
+        Authorization: "Bearer ${{ secrets.GITHUB_TOKEN }}"
+        Content-Type: "application/json"
+        User-Agent: "np-lib-inventory"
+    output_projection:
+      - statusCode
+      - body.data.repository
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.plan_manifest_fetches.outputs.requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 10
+
+  - id: resolve_assets
+    type: module
+    plugin_type: code-exec
+    name: "Resolve Assets To Repository Subtrees"
+    inputs:
+      plans: "${{ steps.plan_manifest_fetches.outputs.plans }}"
+      manifestResults: "${{ steps.fetch_manifests.outputs.items }}"
+    config:
+      code: |
+        // >>> GENERATED resolve_assets — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /**
+         * Build the lookup structures a repo tree needs to answer "which subtree is
+         * this asset?".
+         */
+        function indexTree(paths) {
+          const manifests = new Map(); // path -> ecosystem
+          const dirs = new Set(['']);
+          for (const p of paths) {
+            const slash = p.lastIndexOf('/');
+            if (slash >= 0) {
+              // register every ancestor directory
+              let d = p.slice(0, slash);
+              while (d) {
+                dirs.add(d);
+                const i = d.lastIndexOf('/');
+                d = i < 0 ? '' : d.slice(0, i);
+              }
+            }
+            const lang = manifestLang(slash >= 0 ? p.slice(slash + 1) : p);
+            if (lang) manifests.set(p, lang);
+          }
+
+          const manifestDirs = new Set(
+            [...manifests.keys()].map((p) => {
+              const i = p.lastIndexOf('/');
+              return i < 0 ? '' : p.slice(0, i);
+            }),
+          );
+
+          const hasManifestUnder = (dir) => {
+            if (!dir) return manifests.size > 0;
+            const prefix = `${dir}/`;
+            for (const p of manifests.keys()) if (p.startsWith(prefix)) return true;
+            return false;
+          };
+
+          // basename -> candidate dirs, best first.
+          // TIE-BREAK: a directory that actually contains a manifest wins; among those
+          // the shallowest wins. Without this, `migrations` matches
+          // `migrations/src/main/resources/db/migrations` instead of `migrations/`.
+          const rank = (a, b) => {
+            const ma = hasManifestUnder(a),
+              mb = hasManifestUnder(b);
+            if (ma !== mb) return ma ? -1 : 1;
+            const da = a.split('/').length,
+              db = b.split('/').length;
+            if (da !== db) return da - db;
+            return a.length - b.length;
+          };
+          const byBase = new Map();
+          const byNorm = new Map();
+          for (const d of dirs) {
+            if (!d) continue;
+            const base = d.slice(d.lastIndexOf('/') + 1);
+            if (!byBase.has(base)) byBase.set(base, []);
+            byBase.get(base).push(d);
+            const n = normalizeName(base);
+            if (!byNorm.has(n)) byNorm.set(n, []);
+            byNorm.get(n).push(d);
+          }
+          for (const list of byBase.values()) list.sort(rank);
+          for (const list of byNorm.values()) list.sort(rank);
+
+          return { manifests, manifestDirs, byBase, byNorm, hasManifestUnder };
+        }
+
+        /**
+         * Module name declared *inside* a manifest, for the L2 rung. Maven's
+         * `<artifactId>` is the case that matters: `acme-savings-model` lives in
+         * `modules/model/`, so the directory name never matches.
+         */
+        function declaredName(ecosystem, text) {
+          try {
+            if (ecosystem === 'java-maven') {
+              const body = String(text).replace(/<parent>[\s\S]*?<\/parent>/g, '');
+              const m = /<artifactId>\s*([^<]+?)\s*<\/artifactId>/.exec(body);
+              return m ? m[1] : null;
+            }
+            if (ecosystem === 'node') {
+              const n = JSON.parse(text).name;
+              return typeof n === 'string' ? n : null;
+            }
+            if (ecosystem === 'go') {
+              const m = /^module\s+(\S+)/m.exec(String(text));
+              return m ? m[1].split('/').pop() : null;
+            }
+          } catch {
+            /* a malformed manifest simply does not contribute an L2 candidate */
+          }
+          return null;
+        }
+
+        /**
+         * Resolve one asset name to a repository subtree.
+         * Returns `{ level, dir }`, or null when nothing matched (rung L5).
+         */
+        function resolveAsset(assetName, idx, declaredIndex) {
+          const exact = idx.byBase.get(assetName);
+          if (exact && exact.length) return { level: 'L1', dir: exact[0] };
+
+          if (declaredIndex) {
+            const d = declaredIndex.get(assetName) || declaredIndex.get(normalizeName(assetName));
+            if (d) return { level: 'L2', dir: d };
+          }
+
+          const norm = idx.byNorm.get(normalizeName(assetName));
+          if (norm && norm.length) return { level: 'L3', dir: norm[0] };
+
+          if (idx.manifestDirs.size === 1) {
+            return { level: 'L4', dir: [...idx.manifestDirs][0] };
+          }
+          return null;
+        }
+
+        /** Manifests living inside (or at) a subtree, nearest first. */
+        function manifestsUnder(idx, dir) {
+          const prefix = dir ? `${dir}/` : '';
+          const out = [];
+          for (const [path, ecosystem] of idx.manifests) {
+            if (dir === '' || path.startsWith(prefix)) out.push({ path, ecosystem });
+          }
+          out.sort(
+            (a, b) => a.path.split('/').length - b.path.split('/').length || a.path.localeCompare(b.path),
+          );
+          return out;
+        }
+
+        /** One GraphQL query aliasing every manifest blob at a commit — 1 request, cost 1. */
+        function buildBlobQuery(owner, repo, ref, paths) {
+          const aliases = paths
+            .map(
+              (p, i) =>
+                `    f${i}: object(expression: ${JSON.stringify(`${ref}:${p}`)}) { ... on Blob { text } }`,
+            )
+            .join('\n');
+          return (
+            `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(repo)}) {\n` +
+            `${aliases}\n  } }`
+          );
+        }
+
+        /** Map a GraphQL blob response back onto the manifest paths that produced it. */
+        function readBlobResponse(manifests, result) {
+          const node = result?.body?.data?.repository;
+          const texts = {};
+          if (!node) return texts;
+          manifests.forEach((p, i) => {
+            const t = node[`f${i}`]?.text;
+            if (typeof t === 'string') texts[p] = t;
+          });
+          return texts;
+        }
+
+        /**
+         * STEP 3 — resolve every asset to a repository subtree.
+         *
+         * Pure: no network. The declared-name index (rung L2) is built from the
+         * manifest texts fetched in the previous step, so no extra round trip.
+         */
+        function resolveAssetsForPlans(plans, manifestResults) {
+          return plans.map((plan, i) => {
+            const texts = readBlobResponse(plan.manifests, manifestResults?.[i]);
+            const idx = indexTree(plan.files);
+
+            const declaredIndex = new Map();
+            for (const path of plan.manifests) {
+              const ecosystem = manifestLang(path.slice(path.lastIndexOf('/') + 1));
+              if (!['java-maven', 'node', 'go'].includes(ecosystem)) continue;
+              const n = declaredName(ecosystem, texts[path] || '');
+              if (!n) continue;
+              const dir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+              if (!declaredIndex.has(n)) declaredIndex.set(n, dir);
+              const nn = normalizeName(n);
+              if (!declaredIndex.has(nn)) declaredIndex.set(nn, dir);
+            }
+
+            const assets = (plan.assets || []).map((a) => {
+              const hit = resolveAsset(a.name, idx, declaredIndex);
+              if (!hit)
+                return {
+                  asset_id: a.id,
+                  asset_name: a.name,
+                  exists: a.exists === true,
+                  hit: null,
+                  manifests: [],
+                };
+              return {
+                asset_id: a.id,
+                asset_name: a.name,
+                exists: a.exists === true,
+                hit,
+                manifests: manifestsUnder(idx, hit.dir).slice(0, 8),
+              };
+            });
+
+            return { plan, texts, assets };
+          });
+        }
+
+        /**
+         * STEP `resolve_assets` — each asset to a repository subtree. No network.
+         *
+         * The ladder: exact directory basename, then the name declared inside a
+         * manifest, then a normalized basename, then a single-manifest repo. This is
+         * the domain core of the workflow and the reason no AI is involved.
+         */
+        const resolutions = resolveAssetsForPlans(inputs.plans || [], inputs.manifestResults || []);
+        const levels = {};
+        for (const r of resolutions) {
+          for (const a of r.assets) {
+            const k = a.hit ? a.hit.level : 'unresolved';
+            levels[k] = (levels[k] || 0) + 1;
+          }
+        }
+        log.info('asset resolution', levels);
+        return { resolutions, levels };
+        // <<< END resolve_assets
+
+  # One step per ecosystem. Adding Node or Maven means adding a node here that
+  # also feeds `build_payloads` — not another branch inside a growing body.
+  - id: parse_go
+    type: module
+    plugin_type: code-exec
+    name: "Parse Go Dependencies"
+    inputs:
+      resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    config:
+      code: |
+        // >>> GENERATED parse_go — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /**
+         * Parse a `go.mod`. Returns direct and indirect requirements with the exact
+         * version Go resolved — no `go.sum`, toolchain or module download needed.
+         *
+         * Modules redirected by a `replace` to a filesystem path are in-repo code, not
+         * consumed libraries — they carry a placeholder version
+         * (`v0.0.0-00010101000000-000000000000`) and would otherwise pollute the
+         * inventory. They are kept, flagged `local: true`, and excluded from the
+         * counts, so "which module does this asset share code with" stays answerable.
+         */
+        function parseGoMod(text) {
+          const lines = String(text).split('\n');
+
+          const localModules = new Set();
+          let inReplace = false;
+          for (const raw of lines) {
+            const line = raw.trim();
+            if (!line || line.startsWith('//')) continue;
+            if (/^replace\s*\($/.test(line)) {
+              inReplace = true;
+              continue;
+            }
+            if (inReplace && line === ')') {
+              inReplace = false;
+              continue;
+            }
+
+            let body = null;
+            if (inReplace) body = line;
+            else if (line.startsWith('replace ')) body = line.slice('replace '.length).trim();
+            if (!body) continue;
+
+            const m = /^(\S+)(?:\s+v\S+)?\s*=>\s*(\S+)/.exec(body);
+            if (m && /^(\.{1,2}\/|\/)/.test(m[2])) localModules.add(m[1]);
+          }
+
+          const deps = [];
+          let inBlock = false;
+          for (const raw of lines) {
+            const line = raw.trim();
+            if (!line || line.startsWith('//')) continue;
+            if (/^require\s*\($/.test(line)) {
+              inBlock = true;
+              continue;
+            }
+            if (inBlock && line === ')') {
+              inBlock = false;
+              continue;
+            }
+
+            let body = null;
+            if (inBlock) body = line;
+            else if (line.startsWith('require ')) body = line.slice('require '.length).trim();
+            if (!body) continue;
+
+            const m = /^(\S+)\s+(v\S+)(\s*\/\/\s*indirect)?/.exec(body);
+            if (!m) continue;
+            deps.push({
+              name: m[1],
+              version: m[2],
+              direct: !m[3],
+              ecosystem: 'go',
+              local: localModules.has(m[1]),
+            });
+          }
+          return deps;
+        }
+
+        /**
+         * Dependency blocks of a `package.json`, in the order they are merged. A name
+         * declared twice keeps its FIRST scope — `dependencies` outranks
+         * `devDependencies`, which is what a duplicate almost always means.
+         */
+        const NODE_BLOCKS = [
+          ['dependencies', { dev: false, optional: false }],
+          ['peerDependencies', { dev: false, optional: false, peer: true }],
+          ['optionalDependencies', { dev: false, optional: true }],
+          ['devDependencies', { dev: true, optional: false }],
+        ];
+
+        /** Specifiers that point at code in this repository rather than a registry. */
+        const NODE_LOCAL_SPEC = /^(file:|link:|workspace:|portal:)/;
+
+        /**
+         * Parse a `package.json`.
+         *
+         * DIRECT DEPENDENCIES ONLY, and that is a real limitation rather than an
+         * oversight: npm states transitivity in the LOCKFILE, and lockfiles are the
+         * one artifact large enough to reintroduce the size problem the whole
+         * per-build split exists to solve (megabyte `package-lock.json` files are
+         * ordinary). Go is the exception here, not the rule — `go.mod` carries
+         * `// indirect` inline, so it gets transitive internals for free.
+         *
+         * `version` is the DECLARED RANGE (`^1.2.3`, `workspace:*`, a git URL), not a
+         * resolved version. Nothing is installed or resolved, so a range is the honest
+         * answer; a consumer asking "who is behind" has to compare ranges, not points.
+         *
+         * Workspace/file/link specifiers are in-repo code, not consumed libraries —
+         * same treatment as Go's `replace` to a path: kept, flagged `local`, excluded
+         * from the counts.
+         */
+        function parsePackageJson(text) {
+          let pkg;
+          try {
+            pkg = JSON.parse(String(text));
+          } catch {
+            // A package.json that does not parse is not a dependency list. Returning
+            // nothing lets the asset fall through to `no_manifest`/partial coverage
+            // instead of failing the whole build's scan.
+            return [];
+          }
+          if (pkg === null || typeof pkg !== 'object') return [];
+
+          const deps = [];
+          const seen = new Set();
+          for (const [block, flags] of NODE_BLOCKS) {
+            const entry = pkg[block];
+            if (entry === null || typeof entry !== 'object') continue;
+            for (const [name, spec] of Object.entries(entry)) {
+              if (seen.has(name)) continue;
+              seen.add(name);
+              const version = typeof spec === 'string' ? spec : '';
+              deps.push({
+                name,
+                version,
+                direct: true,
+                ecosystem: 'node',
+                local: NODE_LOCAL_SPEC.test(version),
+                ...flags,
+              });
+            }
+          }
+          return deps;
+        }
+
+        /**
+         * What a `go.mod` declares about ITSELF — the language version the module is
+         * built against, and the pinned toolchain when there is one.
+         */
+        function goModConfig(text) {
+          const cfg = {};
+          for (const raw of String(text).split('\n')) {
+            const line = raw.trim();
+            const go = /^go\s+(\S+)/.exec(line);
+            if (go) cfg.go = go[1];
+            const tc = /^toolchain\s+(\S+)/.exec(line);
+            if (tc) cfg.toolchain = tc[1];
+          }
+          return cfg;
+        }
+
+        /**
+         * What a `package.json` declares about ITSELF.
+         *
+         * Separate from the dependency list on purpose: `engines.node` is a RUNTIME
+         * statement, not a library one, and it answers a different question — "which
+         * assets still declare node 16" is the node equivalent of the lambda-runtime
+         * deprecation sweep, and it is invisible in a dependency array.
+         */
+        function packageJsonConfig(text) {
+          let pkg;
+          try {
+            pkg = JSON.parse(String(text));
+          } catch {
+            return {};
+          }
+          if (pkg === null || typeof pkg !== 'object') return {};
+          const cfg = {};
+          if (typeof pkg.name === 'string') cfg.name = pkg.name;
+          if (typeof pkg.version === 'string') cfg.version = pkg.version;
+          if (typeof pkg.type === 'string') cfg.type = pkg.type;
+          if (typeof pkg.packageManager === 'string') cfg.packageManager = pkg.packageManager;
+          if (pkg.engines !== null && typeof pkg.engines === 'object') {
+            for (const [k, v] of Object.entries(pkg.engines)) {
+              if (typeof v === 'string') cfg[`engines.${k}`] = v;
+            }
+          }
+          // A workspaces field is the difference between "an app" and "a monorepo
+          // root", which is exactly what an L4 match cannot tell you on its own.
+          if (Array.isArray(pkg.workspaces)) cfg.workspaces = String(pkg.workspaces.length);
+          return cfg;
+        }
+
+        /**
+         * Ecosystem -> self-declaration reader. Optional: an ecosystem with no entry
+         * simply contributes nothing to `manifest_config`.
+         */
+        const CONFIG_READERS = { go: goModConfig, node: packageJsonConfig };
+
+        /** Ecosystem -> manifest parser. Adding one here is what enables a parse step. */
+        const PARSERS = { go: parseGoMod, node: parsePackageJson };
+
+        /**
+         * STEP 4 — parse the manifests of ONE ecosystem.
+         *
+         * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
+         * canvas feeding `build_payloads`, not another branch inside a growing blob.
+         * Returns `{ [asset_id]: { dependencies, transitive_external_dropped, config } }`.
+         *
+         * `config` is what the manifests declare about THEMSELVES (`engines.node`, the
+         * `go` directive, the package manager) — runtime statements that answer
+         * "which assets still declare node 16", a question no dependency array can.
+         * Keys are prefixed with the ecosystem so two manifests never collide.
+         */
+        function parseEcosystem(resolutions, ecosystem, opts) {
+          const parse = PARSERS[ecosystem];
+          if (!parse) throw new Error(`no parser registered for ecosystem "${ecosystem}"`);
+          const readConfig = CONFIG_READERS[ecosystem];
+          const keepAll = opts.keepTransitiveExternal === true;
+          const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
+
+          const out = {};
+          for (const r of resolutions) {
+            for (const asset of r.assets) {
+              const mine = asset.manifests.filter((m) => m.ecosystem === ecosystem);
+              if (!mine.length) continue;
+
+              const seen = new Set();
+              const deps = [];
+              const config = {};
+              let dropped = 0;
+              for (const m of mine) {
+                const text = r.texts[m.path];
+                if (text == null) continue;
+                if (readConfig) {
+                  // Last manifest wins on a collision. An asset with several manifests
+                  // of one ecosystem is a monorepo subtree; the deepest one is listed
+                  // last and is the more specific statement.
+                  for (const [k, v] of Object.entries(readConfig(text))) config[`${ecosystem}.${k}`] = v;
+                }
+                for (const d of parse(text)) {
+                  const key = `${d.ecosystem} ${d.name} ${d.version}`;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const internal = isInternal(d.name);
+                  if (!keepAll && !d.direct && !internal && !d.local) {
+                    dropped += 1;
+                    continue;
+                  }
+                  deps.push({ local: false, ...d, internal });
+                }
+              }
+              out[asset.asset_id] = { dependencies: deps, transitive_external_dropped: dropped, config };
+            }
+          }
+          return out;
+        }
+
+        /**
+         * STEP `parse_go` — extract dependencies from the Go manifests. No network.
+         *
+         * One step per ecosystem on purpose: adding Node or Maven becomes a new node on
+         * the canvas feeding `build_payloads`, not another branch inside a growing
+         * blob. `go.mod` is also the only manifest that states transitivity itself, via
+         * the `// indirect` marker `go mod tidy` writes.
+         */
+        const parsed = parseEcosystem(inputs.resolutions || [], 'go', {
+          internalPatterns: compileInternalPatterns(inputs.internalPatterns),
+          keepTransitiveExternal: inputs.keepTransitiveExternal === true,
+        });
+        log.info(`parsed go for ${Object.keys(parsed).length} assets`);
+        return { parsed };
+        // <<< END parse_go
+
+  - id: parse_node
+    type: module
+    plugin_type: code-exec
+    name: "Parse Node Dependencies"
+    inputs:
+      resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    config:
+      code: |
+        // >>> GENERATED parse_node — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /**
+         * Parse a `go.mod`. Returns direct and indirect requirements with the exact
+         * version Go resolved — no `go.sum`, toolchain or module download needed.
+         *
+         * Modules redirected by a `replace` to a filesystem path are in-repo code, not
+         * consumed libraries — they carry a placeholder version
+         * (`v0.0.0-00010101000000-000000000000`) and would otherwise pollute the
+         * inventory. They are kept, flagged `local: true`, and excluded from the
+         * counts, so "which module does this asset share code with" stays answerable.
+         */
+        function parseGoMod(text) {
+          const lines = String(text).split('\n');
+
+          const localModules = new Set();
+          let inReplace = false;
+          for (const raw of lines) {
+            const line = raw.trim();
+            if (!line || line.startsWith('//')) continue;
+            if (/^replace\s*\($/.test(line)) {
+              inReplace = true;
+              continue;
+            }
+            if (inReplace && line === ')') {
+              inReplace = false;
+              continue;
+            }
+
+            let body = null;
+            if (inReplace) body = line;
+            else if (line.startsWith('replace ')) body = line.slice('replace '.length).trim();
+            if (!body) continue;
+
+            const m = /^(\S+)(?:\s+v\S+)?\s*=>\s*(\S+)/.exec(body);
+            if (m && /^(\.{1,2}\/|\/)/.test(m[2])) localModules.add(m[1]);
+          }
+
+          const deps = [];
+          let inBlock = false;
+          for (const raw of lines) {
+            const line = raw.trim();
+            if (!line || line.startsWith('//')) continue;
+            if (/^require\s*\($/.test(line)) {
+              inBlock = true;
+              continue;
+            }
+            if (inBlock && line === ')') {
+              inBlock = false;
+              continue;
+            }
+
+            let body = null;
+            if (inBlock) body = line;
+            else if (line.startsWith('require ')) body = line.slice('require '.length).trim();
+            if (!body) continue;
+
+            const m = /^(\S+)\s+(v\S+)(\s*\/\/\s*indirect)?/.exec(body);
+            if (!m) continue;
+            deps.push({
+              name: m[1],
+              version: m[2],
+              direct: !m[3],
+              ecosystem: 'go',
+              local: localModules.has(m[1]),
+            });
+          }
+          return deps;
+        }
+
+        /**
+         * Dependency blocks of a `package.json`, in the order they are merged. A name
+         * declared twice keeps its FIRST scope — `dependencies` outranks
+         * `devDependencies`, which is what a duplicate almost always means.
+         */
+        const NODE_BLOCKS = [
+          ['dependencies', { dev: false, optional: false }],
+          ['peerDependencies', { dev: false, optional: false, peer: true }],
+          ['optionalDependencies', { dev: false, optional: true }],
+          ['devDependencies', { dev: true, optional: false }],
+        ];
+
+        /** Specifiers that point at code in this repository rather than a registry. */
+        const NODE_LOCAL_SPEC = /^(file:|link:|workspace:|portal:)/;
+
+        /**
+         * Parse a `package.json`.
+         *
+         * DIRECT DEPENDENCIES ONLY, and that is a real limitation rather than an
+         * oversight: npm states transitivity in the LOCKFILE, and lockfiles are the
+         * one artifact large enough to reintroduce the size problem the whole
+         * per-build split exists to solve (megabyte `package-lock.json` files are
+         * ordinary). Go is the exception here, not the rule — `go.mod` carries
+         * `// indirect` inline, so it gets transitive internals for free.
+         *
+         * `version` is the DECLARED RANGE (`^1.2.3`, `workspace:*`, a git URL), not a
+         * resolved version. Nothing is installed or resolved, so a range is the honest
+         * answer; a consumer asking "who is behind" has to compare ranges, not points.
+         *
+         * Workspace/file/link specifiers are in-repo code, not consumed libraries —
+         * same treatment as Go's `replace` to a path: kept, flagged `local`, excluded
+         * from the counts.
+         */
+        function parsePackageJson(text) {
+          let pkg;
+          try {
+            pkg = JSON.parse(String(text));
+          } catch {
+            // A package.json that does not parse is not a dependency list. Returning
+            // nothing lets the asset fall through to `no_manifest`/partial coverage
+            // instead of failing the whole build's scan.
+            return [];
+          }
+          if (pkg === null || typeof pkg !== 'object') return [];
+
+          const deps = [];
+          const seen = new Set();
+          for (const [block, flags] of NODE_BLOCKS) {
+            const entry = pkg[block];
+            if (entry === null || typeof entry !== 'object') continue;
+            for (const [name, spec] of Object.entries(entry)) {
+              if (seen.has(name)) continue;
+              seen.add(name);
+              const version = typeof spec === 'string' ? spec : '';
+              deps.push({
+                name,
+                version,
+                direct: true,
+                ecosystem: 'node',
+                local: NODE_LOCAL_SPEC.test(version),
+                ...flags,
+              });
+            }
+          }
+          return deps;
+        }
+
+        /**
+         * What a `go.mod` declares about ITSELF — the language version the module is
+         * built against, and the pinned toolchain when there is one.
+         */
+        function goModConfig(text) {
+          const cfg = {};
+          for (const raw of String(text).split('\n')) {
+            const line = raw.trim();
+            const go = /^go\s+(\S+)/.exec(line);
+            if (go) cfg.go = go[1];
+            const tc = /^toolchain\s+(\S+)/.exec(line);
+            if (tc) cfg.toolchain = tc[1];
+          }
+          return cfg;
+        }
+
+        /**
+         * What a `package.json` declares about ITSELF.
+         *
+         * Separate from the dependency list on purpose: `engines.node` is a RUNTIME
+         * statement, not a library one, and it answers a different question — "which
+         * assets still declare node 16" is the node equivalent of the lambda-runtime
+         * deprecation sweep, and it is invisible in a dependency array.
+         */
+        function packageJsonConfig(text) {
+          let pkg;
+          try {
+            pkg = JSON.parse(String(text));
+          } catch {
+            return {};
+          }
+          if (pkg === null || typeof pkg !== 'object') return {};
+          const cfg = {};
+          if (typeof pkg.name === 'string') cfg.name = pkg.name;
+          if (typeof pkg.version === 'string') cfg.version = pkg.version;
+          if (typeof pkg.type === 'string') cfg.type = pkg.type;
+          if (typeof pkg.packageManager === 'string') cfg.packageManager = pkg.packageManager;
+          if (pkg.engines !== null && typeof pkg.engines === 'object') {
+            for (const [k, v] of Object.entries(pkg.engines)) {
+              if (typeof v === 'string') cfg[`engines.${k}`] = v;
+            }
+          }
+          // A workspaces field is the difference between "an app" and "a monorepo
+          // root", which is exactly what an L4 match cannot tell you on its own.
+          if (Array.isArray(pkg.workspaces)) cfg.workspaces = String(pkg.workspaces.length);
+          return cfg;
+        }
+
+        /**
+         * Ecosystem -> self-declaration reader. Optional: an ecosystem with no entry
+         * simply contributes nothing to `manifest_config`.
+         */
+        const CONFIG_READERS = { go: goModConfig, node: packageJsonConfig };
+
+        /** Ecosystem -> manifest parser. Adding one here is what enables a parse step. */
+        const PARSERS = { go: parseGoMod, node: parsePackageJson };
+
+        /**
+         * STEP 4 — parse the manifests of ONE ecosystem.
+         *
+         * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
+         * canvas feeding `build_payloads`, not another branch inside a growing blob.
+         * Returns `{ [asset_id]: { dependencies, transitive_external_dropped, config } }`.
+         *
+         * `config` is what the manifests declare about THEMSELVES (`engines.node`, the
+         * `go` directive, the package manager) — runtime statements that answer
+         * "which assets still declare node 16", a question no dependency array can.
+         * Keys are prefixed with the ecosystem so two manifests never collide.
+         */
+        function parseEcosystem(resolutions, ecosystem, opts) {
+          const parse = PARSERS[ecosystem];
+          if (!parse) throw new Error(`no parser registered for ecosystem "${ecosystem}"`);
+          const readConfig = CONFIG_READERS[ecosystem];
+          const keepAll = opts.keepTransitiveExternal === true;
+          const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
+
+          const out = {};
+          for (const r of resolutions) {
+            for (const asset of r.assets) {
+              const mine = asset.manifests.filter((m) => m.ecosystem === ecosystem);
+              if (!mine.length) continue;
+
+              const seen = new Set();
+              const deps = [];
+              const config = {};
+              let dropped = 0;
+              for (const m of mine) {
+                const text = r.texts[m.path];
+                if (text == null) continue;
+                if (readConfig) {
+                  // Last manifest wins on a collision. An asset with several manifests
+                  // of one ecosystem is a monorepo subtree; the deepest one is listed
+                  // last and is the more specific statement.
+                  for (const [k, v] of Object.entries(readConfig(text))) config[`${ecosystem}.${k}`] = v;
+                }
+                for (const d of parse(text)) {
+                  const key = `${d.ecosystem} ${d.name} ${d.version}`;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const internal = isInternal(d.name);
+                  if (!keepAll && !d.direct && !internal && !d.local) {
+                    dropped += 1;
+                    continue;
+                  }
+                  deps.push({ local: false, ...d, internal });
+                }
+              }
+              out[asset.asset_id] = { dependencies: deps, transitive_external_dropped: dropped, config };
+            }
+          }
+          return out;
+        }
+
+        /**
+         * STEP `parse_node` — extract dependencies from the `package.json` files.
+         * No network.
+         *
+         * A sibling of `parse_go`, not a branch inside it: each ecosystem is its own
+         * node on the canvas feeding `build_payloads`, so which ones an organization
+         * actually needs is visible rather than buried in a config blob.
+         *
+         * Node reports DIRECT dependencies only — npm states transitivity in the
+         * lockfile, and lockfiles are large enough to reintroduce the payload problem
+         * the per-build split exists to solve. See `parsePackageJson`.
+         */
+        const parsed = parseEcosystem(inputs.resolutions || [], 'node', {
+          internalPatterns: compileInternalPatterns(inputs.internalPatterns),
+          keepTransitiveExternal: inputs.keepTransitiveExternal === true,
+        });
+        log.info(`parsed node for ${Object.keys(parsed).length} assets`);
+        return { parsed };
+        // <<< END parse_node
+
+  - id: build_payloads
+    type: module
+    plugin_type: code-exec
+    name: "Build Asset Metadata Records"
+    inputs:
+      resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      # One entry per ecosystem step. `build_payloads` merges them, so adding
+      # an ecosystem is a new node plus a line here — never a branch inside a
+      # parser.
+      parsed:
+        - "${{ steps.parse_go.outputs.parsed }}"
+        - "${{ steps.parse_node.outputs.parsed }}"
+      unscannable: "${{ steps.plan_tree_fetches.outputs.unscannable }}"
+      failed: "${{ steps.plan_manifest_fetches.outputs.failed }}"
+    config:
+      code: |
+        // >>> GENERATED build_payloads — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          let s = String(name).toLowerCase();
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        const EMPTY_COUNTS = {
+          total_count: 0,
+          direct_count: 0,
+          internal_count: 0,
+          local_count: 0,
+          transitive_external_dropped: 0,
+        };
+
+        function payload(fields) {
+          return {
+            status: 'ok',
+            status_detail: null,
+            primary_language: null,
+            languages: [],
+            repository_url: null,
+            repository_path: null,
+            commit: null,
+            match_level: null,
+            manifests: [],
+            dependencies: [],
+            manifest_config: {},
+            ...EMPTY_COUNTS,
+            scanned_at: fields.scanned_at,
+            scanner_version: SCANNER_VERSION,
+            ...fields,
+          };
+        }
+
+        /**
+         * Merge the per-ecosystem `parseEcosystem` results into one entry per asset.
+         *
+         * NOT `Object.assign`: an asset whose subtree holds both a `go.mod` and a
+         * `package.json` (a service with a bundled UI — ordinary) appears in BOTH
+         * results, and a shallow merge keeps whichever parse step ran last and
+         * silently discards the other ecosystem's dependencies entirely. The failure
+         * is invisible in the record: `languages` still lists both, so it reads as a
+         * complete scan that is missing half its data.
+         */
+        function mergeParsed(perEcosystem) {
+          const out = {};
+          for (const result of perEcosystem ?? []) {
+            for (const [assetId, got] of Object.entries(result ?? {})) {
+              const prev = out[assetId];
+              if (!prev) {
+                out[assetId] = {
+                  dependencies: [...(got.dependencies ?? [])],
+                  transitive_external_dropped: got.transitive_external_dropped ?? 0,
+                  config: { ...(got.config ?? {}) },
+                };
+                continue;
+              }
+              prev.dependencies.push(...(got.dependencies ?? []));
+              prev.transitive_external_dropped += got.transitive_external_dropped ?? 0;
+              // Config keys are already ecosystem-prefixed, so two ecosystems never
+              // collide here.
+              Object.assign(prev.config, got.config ?? {});
+            }
+          }
+          return out;
+        }
+
+        /**
+         * STEP 5 — assemble one metadata payload per asset.
+         *
+         * `parsed` is the merge of every `parseEcosystem` result. Builds that never got
+         * past an earlier step arrive via `unscannable`/`failed` and still produce a
+         * record — an asset with NO record must mean "never visited", nothing else.
+         */
+        function buildPayloads({ resolutions, parsed, unreachable, now }) {
+          const rows = [];
+
+          for (const { build, status, status_detail } of unreachable ?? []) {
+            for (const a of build.assets || []) {
+              rows.push({
+                asset_id: a.id,
+                asset_name: a.name,
+                exists: a.exists === true,
+                build_id: build.build_id,
+                app_id: build.app_id,
+                data: payload({
+                  repository_url: build.repository_url || null,
+                  commit: build.commit || null,
+                  scanned_at: now,
+                  status,
+                  status_detail,
+                }),
+              });
+            }
+          }
+
+          for (const r of resolutions) {
+            const base = {
+              repository_url: r.plan.repository_url || null,
+              commit: r.plan.commit || null,
+              scanned_at: now,
+            };
+            for (const asset of r.assets) {
+              const row = {
+                asset_id: asset.asset_id,
+                asset_name: asset.asset_name,
+                exists: asset.exists === true,
+                build_id: r.plan.build_id,
+                app_id: r.plan.app_id,
+              };
+              if (!asset.hit) {
+                row.data = payload({
+                  ...base,
+                  status: 'unresolved',
+                  status_detail: `no directory in ${r.plan.owner}/${r.plan.repo} matches asset name "${asset.asset_name}"`,
+                });
+                rows.push(row);
+                continue;
+              }
+
+              const languages = [...new Set(asset.manifests.map((m) => m.ecosystem))].sort();
+              const common = {
+                ...base,
+                repository_path: asset.hit.dir,
+                match_level: asset.hit.level,
+                languages,
+                primary_language: languages[0] ?? null,
+                manifests: asset.manifests.map((m) => ({ path: m.path, language: m.ecosystem })),
+              };
+
+              if (!asset.manifests.length) {
+                row.data = payload({
+                  ...common,
+                  status: 'no_manifest',
+                  status_detail: `resolved to "${asset.hit.dir}" (${asset.hit.level}) but it contains no dependency manifest`,
+                });
+                rows.push(row);
+                continue;
+              }
+
+              const got = parsed[asset.asset_id];
+              if (!got) {
+                row.data = payload({
+                  ...common,
+                  status: 'lang_unsupported',
+                  status_detail: `manifests found (${languages.join(', ')}) but no parser is enabled for them yet`,
+                });
+                rows.push(row);
+                continue;
+              }
+
+              const deps = got.dependencies;
+              const unparsed = languages.filter((l) => !SUPPORTED_ECOSYSTEMS.has(l));
+              row.data = payload({
+                ...common,
+                status: 'ok',
+                status_detail: unparsed.length ? `not parsed yet: ${unparsed.join(', ')}` : null,
+                dependencies: deps,
+                total_count: deps.filter((d) => !d.local).length,
+                direct_count: deps.filter((d) => d.direct && !d.local).length,
+                internal_count: deps.filter((d) => d.internal && !d.local).length,
+                local_count: deps.filter((d) => d.local).length,
+                transitive_external_dropped: got.transitive_external_dropped,
+                manifest_config: got.config ?? {},
+              });
+              rows.push(row);
+            }
+          }
+
+          return rows;
+        }
+
+        /**
+         * STEP `build_payloads` — one metadata record per asset. No network.
+         *
+         * Merges every parse step's output. Builds that never got past an earlier step
+         * arrive through `unreachable` and STILL produce a record: an asset with no
+         * record has to mean "never visited", nothing else, or coverage stops being
+         * measurable.
+         */
+        const parsed = mergeParsed((inputs.parsed || []).filter(Boolean));
+        const rows = buildPayloads({
+          resolutions: inputs.resolutions || [],
+          parsed,
+          unreachable: [...(inputs.unscannable || []), ...(inputs.failed || [])],
+          now: new Date().toISOString(),
+        });
+
+        const byStatus = {};
+        for (const r of rows) byStatus[r.data.status] = (byStatus[r.data.status] || 0) + 1;
+        log.info(`built ${rows.length} asset records`, byStatus);
+
+        return {
+          rows,
+          by_status: byStatus,
+          // POST only: the lake query already excluded assets that have a record, and
+          // the metadata API is create-or-update, not upsert (POST on an existing one
+          // is a 400). An asset is pinned to an immutable commit, so there is nothing
+          // to update — only assets never seen before reach this step.
+          write_requests: rows.map((r) => ({
+            path: `/metadata/asset/${r.asset_id}/dependencies`,
+            body: r.data,
+          })),
+        };
+        // <<< END build_payloads
+
+  # ── Write one metadata record per asset ──────────────────────────────────
+  # POST /metadata/asset/{id}/dependencies is an upsert; re-running the backfill
+  # is idempotent and simply refreshes `scanned_at`.
+  - id: write_metadata
+    type: module
+    plugin_type: np-api-call
+    name: "Write Asset Dependencies Metadata"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      method: POST
+      # Placeholder: validateConfig() runs before per-item inputs merge.
+      path: "/metadata/asset/0/dependencies"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.build_payloads.outputs.write_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 20
+
+  # ── What the caller aggregates ───────────────────────────────────────────
+  # Reached either from `build_payloads` (dry run) or from `write_metadata`.
+  # The default `all` join would wait forever on the branch never traversed:
+  # a `condition: false` edge is not reliably marked skipped.
+  #
+  # This step deliberately does NOT enforce a coverage threshold. One build
+  # resolving badly is a data point; whether the RUN is acceptable is a
+  # judgement only the caller, which sees every build, can make.
+  - id: result
+    type: module
+    plugin_type: code-exec
+    join_strategy: any
+    inputs:
+      scanned: "${{ steps.build_payloads.outputs.rows }}"
+      writtenCount: "${{ steps.write_metadata.outputs.count }}"
+      writeFailed: "${{ steps.write_metadata.outputs.failed }}"
+      levels: "${{ steps.resolve_assets.outputs.levels }}"
+      dryRun: "${{ workflow.inputs.dry_run }}"
+      buildId: "${{ workflow.inputs.build_id }}"
+    name: "Build Result"
+    config:
+      code: |
+        const scanned = inputs.scanned || [];
+
+        const byStatus = {};
+        const byLanguage = {};
+        for (const r of scanned) {
+          byStatus[r.data.status] = (byStatus[r.data.status] || 0) + 1;
+          for (const l of r.data.languages || []) byLanguage[l] = (byLanguage[l] || 0) + 1;
+        }
+
+        // `count` is the iterations attempted and `failed` the ones that
+        // exhausted their retries. Counting the ITEMS array instead shipped
+        // 113 KB into this sandbox and took 302s against 0.8-6.9s for every
+        // other step — measured on the batched shape, 2026-07-26.
+        const written = inputs.dryRun
+          ? 0
+          : Math.max(0, Number(inputs.writtenCount || 0) - Number(inputs.writeFailed || 0));
+
+        const result = {
+          build_id: inputs.buildId,
+          dry_run: inputs.dryRun === true,
+          assets_scanned: scanned.length,
+          assets_written: written,
+          by_status: byStatus,
+          by_language: byLanguage,
+          match_levels: inputs.levels || {},
+          dependencies_stored: scanned.reduce((s, r) => s + (r.data.total_count || 0), 0),
+          transitive_external_dropped: scanned.reduce(
+            (s, r) => s + (r.data.transitive_external_dropped || 0),
+            0,
+          ),
+        };
+        log.info('build scanned', result);
+        return result;
+
+connections:
+  - { id: c1, from: start_manual, to: plan_tree_fetches }
+  - { id: c2, from: plan_tree_fetches, to: fetch_trees }
+  - { id: c3, from: fetch_trees, to: plan_manifest_fetches }
+  - { id: c4, from: plan_manifest_fetches, to: fetch_manifests }
+  - { id: c5, from: fetch_manifests, to: resolve_assets }
+  - { id: c6, from: resolve_assets, to: parse_go }
+  - { id: c6b, from: resolve_assets, to: parse_node }
+  - { id: c7, from: parse_go, to: build_payloads }
+  - { id: c7b, from: parse_node, to: build_payloads }
+  - { id: c8, from: build_payloads, to: write_metadata, condition: "workflow.inputs.dry_run != true" }
+  - { id: c9, from: build_payloads, to: result, condition: "workflow.inputs.dry_run == true" }
+  - { id: c10, from: write_metadata, to: result }
+
+# The sub-workflow plugin returns THESE to the caller — a workflow with no
+# `outputs:` block hands back `{}` no matter what its last step computed, and
+# the caller's aggregation would quietly total zeros.
+outputs:
+  build_id: "${{ steps.result.outputs.build_id }}"
+  assets_scanned: "${{ steps.result.outputs.assets_scanned }}"
+  assets_written: "${{ steps.result.outputs.assets_written }}"
+  by_status: "${{ steps.result.outputs.by_status }}"
+  by_language: "${{ steps.result.outputs.by_language }}"
+  match_levels: "${{ steps.result.outputs.match_levels }}"
+  dependencies_stored: "${{ steps.result.outputs.dependencies_stored }}"
+  transitive_external_dropped: "${{ steps.result.outputs.transitive_external_dropped }}"

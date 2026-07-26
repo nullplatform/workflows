@@ -5,7 +5,7 @@
  * RUN THIS BEFORE COPYING THE SUITE TO A NEW ORGANIZATION. The workflow's
  * defaults — which ecosystems to parse, what counts as an "internal" library,
  * how much coverage to expect, whether the ladder even resolves assets there —
- * were all derived from measurements on ONE organization, and none are portable by
+ * were all derived from measurements on the reference organization, and none of them are portable by
  * assumption. This script re-derives them, read-only, against any org.
  *
  * It answers, with numbers rather than guesses:
@@ -21,7 +21,7 @@
  * Usage:
  *   NP_API_KEY=… GITHUB_TOKEN=… node analysis/analyze-org.mjs [--sample 40] [--json out.json]
  *
- * Interpreting the output: see analysis/README.md, which carries a reference
+ * Interpreting the output: see analysis/README.md, which carries the the reference organization
  * baseline to compare against.
  */
 import { writeFileSync } from 'node:fs';
@@ -89,8 +89,10 @@ function gh(token) {
         );
         if (res.status === 200) {
           const body = await res.json();
-          return { paths: body.tree.filter((n) => n.type === 'blob').map((n) => n.path),
-                   truncated: body.truncated === true };
+          return {
+            paths: body.tree.filter((n) => n.type === 'blob').map((n) => n.path),
+            truncated: body.truncated === true,
+          };
         }
         if (res.status === 401 || res.status === 403) throw new Error(`HTTP ${res.status}`);
       }
@@ -250,7 +252,10 @@ for (const t of trees) {
   }
 }
 report.languages = Object.fromEntries(
-  [...langRepos].map(([l, repos]) => [l, { repos, assets: langAssets.get(l) ?? 0, parsed: SUPPORTED_ECOSYSTEMS.has(l) }]),
+  [...langRepos].map(([l, repos]) => [
+    l,
+    { repos, assets: langAssets.get(l) ?? 0, parsed: SUPPORTED_ECOSYSTEMS.has(l) },
+  ]),
 );
 console.log(`  ${'ecosystem'.padEnd(14)}${'repos'.padStart(7)}${'assets'.padStart(9)}   parser?`);
 for (const [l, n] of [...langRepos].sort((a, b) => b[1] - a[1])) {
@@ -261,7 +266,10 @@ for (const [l, n] of [...langRepos].sort((a, b) => b[1] - a[1])) {
 }
 const noManifest = trees.filter((t) => !t.error && (repoLangs.get(t.app.app_id)?.size ?? 0) === 0);
 console.log(`  repos with no recognised manifest: ${noManifest.length} (third-party images, etc.)`);
-if (truncatedCount) console.log(`  WARNING: ${truncatedCount} repo tree(s) TRUNCATED — those need a different strategy.`);
+if (truncatedCount)
+  console.log(
+    `  WARNING: ${truncatedCount} repo tree(s) TRUNCATED — those need a different strategy.`,
+  );
 if (unreachable.length) {
   console.log(`  UNREACHABLE repos: ${unreachable.length}`);
   for (const u of unreachable.slice(0, 10)) console.log(`    - ${u}`);
@@ -295,7 +303,7 @@ for (const [k, v] of Object.entries(ladder)) {
   console.log(`  ${k}: ${String(v).padStart(5)}  ${pct(v, totalAssets)}`);
 }
 if (ladder.L5 > 0) {
-  console.log(`  ⚠ ${ladder.L5} asset(s) unresolved — this org needs work the defaults do not cover:`);
+  console.log(`  ⚠ ${ladder.L5} asset(s) unresolved — this org needs work the the reference organization rules did not:`);
   for (const e of unresolvedExamples) console.log(`    - ${e}`);
   console.log('    Look at how those repos are laid out before trusting the defaults.');
 } else {
@@ -311,33 +319,44 @@ const scanned = await mapLimit(
   trees.filter((t) => !t.error).slice(0, Math.min(20, trees.length)),
   4,
   async (t) =>
-    scanBuild({ ...t.app, assets: t.app.assets }, {
-      tree: async () => t.paths,
-      blobs: async (owner, repo, ref, paths) => {
-        const out = {};
-        for (let i = 0; i < paths.length; i += 60) {
-          const chunk = paths.slice(i, i + 60);
-          const aliases = chunk
-            .map((p, j) => `f${j}: object(expression: ${JSON.stringify(`${ref}:${p}`)}) { ... on Blob { text } }`)
-            .join('\n');
-          const res = await fetch('https://api.github.com/graphql', {
-            method: 'POST',
-            headers: { ...G.headers, 'content-type': 'application/json' },
-            body: JSON.stringify({
-              query: `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(repo)}) {\n${aliases}\n} }`,
-            }),
-          });
-          const body = await res.json();
-          const node = body.data?.repository;
-          if (node) {
-            chunk.forEach((p, j) => {
-              if (typeof node[`f${j}`]?.text === 'string') out[p] = node[`f${j}`].text;
+    scanBuild(
+      { ...t.app, assets: t.app.assets },
+      {
+        tree: async () => t.paths,
+        blobs: async (owner, repo, ref, paths) => {
+          const out = {};
+          for (let i = 0; i < paths.length; i += 60) {
+            const chunk = paths.slice(i, i + 60);
+            const aliases = chunk
+              .map(
+                (p, j) =>
+                  `f${j}: object(expression: ${JSON.stringify(`${ref}:${p}`)}) { ... on Blob { text } }`,
+              )
+              .join('\n');
+            const res = await fetch('https://api.github.com/graphql', {
+              method: 'POST',
+              headers: { ...G.headers, 'content-type': 'application/json' },
+              body: JSON.stringify({
+                query: `query { repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(repo)}) {\n${aliases}\n} }`,
+              }),
             });
+            const body = await res.json();
+            const node = body.data?.repository;
+            if (node) {
+              chunk.forEach((p, j) => {
+                if (typeof node[`f${j}`]?.text === 'string') out[p] = node[`f${j}`].text;
+              });
+            }
           }
-        }
-        return out;
+          return out;
+        },
       },
-    }, { internalPatterns: compileInternalPatterns([]), now: new Date().toISOString(), keepTransitiveExternal: true }),
+      {
+        internalPatterns: compileInternalPatterns([]),
+        now: new Date().toISOString(),
+        keepTransitiveExternal: true,
+      },
+    ),
 );
 
 const prefixCount = new Map();
@@ -345,7 +364,7 @@ for (const rowsForBuild of scanned) {
   for (const row of rowsForBuild ?? []) {
     for (const dep of row.data.dependencies) {
       if (dep.local) continue;
-      // First two path segments: `github.com/acme`, `com.acme`, `@scope`.
+      // First two path segments: `github.com/acme`, `com.the reference organization`, `@scope`.
       const m = /^(@[^/]+|[^/]+\/[^/]+|[^.]+\.[^.]+)/.exec(dep.name);
       if (m) prefixCount.set(m[1], (prefixCount.get(m[1]) ?? 0) + 1);
     }
@@ -365,7 +384,7 @@ const suggested = ownerList.map(([o]) => `^github\\.com/${o}/`);
 report.repositoryOwners = Object.fromEntries(ownerList);
 report.suggestedInternalPatterns = suggested;
 
-console.log('  repository owners of this org\'s own applications (the reliable signal):');
+console.log("  repository owners of this org's own applications (the reliable signal):");
 for (const [o, n] of ownerList) console.log(`  ${String(n).padStart(6)} apps   github.com/${o}`);
 
 const top = [...prefixCount].sort((a, b) => b[1] - a[1]).slice(0, 15);
@@ -397,7 +416,9 @@ for (const [s, n] of Object.entries(statuses).sort((a, b) => b[1] - a[1])) {
   console.log(`  ${s.padEnd(20)} ${String(n).padStart(5)}  ${pct(n, totalScanned)}`);
 }
 const okPct = (100 * (statuses.ok ?? 0)) / (totalScanned || 1);
-console.log(`\n  → set LIB_MIN_COVERAGE_PCT below the WRITE success rate, not below ${okPct.toFixed(0)}%:`);
+console.log(
+  `\n  → set LIB_MIN_COVERAGE_PCT below the WRITE success rate, not below ${okPct.toFixed(0)}%:`,
+);
 console.log('    coverage counts records WRITTEN, and a lang_unsupported record is still written.');
 
 if (JSON_OUT) {
@@ -409,6 +430,10 @@ bar('Summary — decide these before rolling out');
 console.log(`  LIB_SCAN_NRN_PREFIX    start narrow: one application, then namespace, then org`);
 console.log(`  LIB_INTERNAL_PATTERNS  from section 4 — no default is correct for a new org`);
 console.log(`  LIB_MAX_BUILDS         ${universe.builds} builds total; batch accordingly`);
-console.log(`  parsers to add         ${[...langRepos.keys()].filter((l) => !SUPPORTED_ECOSYSTEMS.has(l)).join(', ') || 'none'}`);
-console.log(`  ladder health          ${ladder.L5 === 0 ? 'OK' : `${ladder.L5} unresolved — investigate first`}`);
+console.log(
+  `  parsers to add         ${[...langRepos.keys()].filter((l) => !SUPPORTED_ECOSYSTEMS.has(l)).join(', ') || 'none'}`,
+);
+console.log(
+  `  ladder health          ${ladder.L5 === 0 ? 'OK' : `${ladder.L5} unresolved — investigate first`}`,
+);
 void MANIFEST_LANGS;
