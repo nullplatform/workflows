@@ -274,7 +274,10 @@ steps:
               properties:
                 application_id: { type: string }
                 summary_md: { type: string }
-                short_summary: { type: string }
+                short_summary:
+                  type: array
+                  maxItems: 3
+                  items: { type: string }
           namespace_summaries:
             type: array
             items:
@@ -283,7 +286,10 @@ steps:
               properties:
                 namespace_id: { type: string }
                 summary_md: { type: string }
-                short_summary: { type: string }
+                short_summary:
+                  type: array
+                  maxItems: 3
+                  items: { type: string }
 
   - id: write
     type: module
@@ -313,7 +319,7 @@ steps:
         const nsSum = new Map((llm.namespace_summaries || []).map(s => [String(s.namespace_id), s.summary_md]));
         const appShort = new Map((llm.app_summaries || []).map(s => [String(s.application_id), s.short_summary]));
         const nsShort = new Map((llm.namespace_summaries || []).map(s => [String(s.namespace_id), s.short_summary]));
-        const derivedShort = (md) => "- " + (String(md || "").split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 100);
+        const derivedShort = (md) => [(String(md || "").split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 100)];
 
         // Fallback narrative when the LLM output is missing for an entity.
         const fallback = (deploys) => deploys.map(d =>
