@@ -61,7 +61,6 @@ steps:
       previously_deployed_override: "${{ steps.trigger.outputs.inputs.previously_deployed }}"
       np_api_key:     "${{ secrets.NP_API_KEY }}"
       github_token:   "${{ secrets.GITHUB_TOKEN }}"
-      np_org_id:      "${{ vars.NP_ORGANIZATION_ID }}"
     config:
       network:
         allowedHosts: ["api.nullplatform.com", "api.github.com"]
@@ -189,30 +188,9 @@ steps:
           participants = [...people].map(([github, roles]) => ({ github, roles: [...roles] }));
         }
 
-        // Map GitHub logins → NP users via user metadata identity.github_username
-        const byGithub = new Map();
-        // Paged: the org can exceed one page (327 users at last count) and a
-        // single limit=200 call silently drops the tail -> unmapped authors.
-        const humans = [];
-        if (participants.length) {
-          for (let off = 0; ; off += 200) {
-            const page = (await np(`/user?organization_id=${$item.np_org_id}&limit=200&offset=${off}`)).results || [];
-            humans.push(...page.filter(u => u.email && !u.email.startsWith("apikey+")));
-            if (page.length < 200) break;
-          }
-        }
-        await Promise.all(humans.map(async (u) => {
-          try {
-            const meta = await np(`/metadata/user/${u.id}`);
-            const login = meta.identity && meta.identity.github_username;
-            if (login) byGithub.set(login.toLowerCase(), u.id);
-          } catch (e) { /* user without metadata */ }
-        }));
-        participants = participants.map(p => ({
-          github: p.github,
-          np_user_id: byGithub.get(p.github.toLowerCase()) || null,
-          roles: p.roles,
-        }));
+        // Participants stay as {github, roles}: mapping to platform users
+        // happens at REPORT time (lake join vs user/identity metadata) — it
+        // stays current when mappings change and costs zero API calls here.
 
         // Deterministic signals
         const PATTERNS = {
@@ -371,7 +349,7 @@ steps:
           ? (mode === "fastpath" ? "Release already deployed to this scope recently - rollback fastpath" : "Auto-approved: risk " + risk + " x criticality " + critName)
           : "Matrix requires " + mode + " approval (risk " + risk + " x criticality " + critName + ") - falls back to manual review until Slack approvals land";
         const participantsLine = (change.participants || [])
-          .map(p => `${p.github}${p.np_user_id ? "" : " (unmapped)"} [${p.roles.join(", ")}]`).join(", ") || "none detected";
+          .map(p => `${p.github} [${p.roles.join(", ")}]`).join(", ") || "none detected";
         const prSummaries = new Map(((llm && llm.pr_summaries) || []).map(p => [p.number, p.summary]));
         const prs_enriched = (change.prs || []).map(p => Object.assign({}, p, {
           summary: prSummaries.get(p.number) || (p.description ? p.description.split("\n")[0].slice(0, 160) : null),
