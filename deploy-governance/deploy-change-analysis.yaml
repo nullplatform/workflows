@@ -191,9 +191,16 @@ steps:
 
         // Map GitHub logins → NP users via user metadata identity.github_username
         const byGithub = new Map();
-        const humans = participants.length
-          ? ((await np(`/user?organization_id=${$item.np_org_id}&limit=200`)).results || []).filter(u => u.email && !u.email.startsWith("apikey+"))
-          : [];
+        // Paged: the org can exceed one page (327 users at last count) and a
+        // single limit=200 call silently drops the tail -> unmapped authors.
+        const humans = [];
+        if (participants.length) {
+          for (let off = 0; ; off += 200) {
+            const page = (await np(`/user?organization_id=${$item.np_org_id}&limit=200&offset=${off}`)).results || [];
+            humans.push(...page.filter(u => u.email && !u.email.startsWith("apikey+")));
+            if (page.length < 200) break;
+          }
+        }
         await Promise.all(humans.map(async (u) => {
           try {
             const meta = await np(`/metadata/user/${u.id}`);
