@@ -36,7 +36,10 @@ steps:
       pathPrefix: /checklist/deploy/change-analysis
       mode: start
       kind: deploy-change-analysis
-      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      # LITERAL on purpose — replace with your org id. Trigger config does
+      # NOT resolve ${{ vars.* }} at activation time; an unresolved nrn makes
+      # the channel POST fail with an opaque 401.
+      nrn: "organization=<your-org-id>"
       npApiKey: "${{ secrets.NP_API_KEY }}"
 
   - id: progress

@@ -90,6 +90,13 @@ four-eyes pair review, and an admin escalation each unblock the deploy.
 
 ## Production gotchas this suite encodes
 
+- **Trigger config is literal**: `${{ vars.* }}` does NOT resolve inside a
+  trigger's `config` at activation (steps resolve at run time; triggers do
+  not) — the `np-checklist-trigger` `nrn` must be a literal, or channel
+  creation fails with an opaque 401. Activation also needs a caller with
+  `notification_channel` permissions (the activate call's bearer is the
+  actor for channel management).
+
 - **Sandbox pool saturation**: firing 100+ analysis children at once exhausts
   the code-exec sandbox pool; children die *before* the LLM step (zero cost).
   The dispatcher skips deploys that already have metadata, so re-firing
