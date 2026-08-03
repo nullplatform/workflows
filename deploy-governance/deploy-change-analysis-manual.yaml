@@ -277,15 +277,18 @@ steps:
         - summary_md: ≤120-word markdown summary of what this deploy changes
           FUNCTIONALLY (features, fixes, behavior), for the human who approves
           it. Do not list files or line counts.
+        - short_summary: ONE plain sentence (max 15 words, no markdown) naming
+          the essential functional change — used where UI space is tight.
         - pr_summaries: for EACH PR in the input, a one-line functional summary
           (≤25 words) of what that PR ships.
       outputSchema:
         type: object
-        required: [risk, rationale, summary_md]
+        required: [risk, rationale, summary_md, short_summary]
         properties:
           risk: { type: string, enum: [low, medium, high] }
           rationale: { type: string }
           summary_md: { type: string }
+          short_summary: { type: string }
           pr_summaries:
             type: array
             items:
@@ -333,6 +336,8 @@ steps:
           `${(change.commits || []).length} commits, ${(change.signals || {}).files_changed || 0} files: ` +
           ((change.prs || []).map(p => p.title).join("; ") || (change.commits || []).slice(0, 5).map(c => c.message).join("; ") || "no commit data");
         const rationale = llm.rationale || "Heuristic score (LLM unavailable).";
+        const short_summary = llm.short_summary ||
+          (summary_md.split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 120);
         const RANK = { mission_critical: 1, critical: 2, important: 3, standard: 4, internal: 5 };
         const critName = change.criticality || "critical";
         const rank = RANK[critName] || 2;
@@ -381,7 +386,7 @@ steps:
         return {
           metadata: Object.assign({}, change, {
             prs: prs_enriched,
-            risk, risk_rationale: rationale, risk_floors_applied: floors, summary_md,
+            risk, risk_rationale: rationale, risk_floors_applied: floors, summary_md, short_summary,
             approval: { mode, criticality: critName },
           }),
           markdown: markdown + "\n**Decision:** " + mode,
@@ -431,6 +436,7 @@ steps:
         const rationale = "Heuristic score (LLM step failed): size, accumulation and sensitive-path signals only.";
         const summary_md = `${(change.commits || []).length} commits, ${s.files_changed || 0} files: ` +
           ((change.prs || []).map(p => p.title).join("; ") || "no commit data");
+        const short_summary = ((change.prs || [])[0] ? (change.prs || [])[0].title : `${(change.commits || []).length} commits`).slice(0, 120);
         const markdown = `### Change analysis — risk: **${risk.toUpperCase()}** _(heuristic)_\n\n${summary_md}\n\n**Why:** ${rationale}`;
         const gate_results = [
           { item: "already_deployed",
@@ -443,7 +449,7 @@ steps:
         ];
         return {
           metadata: Object.assign({}, change, {
-            risk, risk_rationale: rationale, risk_floors_applied: floors, summary_md,
+            risk, risk_rationale: rationale, risk_floors_applied: floors, summary_md, short_summary,
             approval: { mode, criticality: critName },
           }),
           markdown: markdown + "\n**Decision:** " + mode,
@@ -505,7 +511,7 @@ steps:
         const patch = (url, body) => fetch(url, { method: "PATCH", headers: H, body: JSON.stringify(body) });
         await post(`${callbackUrl}/log`, { level: "info", message: `Risk: ${out.risk} - ${out.metadata.risk_rationale}` }).catch(() => null);
         await post(`${callbackUrl}/log`, { level: "info", message: `Matrix decision: ${out.decision_mode} (criticality ${out.metadata.criticality || "critical"})` }).catch(() => null);
-        let r = await patch(callbackUrl, { status: "passed", message: `Change analyzed - risk ${out.risk}`, details: { markdown: out.markdown } });
+        let r = await patch(callbackUrl, { status: "passed", message: `Risk ${out.risk}: ${out.metadata.short_summary || "change analyzed"}`, details: { markdown: out.markdown } });
         if (!r.ok) throw new Error(`change_analysis resolve -> ${r.status}: ${await r.text()}`);
         // Sibling gates (cross_validation group, template v6). Tolerated when
         // the item is absent (404), when the token is item-scoped pre-#260
@@ -575,7 +581,7 @@ steps:
         const patch = (url, body) => fetch(url, { method: "PATCH", headers: H, body: JSON.stringify(body) });
         await post(`${callbackUrl}/log`, { level: "info", message: `Risk: ${out.risk} - ${out.metadata.risk_rationale}` }).catch(() => null);
         await post(`${callbackUrl}/log`, { level: "info", message: `Matrix decision: ${out.decision_mode} (criticality ${out.metadata.criticality || "critical"})` }).catch(() => null);
-        let r = await patch(callbackUrl, { status: "passed", message: `Change analyzed - risk ${out.risk}`, details: { markdown: out.markdown } });
+        let r = await patch(callbackUrl, { status: "passed", message: `Risk ${out.risk}: ${out.metadata.short_summary || "change analyzed"}`, details: { markdown: out.markdown } });
         if (!r.ok) throw new Error(`change_analysis resolve -> ${r.status}: ${await r.text()}`);
         // Sibling gates (cross_validation group, template v6). Tolerated when
         // the item is absent (404), when the token is item-scoped pre-#260

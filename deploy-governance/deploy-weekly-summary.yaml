@@ -247,14 +247,18 @@ steps:
 
         Produce:
         - app_summaries: for EACH application in the input, a markdown summary
-          (≤180 words) of what shipped to production that week, functionally.
+          (≤180 words) of what shipped to production that week, functionally,
+          PLUS short_summary: up to 3 markdown bullets (max 10 words each)
+          with the week's highlights for that app — for tight UI spaces.
           Reference the key PRs by number (e.g. "(#123)"). Do NOT name people
           in the narrative — participants and roles are stored as structured
           data next to the summary. If an app's deploys have no analysis data
           (summary_md null), say what can be inferred from versions and note
           the analysis is missing.
         - namespace_summaries: for EACH namespace, a markdown roll-up (≤250
-          words) built FROM the app summaries: the week's theme, notable
+          words) built FROM the app summaries, PLUS short_summary: up to 3
+          markdown bullets (max 10 words each) with the namespace's week
+          highlights. The roll-up covers: the week's theme, notable
           features/fixes across its apps (reference the most relevant PRs by
           number and app), and anything risky (high-risk deploys, db
           migrations, rollbacks). Do NOT name people in the narrative.
@@ -266,18 +270,20 @@ steps:
             type: array
             items:
               type: object
-              required: [application_id, summary_md]
+              required: [application_id, summary_md, short_summary]
               properties:
                 application_id: { type: string }
                 summary_md: { type: string }
+                short_summary: { type: string }
           namespace_summaries:
             type: array
             items:
               type: object
-              required: [namespace_id, summary_md]
+              required: [namespace_id, summary_md, short_summary]
               properties:
                 namespace_id: { type: string }
                 summary_md: { type: string }
+                short_summary: { type: string }
 
   - id: write
     type: module
@@ -305,6 +311,9 @@ steps:
 
         const appSum = new Map((llm.app_summaries || []).map(s => [String(s.application_id), s.summary_md]));
         const nsSum = new Map((llm.namespace_summaries || []).map(s => [String(s.namespace_id), s.summary_md]));
+        const appShort = new Map((llm.app_summaries || []).map(s => [String(s.application_id), s.short_summary]));
+        const nsShort = new Map((llm.namespace_summaries || []).map(s => [String(s.namespace_id), s.short_summary]));
+        const derivedShort = (md) => "- " + (String(md || "").split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 100);
 
         // Fallback narrative when the LLM output is missing for an entity.
         const fallback = (deploys) => deploys.map(d =>
@@ -327,6 +336,7 @@ steps:
           const latest = weeks[0];
           const body = JSON.stringify({
             latest_summary: `**Semana ${latest.week_start} → ${latest.week_end}** — ${latest.deploys} deploys (risk: ${latest.risk.low || 0} low / ${latest.risk.medium || 0} medium / ${latest.risk.high || 0} high)\n\n${latest.summary_md}`,
+            latest_short: latest.short_summary || derivedShort(latest.summary_md),
             weeks,
           });
           let res = await fetch(url, { method: "POST", headers: H, body });
@@ -347,6 +357,7 @@ steps:
             deploys: a.stats.deploys, risk: a.stats.risk, fastpath: a.stats.fastpath,
             db_migrations: a.stats.db_migrations,
             summary_md: appSum.get(String(a.application_id)) || fallback(a.deploys),
+            short_summary: appShort.get(String(a.application_id)) || derivedShort(appSum.get(String(a.application_id)) || fallback(a.deploys)),
             prs: (a.all_prs || []).map(p => ({ number: p.number, title: p.title, author: p.author, summary: p.summary })),
             people: a.people || [],
             generated_at,
@@ -381,6 +392,7 @@ steps:
             contributors,
             summary_md: nsSum.get(String(ns.namespace_id)) ||
               nsApps.map(a => `**${a.app_name}**: ${(appSum.get(String(a.application_id)) || "(sin resumen)").split("\n")[0]}`).join("\n"),
+            short_summary: nsShort.get(String(ns.namespace_id)) || derivedShort(nsSum.get(String(ns.namespace_id)) || ""),
             generated_at,
           });
           nsWritten++;
