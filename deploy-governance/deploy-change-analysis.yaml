@@ -179,12 +179,36 @@ steps:
             }
             pr._collab = [...prPeople].map(([github, roles]) => ({ github, roles: [...roles] }));
           });
-          prs = [...prMap.values()].map(p => ({
-            number: p.number, title: p.title, branch: p.head && p.head.ref,
-            author: p.user && p.user.login,
-            collaborators: p._collab || [],
-            description: (p.body || "").slice(0, 500),
-          }));
+          // --- AI usage per PR: commit trailers (Co-Authored-By: Claude/...)
+          // and PR-body markers. "level" buckets the share of AI commits.
+          const AI_COMMIT = /co-authored-by:.*?(claude|copilot|cursor|devin|aider|codegen|windsurf)|generated with \[?claude|claude-session:/i;
+          const AI_BODY = /claude code|claude\.ai\/code|github copilot|devin\.ai|generated with/i;
+          const prAi = new Map();
+          const cList = (cmp.commits || []).slice(0, 250);
+          cList.forEach((c, i) => {
+            const isAi = AI_COMMIT.test((c.commit && c.commit.message) || "");
+            for (const pr of prLists[i] || []) {
+              if (!prAi.has(pr.number)) prAi.set(pr.number, { total: 0, ai: 0 });
+              const s = prAi.get(pr.number); s.total++; if (isAi) s.ai++;
+            }
+          });
+          prs = [...prMap.values()].map(p => {
+            const st = prAi.get(p.number) || { total: 0, ai: 0 };
+            const bodyMarker = AI_BODY.test(p.body || "");
+            const ratio = st.total ? st.ai / st.total : 0;
+            const used = st.ai > 0 || bodyMarker;
+            return {
+              number: p.number, title: p.title, branch: p.head && p.head.ref,
+              author: p.user && p.user.login,
+              collaborators: p._collab || [],
+              description: (p.body || "").slice(0, 500),
+              ai: {
+                used,
+                level: !used ? "none" : ratio >= 1 ? "full" : ratio >= 0.5 ? "mostly" : "assisted",
+                commits_ai: st.ai, commits_total: st.total, body_marker: bodyMarker,
+              },
+            };
+          });
           participants = [...people].map(([github, roles]) => ({ github, roles: [...roles] }));
         }
 
@@ -232,6 +256,12 @@ steps:
           previously_deployed,
           releases_between,
           commits, files, prs, participants, signals,
+          ai_usage: {
+            prs_ai: prs.filter(p => p.ai && p.ai.used).length,
+            prs_total: prs.length,
+            commits_ai: prs.reduce((n, p) => n + ((p.ai && p.ai.commits_ai) || 0), 0),
+            commits_total: prs.reduce((n, p) => n + ((p.ai && p.ai.commits_total) || 0), 0),
+          },
         };
     errorHandling:
       fallbackStep: resolve_failure
@@ -362,7 +392,8 @@ steps:
         const prLines = prs_enriched.map(p => {
           const others = (p.collaborators || []).filter(c => c.github !== p.author)
             .map(c => `${c.github} (${c.roles.join("/")})`).join(", ");
-          return `- **#${p.number} ${p.title}** — ${p.author}${others ? " · con " + others : ""}${p.summary ? `\n  ${p.summary}` : ""}`;
+          const aiTag = p.ai && p.ai.used ? ` · 🤖 AI ${p.ai.level}` : "";
+          return `- **#${p.number} ${p.title}** — ${p.author}${others ? " · con " + others : ""}${aiTag}${p.summary ? `\n  ${p.summary}` : ""}`;
         }).join("\n");
         const markdown = [
           `### Change analysis — risk: **${risk.toUpperCase()}**${floors.length ? ` _(floors: ${floors.join(", ")})_` : ""}`,

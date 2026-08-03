@@ -132,6 +132,7 @@ steps:
             floors: (change && change.risk_floors_applied) || [],
             prs: ((change && change.prs) || []).map(p => ({
               number: p.number, title: p.title, author: p.author, summary: p.summary || null,
+              ai: (p.ai && p.ai.level) || null,
               collaborators: (p.collaborators || []).map(c => ({ github: c.github, roles: c.roles })),
             })),
             participants: ((change && change.participants) || []).map(p => ({ github: p.github, roles: p.roles || [] })),
@@ -174,6 +175,7 @@ steps:
             risk: hist(a.deploys),
             fastpath: a.deploys.filter(d => d.fastpath).length,
             db_migrations: a.deploys.filter(d => (d.floors || []).includes("db_migration")).length,
+            ai_prs: mergePrs(a.deploys).filter(p => p.ai && p.ai !== "none").length,
             prs: mergePrs(a.deploys).length,
             participants: mergeRoles(a.deploys).length,
           },
@@ -361,10 +363,10 @@ steps:
           await upsert("application", a.application_id, {
             week_start: gathered.week_start, week_end: gathered.week_end,
             deploys: a.stats.deploys, risk: a.stats.risk, fastpath: a.stats.fastpath,
-            db_migrations: a.stats.db_migrations,
+            db_migrations: a.stats.db_migrations, ai_prs: a.stats.ai_prs,
             summary_md: appSum.get(String(a.application_id)) || fallback(a.deploys),
             short_summary: appShort.get(String(a.application_id)) || derivedShort(appSum.get(String(a.application_id)) || fallback(a.deploys)),
-            prs: (a.all_prs || []).map(p => ({ number: p.number, title: p.title, author: p.author, summary: p.summary })),
+            prs: (a.all_prs || []).map(p => ({ number: p.number, title: p.title, author: p.author, summary: p.summary, ai: p.ai || null })),
             people: a.people || [],
             generated_at,
           });
@@ -394,6 +396,7 @@ steps:
             apps: nsApps.map(a => ({ id: a.application_id, name: a.app_name, deploys: a.stats.deploys })),
             risk: agg,
             prs: nsApps.reduce((n, a) => n + (a.all_prs || []).length, 0),
+            ai_prs: nsApps.reduce((n, a) => n + (a.stats.ai_prs || 0), 0),
             db_migrations: nsApps.reduce((n, a) => n + a.stats.db_migrations, 0),
             contributors,
             summary_md: nsSum.get(String(ns.namespace_id)) ||
