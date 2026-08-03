@@ -1,0 +1,394 @@
+# Deploy Weekly Summary — aggregates the week's production deploys into
+# functional summaries at APP and NAMESPACE level, persisted as rolling
+# metadata (last 53 weeks) for reporting/dashboards.
+#
+# Data source: deployment.metadata.change (written by deploy-change-analysis)
+# — the per-deploy summary_md and PR summaries already exist, so this is pure
+# text aggregation: NO GitHub calls, NO re-analysis. One LLM call per week.
+#
+# Triggers:
+#   - cron: Mondays 07:00 America/Argentina/Buenos_Aires (summarizes the week
+#     that just ended: Mon 00:00 UTC → next Mon 00:00 UTC).
+#   - webhook (manual/testing): POST body {"week_offset": 1}
+#     week_offset=1 → last full week; 2 → the week before; default 1.
+#
+# Storage: metadata `deploy_summaries` on application and namespace entities.
+# Rolling window: newest-first array, trimmed to 53 entries (~1 year).
+# Idempotent: re-running a week replaces that week's entry (upsert by
+# week_start), so manual re-fires are safe.
+id: deploy-weekly-summary
+key: deploy-weekly-summary
+name: "Deploy Weekly Summary (app + namespace)"
+description: >
+  Weekly cron: collects the previous week's production deployments and their
+  change metadata, produces functional summaries per application and per
+  namespace with one LLM call, and persists them as rolling 53-week metadata
+  (deploy_summaries) on each entity.
+semantic_version: 1.0.0
+path: "/checklist/deploy"
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+steps:
+  # 09:00 keeps it well clear of the 01:30 nightly backfill: by the time the
+  # weekly runs, every deploy of the closing week already has its metadata.
+  - id: trigger
+    type: trigger
+    pluginType: cron
+    name: "Weekly (Mondays 09:00 AR)"
+    config:
+      schedule: "0 9 * * 1"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  - id: gather
+    type: module
+    pluginType: code-exec
+    name: "Collect week's deploys + change metadata"
+    inputs:
+      week_offset: "${{ workflow.inputs.body.week_offset }}"
+      np_api_key: "${{ secrets.NP_API_KEY }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const npApiKey = $item.np_api_key;
+        const weekOffset = Number($item.week_offset) || 1;
+
+        // Previous full week in UTC: Monday 00:00 → next Monday 00:00.
+        const now = new Date();
+        const day = (now.getUTCDay() + 6) % 7; // 0 = Monday
+        const thisMonday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - day));
+        const weekStart = new Date(thisMonday.getTime() - weekOffset * 7 * 86400000);
+        const weekEnd = new Date(weekStart.getTime() + 7 * 86400000);
+        const iso = (d) => d.toISOString().slice(0, 10);
+        const fmt = (d) => d.toISOString().slice(0, 19).replace("T", " ");
+
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: npApiKey }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+
+        // Lake: finalized production deploys inside the week, with app + namespace.
+        const sql = `
+          WITH prod_scopes AS (
+            SELECT DISTINCT scope_id FROM core_entities_scope_dimension
+            WHERE dimension_slug = 'environment' AND value_slug = 'production'
+          )
+          SELECT d.id, s.application_id, a.app_name, a.namespace_id, n.namespace_name, d.created_at
+          FROM core_entities_deployment d FINAL
+          JOIN core_entities_scope s FINAL ON s.id = d.scope_id
+          JOIN core_entities_application a FINAL ON a.app_id = s.application_id
+          LEFT JOIN core_entities_namespace n FINAL ON n.namespace_id = a.namespace_id
+          WHERE d.status = 'finalized'
+            AND d.scope_id IN (SELECT scope_id FROM prod_scopes)
+            AND d.created_at >= toDateTime('${fmt(weekStart)}')
+            AND d.created_at <  toDateTime('${fmt(weekEnd)}')
+          ORDER BY d.created_at`;
+        const lakeRes = await fetch("https://api.nullplatform.com/data/lake/query", {
+          method: "POST",
+          headers: { authorization: `Bearer ${npToken}`, "content-type": "application/json" },
+          body: JSON.stringify({ query: sql }),
+        });
+        if (!lakeRes.ok) throw new Error(`lake query → ${lakeRes.status}: ${(await lakeRes.text()).slice(0, 200)}`);
+        // Headerless TSV, columns in SELECT order; numbers arrive as strings.
+        const COLS = ["deployment_id", "application_id", "app_name", "namespace_id", "namespace_name", "created_at"];
+        const rows = (await lakeRes.text()).trim().split("\n").filter(Boolean).map((line) => {
+          const parts = line.split("\t");
+          const r = {};
+          for (let i = 0; i < COLS.length; i++) r[COLS[i]] = parts[i];
+          return r;
+        });
+
+        // Fetch change metadata per deploy (already computed by the analysis
+        // workflow; 404 = deploy without analysis, still counted).
+        const deploys = [];
+        for (const r of rows) {
+          let change = null;
+          try {
+            const res = await fetch(`https://api.nullplatform.com/metadata/deployment/${r.deployment_id}/change`, {
+              headers: { authorization: `Bearer ${npToken}` },
+            });
+            if (res.ok) change = await res.json();
+          } catch (e) { /* keep null */ }
+          deploys.push({
+            deployment_id: r.deployment_id,
+            application_id: r.application_id,
+            app_name: r.app_name,
+            namespace_id: r.namespace_id,
+            namespace_name: r.namespace_name || "(sin namespace)",
+            date: r.created_at,
+            risk: change && change.risk || null,
+            mode: change && change.approval && change.approval.mode || null,
+            fastpath: !!(change && change.previously_deployed),
+            from_semver: change && change.from_release && change.from_release.semver || null,
+            to_semver: change && change.to_release && change.to_release.semver || null,
+            summary_md: change && change.summary_md || null,
+            floors: (change && change.risk_floors_applied) || [],
+            prs: ((change && change.prs) || []).map(p => ({
+              number: p.number, title: p.title, author: p.author, summary: p.summary || null,
+              collaborators: (p.collaborators || []).map(c => ({ github: c.github, roles: c.roles })),
+            })),
+            participants: ((change && change.participants) || []).map(p => ({ github: p.github, roles: p.roles || [] })),
+          });
+        }
+
+        // Group by app; count risk histogram.
+        const byApp = new Map();
+        for (const d of deploys) {
+          if (!byApp.has(d.application_id)) byApp.set(d.application_id, {
+            application_id: d.application_id, app_name: d.app_name,
+            namespace_id: d.namespace_id, namespace_name: d.namespace_name,
+            deploys: [],
+          });
+          byApp.get(d.application_id).deploys.push(d);
+        }
+        const hist = (list) => {
+          const h = { low: 0, medium: 0, high: 0, unknown: 0 };
+          for (const d of list) h[d.risk || "unknown"]++;
+          return h;
+        };
+        const mergeRoles = (deploys) => {
+          const m = new Map();
+          for (const d of deploys) for (const p of d.participants || []) {
+            if (!m.has(p.github)) m.set(p.github, new Set());
+            for (const r of p.roles) m.get(p.github).add(r);
+          }
+          return [...m].map(([github, roles]) => ({ github, roles: [...roles] }));
+        };
+        const mergePrs = (deploys) => {
+          const m = new Map();
+          for (const d of deploys) for (const p of d.prs || []) if (!m.has(p.number)) m.set(p.number, p);
+          return [...m.values()];
+        };
+        const apps = [...byApp.values()].map(a => Object.assign(a, {
+          people: mergeRoles(a.deploys),
+          all_prs: mergePrs(a.deploys),
+          stats: {
+            deploys: a.deploys.length,
+            risk: hist(a.deploys),
+            fastpath: a.deploys.filter(d => d.fastpath).length,
+            db_migrations: a.deploys.filter(d => (d.floors || []).includes("db_migration")).length,
+            prs: mergePrs(a.deploys).length,
+            participants: mergeRoles(a.deploys).length,
+          },
+        }));
+
+        const byNs = new Map();
+        for (const a of apps) {
+          if (!byNs.has(a.namespace_id)) byNs.set(a.namespace_id, {
+            namespace_id: a.namespace_id, namespace_name: a.namespace_name, apps: [],
+          });
+          byNs.get(a.namespace_id).apps.push(a.application_id);
+        }
+        const namespaces = [...byNs.values()];
+
+        // Compact view for the LLM prompt: the full `apps` (with people,
+        // collaborators, etc.) blows past the agent runner's prompt-size
+        // limit on busy weeks (~180KB → exit 126). The narrative does not
+        // name people, so the LLM only needs summaries + PR titles.
+        const llm_view = apps.map(a => ({
+          application_id: a.application_id, app_name: a.app_name,
+          namespace_id: a.namespace_id, namespace_name: a.namespace_name,
+          deploys: a.deploys.map(d => ({
+            date: String(d.date || "").slice(0, 10),
+            risk: d.risk, mode: d.mode, fastpath: d.fastpath,
+            from: d.from_semver, to: d.to_semver,
+            summary: d.summary_md ? String(d.summary_md).slice(0, 700) : null,
+            prs: (d.prs || []).slice(0, 20).map(p => ({
+              n: p.number, t: p.title,
+              s: p.summary ? String(p.summary).slice(0, 180) : null,
+            })),
+          })),
+        }));
+
+        return {
+          week_start: iso(weekStart), week_end: iso(new Date(weekEnd.getTime() - 86400000)),
+          has_data: apps.length > 0,
+          total_deploys: deploys.length,
+          apps, namespaces, llm_view,
+        };
+
+  - id: summarize
+    type: module
+    pluginType: claude-code-agent
+    name: "Weekly functional summaries (app + namespace)"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 15
+      systemPrompt: |
+        IMPORTANT: All the data you need is in the user message. Do NOT use
+        tools (no Read, no Write, no exploration) — produce the structured
+        output directly from the input, in your first response.
+
+        You write weekly release-notes-style summaries of what shipped to
+        production at nullplatform, from per-deploy summaries that already
+        exist. Summaries must be FUNCTIONAL: features shipped, bugs fixed,
+        behavior changes — what users or operators will notice. Never list
+        files, deploy counts alone, or version numbers without meaning.
+        Merge redundant deploys of the same change (rollback+refix, repeated
+        fastpaths) into a single narrative line. Be concrete and concise.
+      userPrompt: |
+        Week ${{ steps.gather.outputs.week_start }} → ${{ steps.gather.outputs.week_end }}.
+        Production deploys grouped by application. Per deploy: date, risk,
+        approval mode, fastpath (rollback/re-deploy), from→to version,
+        functional summary, and prs (n = PR number, t = title, s = summary):
+
+        ${{ steps.gather.outputs.llm_view }}
+
+        Namespaces (grouping of the apps above):
+
+        ${{ steps.gather.outputs.namespaces }}
+
+        Produce:
+        - app_summaries: for EACH application in the input, a markdown summary
+          (≤180 words) of what shipped to production that week, functionally.
+          Reference the key PRs by number (e.g. "(#123)"). Do NOT name people
+          in the narrative — participants and roles are stored as structured
+          data next to the summary. If an app's deploys have no analysis data
+          (summary_md null), say what can be inferred from versions and note
+          the analysis is missing.
+        - namespace_summaries: for EACH namespace, a markdown roll-up (≤250
+          words) built FROM the app summaries: the week's theme, notable
+          features/fixes across its apps (reference the most relevant PRs by
+          number and app), and anything risky (high-risk deploys, db
+          migrations, rollbacks). Do NOT name people in the narrative.
+      outputSchema:
+        type: object
+        required: [app_summaries, namespace_summaries]
+        properties:
+          app_summaries:
+            type: array
+            items:
+              type: object
+              required: [application_id, summary_md]
+              properties:
+                application_id: { type: string }
+                summary_md: { type: string }
+          namespace_summaries:
+            type: array
+            items:
+              type: object
+              required: [namespace_id, summary_md]
+              properties:
+                namespace_id: { type: string }
+                summary_md: { type: string }
+
+  - id: write
+    type: module
+    pluginType: code-exec
+    name: "Persist rolling deploy_summaries (app + namespace)"
+    inputs:
+      gathered: "${{ steps.gather.outputs }}"
+      llm: "${{ steps.summarize.outputs }}"
+      np_api_key: "${{ secrets.NP_API_KEY }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const { gathered, np_api_key } = $item;
+        const llm = $item.llm || {};
+        const MAX_WEEKS = 53; // ~1 year rolling window
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: np_api_key }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+        const H = { authorization: `Bearer ${npToken}`, "content-type": "application/json" };
+
+        const appSum = new Map((llm.app_summaries || []).map(s => [String(s.application_id), s.summary_md]));
+        const nsSum = new Map((llm.namespace_summaries || []).map(s => [String(s.namespace_id), s.summary_md]));
+
+        // Fallback narrative when the LLM output is missing for an entity.
+        const fallback = (deploys) => deploys.map(d =>
+          `- ${d.to_semver || d.deployment_id}: ${d.summary_md ? d.summary_md.split("\n")[0] : "(sin análisis)"}`
+        ).join("\n");
+
+        const upsert = async (entity, id, entry) => {
+          const url = `https://api.nullplatform.com/metadata/${entity}/${id}/deploy_summaries`;
+          let current = { weeks: [] };
+          const getRes = await fetch(url, { headers: H });
+          if (getRes.ok) {
+            try { const j = await getRes.json(); if (j && Array.isArray(j.weeks)) current = j; } catch (e) {}
+          }
+          // Idempotent by week_start: replace if re-run; newest first; trim to a year.
+          const weeks = [entry, ...current.weeks.filter(w => w.week_start !== entry.week_start)]
+            .sort((a, b) => (a.week_start < b.week_start ? 1 : -1))
+            .slice(0, MAX_WEEKS);
+          // latest_summary mirrors the newest week: it is what the Catalog
+          // card shows (weeks stays for the detail view).
+          const latest = weeks[0];
+          const body = JSON.stringify({
+            latest_summary: `**Semana ${latest.week_start} → ${latest.week_end}** — ${latest.deploys} deploys (risk: ${latest.risk.low || 0} low / ${latest.risk.medium || 0} medium / ${latest.risk.high || 0} high)\n\n${latest.summary_md}`,
+            weeks,
+          });
+          let res = await fetch(url, { method: "POST", headers: H, body });
+          if (!res.ok) {
+            const text = await res.text();
+            if (text.includes("already exists")) res = await fetch(url, { method: "PATCH", headers: H, body });
+            else throw new Error(`metadata POST ${entity}/${id} → ${res.status}: ${text.slice(0, 200)}`);
+          }
+          if (!res.ok) throw new Error(`metadata PATCH ${entity}/${id} → ${res.status}`);
+        };
+
+        const generated_at = new Date().toISOString();
+        let appsWritten = 0, nsWritten = 0;
+
+        for (const a of gathered.apps || []) {
+          await upsert("application", a.application_id, {
+            week_start: gathered.week_start, week_end: gathered.week_end,
+            deploys: a.stats.deploys, risk: a.stats.risk, fastpath: a.stats.fastpath,
+            db_migrations: a.stats.db_migrations,
+            summary_md: appSum.get(String(a.application_id)) || fallback(a.deploys),
+            prs: (a.all_prs || []).map(p => ({ number: p.number, title: p.title, author: p.author, summary: p.summary })),
+            people: a.people || [],
+            generated_at,
+          });
+          appsWritten++;
+        }
+
+        for (const ns of gathered.namespaces || []) {
+          const nsApps = (gathered.apps || []).filter(a => String(a.namespace_id) === String(ns.namespace_id));
+          const agg = { low: 0, medium: 0, high: 0, unknown: 0 };
+          for (const a of nsApps) for (const k of Object.keys(agg)) agg[k] += a.stats.risk[k] || 0;
+          // People across the namespace, with PR counts for "top contributors".
+          const prCount = new Map();
+          const roleMap = new Map();
+          for (const a of nsApps) {
+            for (const p of a.all_prs || []) prCount.set(p.author, (prCount.get(p.author) || 0) + 1);
+            for (const per of a.people || []) {
+              if (!roleMap.has(per.github)) roleMap.set(per.github, new Set());
+              for (const r of per.roles) roleMap.get(per.github).add(r);
+            }
+          }
+          const contributors = [...roleMap].map(([github, roles]) => ({
+            github, roles: [...roles], prs: prCount.get(github) || 0,
+          })).sort((x, y) => y.prs - x.prs);
+          await upsert("namespace", ns.namespace_id, {
+            week_start: gathered.week_start, week_end: gathered.week_end,
+            deploys: nsApps.reduce((n, a) => n + a.stats.deploys, 0),
+            apps: nsApps.map(a => ({ id: a.application_id, name: a.app_name, deploys: a.stats.deploys })),
+            risk: agg,
+            prs: nsApps.reduce((n, a) => n + (a.all_prs || []).length, 0),
+            db_migrations: nsApps.reduce((n, a) => n + a.stats.db_migrations, 0),
+            contributors,
+            summary_md: nsSum.get(String(ns.namespace_id)) ||
+              nsApps.map(a => `**${a.app_name}**: ${(appSum.get(String(a.application_id)) || "(sin resumen)").split("\n")[0]}`).join("\n"),
+            generated_at,
+          });
+          nsWritten++;
+        }
+
+        return { week_start: gathered.week_start, apps_written: appsWritten, namespaces_written: nsWritten, total_deploys: gathered.total_deploys };
+
+connections:
+  - { id: c1, from: trigger, to: gather }
+  - { id: c2, from: gather, to: summarize }
+  - { id: c3, from: summarize, to: write }
