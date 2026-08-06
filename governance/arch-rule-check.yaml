@@ -1,0 +1,554 @@
+# Architecture Compliance — per-rule checklist item resolver (kwik-e-mart demo).
+# rev 2: incremental analysis + change categorization.
+#
+# Pairs with checklist external items of `kind: arch-rule-check`. Each item
+# carries ONE architecture rule in its inputs (rule_id, rule_title,
+# instruction, file_pattern). Every dispatch spawns its own execution.
+#
+# Incremental strategy (rev 2): past checklist runs ARE the checkpoint store —
+# every resolution stamps `analyzed_sha` into the item's details. On the next
+# deploy, gather reads the previous run's verdict for THIS rule, diffs
+# prev_sha...current_sha via the GitHub compare API and decides:
+#   - no changed file matches the rule's file_pattern → CARRY-OVER: previous
+#     verdict re-applied, zero LLM cost.
+#   - matches exist → scoped analysis: llm_view prioritizes the changed files.
+#   - previous verdict was FAILED → always re-analyze in fix-verification mode
+#     (the agent receives the previous findings and checks they were resolved).
+#   - no checkpoint / compare failure / huge diff / force_full → full analysis.
+#     Fail open towards FULL analysis, never towards skipping.
+#
+# The architecture_summary rule additionally classifies the changes included
+# in the deployment (features, bugfixes, security, …) from the compare's
+# commit list — LLM-only by design (no conventional-commit assumption).
+id: arch-rule-check
+key: arch-rule-check
+name: "Architecture Compliance — Rule Check"
+description: >
+  Evaluates one company architecture rule against the application repository
+  and resolves the corresponding checklist item with findings and fix
+  instructions. Incremental: unchanged rules carry over their previous
+  verdict; failed rules are re-checked in fix-verification mode. One
+  execution per checklist item (kind: arch-rule-check).
+semantic_version: 2.0.0
+path: "/checklist/arch"
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-checklist-trigger
+    name: "On checklist dispatch (arch-rule-check)"
+    config:
+      pathPrefix: /np/checklist/arch-rule-check
+      mode: start
+      kind: arch-rule-check
+      # NOTE: on engines where trigger config does not resolve vars at
+      # activation time, replace with the literal org NRN before publishing.
+      nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+      npApiKey: "${{ secrets.NP_API_KEY }}"
+
+  - id: progress
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: preparing analysis"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Checking what changed since the last audit of rule '${{ steps.trigger.outputs.inputs.rule_id }}'…"
+
+  - id: gather
+    type: module
+    plugin_type: code-exec
+    name: "Checkpoint + diff + repo content"
+    inputs:
+      application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
+      release_id:     "${{ steps.trigger.outputs.inputs.release_id }}"
+      rule_id:        "${{ steps.trigger.outputs.inputs.rule_id }}"
+      file_pattern:   "${{ steps.trigger.outputs.inputs.file_pattern }}"
+      force_full:     "${{ steps.trigger.outputs.inputs.force_full }}"
+      callbackUrl:    "${{ steps.trigger.outputs.callbackUrl }}"
+      np_api_key:     "${{ secrets.NP_API_KEY }}"
+      github_token:   "${{ secrets.GITHUB_TOKEN }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com", "api.github.com"]
+      code: |
+        const { application_id, release_id, rule_id, file_pattern, force_full, callbackUrl, np_api_key, github_token } = $item;
+
+        // --- NP client (api-key → token) ---
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: np_api_key }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+        const np = async (path) => {
+          const r = await fetch(`https://api.nullplatform.com${path}`, {
+            headers: { authorization: `Bearer ${npToken}` },
+          });
+          if (!r.ok) throw new Error(`NP GET ${path} → ${r.status}`);
+          return r.json();
+        };
+        const npTry = async (path) => { try { return await np(path); } catch (e) { return null; } };
+        const ghJson = async (path) => {
+          const r = await fetch(`https://api.github.com${path}`, {
+            headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github+json" },
+          });
+          if (!r.ok) throw new Error(`GitHub ${path} → ${r.status}`);
+          return r.json();
+        };
+        const ghRaw = async (path) => {
+          const r = await fetch(`https://api.github.com${path}`, {
+            headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github.raw+json" },
+          });
+          if (!r.ok) return null;
+          return r.text();
+        };
+
+        // --- App, repo, current commit ---
+        const app = await np(`/application/${application_id}`);
+        const repo = (app.repository_url || "").replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
+        if (!repo) throw new Error(`application ${application_id} has no repository_url`);
+        let currentSha = null, branch = null;
+        if (release_id) {
+          const rel = await npTry(`/release/${release_id}`);
+          const build = rel && rel.build_id ? await npTry(`/build/${rel.build_id}`) : null;
+          currentSha = build && build.commit && build.commit.id || null;
+          branch = build && build.branch || null;
+        }
+        const repoInfo = await ghJson(`/repos/${repo}`);
+        branch = branch || repoInfo.default_branch || "main";
+        if (!currentSha) {
+          const head = await ghJson(`/repos/${repo}/commits/${branch}`);
+          currentSha = head.sha;
+        }
+
+        // --- Checkpoint: previous checklist run of this app with our rule stamped ---
+        const myApproval = (callbackUrl.match(/\/approval\/(\d+)\//) || [])[1];
+        const flatten = (items) => (items || []).reduce((acc, it) => {
+          acc.push(it);
+          if (it.children) acc.push(...flatten(it.children));
+          return acc;
+        }, []);
+        let checkpoint = null;
+        const appNrn = encodeURIComponent(app.nrn);
+        const prior = await npTry(`/approval?nrn=${appNrn}&limit=10`);
+        // NOTE: cancelled approvals are VALID checkpoints — the natural agent
+        // loop is cancel → fix → redeploy, so the previous run is almost
+        // always cancelled. What matters is that the item resolved and
+        // stamped its analyzed_sha, not how the request ended.
+        for (const row of (prior && prior.results || [])) {
+          if (String(row.id) === String(myApproval)) continue;
+          if (row.mode !== "checklist") continue;
+          const run = await npTry(`/approval/${row.id}/checklist`);
+          if (!run) continue;
+          const item = flatten(run.items).find(i => i.id === rule_id);
+          const det = item && (item.details || (item.state && item.state.details));
+          if (item && det && det.analyzed_sha && (item.status === "passed" || item.status === "failed")) {
+            checkpoint = {
+              approval_id: row.id,
+              sha: det.analyzed_sha,
+              status: item.status,
+              findings: det.findings || [],
+              markdown: det.markdown || "",
+            };
+            break;
+          }
+        }
+
+        // --- Decision: carry_over vs analyze (full | diff | verify_fix) ---
+        const forceFull = String(force_full || "") === "true";
+        let mode = "analyze", scope = "full", changed = null, commits = [];
+        let ruleRe = null;
+        try { if (file_pattern) ruleRe = new RegExp(file_pattern, "i"); } catch (e) { ruleRe = null; }
+
+        if (!forceFull && checkpoint && checkpoint.sha) {
+          if (checkpoint.sha === currentSha) {
+            mode = checkpoint.status === "failed" ? "analyze" : "carry_over";
+            changed = [];
+          } else {
+            try {
+              const cmp = await ghJson(`/repos/${repo}/compare/${checkpoint.sha}...${currentSha}`);
+              changed = (cmp.files || []).map(f => f.filename);
+              commits = (cmp.commits || []).slice(-60).map(c => ({
+                sha: c.sha.slice(0, 7),
+                message: (c.commit.message || "").split("\n")[0].slice(0, 160),
+              }));
+              const tooBig = changed.length > 80 || (cmp.files || []).length === 0 && (cmp.commits || []).length > 0;
+              const matched = ruleRe ? changed.filter(p => ruleRe.test(p)) : changed;
+              if (tooBig) { mode = "analyze"; scope = "full"; }
+              else if (checkpoint.status === "failed") { mode = "analyze"; scope = "verify_fix"; }
+              else if (matched.length === 0) { mode = "carry_over"; }
+              else { mode = "analyze"; scope = "diff"; }
+            } catch (e) {
+              // compare failed (force-push, divergent history) → full, never skip
+              mode = "analyze"; scope = "full"; changed = null;
+            }
+          }
+        }
+        // architecture_summary never carries over when there ARE changes: its
+        // job is describing THIS deployment (incl. change categories).
+        if (rule_id === "architecture_summary" && changed && changed.length > 0) {
+          mode = "analyze"; scope = "diff";
+        }
+
+        if (mode === "carry_over") {
+          return {
+            mode, repo, branch, analyzed_sha: currentSha,
+            prev: checkpoint,
+            changed_count: changed ? changed.length : 0,
+          };
+        }
+
+        // --- Build llm_view for the analysis path ---
+        const tree = await ghJson(`/repos/${repo}/git/trees/${branch}?recursive=1`);
+        const blobs = (tree.tree || []).filter(t => t.type === "blob");
+        const paths = blobs.map(t => t.path);
+        const ALWAYS = /(^|\/)(package\.json|requirements\.txt|pyproject\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|Gemfile|composer\.json|Dockerfile|docker-compose\.ya?ml|README[^/]*|null(app)?\.ya?ml|\.nullplatform\/[^/]+|tailwind\.config\.[cm]?[jt]s|components\.json|\.env\.example)$/i;
+        const ENTRY = /(^|\/)(src\/)?(index|main|app|server)\.[cm]?[jt]sx?$|(^|\/)(app|main)\.py$|(^|\/)main\.go$/i;
+        const SKIP = /(^|\/)(node_modules|dist|build|\.git|vendor|coverage|\.next|out)\/|(\.(png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|lock|min\.js|min\.css))$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
+
+        const changedSet = new Set(changed || []);
+        const findingFiles = new Set((checkpoint && checkpoint.findings || []).map(f => f.file));
+        // Scoped runs put changed + previously-flagged files first; full runs
+        // rank by rule relevance as in rev 1.
+        const score = (p) => {
+          if (SKIP.test(p)) return -1;
+          if (scope !== "full" && (changedSet.has(p) || findingFiles.has(p))) return 4;
+          if (ALWAYS.test(p)) return 3;
+          if (ruleRe && ruleRe.test(p)) return scope === "full" ? 2 : 0;
+          if (ENTRY.test(p)) return 1;
+          return 0;
+        };
+        const ranked = blobs
+          .map(b => ({ path: b.path, size: b.size || 0, s: score(b.path) }))
+          .filter(b => b.s > 0 && b.size < 200000)
+          .sort((a, b) => b.s - a.s || a.size - b.size)
+          .slice(0, 30);
+
+        const PER_FILE = 12000, TOTAL = 90000;
+        let used = 0;
+        const files = [];
+        for (const f of ranked) {
+          if (used >= TOTAL) break;
+          const content = await ghRaw(`/repos/${repo}/contents/${encodeURIComponent(f.path).replace(/%2F/g, "/")}?ref=${branch}`);
+          if (content === null) continue;
+          const clipped = content.slice(0, Math.min(PER_FILE, TOTAL - used));
+          used += clipped.length;
+          files.push({ path: f.path, truncated: content.length > clipped.length, content: clipped });
+        }
+
+        const treeView = paths.filter(p => !SKIP.test(p)).slice(0, 400).join("\n");
+        const scopeNote = scope === "full"
+          ? "FULL AUDIT: no previous checkpoint (or forced)."
+          : scope === "verify_fix"
+            ? `FIX VERIFICATION: this rule FAILED at commit ${checkpoint.sha.slice(0,7)}. Changed files since then: ${(changed||[]).join(", ") || "(none)"}.`
+            : `DIFF-SCOPED AUDIT: rule passed at ${checkpoint.sha.slice(0,7)}; re-checking because these changed files match the rule: ${(changed||[]).filter(p => !ruleRe || ruleRe.test(p)).join(", ")}.`;
+        const commitsView = commits.length
+          ? "### Commits included in this deployment\n" + commits.map(c => `- ${c.sha} ${c.message}`).join("\n")
+          : "";
+        const llm_view = [
+          `## Repository: ${repo} (branch: ${branch}, commit: ${currentSha.slice(0,7)}) — application "${app.name}"`,
+          ``, `### Analysis scope`, scopeNote, ``,
+          commitsView,
+          `### Full file tree (${paths.length} files)`,
+          "```", treeView, "```",
+          ``,
+          `### Selected file contents (${files.length} files, rule: ${rule_id})`,
+          ...files.map(f => `\n--- ${f.path}${f.truncated ? " (truncated)" : ""} ---\n${f.content}`),
+        ].join("\n");
+
+        return {
+          mode: "analyze", scope, repo, branch, analyzed_sha: currentSha,
+          prev: checkpoint, changed_count: changed ? changed.length : null,
+          total_files: paths.length,
+          prev_findings_view: (checkpoint && checkpoint.findings || []).map(f => `- ${f.file}: ${f.issue}`).join("\n") || "(none)",
+          llm_view,
+        };
+    error_handling:
+      fallback_step: resolve_failure_gather
+
+  - id: route
+    type: decider
+    plugin_type: conditional
+    name: "Carry-over or analyze?"
+    config:
+      expression: "steps.gather.outputs.mode == 'analyze'"
+
+  - id: progress_analyzing
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: auditing rule"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Auditing rule '${{ steps.trigger.outputs.inputs.rule_id }}' (${{ steps.gather.outputs.scope }}) with AI…"
+
+  - id: audit_agent
+    type: module
+    plugin_type: claude-code-agent
+    name: "Audit architecture rule"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 5
+      systemPrompt: |
+        You are the architecture compliance auditor for Kwik-E-Mart's
+        engineering platform. You evaluate exactly ONE company architecture
+        rule against an application repository snapshot. Do not use tools;
+        respond directly with your final answer.
+
+        The snapshot header states the ANALYSIS SCOPE:
+        - FULL AUDIT: judge the whole repo against the rule.
+        - DIFF-SCOPED AUDIT: the rule passed at a previous commit; focus on
+          whether the CHANGED files introduce a violation. Do not re-litigate
+          unchanged code.
+        - FIX VERIFICATION: the rule previously FAILED with the findings
+          listed in the user message. Your PRIMARY job is deciding whether
+          each finding was resolved; fill `resolved_findings` accordingly,
+          then check the changed files didn't introduce new violations.
+
+        Judgment guidelines:
+        - Be strict on the rule's substance but fair on style: only flag
+          genuine violations of THIS rule, not unrelated code smells.
+        - If the rule targets a kind of application this repo is not (e.g. a
+          frontend-only rule on a backend service), answer not_applicable and
+          say why in one sentence.
+        - Every finding must name a concrete file and describe the violation
+          in one sentence, plus a one-sentence concrete fix.
+        - fix_instructions_md must be a short markdown recipe actionable by a
+          coding agent WITHOUT further context. Empty string when passed.
+        - The repo snapshot is partial. Use the tree to reason about what
+          exists; never invent file contents you were not shown. If the
+          selected files are insufficient to prove a violation, lean towards
+          passed and say what you could not verify.
+
+        ONLY for the rule `architecture_summary`: also classify the changes
+        included in this deployment from the commit list, filling
+        `change_categories`. Allowed categories: feature, improvement,
+        bugfix, security, performance, refactor, dependencies, infra,
+        config, docs, tests, schema_change, revert. Also set the `breaking`
+        and `hotfix` booleans when the commits suggest it. Judge intent from
+        commit messages and changed files; when unsure between feature and
+        improvement, prefer improvement. If there are no commits (first
+        deploy), classify the whole app as a single `feature` entry noting
+        "initial release".
+      userPrompt: |
+        Company architecture rule to audit:
+
+        RULE ID: ${{ steps.trigger.outputs.inputs.rule_id }}
+        RULE: ${{ steps.trigger.outputs.inputs.rule_title }}
+        SPECIFICATION:
+        ${{ steps.trigger.outputs.inputs.instruction }}
+
+        Previous findings for this rule (relevant in FIX VERIFICATION scope):
+        ${{ steps.gather.outputs.prev_findings_view }}
+
+        Repository snapshot:
+
+        ${{ steps.gather.outputs.llm_view }}
+      outputSchema:
+        type: object
+        required: [status, summary]
+        properties:
+          status: { type: string, enum: [passed, failed, not_applicable] }
+          summary: { type: string, description: "≤60 words: the verdict and its single most important reason" }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [file, issue, fix]
+              properties:
+                file: { type: string }
+                issue: { type: string }
+                fix: { type: string }
+          resolved_findings:
+            type: array
+            items:
+              type: object
+              required: [file, issue, resolution]
+              properties:
+                file: { type: string }
+                issue: { type: string }
+                resolution: { type: string }
+          fix_instructions_md: { type: string }
+          change_categories:
+            type: array
+            items:
+              type: object
+              required: [category, count]
+              properties:
+                category: { type: string, enum: [feature, improvement, bugfix, security, performance, refactor, dependencies, infra, config, docs, tests, schema_change, revert] }
+                count: { type: integer }
+                notes: { type: string, description: "≤20 words naming the concrete changes" }
+          breaking: { type: boolean }
+          hotfix: { type: boolean }
+    error_handling:
+      fallback_step: resolve_failure_agent
+
+  - id: resolve
+    type: module
+    plugin_type: code-exec
+    name: "Log findings + resolve item"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      rule_id:       "${{ steps.trigger.outputs.inputs.rule_id }}"
+      rule_title:    "${{ steps.trigger.outputs.inputs.rule_title }}"
+      verdict:       "${{ steps.audit_agent.outputs }}"
+      gathered:      "${{ steps.gather.outputs }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const { callbackUrl, callbackToken, rule_id, rule_title, verdict, gathered } = $item;
+        const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
+        const post = (url, body) => fetch(url, { method: "POST", headers: H, body: JSON.stringify(body) });
+        const patch = (url, body) => fetch(url, { method: "PATCH", headers: H, body: JSON.stringify(body) });
+
+        const v = verdict || {};
+        const na = v.status === "not_applicable";
+        const status = v.status === "failed" ? "failed" : "passed";
+        const findings = v.findings || [];
+        const resolved = v.resolved_findings || [];
+        const cats = v.change_categories || [];
+        const scope = gathered.scope || "full";
+        const sha7 = (gathered.analyzed_sha || "").slice(0, 7);
+
+        for (const f of resolved) {
+          await post(`${callbackUrl}/log`, { level: "info", message: `Resolved: ${f.file} — ${f.issue} → ${f.resolution}` }).catch(() => null);
+        }
+        for (const f of findings) {
+          await post(`${callbackUrl}/log`, {
+            level: status === "failed" ? "warning" : "info",
+            message: `${f.file}: ${f.issue} — Fix: ${f.fix}`,
+          }).catch(() => null);
+        }
+        await post(`${callbackUrl}/log`, {
+          level: "info",
+          message: na ? `Rule not applicable — treated as passed.` : `Verdict (${scope} @ ${sha7}): ${v.status}. ${v.summary || ""}`,
+        }).catch(() => null);
+
+        const mdResolved = resolved.length
+          ? "\n**Findings resueltos desde el último deploy:**\n" + resolved.map(f => `- ✅ \`${f.file}\` — ${f.issue}\n  - ${f.resolution}`).join("\n")
+          : "";
+        const mdFindings = findings.length
+          ? "\n**Findings:**\n" + findings.map(f => `- \`${f.file}\` — ${f.issue}\n  - **Fix:** ${f.fix}`).join("\n")
+          : "";
+        const mdFix = (status === "failed" && v.fix_instructions_md)
+          ? `\n\n#### How to fix\n${v.fix_instructions_md}`
+          : "";
+        const mdCats = cats.length
+          ? "\n**Cambios incluidos en este deployment:**\n" + cats.map(c =>
+              `- ${c.category} × ${c.count}${c.notes ? ` — ${c.notes}` : ""}`).join("\n")
+            + ((v.breaking || v.hotfix) ? `\n- ⚠️ ${[v.breaking ? "breaking change" : null, v.hotfix ? "hotfix" : null].filter(Boolean).join(", ")}` : "")
+          : "";
+        const scopeLabel = scope === "full" ? "análisis completo"
+          : scope === "verify_fix" ? "verificación de fixes"
+          : `incremental (${gathered.changed_count} archivos cambiados)`;
+        const markdown = [
+          `### ${rule_title} — ${na ? "N/A" : status.toUpperCase()}`,
+          ``,
+          `Repo: \`${gathered.repo}\` · 🔎 ${scopeLabel} @ \`${sha7}\``,
+          ``,
+          v.summary || "",
+          mdCats, mdResolved, mdFindings, mdFix,
+        ].join("\n");
+
+        const message = na
+          ? `N/A: ${v.summary || "rule does not apply to this application"}`
+          : `${status === "passed" ? "OK" : `${findings.length} violation(s)`} [${scopeLabel}]: ${(v.summary || "").slice(0, 160)}`;
+
+        const details = { markdown, rule_id, findings, analyzed_sha: gathered.analyzed_sha, scope };
+        if (cats.length) details.change_categories = cats.map(c => ({ ...c }));
+        if (v.breaking) details.breaking = true;
+        if (v.hotfix) details.hotfix = true;
+
+        const r = await patch(callbackUrl, { status, message, details });
+        if (!r.ok) throw new Error(`resolve ${rule_id} -> ${r.status}: ${await r.text()}`);
+        return { resolved: true, status, findings: findings.length, scope };
+
+  - id: resolve_carryover
+    type: module
+    plugin_type: code-exec
+    name: "Carry over previous verdict (no relevant changes)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      rule_id:       "${{ steps.trigger.outputs.inputs.rule_id }}"
+      rule_title:    "${{ steps.trigger.outputs.inputs.rule_title }}"
+      gathered:      "${{ steps.gather.outputs }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const { callbackUrl, callbackToken, rule_id, rule_title, gathered } = $item;
+        const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
+        const prev = gathered.prev || {};
+        const sha7 = (gathered.analyzed_sha || "").slice(0, 7);
+        const prev7 = (prev.sha || "").slice(0, 7);
+        const n = gathered.changed_count || 0;
+
+        const message = `≡ Sin cambios que afecten esta regla desde ${prev7} (${n} archivo(s) tocados, ninguno relevante) — se mantiene ${prev.status.toUpperCase()}`;
+        const markdown = [
+          `### ${rule_title} — ${prev.status.toUpperCase()} (carry-over)`,
+          ``,
+          `Repo: \`${gathered.repo}\` · ≡ sin re-análisis: los ${n} archivo(s) cambiados desde \`${prev7}\` no matchean esta regla.`,
+          ``,
+          `_Último análisis real (@ \`${prev7}\`):_`,
+          ``,
+          prev.markdown || "(sin detalle previo)",
+        ].join("\n");
+
+        await fetch(`${callbackUrl}/log`, { method: "POST", headers: H, body: JSON.stringify({
+          level: "info", message: `Carry-over from approval ${prev.approval_id} @ ${prev7}: ${n} changed file(s), none match this rule.`,
+        }) }).catch(() => null);
+
+        const r = await fetch(callbackUrl, { method: "PATCH", headers: H, body: JSON.stringify({
+          status: prev.status, message,
+          details: { markdown, rule_id, findings: prev.findings || [], analyzed_sha: gathered.analyzed_sha, scope: "carry_over", carried_from: prev.sha },
+        }) });
+        if (!r.ok) throw new Error(`carry-over resolve ${rule_id} -> ${r.status}: ${await r.text()}`);
+        return { resolved: true, status: prev.status, scope: "carry_over" };
+
+  # Fallbacks — gates fail closed with the raw error so the run never hangs.
+  - id: resolve_failure_gather
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve failed (checkpoint/repo fetch crashed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Architecture analysis could not prepare the audit: ${{ steps.gather.error.message }}"
+      details:
+        markdown: "The analysis failed before auditing the rule. Error: ${{ steps.gather.error.message }}"
+
+  - id: resolve_failure_agent
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve failed (audit agent crashed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Architecture audit agent crashed: ${{ steps.audit_agent.error.message }}"
+      details:
+        markdown: "The AI audit step failed for this rule. Error: ${{ steps.audit_agent.error.message }}"
+
+connections:
+  - { id: c1, from: trigger,            to: progress }
+  - { id: c2, from: progress,           to: gather }
+  - { id: c3, from: gather,             to: route }
+  - { id: c4, from: route,              to: progress_analyzing, source_port: "true" }
+  - { id: c5, from: route,              to: resolve_carryover,  source_port: "false" }
+  - { id: c6, from: progress_analyzing, to: audit_agent }
+  - { id: c7, from: audit_agent,        to: resolve }
+  # Dormant edges: keep the fallback tails out of the entry-point set; the
+  # engine routes to them on terminal failure via errorHandling.fallbackStep.
+  - { id: c8, from: gather,      to: resolve_failure_gather, condition: "false" }
+  - { id: c9, from: audit_agent, to: resolve_failure_agent,  condition: "false" }
