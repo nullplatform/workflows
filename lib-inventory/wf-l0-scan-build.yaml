@@ -2847,19 +2847,32 @@ steps:
           for (const l of r.data.languages || []) byLanguage[l] = (byLanguage[l] || 0) + 1;
         }
 
-        // `count` is the iterations attempted and `failed` the ones that
+        // `count` is the iterations ATTEMPTED and `failed` the ones that
         // exhausted their retries. Counting the ITEMS array instead shipped
         // 113 KB into this sandbox and took 302s against 0.8-6.9s for every
         // other step — measured on the batched shape, 2026-07-26.
-        const written = inputs.dryRun
-          ? 0
-          : Math.max(0, Number(inputs.writtenCount || 0) - Number(inputs.writeFailed || 0));
+        //
+        // `failed` is NOT optional here. A `forEach` in parallel mode absorbs a
+        // failed iteration, so a rejected write leaves the step `completed` and
+        // only this number says otherwise. Treating a missing `failed` as zero
+        // is how a build reported `assets_written: 1` while the API had
+        // answered 400 and written nothing — the exact silent success this
+        // design exists to prevent. When it is absent the count is UNKNOWN, and
+        // unknown must not read as success.
+        const attempted = Number(inputs.writtenCount || 0);
+        const failedRaw = inputs.writeFailed;
+        const failed = failedRaw === undefined || failedRaw === null ? null : Number(failedRaw);
+        const written = inputs.dryRun ? 0 : failed === null ? 0 : Math.max(0, attempted - failed);
 
         const result = {
           build_id: inputs.buildId,
           dry_run: inputs.dryRun === true,
           assets_scanned: scanned.length,
           assets_written: written,
+          // Separated so a caller can tell "nothing to write" from "we could
+          // not tell whether the writes landed".
+          assets_write_attempted: attempted,
+          write_failures: failed,
           by_status: byStatus,
           by_language: byLanguage,
           match_levels: inputs.levels || {},
@@ -2897,6 +2910,8 @@ outputs:
   build_id: "${{ steps.result.outputs.build_id }}"
   assets_scanned: "${{ steps.result.outputs.assets_scanned }}"
   assets_written: "${{ steps.result.outputs.assets_written }}"
+  assets_write_attempted: "${{ steps.result.outputs.assets_write_attempted }}"
+  write_failures: "${{ steps.result.outputs.write_failures }}"
   by_status: "${{ steps.result.outputs.by_status }}"
   by_language: "${{ steps.result.outputs.by_language }}"
   match_levels: "${{ steps.result.outputs.match_levels }}"

@@ -12,6 +12,8 @@ increment — the inventory has to exist and be trustworthy first.
 Design doc:
 [`docs/design.md`](./docs/design.md).
 Querying it once it is populated: [`docs/queries.md`](./docs/queries.md).
+What an organization has to have in place — and what to ask them for to get
+deeper coverage: [`docs/prerequisites.md`](./docs/prerequisites.md).
 
 Rollout: **the reference organization** (org `<ORG_ID>`), whole organization; **kwik-e-mart** and
 **null** for testing.

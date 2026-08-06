@@ -10,6 +10,12 @@ curl -s -X POST https://api.nullplatform.com/data/lake/query \
 
 Three things that will bite you if nobody says them first:
 
+- **A deleted METADATA RECORD still looks present.** `core_entities_metadata`
+  keeps deleted rows with `_deleted = 1`, so any "has this asset been scanned"
+  CTE needs `FINAL` and `AND m._deleted = 0`. Without them, deleting a record to
+  force a rescan silently does nothing — the asset is skipped forever. That
+  stranded 341 assets, every Java one among them, after their records were
+  deliberately deleted so a new parser would re-read them (2026-07-26).
 - **A deleted scope still looks deployed.** Its deployments keep
   `status_in_scope = 'active'` in the lake, so the "what is live" CTE has to
   carry `AND s.status != 'deleted'` or it reports on builds nothing runs — 37%
@@ -176,8 +182,9 @@ WITH live AS (
 ),
 existing AS (
   SELECT toInt32OrZero(m.id) AS asset_id
-  FROM customers_lake.core_entities_metadata AS m
-  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies' AND m.data IS NOT NULL
+  FROM customers_lake.core_entities_metadata AS m FINAL
+  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
+    AND m.data IS NOT NULL AND m._deleted = 0
 )
 SELECT count(DISTINCT x.id)                                              AS live_assets,
        countDistinctIf(x.id, x.id IN (SELECT asset_id FROM existing))    AS scanned

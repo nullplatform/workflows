@@ -48,6 +48,12 @@ SPEC=$(jq -n --arg nrn "organization=$ORG_ID" '{
         dev:       {type:"boolean"},
         optional:  {type:"boolean"},
         peer:      {type:"boolean"},
+        # Maven scope, verbatim: compile, provided, runtime, test, system.
+        # A parser that adds a field and forgets it here does NOT degrade
+        # gracefully - the POST is rejected with "must NOT have additional
+        # properties" and the asset gets no record at all. That is how 179 Java
+        # assets stayed at zero while their parser was verified working.
+        scope:     {type:"string"},
         ecosystem: {type:"string"} } } },
       # What the manifests declare about THEMSELVES rather than about their
       # dependencies: `node.engines.node`, `go.go`, `node.packageManager`.
