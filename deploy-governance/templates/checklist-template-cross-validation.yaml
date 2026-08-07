@@ -1,0 +1,101 @@
+# Target template (Gabriel's cross-validation structure, 2026-07-31).
+# REQUIRES in prod approval-api:
+#   - main-approval-api#258 (manual inputs + validations, group aggregation: any)
+#   - main-approval-api#260 (orchestrator token scope)
+items:
+  - id: change_analysis
+    type: external
+    behavior: informational
+    severity: info
+    title: "Change analysis"
+    description: >
+      Diff between the deployed release and this candidate: commits, PRs,
+      participants, risk signals + LLM score. Informational — the decision
+      lives in the cross-validation group below.
+    external:
+      kind: deploy-change-analysis
+      trigger: auto
+      timeout_seconds: 600
+      token_scope: orchestrator
+      inputs:
+        application_id: "{{ context.application.id }}"
+        release_id: "{{ context.release.id }}"
+        scope_id: "{{ context.scope.id }}"
+        deployment_id: "{{ context.deployment.id }}"
+
+  - id: cross_validation
+    type: group
+    behavior: gate
+    aggregation: any          # ONE of the children passing approves the deploy
+    title: "Cross validation — one of"
+    children:
+      - id: already_deployed
+        type: external
+        behavior: gate
+        severity: info
+        title: "Already deployed release"
+        description: >
+          Passes when this release was deployed to this scope within the
+          last 10 finalized deploys — fast rollbacks and config re-deploys
+          skip everything else.
+        external:
+          kind: deploy-already-released
+          trigger: auto
+          timeout_seconds: 900
+
+      - id: risk_matrix
+        type: external
+        behavior: gate
+        severity: major
+        title: "Risk matrix"
+        description: >
+          Computed after the change assessment: auto-passes when the light
+          matrix (change risk x app criticality) allows it. When it does
+          not, one of the human reviews below unblocks the deploy.
+        external:
+          kind: deploy-risk-matrix
+          trigger: auto
+          timeout_seconds: 900
+
+      - id: pair_review
+        type: manual
+        behavior: gate
+        severity: major
+        title: "Pair review"
+        description: >
+          Cross approval by a peer: anyone in the org EXCEPT the requester.
+          Use when the risk matrix asks for a second pair of eyes.
+        validations:
+          - id: four_eyes
+            rule:
+              actor.user_id: { $ne: "$approval.requested_by" }
+            message: "Un par distinto del requester debe aprobar este deploy"
+          # Validación EXTERNA evaluada AL MOMENTO del submit (no al crear el
+          # run): el workflow deploy-review-level lee la metadata ya escrita
+          # por el análisis y solo deja pasar el pair review si la matriz
+          # pidió nivel "par". Así se "enciende" el item correcto sin
+          # recalcular conditions: la revalidación ocurre cuando el humano
+          # actúa, con la metadata ya existente.
+          - id: review_level
+            external:
+              kind: deploy-review-level
+              timeout_seconds: 120
+              inputs:
+                deployment_id: "{{ context.deployment.id }}"
+                required_level: "par"
+            on_timeout: fail
+            message: "La matriz pidió otro nivel de aprobación para este deploy (ver Change analysis)"
+
+      - id: admin_review
+        type: manual
+        behavior: gate
+        severity: major
+        title: "Admin review"
+        description: >
+          Approval by the platform admin group. Always available and
+          overrides the matrix for high-risk deploys.
+        validations:
+          - id: admin_only
+            rule:
+              actor.effective_roles: { $in: ["admin", "ops", "secops"] }
+            message: "Solo admins/ops pueden usar esta aprobación"

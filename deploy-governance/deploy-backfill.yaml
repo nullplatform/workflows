@@ -1,0 +1,168 @@
+# Deploy Backfill — computes deployment.metadata.change for historical
+# production deploys by firing the deploy-change-analysis-manual webhook
+# once per deploy. Single code-exec step: lake query + payload build +
+# webhook fan-out (children run as independent engine executions).
+#
+# Fire manually:
+#   POST <webhook>/checklist/deploy/backfill
+#   body: {"days": 15, "application_id": <app-id>}   # application_id: 0 = all apps
+#
+# NOTE: this engine does not resolve `${{ steps.X.outputs.* }}` inside step
+# `inputs:` (arrives empty in the sandbox) — hence the single-step design.
+id: deploy-backfill
+key: deploy-backfill
+name: "Deploy Backfill (change analysis)"
+description: >
+  Queries the lake for finalized production deployments in the last N days,
+  computes each deploy's previous release at that point in time, and fires
+  the change-analysis workflow webhook per deploy with from_release_id /
+  previously_deployed overrides.
+semantic_version: 1.2.0
+path: "/checklist/deploy"
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+steps:
+  - id: trigger
+    type: trigger
+    pluginType: webhook
+    name: "Manual backfill trigger"
+    config:
+      path: /checklist/deploy/backfill
+      method: POST
+      mode: start
+
+  # Nightly safety net until the checklist gates every prod deploy: catches
+  # any production deployment that finished without change metadata (deploys
+  # while the pilot action is detached, workflow hiccups, etc.). The 3-day
+  # window + skip-existing makes it self-healing and idempotent.
+  - id: trigger_nightly
+    type: trigger
+    pluginType: cron
+    name: "Nightly backfill (01:30 AR, last 3 days)"
+    config:
+      schedule: "30 1 * * *"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  - id: run
+    type: module
+    pluginType: code-exec
+    name: "Lake pairs + fan-out webhooks"
+    inputs:
+      days: "${{ workflow.inputs.body.days }}"
+      application_id: "${{ workflow.inputs.body.application_id }}"
+      np_api_key: "${{ secrets.NP_API_KEY }}"
+      child_webhook: "${{ secrets.CHANGE_ANALYSIS_WEBHOOK }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        // Default 3: the nightly cron fires with no body — a 3-day window
+        // self-heals weekend gaps. Manual webhook calls pass days explicitly.
+        const days = Number($item.days) || 3;
+        const appId = Number($item.application_id) || 0;
+        const npApiKey = $item.np_api_key;
+        // Activated webhook URL of deploy-change-analysis-manual (token-bearing,
+        // minted at alias activation) — configured as a workflow var, never in YAML.
+        const CHILD_WEBHOOK = $item.child_webhook;
+        if (!CHILD_WEBHOOK) return { stage: "config", error: "CHANGE_ANALYSIS_WEBHOOK var is not set" };
+
+        let stage = "token";
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: npApiKey }),
+        });
+        const tokText = await tokRes.text();
+        let npToken;
+        try { npToken = JSON.parse(tokText).access_token; }
+        catch (e) { return { stage, error: String(e), sample: tokText.slice(0, 200) }; }
+        if (!npToken) return { stage, error: "no access_token", sample: tokText.slice(0, 200) };
+
+        const sql = `
+          WITH prod_scopes AS (
+            SELECT DISTINCT scope_id FROM core_entities_scope_dimension
+            WHERE dimension_slug = 'environment' AND value_slug = 'production'
+          ),
+          ordered AS (
+            SELECT d.id AS deployment_id, d.scope_id, d.release_id, d.created_at,
+                   s.application_id,
+                   groupArray(d.release_id) OVER (PARTITION BY d.scope_id ORDER BY d.created_at ROWS BETWEEN 10 PRECEDING AND 1 PRECEDING) AS prev10,
+                   lagInFrame(d.release_id) OVER (PARTITION BY d.scope_id ORDER BY d.created_at) AS from_release_id
+            FROM core_entities_deployment d FINAL
+            JOIN core_entities_scope s FINAL ON s.id = d.scope_id
+            WHERE d.status = 'finalized' AND d.scope_id IN (SELECT scope_id FROM prod_scopes)
+          )
+          SELECT deployment_id, application_id, scope_id, release_id, from_release_id,
+                 has(prev10, release_id) AS previously_deployed
+          FROM ordered
+          WHERE created_at > now() - INTERVAL ${days} DAY
+            AND (${appId} = 0 OR application_id = ${appId})
+          ORDER BY created_at`;
+
+        const lakeRes = await fetch("https://api.nullplatform.com/data/lake/query", {
+          method: "POST",
+          headers: { authorization: `Bearer ${npToken}`, "content-type": "application/json" },
+          body: JSON.stringify({ query: sql }),
+        });
+        stage = "lake";
+        const lakeText = await lakeRes.text();
+        if (!lakeRes.ok) return { stage, error: "http " + lakeRes.status, sample: lakeText.slice(0, 200) };
+        // Lake responds TSV without headers, columns in SELECT order.
+        const COLS = ["deployment_id", "application_id", "scope_id", "release_id", "from_release_id", "previously_deployed"];
+        const rows = lakeText.trim().split("\n").filter(Boolean).map((line) => {
+          const parts = line.split("\t");
+          const r = {};
+          for (let i = 0; i < COLS.length; i++) r[COLS[i]] = parts[i];
+          return r;
+        });
+
+        // Idempotent + convergent: skip deploys whose metadata.change already
+        // exists, so re-running the backfill only fires what's missing. A
+        // large fresh run saturates the sandbox pool (E2B) and some children
+        // die BEFORE the LLM step (zero cost) — just re-fire this webhook
+        // until it reports fired=0.
+        let fired = 0, firstDeploys = 0, errors = 0, skippedDone = 0;
+        for (const r of rows) {
+          const metaRes = await fetch(`https://api.nullplatform.com/metadata/deployment/${r.deployment_id}/change`, {
+            headers: { authorization: `Bearer ${npToken}` },
+          });
+          if (metaRes.ok) { skippedDone++; continue; }
+          const from = String(r.from_release_id || "");
+          // "\N" = ClickHouse NULL in TSV (scope's first deploy ever).
+          // Fire with the explicit "none" sentinel: the analysis runs the
+          // first-deploy path (no diff, first_deploy floor) instead of
+          // wrongly diffing against TODAY's current release.
+          const isFirst = !from || from === "0" || from === "\\N";
+          if (isFirst) firstDeploys++;
+          const body = {
+            kind: "deploy-change-analysis",
+            runId: "backfill-" + r.deployment_id,
+            itemId: "change_analysis",
+            callbackUrl: "https://echo.free.beeceptor.com/checklist-callback",
+            callbackToken: "backfill",
+            approvalRequestId: 0,
+            inputs: {
+              application_id: r.application_id,
+              release_id: r.release_id,
+              scope_id: r.scope_id,
+              deployment_id: r.deployment_id,
+              from_release_id: isFirst ? "none" : from,
+              previously_deployed: String(r.previously_deployed) === "1",
+            },
+          };
+          const res = await fetch(CHILD_WEBHOOK, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (res.ok) fired++; else errors++;
+        }
+        return { total_rows: rows.length, fired, already_done: skippedDone, first_deploys: firstDeploys, webhook_errors: errors };
+
+connections:
+  - { id: c1, from: trigger, to: run }
+  - { id: c2, from: trigger_nightly, to: run }

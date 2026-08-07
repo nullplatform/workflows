@@ -1,0 +1,672 @@
+# Deploy Change Analysis — checklist external item resolver.
+#
+# Pairs with checklist external items of `kind: deploy-change-analysis`.
+# Computes the diff between the currently-deployed release and the candidate
+# (origin→destination, accumulating intermediate releases), extracts
+# participants (GitHub → NP users via user metadata identity.github_username),
+# deterministic risk signals, and an LLM risk score bounded by hard floors.
+# Persists everything to deployment metadata `change` and resolves the item
+# with a markdown summary.
+#
+# The item is informational —
+# it never blocks a deploy. Gates (risk_gate/group_override) come later.
+id: deploy-change-analysis-manual
+key: deploy-change-analysis-manual
+name: "Deploy Change Analysis (manual test)"
+description: >
+  Analyzes the accumulated change of a deployment (deployed release vs
+  candidate), scores its risk (signals + LLM with hard floors), writes
+  deployment.metadata.change and resolves the checklist item with a
+  markdown summary. Informational: resolves passed unless the analysis
+  itself crashes, in which case it resolves failed with the error.
+semantic_version: 1.0.0
+path: "/checklist/deploy"
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+steps:
+  - id: trigger
+    type: trigger
+    pluginType: webhook
+    name: "Manual webhook (same payload shape as np-checklist-trigger outputs)"
+    config:
+      path: /checklist/deploy/change-analysis-manual
+      method: POST
+      mode: start
+
+  - id: progress
+    type: module
+    pluginType: np-checklist-item-progress
+    name: "Heartbeat: analyzing change"
+    inputs:
+      callbackUrl:   "${{ workflow.inputs.body.callbackUrl }}"
+      callbackToken: "${{ workflow.inputs.body.callbackToken }}"
+      message:       "Computing diff between deployed and candidate release…"
+
+  - id: gather
+    type: module
+    pluginType: code-exec
+    name: "Gather change data (NP + GitHub)"
+    inputs:
+      application_id: "${{ workflow.inputs.body.inputs.application_id }}"
+      release_id:     "${{ workflow.inputs.body.inputs.release_id }}"
+      scope_id:       "${{ workflow.inputs.body.inputs.scope_id }}"
+      deployment_id:  "${{ workflow.inputs.body.inputs.deployment_id }}"
+      from_release_id: "${{ workflow.inputs.body.inputs.from_release_id }}"
+      previously_deployed_override: "${{ workflow.inputs.body.inputs.previously_deployed }}"
+      np_api_key:     "${{ secrets.NP_API_KEY }}"
+      github_token:   "${{ secrets.GITHUB_TOKEN }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com", "api.github.com"]
+      code: |
+        const { application_id, release_id, scope_id, np_api_key, github_token } = $item;
+
+        // --- NP client (api-key → token) ---
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: np_api_key }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+        const np = async (path) => {
+          const r = await fetch(`https://api.nullplatform.com${path}`, {
+            headers: { authorization: `Bearer ${npToken}` },
+          });
+          if (!r.ok) throw new Error(`NP GET ${path} → ${r.status}`);
+          return r.json();
+        };
+        const gh = async (path) => {
+          const r = await fetch(`https://api.github.com${path}`, {
+            headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github+json" },
+          });
+          if (!r.ok) throw new Error(`GitHub ${path} → ${r.status}`);
+          return r.json();
+        };
+
+        const releaseInfo = async (id) => {
+          const rel = await np(`/release/${id}`);
+          const build = await np(`/build/${rel.build_id}`);
+          return { id: rel.id, semver: rel.semver, created_at: rel.created_at,
+                   commit_sha: build.commit && build.commit.id, branch: build.branch };
+        };
+
+        // Candidate (to) release + currently deployed (from) release + fastpath
+        const to = await releaseInfo(release_id);
+        const deps = await np(`/deployment?scope_id=${scope_id}&limit=30`);
+        const finalized = (deps.results || [])
+          .filter(d => ["finalized", "active"].includes(d.status))
+          .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        let previously_deployed = finalized.slice(0, 10)
+          .some(d => String(d.release_id) === String(release_id));
+        const pdOverride = $item.previously_deployed_override;
+        if (pdOverride !== undefined && pdOverride !== null && pdOverride !== "") {
+          previously_deployed = String(pdOverride) === "true" || pdOverride === true;
+        }
+        // from_release_id: "none" (or ClickHouse TSV null "\N") = explicit
+        // first deploy — keep from=null, do NOT fall back to the current list
+        // (for backfills the current list reflects TODAY, not deploy time).
+        const fromArg = String($item.from_release_id || "");
+        let from = null;
+        if (fromArg && fromArg !== "none" && fromArg !== "\\N" && fromArg !== "0") {
+          from = await releaseInfo(fromArg);
+        } else if (!fromArg) {
+          const current = finalized.find(d => String(d.release_id) !== String(release_id));
+          if (current) from = await releaseInfo(current.release_id);
+        }
+
+        // Repo
+        const app = await np(`/application/${application_id}`);
+        const repo = (app.repository_url || "").replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
+        if (!repo) throw new Error(`application ${application_id} has no repository_url`);
+
+        // Intermediate releases
+        let releases_between = 0;
+        if (from) {
+          const rels = await np(`/release?application_id=${application_id}&limit=100`);
+          releases_between = (rels.results || []).filter(r =>
+            new Date(r.created_at) > new Date(from.created_at) &&
+            new Date(r.created_at) < new Date(to.created_at)).length;
+        }
+
+        // GitHub compare + participants (roles: author / reviewer / approver)
+        let commits = [], files = [], prs = [], participants = [];
+        if (!previously_deployed && from && from.commit_sha && to.commit_sha && from.commit_sha !== to.commit_sha) {
+          const cmp = await gh(`/repos/${repo}/compare/${from.commit_sha}...${to.commit_sha}`);
+          commits = (cmp.commits || []).map(c => ({ sha: c.sha, message: c.commit.message.split("\n")[0] }));
+          files = (cmp.files || []).map(f => ({ filename: f.filename, additions: f.additions, deletions: f.deletions }));
+          // Parallel in chunks: huge diffs (100+ commits) exceeded the 60s
+          // sandbox budget when these calls ran sequentially.
+          const inChunks = async (items, size, fn) => {
+            const out = [];
+            for (let i = 0; i < items.length; i += size) {
+              out.push(...await Promise.all(items.slice(i, i + size).map(fn)));
+            }
+            return out;
+          };
+          const prMap = new Map();
+          const prLists = await inChunks((cmp.commits || []).slice(0, 250), 10,
+            c => gh(`/repos/${repo}/commits/${c.sha}/pulls`).catch(() => []));
+          for (const list of prLists) for (const pr of list) prMap.set(pr.number, pr);
+          const people = new Map();
+          const add = (login, role) => {
+            if (!login || login.endsWith("[bot]")) return;
+            if (!people.has(login)) people.set(login, new Set());
+            people.get(login).add(role);
+          };
+          for (const c of cmp.commits || []) add(c.author && c.author.login, "author");
+          const prArr = [...prMap.values()];
+          const reviewLists = await inChunks(prArr, 10,
+            pr => gh(`/repos/${repo}/pulls/${pr.number}/reviews`).catch(() => []));
+          // Lead-time + size inputs: the PR detail carries additions/deletions
+          // (absent from the simple PR object) and /commits page 1 item 1 is
+          // the OLDEST commit — the true "first line" even under squash-merge.
+          const prDetails = await inChunks(prArr, 10,
+            pr => gh(`/repos/${repo}/pulls/${pr.number}`).catch(() => null));
+          const prFirstCommits = await inChunks(prArr, 10,
+            pr => gh(`/repos/${repo}/pulls/${pr.number}/commits?per_page=1`).catch(() => []));
+          prArr.forEach((pr, i) => {
+            add(pr.user && pr.user.login, "author");
+            const prPeople = new Map();
+            const addPr = (login, role) => {
+              if (!login || login.endsWith("[bot]")) return;
+              if (!prPeople.has(login)) prPeople.set(login, new Set());
+              prPeople.get(login).add(role);
+            };
+            addPr(pr.user && pr.user.login, "author");
+            for (const rv of reviewLists[i]) {
+              add(rv.user && rv.user.login, rv.state === "APPROVED" ? "approver" : "reviewer");
+              addPr(rv.user && rv.user.login, rv.state === "APPROVED" ? "approver" : "reviewer");
+            }
+            pr._collab = [...prPeople].map(([github, roles]) => ({ github, roles: [...roles] }));
+          });
+          // --- AI usage per PR: commit trailers (Co-Authored-By: Claude/...)
+          // and PR-body markers. "level" buckets the share of AI commits.
+          const AI_COMMIT = /co-authored-by:.*?(claude|copilot|cursor|devin|aider|codegen|windsurf)|generated with \[?claude|claude-session:/i;
+          const AI_BODY = /claude code|claude\.ai\/code|github copilot|devin\.ai|generated with/i;
+          const prAi = new Map();
+          const cList = (cmp.commits || []).slice(0, 250);
+          cList.forEach((c, i) => {
+            const isAi = AI_COMMIT.test((c.commit && c.commit.message) || "");
+            for (const pr of prLists[i] || []) {
+              if (!prAi.has(pr.number)) prAi.set(pr.number, { total: 0, ai: 0 });
+              const s = prAi.get(pr.number); s.total++; if (isAi) s.ai++;
+            }
+          });
+          prs = prArr.map((p, pi) => {
+            const st = prAi.get(p.number) || { total: 0, ai: 0 };
+            const det = prDetails[pi];
+            const fc = (prFirstCommits[pi] || [])[0];
+            const bodyMarker = AI_BODY.test(p.body || "");
+            const ratio = st.total ? st.ai / st.total : 0;
+            const used = st.ai > 0 || bodyMarker;
+            return {
+              number: p.number, title: p.title, branch: p.head && p.head.ref,
+              author: p.user && p.user.login,
+              collaborators: p._collab || [],
+              description: (p.body || "").slice(0, 500),
+              first_commit_at: (fc && fc.commit && fc.commit.author && fc.commit.author.date) || null,
+              opened_at: p.created_at || null,
+              merged_at: p.merged_at || null,
+              size: det ? { additions: det.additions, deletions: det.deletions, files: det.changed_files } : null,
+              ai: {
+                used,
+                level: !used ? "none" : ratio >= 1 ? "full" : ratio >= 0.5 ? "mostly" : "assisted",
+                commits_ai: st.ai, commits_total: st.total, body_marker: bodyMarker,
+              },
+            };
+          });
+          participants = [...people].map(([github, roles]) => ({ github, roles: [...roles] }));
+        }
+
+        // Participants stay as {github, roles}: mapping to platform users
+        // happens at REPORT time (lake join vs user/identity metadata) — it
+        // stays current when mappings change and costs zero API calls here.
+
+        // Deterministic signals
+        const PATTERNS = {
+          db_migrations: /(^|\/)(migrations?|db\/migrate|liquibase|flyway)\//i,
+          auth: /(^|\/)(auth|authn|authz|permissions?|iam)\//i,
+          infra: /(^|\/)(terraform|infra(structure)?|helm|k8s|\.github\/workflows)\/|(^|\/)Dockerfile$/i,
+          dependencies: /(^|\/)(package(-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|go\.(mod|sum)|requirements\.txt|Gemfile(\.lock)?|pom\.xml)$/i,
+        };
+        const sensitive_paths = {};
+        for (const k of Object.keys(PATTERNS)) sensitive_paths[k] = files.some(f => PATTERNS[k].test(f.filename));
+        const signals = {
+          lines_added: files.reduce((n, f) => n + (f.additions || 0), 0),
+          lines_deleted: files.reduce((n, f) => n + (f.deletions || 0), 0),
+          files_changed: files.length,
+          commits: commits.length,
+          prs: prs.map(p => p.number),
+          branches: new Set(prs.map(p => p.branch).filter(Boolean)).size,
+          intermediate_releases: releases_between,
+          sensitive_paths,
+        };
+
+        let criticality = "critical";
+        try {
+          const gmeta = await np(`/metadata/application/${application_id}`);
+          if (gmeta.governance && gmeta.governance.criticality) criticality = String(gmeta.governance.criticality);
+        } catch (e) { /* unclassified -> critical */ }
+
+        let deployment_id = $item.deployment_id;
+        if (!deployment_id) {
+          const cand = (deps.results || []).find(d => String(d.release_id) === String(release_id));
+          deployment_id = cand && cand.id;
+        }
+
+        return {
+          deployment_id,
+          criticality,
+          from_release: from ? { id: from.id, semver: from.semver, commit_sha: from.commit_sha } : null,
+          to_release: { id: to.id, semver: to.semver, commit_sha: to.commit_sha },
+          previously_deployed,
+          releases_between,
+          commits, files, prs, participants, signals,
+          ai_usage: {
+            prs_ai: prs.filter(p => p.ai && p.ai.used).length,
+            prs_total: prs.length,
+            commits_ai: prs.reduce((n, p) => n + ((p.ai && p.ai.commits_ai) || 0), 0),
+            commits_total: prs.reduce((n, p) => n + ((p.ai && p.ai.commits_total) || 0), 0),
+          },
+        };
+    errorHandling:
+      fallbackStep: resolve_failure
+
+  - id: progress_gathered
+    type: module
+    pluginType: np-checklist-item-progress
+    name: "Heartbeat: diff computed"
+    inputs:
+      callbackUrl:   "${{ workflow.inputs.body.callbackUrl }}"
+      callbackToken: "${{ workflow.inputs.body.callbackToken }}"
+      message:       "Diff computed: ${{ steps.gather.outputs.signals.commits }} commits, ${{ steps.gather.outputs.signals.files_changed }} files, ${{ steps.gather.outputs.releases_between }} intermediate releases. Scoring risk…"
+
+  - id: risk_agent
+    type: module
+    pluginType: claude-code-agent
+    name: "Score change risk"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 3
+      systemPrompt: |
+        You assess deployment risk for nullplatform's own production deploys.
+        Rules of thumb: config/copy tweaks and small isolated fixes are low;
+        new features, schema or dependency changes are medium; anything
+        touching auth, data migrations, infra, or very large / multi-branch
+        accumulations is high. Be concise and concrete: name the riskiest
+        part of the change in the rationale.
+
+        The summary must be FUNCTIONAL: describe what this deploy changes in
+        behavior or capability (features shipped, bugs fixed, what users or
+        operators will notice), NOT which files were touched — file and line
+        detail is already shown as structured data next to your summary.
+        Name a code component only when it is essential to understand the risk.
+      userPrompt: |
+        Assess this deployment change.
+
+        Signals: ${{ steps.gather.outputs.signals }}
+        Commit messages: ${{ steps.gather.outputs.commits }}
+        PR titles: ${{ steps.gather.outputs.prs }}
+        Files: ${{ steps.gather.outputs.files }}
+
+        Produce:
+        - risk: low | medium | high
+        - rationale: ≤50 words, name the riskiest concrete element
+        - summary_md: ≤120-word markdown summary of what this deploy changes
+          FUNCTIONALLY (features, fixes, behavior), for the human who approves
+          it. Do not list files or line counts.
+        - short_summary: ONE plain sentence (max 15 words, no markdown) naming
+          the essential functional change — used where UI space is tight.
+        - pr_summaries: for EACH PR in the input, a one-line functional summary
+          (≤25 words) of what that PR ships.
+      outputSchema:
+        type: object
+        required: [risk, rationale, summary_md, short_summary]
+        properties:
+          risk: { type: string, enum: [low, medium, high] }
+          rationale: { type: string }
+          summary_md: { type: string }
+          short_summary: { type: string }
+          pr_summaries:
+            type: array
+            items:
+              type: object
+              required: [number, summary]
+              properties:
+                number: { type: integer }
+                summary: { type: string }
+    errorHandling:
+      fallbackStep: assemble_heuristic
+
+  # LLM path: floors + assemble the final change object.
+  - id: assemble
+    type: module
+    pluginType: code-exec
+    name: "Apply floors + assemble metadata"
+    inputs:
+      change: "${{ steps.gather.outputs }}"
+      llm: "${{ steps.risk_agent.outputs }}"
+    config:
+      code: |
+        const change = $item.change;
+        const llm = $item.llm || {};
+        const ORDER = { low: 0, medium: 1, high: 2 };
+        const floors = [];
+        const sp = (change.signals && change.signals.sensitive_paths) || {};
+        if (sp.db_migrations) floors.push("db_migration");
+        if (sp.auth) floors.push("auth_change");
+        if (!change.from_release) floors.push("first_deploy");
+        const heuristic = (() => {
+          const s = change.signals || {};
+          let n = 0;
+          if ((s.lines_added || 0) + (s.lines_deleted || 0) > 500) n++;
+          if ((s.files_changed || 0) > 20) n++;
+          if ((s.intermediate_releases || 0) > 2) n++;
+          if (sp.dependencies) n++;
+          if (sp.infra) n++;
+          if (sp.db_migrations || sp.auth) n += 2;
+          return n >= 3 ? "high" : n >= 1 ? "medium" : "low";
+        })();
+        const scored = llm.risk || heuristic;
+        const floored = floors.length ? "medium" : "low";
+        const risk = ORDER[scored] >= ORDER[floored] ? scored : floored;
+        const summary_md = llm.summary_md ||
+          `${(change.commits || []).length} commits, ${(change.signals || {}).files_changed || 0} files: ` +
+          ((change.prs || []).map(p => p.title).join("; ") || (change.commits || []).slice(0, 5).map(c => c.message).join("; ") || "no commit data");
+        const rationale = llm.rationale || "Heuristic score (LLM unavailable).";
+        const short_summary = llm.short_summary ||
+          (summary_md.split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 120);
+        const RANK = { mission_critical: 1, critical: 2, important: 3, standard: 4, internal: 5 };
+        const critName = change.criticality || "critical";
+        const rank = RANK[critName] || 2;
+        let mode;
+        if (change.previously_deployed) mode = "fastpath";
+        else if (risk === "low") mode = "auto";
+        else if (risk === "medium") mode = rank <= 2 ? "par" : "auto";
+        else mode = rank === 1 ? "grupo" : rank <= 3 ? "par" : "auto";
+        const auto = mode === "auto" || mode === "fastpath";
+        const risk_gate_status = auto ? "passed" : "failed";
+        const risk_gate_message = auto
+          ? (mode === "fastpath" ? "Release already deployed to this scope recently - rollback fastpath" : "Auto-approved: risk " + risk + " x criticality " + critName)
+          : "Matrix requires " + mode + " approval (risk " + risk + " x criticality " + critName + ") - falls back to manual review until Slack approvals land";
+        const participantsLine = (change.participants || [])
+          .map(p => `${p.github} [${p.roles.join(", ")}]`).join(", ") || "none detected";
+        const prSummaries = new Map(((llm && llm.pr_summaries) || []).map(p => [p.number, p.summary]));
+        const prs_enriched = (change.prs || []).map(p => Object.assign({}, p, {
+          summary: prSummaries.get(p.number) || (p.description ? p.description.split("\n")[0].slice(0, 160) : null),
+        }));
+        const prLines = prs_enriched.map(p => {
+          const others = (p.collaborators || []).filter(c => c.github !== p.author)
+            .map(c => `${c.github} (${c.roles.join("/")})`).join(", ");
+          const aiTag = p.ai && p.ai.used ? ` · 🤖 AI ${p.ai.level}` : "";
+          return `- **#${p.number} ${p.title}** — ${p.author}${others ? " · con " + others : ""}${aiTag}${p.summary ? `\n  ${p.summary}` : ""}`;
+        }).join("\n");
+        const markdown = [
+          `### Change analysis — risk: **${risk.toUpperCase()}**${floors.length ? ` _(floors: ${floors.join(", ")})_` : ""}`,
+          "",
+          change.previously_deployed ? "♻️ **This release was already deployed to this scope recently (rollback fastpath candidate).**\n" : "",
+          summary_md,
+          prLines ? "\n**PRs:**\n" + prLines : "",
+          "",
+          `**From → to:** ${change.from_release ? change.from_release.semver : "(first deploy)"} → ${change.to_release.semver} (${change.releases_between} releases in between)`,
+          `**Size:** ${change.signals.lines_added}+/${change.signals.lines_deleted}- across ${change.signals.files_changed} files, ${change.signals.commits} commits, ${(change.prs || []).length} PRs`,
+          `**Participants:** ${participantsLine}`,
+          `**Why:** ${rationale}`,
+        ].join("\n");
+        const gate_results = [
+          { item: "already_deployed",
+            status: change.previously_deployed ? "passed" : "failed",
+            message: change.previously_deployed
+              ? "Release deployed to this scope within the last 10 finalized deploys - rollback fastpath"
+              : "Release not among the last 10 finalized deploys of this scope" },
+          { item: "risk_matrix", status: auto ? "passed" : "failed", message: risk_gate_message },
+          { item: "risk_gate", status: risk_gate_status, message: risk_gate_message },
+        ];
+        return {
+          metadata: Object.assign({}, change, {
+            prs: prs_enriched,
+            risk, risk_rationale: rationale, risk_floors_applied: floors, summary_md, short_summary,
+            approval: { mode, criticality: critName },
+          }),
+          markdown: markdown + "\n**Decision:** " + mode,
+          risk, gate_results, decision_mode: mode,
+        };
+
+  # Heuristic path (LLM failed): dedicated node so joins stay single-predecessor.
+  - id: assemble_heuristic
+    type: module
+    pluginType: code-exec
+    name: "Assemble metadata (heuristic, LLM failed)"
+    inputs:
+      change: "${{ steps.gather.outputs }}"
+    config:
+      code: |
+        const change = $item.change;
+        const ORDER = { low: 0, medium: 1, high: 2 };
+        const floors = [];
+        const sp = (change.signals && change.signals.sensitive_paths) || {};
+        if (sp.db_migrations) floors.push("db_migration");
+        if (sp.auth) floors.push("auth_change");
+        if (!change.from_release) floors.push("first_deploy");
+        const s = change.signals || {};
+        let n = 0;
+        if ((s.lines_added || 0) + (s.lines_deleted || 0) > 500) n++;
+        if ((s.files_changed || 0) > 20) n++;
+        if ((s.intermediate_releases || 0) > 2) n++;
+        if (sp.dependencies) n++;
+        if (sp.infra) n++;
+        if (sp.db_migrations || sp.auth) n += 2;
+        const scored = n >= 3 ? "high" : n >= 1 ? "medium" : "low";
+        const floored = floors.length ? "medium" : "low";
+        const risk = ORDER[scored] >= ORDER[floored] ? scored : floored;
+        const RANK = { mission_critical: 1, critical: 2, important: 3, standard: 4, internal: 5 };
+        const critName = change.criticality || "critical";
+        const rank = RANK[critName] || 2;
+        let mode;
+        if (change.previously_deployed) mode = "fastpath";
+        else if (risk === "low") mode = "auto";
+        else if (risk === "medium") mode = rank <= 2 ? "par" : "auto";
+        else mode = rank === 1 ? "grupo" : rank <= 3 ? "par" : "auto";
+        const auto = mode === "auto" || mode === "fastpath";
+        const risk_gate_status = auto ? "passed" : "failed";
+        const risk_gate_message = auto
+          ? (mode === "fastpath" ? "Release already deployed to this scope recently - rollback fastpath" : "Auto-approved: risk " + risk + " x criticality " + critName)
+          : "Matrix requires " + mode + " approval (risk " + risk + " x criticality " + critName + ") - falls back to manual review until Slack approvals land";
+        const rationale = "Heuristic score (LLM step failed): size, accumulation and sensitive-path signals only.";
+        const summary_md = `${(change.commits || []).length} commits, ${s.files_changed || 0} files: ` +
+          ((change.prs || []).map(p => p.title).join("; ") || "no commit data");
+        const short_summary = ((change.prs || [])[0] ? (change.prs || [])[0].title : `${(change.commits || []).length} commits`).slice(0, 120);
+        const markdown = `### Change analysis — risk: **${risk.toUpperCase()}** _(heuristic)_\n\n${summary_md}\n\n**Why:** ${rationale}`;
+        const gate_results = [
+          { item: "already_deployed",
+            status: change.previously_deployed ? "passed" : "failed",
+            message: change.previously_deployed
+              ? "Release deployed to this scope within the last 10 finalized deploys - rollback fastpath"
+              : "Release not among the last 10 finalized deploys of this scope" },
+          { item: "risk_matrix", status: auto ? "passed" : "failed", message: risk_gate_message },
+          { item: "risk_gate", status: risk_gate_status, message: risk_gate_message },
+        ];
+        return {
+          metadata: Object.assign({}, change, {
+            risk, risk_rationale: rationale, risk_floors_applied: floors, summary_md, short_summary,
+            approval: { mode, criticality: critName },
+          }),
+          markdown: markdown + "\n**Decision:** " + mode,
+          risk, gate_results, decision_mode: mode,
+        };
+
+  # ── Success tail (LLM path) ────────────────────────────────────────────
+  - id: write_metadata
+    type: module
+    pluginType: code-exec
+    name: "Persist deployment.metadata.change (upsert)"
+    inputs:
+      deployment_id: "${{ steps.gather.outputs.deployment_id }}"
+      np_api_key: "${{ secrets.NP_API_KEY }}"
+      metadata: "${{ steps.assemble.outputs.metadata }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const { deployment_id, np_api_key, metadata } = $item;
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: np_api_key }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+        const url = `https://api.nullplatform.com/metadata/deployment/${deployment_id}/change`;
+        const call = (method) => fetch(url, {
+          method,
+          headers: { authorization: `Bearer ${npToken}`, "content-type": "application/json" },
+          body: JSON.stringify(metadata),
+        });
+        let res = await call("POST");
+        if (!res.ok) {
+          const text = await res.text();
+          if (text.includes("already exists")) res = await call("PATCH");
+          else throw new Error(`metadata POST → ${res.status}: ${text}`);
+        }
+        if (!res.ok) throw new Error(`metadata PATCH → ${res.status}: ${await res.text()}`);
+        return { written: true };
+
+
+  - id: resolve
+    type: module
+    pluginType: code-exec
+    name: "Resolve items (change_analysis + risk_gate)"
+    inputs:
+      callbackUrl:   "${{ workflow.inputs.body.callbackUrl }}"
+      callbackToken: "${{ workflow.inputs.body.callbackToken }}"
+      out:           "${{ steps.assemble.outputs }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com", "echo.free.beeceptor.com"]
+      code: |
+        const { callbackUrl, callbackToken, out } = $item;
+        const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
+        const post = (url, body) => fetch(url, { method: "POST", headers: H, body: JSON.stringify(body) });
+        const patch = (url, body) => fetch(url, { method: "PATCH", headers: H, body: JSON.stringify(body) });
+        await post(`${callbackUrl}/log`, { level: "info", message: `Risk: ${out.risk} - ${out.metadata.risk_rationale}` }).catch(() => null);
+        await post(`${callbackUrl}/log`, { level: "info", message: `Matrix decision: ${out.decision_mode} (criticality ${out.metadata.criticality || "critical"})` }).catch(() => null);
+        let r = await patch(callbackUrl, { status: "passed", message: `Risk ${out.risk}: ${out.metadata.short_summary || "change analyzed"}`, details: { markdown: out.markdown } });
+        if (!r.ok) throw new Error(`change_analysis resolve -> ${r.status}: ${await r.text()}`);
+        // Sibling gates (cross_validation group, template v6). Tolerated when
+        // the item is absent (404), when the token is item-scoped pre-#260
+        // (401), or when the run already resolved (409).
+        const results = {};
+        for (const g of out.gate_results || []) {
+          const url = callbackUrl.replace(/\/items\/[^/]+$/, `/items/${g.item}`);
+          const rr = await patch(url, { status: g.status, message: g.message });
+          results[g.item] = rr.ok ? g.status : `skipped_${rr.status}`;
+          if (!rr.ok && ![401, 404, 409].includes(rr.status)) throw new Error(`${g.item} resolve -> ${rr.status}: ${await rr.text()}`);
+        }
+        return { resolved: true, gates: results };
+
+
+  # ── Heuristic tail (LLM failed; dedicated nodes, no mixed joins) ──────
+  - id: write_metadata_h
+    type: module
+    pluginType: code-exec
+    name: "Persist deployment.metadata.change (heuristic, upsert)"
+    inputs:
+      deployment_id: "${{ steps.gather.outputs.deployment_id }}"
+      np_api_key: "${{ secrets.NP_API_KEY }}"
+      metadata: "${{ steps.assemble_heuristic.outputs.metadata }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const { deployment_id, np_api_key, metadata } = $item;
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: np_api_key }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+        const url = `https://api.nullplatform.com/metadata/deployment/${deployment_id}/change`;
+        const call = (method) => fetch(url, {
+          method,
+          headers: { authorization: `Bearer ${npToken}`, "content-type": "application/json" },
+          body: JSON.stringify(metadata),
+        });
+        let res = await call("POST");
+        if (!res.ok) {
+          const text = await res.text();
+          if (text.includes("already exists")) res = await call("PATCH");
+          else throw new Error(`metadata POST → ${res.status}: ${text}`);
+        }
+        if (!res.ok) throw new Error(`metadata PATCH → ${res.status}: ${await res.text()}`);
+        return { written: true };
+
+
+  - id: resolve_h
+    type: module
+    pluginType: code-exec
+    name: "Resolve items (change_analysis + risk_gate)"
+    inputs:
+      callbackUrl:   "${{ workflow.inputs.body.callbackUrl }}"
+      callbackToken: "${{ workflow.inputs.body.callbackToken }}"
+      out:           "${{ steps.assemble_heuristic.outputs }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com", "echo.free.beeceptor.com"]
+      code: |
+        const { callbackUrl, callbackToken, out } = $item;
+        const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
+        const post = (url, body) => fetch(url, { method: "POST", headers: H, body: JSON.stringify(body) });
+        const patch = (url, body) => fetch(url, { method: "PATCH", headers: H, body: JSON.stringify(body) });
+        await post(`${callbackUrl}/log`, { level: "info", message: `Risk: ${out.risk} - ${out.metadata.risk_rationale}` }).catch(() => null);
+        await post(`${callbackUrl}/log`, { level: "info", message: `Matrix decision: ${out.decision_mode} (criticality ${out.metadata.criticality || "critical"})` }).catch(() => null);
+        let r = await patch(callbackUrl, { status: "passed", message: `Risk ${out.risk}: ${out.metadata.short_summary || "change analyzed"}`, details: { markdown: out.markdown } });
+        if (!r.ok) throw new Error(`change_analysis resolve -> ${r.status}: ${await r.text()}`);
+        // Sibling gates (cross_validation group, template v6). Tolerated when
+        // the item is absent (404), when the token is item-scoped pre-#260
+        // (401), or when the run already resolved (409).
+        const results = {};
+        for (const g of out.gate_results || []) {
+          const url = callbackUrl.replace(/\/items\/[^/]+$/, `/items/${g.item}`);
+          const rr = await patch(url, { status: g.status, message: g.message });
+          results[g.item] = rr.ok ? g.status : `skipped_${rr.status}`;
+          if (!rr.ok && ![401, 404, 409].includes(rr.status)) throw new Error(`${g.item} resolve -> ${rr.status}: ${await rr.text()}`);
+        }
+        return { resolved: true, gates: results };
+
+
+  # Reached only via gather's `error_handling.fallback_step`: the analysis
+  # itself crashed (NP/GitHub unavailable, bad repo, etc.). The item is
+  # informational so this does not block the deploy; the error is surfaced
+  # verbatim for debugging.
+  - id: resolve_failure
+    type: module
+    pluginType: np-checklist-item-resolve
+    name: "Resolve as failed (analysis crashed)"
+    inputs:
+      callbackUrl:   "${{ workflow.inputs.body.callbackUrl }}"
+      callbackToken: "${{ workflow.inputs.body.callbackToken }}"
+      status:        failed
+      message:       "Change analysis crashed: ${{ steps.gather.error.message }}"
+      details:
+        markdown: "The analysis workflow failed before producing a result. Deploy is NOT blocked (informational item). Error: ${{ steps.gather.error.message }}"
+
+connections:
+  - { id: c1, from: trigger,    to: progress }
+  - { id: c2, from: progress,   to: gather }
+  - { id: c3, from: gather,     to: progress_gathered }
+  - { id: c3b, from: progress_gathered, to: risk_agent }
+  - { id: c4, from: risk_agent, to: assemble }
+  - { id: c5, from: assemble,   to: resolve }
+  - { id: c6, from: resolve,    to: write_metadata }
+  # Dormant edges: keep the fallback tails out of the entry-point set;
+  # the engine routes to them on terminal failure via fallback_step.
+  - { id: c7, from: gather,     to: resolve_failure,   condition: "false" }
+  - { id: c8, from: risk_agent, to: assemble_heuristic, condition: "false" }
+  - { id: c9,  from: assemble_heuristic, to: resolve_h }
+  - { id: c10, from: resolve_h,          to: write_metadata_h }
