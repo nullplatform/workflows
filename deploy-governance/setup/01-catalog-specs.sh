@@ -4,7 +4,8 @@
 # Creates the metadata specifications the workflows read and write:
 #   application/governance        — criticality (named enum, UI-selectable)
 #   user/identity                 — github_username (GitHub -> NP user mapping)
-#   deployment/change             — per-deploy change analysis (open schema)
+#   deployment/change             — per-deploy change analysis (full schema,
+#                                   sourced from ../specs/deployment-change.spec.json)
 #   application/deploy_summaries  — weekly rolling summaries (app level)
 #   namespace/deploy_summaries    — weekly rolling summaries (namespace level)
 #
@@ -13,6 +14,9 @@
 #
 # Idempotent-ish: re-running when a spec already exists prints the API error
 # for that spec and continues (specs are keyed by entity+metadata per NRN).
+# Exception: deployment/change is a true upsert — when it already exists its
+# schema+description are PATCHed in place, so schema evolution ships by
+# editing specs/deployment-change.spec.json and re-running this script.
 set -euo pipefail
 
 : "${NP_API_KEY:?set NP_API_KEY}"
@@ -68,14 +72,31 @@ create_spec "$(jq -n --arg nrn "$NRN" '{
   }
 }')"
 
-# --- deployment/change: the per-deploy analysis document (open schema: the
-# workflow owns the shape; see deploy-change-analysis.yaml).
-create_spec "$(jq -n --arg nrn "$NRN" '{
-  nrn: $nrn, entity: "deployment", metadata: "change",
-  name: "Deployment change analysis",
-  description: "Diff, participants, risk signals, LLM risk score and approval-matrix decision for a production deployment. Written by the deploy-change-analysis workflow.",
-  schema: { type: "object", additionalProperties: true }
-}')"
+# --- deployment/change: the per-deploy analysis document. Full schema lives
+# in specs/deployment-change.spec.json (single source of truth — the metadata
+# service VALIDATES every write against it, so before changing it check that
+# real stored docs still validate; see the README "Metadata contract" section).
+# Upserted: created if absent, otherwise schema+description PATCHed in place.
+SPEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../specs" && pwd)"
+CHANGE_SPEC="$(jq --arg nrn "$NRN" '. + {nrn: $nrn}' "$SPEC_DIR/deployment-change.spec.json")"
+echo "== deployment/change"
+out=$(curl -s -X POST "$API/metadata/metadata_specification" \
+  -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d "$CHANGE_SPEC")
+if [[ "$(jq -r '.id // empty' <<<"$out")" != "" ]]; then
+  jq -c '{id: .id}' <<<"$out"
+else
+  sid=$(curl -s "$API/metadata/metadata_specification?nrn=$NRN&limit=100" \
+    -H "authorization: Bearer $TOKEN" \
+    | jq -r '(.results // .) | map(select(.entity=="deployment" and .metadata=="change")) | .[0].id // empty')
+  if [[ -z "$sid" ]]; then
+    echo "FAILED: could not create nor find deployment/change: $(jq -c '{error: .message}' <<<"$out")"; exit 1
+  fi
+  curl -s -X PATCH "$API/metadata/metadata_specification/$sid" \
+    -H "authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+    -d "$(jq -c '{schema, description}' <<<"$CHANGE_SPEC")" \
+    | jq -c '{id: (.id // null), error: (.message // null)}'
+fi
 
 # --- deploy_summaries (app + namespace): rolling weekly summaries. The UI
 # card renders only latest_summary (visibleOn); weeks is API/lake-only data.

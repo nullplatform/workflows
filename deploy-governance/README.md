@@ -82,6 +82,45 @@ four-eyes pair review, and an admin escalation each unblock the deploy.
    `{"days": 14, "application_id": 0}` (0 = all apps). Re-fire until it
    reports `fired: 0` — see gotchas.
 
+## Metadata contract: `deployment.metadata.change`
+
+The durable artifact of the suite. Its specification carries a **full JSON
+Schema** (`specs/deployment-change.spec.json`, upserted by the setup script)
+so the dashboard renders it schema-driven instead of dumping a JSON blob.
+
+What the analysis writes per deploy (all levels `additionalProperties: true`):
+
+| Field | Shape | Notes |
+|---|---|---|
+| `risk` | `low \| medium \| high` | LLM score bounded by deterministic floors |
+| `short_summary` / `summary_md` | string / markdown | one-liner + full narrative (PRs, participants, rationale) |
+| `risk_rationale`, `risk_floors_applied` | string, string[] | floors: `db_migration`, `auth_change`, `first_deploy` |
+| `change_categories` | `[{category, count, notes}]` | LLM taxonomy (feature/bugfix/security/…); `category` is deliberately a free string in the schema so historical docs never fail write-validation |
+| `breaking`, `hotfix` | boolean | only present when true |
+| `approval` | `{mode, criticality}` | matrix decision: `auto \| fastpath \| par \| grupo` |
+| `from_release` / `to_release` | `{id, semver, commit_sha}` | `from_release` is `null` on first deploys |
+| `releases_between`, `previously_deployed` | int, bool | accumulation + rollback fastpath |
+| `signals` | sizes + `sensitive_paths{}` | deterministic inputs to the risk score |
+| `prs` | rich PR objects | number/title/author/summary/size + per-PR `ai {used, level}` |
+| `participants` | `[{github, np_user_id?, roles}]` | `np_user_id` null until mapped via `user/identity` |
+| `ai_usage` | `{prs_ai, prs_total, commits_ai, commits_total}` | declared-AI lower bound |
+
+**Visibility contract**: the schema declares `visibleOn: ["read"]` at the
+root — the document renders on the **deployment detail** only. It never
+becomes deployment-list columns (nothing is marked `visibleOn: list`, which
+list columns require per property) and never appears in create/update forms
+(it is machine-written). Raw payloads (`commits`, `files`, long PR
+descriptions, plumbing ids) are intentionally **not declared** as properties:
+`additionalProperties: true` keeps accepting them on writes, but the
+schema-driven UI does not render them — `summary_md` already narrates that
+content.
+
+**Evolving the schema**: the metadata service validates every write against
+it, so a stricter schema can brick the analysis pipeline. Before changing
+`specs/deployment-change.spec.json`, validate a sample of real stored docs
+against the new schema (AJV 8, `strict: false` — same as the service), then
+re-run `setup/01-catalog-specs.sh` (it PATCHes the existing spec in place).
+
 ## Cron layout
 
 - Backfill: nightly (e.g. `30 1 * * *`), window 3 days — self-heals gaps.
