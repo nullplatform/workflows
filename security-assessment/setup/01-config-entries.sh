@@ -26,9 +26,9 @@ entry NP_ORGANIZATION_ID "${NP_ORGANIZATION_ID:?set NP_ORGANIZATION_ID}" false
 entry SEC_CATEGORY_SLUG "${SEC_CATEGORY_SLUG:?set SEC_CATEGORY_SLUG}" false
 entry SEC_MIN_SEVERITY "${SEC_MIN_SEVERITY:-medium}" false
 entry SEC_DUE_DAYS "${SEC_DUE_DAYS:-14}" false
-# SEC_AGENT_MODEL is OPTIONAL — the YAMLs read
-# ${{ vars.SEC_AGENT_MODEL || 'claude-opus-5' }}, so an unset entry just
-# takes the default. Not force-seeded here; set it explicitly only if a run
-# needs a non-default model:
-#   entry SEC_AGENT_MODEL "claude-opus-5" false
+# SEC_AGENT_MODEL looks optional (the YAMLs read
+# ${{ vars.SEC_AGENT_MODEL || 'claude-opus-5' }}) but the || fallback never
+# fires: the expression resolver throws CONFIG_ENTRY_UNRESOLVED on the
+# unresolved var before evaluating the ||, so the entry MUST exist.
+entry SEC_AGENT_MODEL "${SEC_AGENT_MODEL:-claude-opus-5}" false
 echo "Done."

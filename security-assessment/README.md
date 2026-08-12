@@ -86,12 +86,9 @@ Set on folder `/action-items/security-assessment` (see the header comment in
 | `SEC_CATEGORY_SLUG` | var | Action item category slug |
 | `SEC_MIN_SEVERITY` | var | Minimum severity to materialize (default `medium`) |
 | `SEC_DUE_DAYS` | var | Due-date offset in days (default `14`) |
-| `SEC_AGENT_MODEL` | var | Optional agent model override (default `claude-opus-5`, baked into the YAMLs via `${{ vars.SEC_AGENT_MODEL || 'claude-opus-5' }}`) |
+| `SEC_AGENT_MODEL` | var | Agent model — **required** (e.g. `claude-opus-5`). The YAMLs read `${{ vars.SEC_AGENT_MODEL || 'claude-opus-5' }}`, but the `\|\|` fallback never fires: the resolver throws `CONFIG_ENTRY_UNRESOLVED` on the unresolved var before evaluating it, so every referenced var is effectively required. |
 
-`01-config-entries.sh` seeds the first six; `SEC_AGENT_MODEL` is optional and
-**not** written by the script — only set it (via `POST /workflows/config`, or
-by uncommenting the `entry` line in the script) if a run needs a non-default
-model.
+`01-config-entries.sh` seeds all seven.
 
 > **`GITHUB_TOKEN` must be read-only.** Scope it to `contents: read` on the
 > repositories being assessed — a fine-grained PAT or a GitHub App
