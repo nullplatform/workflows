@@ -1,0 +1,176 @@
+# Remediation Planner — sub-workflow
+#
+# Invoked by on-action-item-event when an action item with
+# workflow_type=cost-optimization is created.
+# Can also be run manually by passing action_item_id.
+#
+# Uses a Claude agent to analyze the action item context and create
+# a structured suggestion with a concrete remediation plan.
+
+id: remediation_planner
+name: "Remediation Planner"
+description: >
+  Sub-workflow that analyzes a cost-optimization action item and creates
+  a structured remediation suggestion. Uses an AI agent to contextualize
+  the recommendation based on the application type and workload patterns.
+  Called by on-action-item-event or manually.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+inputs:
+  action_item_id:
+    type: string
+    required: true
+    description: "Action item ID to plan remediation for"
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Planning"
+    config:
+      description: "Creates a remediation plan (suggestion) for a cost-optimization action item"
+      inputs:
+        action_item_id:
+          type: string
+          required: true
+          description: "Action item ID"
+          placeholder: "e.g. AI-001 or THPEK4MRL4oJ"
+
+  - id: fetch_action_item
+    type: module
+    plugin_type: np-action-item-get
+    name: "Get Action Item"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+
+  - id: comment_start
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Notify Planning Started"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:remediation-planner"
+      content: "Analyzing this finding and preparing a remediation plan..."
+
+  - id: plan_agent
+    type: module
+    plugin_type: claude-code-agent
+    name: "Create Remediation Plan"
+    config:
+      model: claude-opus-4-7
+      maxIterations: 5
+      systemPrompt: |
+        You are a cost optimization specialist for nullplatform.
+        You analyze over-provisioned resources and create remediation plans.
+
+        You will receive an action item with metadata containing:
+        - analyses[]: each with resource type, current allocation, recommended values
+        - scope_id, application_id, replicas
+
+        Your job:
+        1. Analyze the recommendation in the action item metadata
+        2. Consider the application context (replicas, workload type)
+        3. Create a concrete remediation plan with specific parameter changes
+        4. Be conservative: ensure the recommended values have enough headroom
+
+        For CPU:
+        - Never recommend less than 100m request (Nullplatform enforces this floor — any value below is rejected with 400)
+        - Always keep limit >= 2x request for burst handling
+        - Round to nice values (multiples of 50m or 100m)
+
+        For memory:
+        - Never recommend less than 128Mi (matching NP's minimum allocation)
+        - Keep limit >= 1.5x request
+        - Round to multiples of 32Mi or 64Mi
+
+        Output a structured JSON with the plan.
+      userPrompt: |
+        Analyze this action item and create a remediation plan:
+
+        Title: ${{ steps.fetch_action_item.outputs.actionItem.title }}
+        Metadata: ${{ steps.fetch_action_item.outputs.actionItem.metadata }}
+        Current status: ${{ steps.fetch_action_item.outputs.actionItem.status }}
+        Priority: ${{ steps.fetch_action_item.outputs.actionItem.priority }}
+
+        Create a plan with specific CPU and/or memory changes.
+      outputSchema:
+        type: object
+        required: [plan_description, changes, deployment_required, risk_level]
+        properties:
+          plan_description:
+            type: string
+            description: "Human-readable description of the plan"
+          changes:
+            type: array
+            items:
+              type: object
+              required: [parameter, from_value, to_value, unit]
+              properties:
+                parameter:
+                  type: string
+                  description: "cpu_request, cpu_limit, memory_request, memory_limit"
+                from_value: { type: number }
+                to_value: { type: number }
+                unit:
+                  type: string
+                  description: "m (millicores) or Mi (mebibytes)"
+          deployment_required: { type: boolean }
+          risk_level:
+            type: string
+            enum: [low, medium, high]
+          rollback_plan: { type: string }
+          estimated_savings_usd_month: { type: number }
+      tools: []
+
+  - id: create_suggestion
+    type: module
+    plugin_type: np-action-item-suggestion-create
+    name: "Create Suggestion"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      createdBy: "agent:remediation-planner"
+      owner: "executor:cost-applier"
+      confidence: 0.85
+      description: "${{ steps.plan_agent.outputs.plan_description }}"
+      metadata:
+        changes: "${{ steps.plan_agent.outputs.changes }}"
+        deployment_required: "${{ steps.plan_agent.outputs.deployment_required }}"
+        risk_level: "${{ steps.plan_agent.outputs.risk_level }}"
+        rollback_plan: "${{ steps.plan_agent.outputs.rollback_plan }}"
+        estimated_savings_usd_month: "${{ steps.plan_agent.outputs.estimated_savings_usd_month }}"
+        scope_id: "${{ steps.fetch_action_item.outputs.actionItem.metadata.scope_id }}"
+        application_id: "${{ steps.fetch_action_item.outputs.actionItem.metadata.application_id }}"
+
+  - id: comment_plan
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Post Plan Summary"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      author: "agent:remediation-planner"
+      content: "Remediation plan created (suggestion ${{ steps.create_suggestion.outputs.suggestionId }}). Review and approve to apply automatically."
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Done"
+    config:
+      level: info
+      message: "Remediation plan created for AI ${{ workflow.inputs.action_item_id }}, suggestion ${{ steps.create_suggestion.outputs.suggestionId }}"
+
+connections:
+  - { id: c1, from: start, to: fetch_action_item }
+  - { id: c2, from: fetch_action_item, to: comment_start }
+  - { id: c3, from: comment_start, to: plan_agent }
+  - { id: c4, from: plan_agent, to: create_suggestion }
+  - { id: c5, from: create_suggestion, to: comment_plan }
+  - { id: c6, from: comment_plan, to: log_done }
+
+outputs:
+  suggestion_id: "${{ steps.create_suggestion.outputs.suggestionId }}"
+  plan: "${{ steps.plan_agent.outputs }}"

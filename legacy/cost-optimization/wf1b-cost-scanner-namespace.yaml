@@ -1,0 +1,160 @@
+# Cost Action Items — NAMESPACE scope
+#
+# Scans all active applications of a namespace. Per app, delegates to
+# the `cost_action_items` sub-workflow (which itself streams scopes).
+# Three-level delegation chain:
+#   organization → account → namespace → application → scope
+#   wf6           wf5       wf4 (this) → wf1          → analyze_scope
+
+id: cost_action_items_for_namespace
+name: "Cost Action Items (namespace)"
+description: >
+  Scans every active application within a single namespace for
+  over-provisioned CPU and memory. Fetches apps page-by-page (streaming)
+  and delegates the per-application work to `cost_action_items`.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+inputs:
+  namespace_id:
+    type: number
+    required: true
+    description: "NP namespace ID to scan"
+  np_api_base:
+    type: string
+    required: false
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+# Per-page results accumulate here across re-entries via the `acc_apps`
+# step. The `summary` node reads this variable directly because the
+# `fetch_applications:done` envelope it normally fans into is empty.
+variables:
+  app_results:
+    initialValue: []
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Namespace Scan"
+    config:
+      description: "Run cost-optimization scan across every application in a namespace"
+      inputs:
+        namespace_id:
+          type: number
+          required: true
+          description: "NP namespace ID"
+          placeholder: "e.g. 55381482"
+        np_api_base:
+          type: string
+          required: false
+          default: "https://api.nullplatform.com"
+
+  # Streaming page-by-page: loop until `done` port fires.
+  - id: fetch_applications
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "List Applications"
+    config:
+      apiBaseUrl: "${{ workflow.inputs.np_api_base || 'https://api.nullplatform.com' }}"
+      apiToken: "${{ secrets.np_api_token }}"
+      entity: application
+      filters:
+        namespace_id: "${{ workflow.inputs.namespace_id }}"
+        status: active
+      limit: 100
+      mode: stream
+
+  - id: scan_application
+    type: module
+    plugin_type: sub-workflow
+    name: "Scan Application"
+    config:
+      workflowId: cost_action_items
+      waitForCompletion: true
+    inputs:
+      application_id: "${{ $item.id }}"
+
+  # Append this page's per-app scan outputs to the workflow-level
+  # accumulator. set-variable runs once per loop iteration with the full
+  # batch in `$items`, so `concat(variables.app_results, $items)` grows
+  # the list page-by-page. `flipPorts` keeps the visual back-edge tidy.
+  - id: acc_apps
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate App Results"
+    metadata:
+      flipPorts: true
+    config:
+      path: app_results
+      value: "${{ concat(variables.app_results, $items) }}"
+
+  # Pulls the accumulated list out of variables (the `done` envelope from
+  # `fetch_applications` is empty by design) and rolls it into the
+  # workflow-level totals.
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Namespace Summary"
+    inputs:
+      results:      "${{ variables.app_results }}"
+      namespace_id: "${{ workflow.inputs.namespace_id }}"
+    config:
+      code: |
+        var items = inputs.results || [];
+        var totalAIs = 0;
+        var allIds = [];
+        var allFindings = [];
+        for (var i = 0; i < items.length; i++) {
+          var r = items[i] || {};
+          totalAIs += r.action_items_created || 0;
+          var ids = r.action_item_ids || [];
+          for (var j = 0; j < ids.length; j++) allIds.push(ids[j]);
+          var fs = r.findings || [];
+          for (var k = 0; k < fs.length; k++) {
+            var f = fs[k] || {};
+            allFindings.push({
+              namespace_id:   f.namespace_id != null ? f.namespace_id : inputs.namespace_id,
+              application_id: f.application_id != null ? f.application_id : null,
+              scope_id:       f.scope_id || null,
+              scope_name:     f.scope_name || null,
+              scope_nrn:      f.scope_nrn || null,
+              action_item_id: f.action_item_id || null,
+              title:          f.title || null,
+              value:          f.value != null ? f.value : null,
+              priority:       f.priority || null,
+              resources:      f.resources || null,
+            });
+          }
+        }
+        return {
+          apps_scanned:         items.length,
+          action_items_created: totalAIs,
+          action_item_ids:      allIds,
+          findings:             allFindings,
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Scan Complete"
+    config:
+      level: info
+      message: "Namespace scan complete. Apps: ${{ steps.summary.outputs.apps_scanned }}, AIs: ${{ steps.summary.outputs.action_items_created }}."
+
+connections:
+  - { id: c1, from: start, to: fetch_applications }
+  - { id: c2, from: fetch_applications, to: scan_application, source_port: loop }
+  - { id: c3, from: scan_application, to: acc_apps }
+  - { id: c4, from: acc_apps, to: fetch_applications, target_port: callback }
+  - { id: c5, from: fetch_applications, to: summary, source_port: done }
+  - { id: c6, from: summary, to: log_done }
+
+outputs:
+  apps_scanned:         "${{ steps.summary.outputs.apps_scanned }}"
+  action_items_created: "${{ steps.summary.outputs.action_items_created }}"
+  action_item_ids:      "${{ steps.summary.outputs.action_item_ids }}"
+  findings:             "${{ steps.summary.outputs.findings }}"

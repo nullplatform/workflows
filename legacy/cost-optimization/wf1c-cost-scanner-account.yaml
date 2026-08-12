@@ -1,0 +1,132 @@
+# Cost Action Items — ACCOUNT scope
+#
+# Scans every namespace of an account. Per namespace, delegates to
+# `cost_action_items_for_namespace`. Same streaming pattern.
+
+id: cost_action_items_for_account
+name: "Cost Action Items (account)"
+description: >
+  Scans every namespace within a single account for cost-optimization
+  findings. Fetches namespaces page-by-page and delegates per-namespace
+  work to `cost_action_items_for_namespace`.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+inputs:
+  account_id:
+    type: number
+    required: true
+    description: "NP account ID to scan"
+  np_api_base:
+    type: string
+    required: false
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+variables:
+  ns_results:
+    initialValue: []
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Account Scan"
+    config:
+      description: "Run cost-optimization scan across every namespace in an account"
+      inputs:
+        account_id:
+          type: number
+          required: true
+          description: "NP account ID"
+          placeholder: "e.g. 17"
+        np_api_base:
+          type: string
+          required: false
+          default: "https://api.nullplatform.com"
+
+  - id: fetch_namespaces
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "List Namespaces"
+    config:
+      apiBaseUrl: "${{ workflow.inputs.np_api_base || 'https://api.nullplatform.com' }}"
+      apiToken: "${{ secrets.np_api_token }}"
+      entity: namespace
+      filters:
+        account_id: "${{ workflow.inputs.account_id }}"
+      limit: 100
+      mode: stream
+
+  - id: scan_namespace
+    type: module
+    plugin_type: sub-workflow
+    name: "Scan Namespace"
+    config:
+      workflowId: cost_action_items_for_namespace
+      waitForCompletion: true
+    inputs:
+      namespace_id: "${{ $item.id }}"
+
+  - id: acc_namespaces
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate Namespace Results"
+    metadata:
+      flipPorts: true
+    config:
+      path: ns_results
+      value: "${{ concat(variables.ns_results, $items) }}"
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Account Summary"
+    inputs:
+      results: "${{ variables.ns_results }}"
+    config:
+      code: |
+        var items = inputs.results || [];
+        var totalApps = 0, totalAIs = 0, allIds = [];
+        var allFindings = [];
+        for (var i = 0; i < items.length; i++) {
+          var r = items[i] || {};
+          totalApps += r.apps_scanned || 0;
+          totalAIs += r.action_items_created || 0;
+          var ids = r.action_item_ids || [];
+          for (var j = 0; j < ids.length; j++) allIds.push(ids[j]);
+          var fs = r.findings || [];
+          for (var k = 0; k < fs.length; k++) allFindings.push(fs[k]);
+        }
+        return {
+          namespaces_scanned:   items.length,
+          apps_scanned:         totalApps,
+          action_items_created: totalAIs,
+          action_item_ids:      allIds,
+          findings:             allFindings,
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Scan Complete"
+    config:
+      level: info
+      message: "Account scan done. Namespaces: ${{ steps.summary.outputs.namespaces_scanned }}, Apps: ${{ steps.summary.outputs.apps_scanned }}, AIs: ${{ steps.summary.outputs.action_items_created }}."
+
+connections:
+  - { id: c1, from: start, to: fetch_namespaces }
+  - { id: c2, from: fetch_namespaces, to: scan_namespace, source_port: loop }
+  - { id: c3, from: scan_namespace, to: acc_namespaces }
+  - { id: c4, from: acc_namespaces, to: fetch_namespaces, target_port: callback }
+  - { id: c5, from: fetch_namespaces, to: summary, source_port: done }
+  - { id: c6, from: summary, to: log_done }
+
+outputs:
+  namespaces_scanned:   "${{ steps.summary.outputs.namespaces_scanned }}"
+  apps_scanned:         "${{ steps.summary.outputs.apps_scanned }}"
+  action_items_created: "${{ steps.summary.outputs.action_items_created }}"
+  action_item_ids:      "${{ steps.summary.outputs.action_item_ids }}"
+  findings:             "${{ steps.summary.outputs.findings }}"

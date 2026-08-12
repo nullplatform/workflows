@@ -1,0 +1,137 @@
+# Cost Action Items — ORGANIZATION scope
+#
+# Top of the delegation chain: scans every account in an organization.
+# Per account, delegates to `cost_action_items_for_account`.
+
+id: cost_action_items_for_organization
+name: "Cost Action Items (organization)"
+description: >
+  Org-wide cost-optimization scan. Fetches every account in the
+  organization and delegates per-account work to
+  `cost_action_items_for_account`. Together the four layers (org →
+  account → namespace → application → scope) share exactly one place
+  for the actual analysis logic: `analyze_scope`.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+inputs:
+  organization_id:
+    type: number
+    required: true
+    description: "NP organization ID to scan"
+  np_api_base:
+    type: string
+    required: false
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+variables:
+  acct_results:
+    initialValue: []
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Org Scan"
+    config:
+      description: "Run cost-optimization scan across every account in an organization"
+      inputs:
+        organization_id:
+          type: number
+          required: true
+          description: "NP organization ID"
+          placeholder: "e.g. 4"
+        np_api_base:
+          type: string
+          required: false
+          default: "https://api.nullplatform.com"
+
+  - id: fetch_accounts
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "List Accounts"
+    config:
+      apiBaseUrl: "${{ workflow.inputs.np_api_base || 'https://api.nullplatform.com' }}"
+      apiToken: "${{ secrets.np_api_token }}"
+      entity: account
+      filters:
+        organization_id: "${{ workflow.inputs.organization_id }}"
+      limit: 100
+      mode: stream
+
+  - id: scan_account
+    type: module
+    plugin_type: sub-workflow
+    name: "Scan Account"
+    config:
+      workflowId: cost_action_items_for_account
+      waitForCompletion: true
+    inputs:
+      account_id: "${{ $item.id }}"
+
+  - id: acc_accounts
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate Account Results"
+    metadata:
+      flipPorts: true
+    config:
+      path: acct_results
+      value: "${{ concat(variables.acct_results, $items) }}"
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Org Summary"
+    inputs:
+      results: "${{ variables.acct_results }}"
+    config:
+      code: |
+        var items = inputs.results || [];
+        var totalNs = 0, totalApps = 0, totalAIs = 0, allIds = [];
+        var allFindings = [];
+        for (var i = 0; i < items.length; i++) {
+          var r = items[i] || {};
+          totalNs += r.namespaces_scanned || 0;
+          totalApps += r.apps_scanned || 0;
+          totalAIs += r.action_items_created || 0;
+          var ids = r.action_item_ids || [];
+          for (var j = 0; j < ids.length; j++) allIds.push(ids[j]);
+          var fs = r.findings || [];
+          for (var k = 0; k < fs.length; k++) allFindings.push(fs[k]);
+        }
+        return {
+          accounts_scanned:     items.length,
+          namespaces_scanned:   totalNs,
+          apps_scanned:         totalApps,
+          action_items_created: totalAIs,
+          action_item_ids:      allIds,
+          findings:             allFindings,
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Scan Complete"
+    config:
+      level: info
+      message: "Org scan done. Accounts: ${{ steps.summary.outputs.accounts_scanned }}, NS: ${{ steps.summary.outputs.namespaces_scanned }}, Apps: ${{ steps.summary.outputs.apps_scanned }}, AIs: ${{ steps.summary.outputs.action_items_created }}."
+
+connections:
+  - { id: c1, from: start, to: fetch_accounts }
+  - { id: c2, from: fetch_accounts, to: scan_account, source_port: loop }
+  - { id: c3, from: scan_account, to: acc_accounts }
+  - { id: c4, from: acc_accounts, to: fetch_accounts, target_port: callback }
+  - { id: c5, from: fetch_accounts, to: summary, source_port: done }
+  - { id: c6, from: summary, to: log_done }
+
+outputs:
+  accounts_scanned:     "${{ steps.summary.outputs.accounts_scanned }}"
+  namespaces_scanned:   "${{ steps.summary.outputs.namespaces_scanned }}"
+  apps_scanned:         "${{ steps.summary.outputs.apps_scanned }}"
+  action_items_created: "${{ steps.summary.outputs.action_items_created }}"
+  action_item_ids:      "${{ steps.summary.outputs.action_item_ids }}"
+  findings:             "${{ steps.summary.outputs.findings }}"
