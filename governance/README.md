@@ -13,6 +13,8 @@ channel on alias activation, receives the dispatch (with a `callbackUrl` /
 | `validate-jira-epic.yaml` | `validate-jira-epic` | The Jira epic referenced in deployment metadata exists, is of type Epic, and sits in a permissible status. Fetches the epic (`jira-get-issue`), validates, resolves the item. |
 | `check-release-staged.yaml` | `check-release-staged` | The release was previously deployed to a `dimensions.environment=stage` scope of the same application — scans the last 30 finalized deployments and passes on a match. |
 | `create-jira-ticket.yaml` | `create-jira-ticket` | Creates a Jira ticket, writes a per-execution callback URL into a custom field, then **parks on `signal-wait`** until a Jira Automation rule pokes it back. On the poke it re-reads the ticket from Jira (source of truth — the webhook body is untrusted) and resolves passed / failed. |
+| `arch-rule-check.yaml` | `arch-rule-check` | Evaluates ONE company architecture rule (carried in the item inputs) against the application repository with an LLM pass, and resolves the item with findings and fix instructions. Incremental: a rule whose files did not change carries over its previous verdict. |
+| `audit-entity-check.yaml` | `audit-entity-check` | Validates that the entities this application writes are correctly wired into the HTTP audit pipeline (producer emits the event, the audit-enhancer has config for the entity name, its service account can read it). Combines deterministic signals — two lake queries, the enhancer's `entityConfig`, and a fetch probe replaying the enhancer's own GET — with an LLM pass for write routes that produce no audit at all. Incremental, same checkpoint scheme as `arch-rule-check`. |
 
 ## Patterns worth knowing
 
@@ -29,6 +31,17 @@ channel on alias activation, receives the dispatch (with a `callbackUrl` /
   `timeout` output port — module descriptors can be stale in the Temporal
   worker's in-sandbox graph validation, so an edge off a non-default port trips
   `CONNECTION_SOURCE_PORT_UNKNOWN` at runtime.
+- **A fallback needs a declared edge** (`condition: "false"` keeps it dormant),
+  and it can only fire into a node whose predecessors are *all* settled. When a
+  failed step must rejoin the main path instead of resolving the item — the two
+  lake queries in `audit-entity-check` — it gets its own single-predecessor
+  re-entry node, and the shared target declares `join_strategy: any` so the
+  first completed edge starts it.
+- **Degraded sources are not findings** (`audit-entity-check`): signal
+  collection reports anomalies of the audited system and failures to read a
+  source on two separate channels. Only the former may force an analysis;
+  otherwise one missing credential silently disables the incremental path
+  forever. Both are published on the item.
 
 ## Configuration
 
@@ -38,8 +51,10 @@ never inlined:
 
 | Name | Kind | Used by |
 |---|---|---|
-| `NP_API_KEY` | secret | all three (NP API calls / channel registration) |
-| `NP_ORGANIZATION_ID` | var | all three (org NRN the trigger registers under) |
+| `NP_API_KEY` | secret | all five (NP API calls, lake queries) |
+| `NP_ORGANIZATION_ID` | var | the org NRN the trigger registers the channel under. `audit-entity-check` cannot use the expression (the hosted engine does not resolve `vars` in trigger config) and carries the literal org id instead — keep the two in sync. |
+| `GITHUB_TOKEN` | secret | `arch-rule-check`, `audit-entity-check` (read the application repo, and the enhancer repo) |
+| `ENHANCER_API_KEY` | secret | `audit-entity-check` (the audit-enhancer's own api key: the fetch probe replays its GET with its identity, so the response codes are conclusive) |
 | `JIRA_BASE_URL` | var | `validate-jira-epic`, `create-jira-ticket` |
 | `JIRA_EMAIL` | var | `validate-jira-epic`, `create-jira-ticket` |
 | `JIRA_API_TOKEN` | secret | `validate-jira-epic`, `create-jira-ticket` |
