@@ -1,0 +1,34 @@
+# Checklist template: jira-ticket-gate
+#
+# Single-item template for `governance/create-jira-ticket.yaml`: dispatching
+# the item creates a Jira ticket and the gate stays pending until the ticket
+# is resolved in Jira (a Jira Automation rule pokes the workflow back; the
+# workflow re-reads the ticket — source of truth — and resolves the item).
+#
+# Item contract (`kind: create-jira-ticket`) — the dispatch carries, under
+# `context.inputs`: `summary` (string, required), `description` (string,
+# optional), `labels` (string[], optional).
+#
+# The mustache-style `$context.*` values below are resolved by the
+# approval-api against the run's context snapshot at dispatch time; adjust
+# them (or replace with literals) to taste — only `summary` is required.
+items:
+  - id: jira_tracking_ticket
+    type: external
+    behavior: gate
+    severity: error
+    title: "Tracking ticket resolved in Jira"
+    description: |
+      Creates a Jira ticket for this change and waits until it is resolved
+      (Done/Closed → passed, Discarded → failed). The ticket carries a
+      per-execution callback URL in a custom field; a one-time Jira
+      Automation rule POSTs to it on every transition.
+    external:
+      kind: "create-jira-ticket"
+      inputs:
+        summary: "Deploy approval: $context.application.name — release $context.release.id"
+        description: "Auto-created by the deploy checklist gate. Resolve to approve the deployment; discard to reject it."
+      # Human-latency gate: the workflow itself parks on signal-wait for up
+      # to 2h; give the item a matching window.
+      timeout_seconds: 7200
+      trigger: auto
