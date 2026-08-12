@@ -1,0 +1,111 @@
+# Checklist template: security-deploy-gate-v2
+#
+# Snapshot of the LIVE template (tmpl_9a7hsfvf9zo244vx, v5, 2026-07-16),
+# associated in production with `deployment:create` actions — the security
+# checklist demo: company-policy confirmations for every deploy, plus three
+# public-scope-only controls (security assessment ticket in metadata,
+# second-person verification, product approval), each backed by a Jira
+# ticket workflow.
+#
+# Referenced external kinds and their resolving workflows:
+#   create-jira-ticket-public   — create-jira-ticket variant that also
+#                                 receives scope visibility inputs and
+#                                 no-ops (passes) on non-public scopes
+#   validate-security-assessment — validates in Jira that the ticket in
+#                                 deployment.metadata.security_assessment
+#                                 exists and is not discarded
+#
+# ⚠️ COMPATIBILITY NOTE — the `security_ticket_presente` condition below is
+# preserved AS DEPLOYED, using the legacy `evaluator: expression` dialect.
+# The current approval-api validator REJECTS that dialect
+# (`condition.evaluator.removed`): re-creating this template today requires
+# rewriting the condition as a mongo-like `query` (and note the live
+# expression's `visibility.reachability` sub-path — mirror the real context
+# shape when rewriting). In-flight/live runs are unaffected (snapshots).
+items:
+  - id: politicas
+    type: manual
+    behavior: gate
+    title: "Deployment policies followed"
+    description: |-
+      Confirm this deployment complies with the **company deployment policies**.
+
+      - 📖 [Deployment policies — Confluence](https://nullplatform.atlassian.net/wiki/spaces/POL/overview)
+      - Pay special attention to **rollback plan** and **maintenance windows**
+      - When in doubt, ask in **#deployments** before confirming
+    require_comment: false
+
+  - id: sin_info_sensible
+    type: manual
+    behavior: gate
+    title: "No sensitive information exposed"
+    description: |-
+      Confirm this deploy does **not** expose sensitive data:
+
+      - No **PII** in logs or API responses
+      - No **secrets or credentials** in configuration, environment or code
+      - No internal endpoints reachable from the public internet
+    require_comment: false
+
+  - id: security_ticket_presente
+    type: condition
+    behavior: gate
+    title: "[Public scope] Security assessment ticket provided"
+    # Legacy dialect — see the compatibility note in the header.
+    evaluator: expression
+    expression: "(context.scope.capabilities.visibility != 'public' && context.scope.capabilities.visibility.reachability != 'public') || context.deployment.metadata.security_assessment.ticket > ''"
+    description: >-
+      The deployment must declare its **security assessment ticket** in the
+      metadata (*Security Assessment → ticket*). ✅ Passes automatically when
+      the scope is **not public**.
+
+  - id: doble_verificacion
+    type: external
+    behavior: gate
+    title: "[Public scope] Second-person verification"
+    description: >-
+      Creates a Jira ticket so another person double-checks this deploy to a
+      public scope. Resolves when the ticket is resolved. Automatically
+      passes (not applicable) on non-public scopes.
+    external:
+      kind: "create-jira-ticket-public"
+      inputs:
+        summary: "[Double check] Deploy to public scope: {{ context.application.name }} (release {{ context.release.id }})"
+        description: "Deploy to a PUBLIC scope of {{ context.application.name }} requested by {{ context.user.username }}. Review the change and resolve this ticket to allow the deployment."
+        scope_visibility: "{{ context.scope.capabilities.visibility }}"
+        scope_visibility_reachability: "{{ context.scope.capabilities.visibility.reachability }}"
+      trigger: auto
+      timeout_seconds: 7200
+
+  - id: ticket_producto
+    type: external
+    behavior: gate
+    title: "[Public scope] Product approval ticket"
+    description: >-
+      Creates a Jira ticket for the Product team to approve the release.
+      Resolves when the ticket is resolved. Automatically passes (not
+      applicable) on non-public scopes.
+    external:
+      kind: "create-jira-ticket-public"
+      inputs:
+        summary: "[Product] Approve release {{ context.release.id }} of {{ context.application.name }}"
+        description: "Product approval for the deploy of {{ context.application.name }} to a public scope. Resolve this ticket to approve the release."
+        scope_visibility: "{{ context.scope.capabilities.visibility }}"
+        scope_visibility_reachability: "{{ context.scope.capabilities.visibility.reachability }}"
+      trigger: auto
+      timeout_seconds: 7200
+
+  - id: security_ticket_valido
+    type: external
+    behavior: gate
+    title: "[Public scope] Security assessment ticket is valid"
+    description: >-
+      Validates in Jira that the ticket declared in the deployment metadata
+      exists and is not discarded. Automatically passes when no ticket is
+      declared (only required for public scopes).
+    external:
+      kind: "validate-security-assessment"
+      inputs:
+        ticket: "{{ context.deployment.metadata.security_assessment.ticket }}"
+      trigger: auto
+      timeout_seconds: 1800

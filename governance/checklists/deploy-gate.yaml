@@ -1,10 +1,9 @@
 # Checklist template: deploy-gate
 #
-# The template the governance workflows in this folder pair with. Associate
-# it with the ApprovalAction for `deployment:create` (typically scoped to
-# `dimensions.environment=production`); every deployment then opens a
-# ChecklistRun with these items, and the external ones are resolved by the
-# workflows in `governance/` (matched by `external.kind` — see README.md).
+# Snapshot of the LIVE template (tmpl_9biefuuos8lbszqc, v2, 2026-05-23),
+# associated in production with the `deployment:create` approval action on
+# `dimensions.environment=production`. This is the template the governance
+# workflows in this folder resolve items for.
 #
 # External items on the NP dispatch path declare ONLY
 # `kind` + `inputs` + `timeout_seconds` + `trigger`. There is no
@@ -15,6 +14,10 @@
 # approval-api validator rejects the old url-bearing shape
 # (CHECKLIST_TEMPLATE.INVALID_EXTERNAL_SHAPE).
 #
+# `external.inputs` values are mustache placeholders resolved against the
+# run context at dispatch time — these KEEP the `context.` root (dispatch
+# payload, not the condition query language).
+#
 # Create + associate with the np-checklist skill (or the raw API):
 #   create_template.sh --nrn "organization=<org-id>" --name "deploy-gate" \
 #     --definition-file ./deploy-gate.yaml --created-by "<user>"
@@ -23,24 +26,23 @@ items:
   - id: epic_valid
     type: external
     behavior: gate
-    severity: error
+    severity: critical
     title: "Jira Epic is valid"
-    description: |
+    description: >-
       Validates that deployment.metadata.jira_epic refers to a Jira Epic
-      currently in In Progress / In Development. Workflow returns the
-      exact Jira error verbatim when the epic is missing, invalid, or
-      in an unacceptable status.
+      currently In Progress / In Development. The Jira API error is passed
+      verbatim back to the run.
     external:
       kind: "validate-jira-epic"
       inputs:
-        jira_epic: "$context.metadata.jira_epic"
-      timeout_seconds: 60
+        jira_epic: "{{ context.deployment.metadata.deployment.jira_epic }}"
       trigger: auto
+      timeout_seconds: 60
 
   - id: tests_confirmed
     type: manual
     behavior: gate
-    severity: warn
+    severity: minor
     title: "I ran tests for this change"
     description: "Confirm after running the full test suite locally or in CI."
     require_comment: false
@@ -48,16 +50,16 @@ items:
   - id: release_passed_stage
     type: external
     behavior: gate
-    severity: error
+    severity: critical
     title: "Release was deployed to a stage scope"
-    description: |
+    description: >-
       Searches the last 30 finalized deployments across scopes with
       dimensions.environment=stage for this application; fails if the
       current release id is not found.
     external:
       kind: "check-release-staged"
       inputs:
-        release_id: "$context.release.id"
-        application_id: "$context.application.id"
-      timeout_seconds: 60
+        release_id: "{{ context.release.id }}"
+        application_id: "{{ context.application.id }}"
       trigger: auto
+      timeout_seconds: 60

@@ -20,8 +20,9 @@ channel on alias activation, receives the dispatch (with a `callbackUrl` /
 The workflows above resolve items of a **checklist template** that must exist
 in the approval-api and be associated with an `ApprovalAction`. The template
 definitions are versioned in [`checklists/`](./checklists/) (`deploy-gate`,
-`jira-ticket-gate`) together with the create/associate runbook and the
-external-item contract.
+`create-jira-ticket-gate`, `security-deploy-gate` — live production
+snapshots) together with the create/associate runbook and the external-item
+contract.
 
 ## Patterns worth knowing
 

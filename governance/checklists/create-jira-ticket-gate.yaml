@@ -1,0 +1,28 @@
+# Checklist template: create-jira-ticket-gate
+#
+# Snapshot of the LIVE template (tmpl_29u1dbnujpvjpgcq, v1, 2026-06-25),
+# associated in production with `deployment:create` (and reused on
+# service:action / action_item actions of a test app). Pairs with
+# `governance/create-jira-ticket.yaml`: dispatching the item creates a Jira
+# ticket and the gate stays pending until the ticket is resolved in Jira
+# (a Jira Automation rule pokes the workflow back; the workflow re-reads
+# the ticket — source of truth — and resolves the item).
+#
+# Item contract (`kind: create-jira-ticket`) — the dispatch carries, under
+# `context.inputs`: `summary` (string, required), `description` (string,
+# optional), `labels` (string[], optional).
+items:
+  - id: create_jira
+    type: external
+    behavior: gate
+    title: "Create Jira ticket and wait for resolution"
+    description: >-
+      Creates a Jira ticket and parks until it is resolved
+      (Done/Resolved/Closed) or fails after 2h.
+    external:
+      kind: "create-jira-ticket"
+      inputs:
+        summary: "[E2E] Approve deployment of {{ context.application.name }} (release {{ context.release.id }})"
+        description: "Auto-created by the create-jira-ticket deployment gate. Resolve this ticket in Jira to let the deployment proceed."
+      trigger: auto
+      timeout_seconds: 7200

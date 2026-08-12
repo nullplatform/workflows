@@ -6,10 +6,19 @@ approval-api and is associated with an `ApprovalAction`. These files version
 those template definitions — the other half of the experience, which
 otherwise lives only as rows in the approval-api.
 
-| Template | Items | Paired workflow(s) |
-|---|---|---|
-| [`deploy-gate.yaml`](./deploy-gate.yaml) | `epic_valid` (external, `validate-jira-epic`) + `tests_confirmed` (manual) + `release_passed_stage` (external, `check-release-staged`) | `validate-jira-epic.yaml`, `check-release-staged.yaml` |
-| [`jira-ticket-gate.yaml`](./jira-ticket-gate.yaml) | `jira_tracking_ticket` (external, `create-jira-ticket`) | `create-jira-ticket.yaml` |
+All three are **snapshots of the live production templates** (fetched from
+the approval-api on 2026-08-12), not sketches:
+
+| Template | Live id | Items | Paired workflow(s) |
+|---|---|---|---|
+| [`deploy-gate.yaml`](./deploy-gate.yaml) | `tmpl_9biefuuos8lbszqc` v2 | `epic_valid` (external, `validate-jira-epic`) + `tests_confirmed` (manual) + `release_passed_stage` (external, `check-release-staged`) | `validate-jira-epic.yaml`, `check-release-staged.yaml` |
+| [`create-jira-ticket-gate.yaml`](./create-jira-ticket-gate.yaml) | `tmpl_29u1dbnujpvjpgcq` v1 | `create_jira` (external, `create-jira-ticket`) | `create-jira-ticket.yaml` |
+| [`security-deploy-gate.yaml`](./security-deploy-gate.yaml) | `tmpl_9a7hsfvf9zo244vx` v5 | 2 manual policy confirmations + 1 condition + 3 public-scope external gates (`create-jira-ticket-public` ×2, `validate-security-assessment`) | Jira-ticket workflow variants (live in the demo org; not yet in this repo) |
+
+⚠️ `security-deploy-gate.yaml` predates the removal of the legacy condition
+dialect — its condition item uses `evaluator: expression`, which today's
+validator rejects (`condition.evaluator.removed`). Rewrite it as a
+mongo-like `query` before re-creating that template (note in the file).
 
 ## How the halves connect
 
