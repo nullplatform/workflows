@@ -1,0 +1,219 @@
+# Sub-workflow: idempotently ensure an action item exists for ONE security finding.
+#
+# Called by security_assess_deployment once per normalized finding.
+# Idempotency: keyed by metadata.finding_key = "sec:<scope_id>:<slug(rule_id:file)>"
+# (string — the NP metadata filter only matches string values). Exactly one live
+# item per finding:
+#   - no live item with the key → create (priority/value from the finding's severity)
+#   - live item, same commit    → no-op
+#   - live item, other commit (finding survived a redeploy) → patch metadata
+id: security_ensure_action_item
+name: "Security Assessment — Ensure Action Item"
+description: >
+  Idempotent create/update of the action item for a single security finding.
+  Finds by metadata.finding_key; creates when missing, refreshes metadata when
+  the deployed commit changed, no-ops otherwise.
+path: "/action-items/security-assessment"
+semantic_version: 1.0.0
+
+inputs:
+  finding:
+    type: object
+    required: true
+    description: "Normalized finding: {finding_key, scope_id, scope_name, scope_nrn, application, application_id, deployment_id, rule_id, severity, priority, value, title, file, evidence, recommendation, repo, commit, due_date, metadata{}}"
+  category_slug:
+    type: string
+    required: true
+    description: "Slug of the (pre-existing) action item category"
+  organization_id:
+    type: string
+    required: true
+    description: "NP organization id (search scope for the idempotency lookup)"
+
+variables:
+  found:  { initialValue: { count: 0, items: [], firstMatch: null } }
+  result: { initialValue: { action: "unchanged", action_item_id: null } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Ensures the action item for one security finding (normally invoked by the assessor)."
+      inputs:
+        finding:
+          type: object
+          required: true
+          description: "Normalized security finding (see workflow description)"
+        category_slug:
+          type: string
+          required: true
+          description: "Action item category slug"
+        organization_id:
+          type: string
+          required: true
+          description: "NP organization id"
+
+  - id: find_existing
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Existing Item"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ workflow.inputs.organization_id }}"
+      metadataKey: finding_key
+      metadataValue: "${{ workflow.inputs.finding.finding_key }}"
+
+  - id: stash_found
+    type: module
+    plugin_type: set-variable
+    name: "Stash Find Result → variables"
+    inputs:
+      raw: "${{ steps.find_existing.outputs }}"
+    config:
+      path: found
+      value: "${{ inputs.raw }}"
+
+  - id: missing
+    type: decider
+    plugin_type: conditional
+    name: "No Live Item Yet?"
+    config:
+      expression: "variables.found.count == 0"
+
+  # ── create path ──────────────────────────────────────────────────────
+  - id: build_description
+    type: module
+    plugin_type: code-exec
+    name: "Build Description"
+    inputs:
+      finding: "${{ workflow.inputs.finding }}"
+    config:
+      code: |
+        var f = inputs.finding || {};
+        var lines = [
+          '## Security finding: ' + (f.title || f.rule_id),
+          '',
+          'Scope **' + f.scope_name + '** (application **' + f.application + '**), environment reviewed at',
+          '`' + (f.repo || 'unknown repo') + '@' + (f.commit || 'HEAD') + '`.',
+          '',
+          '- **Severity**: ' + f.severity,
+          '- **Rule**: `' + f.rule_id + '`',
+          '- **Location**: `' + (f.file || 'n/a') + '`',
+          '- **Deployment**: ' + f.deployment_id,
+          '- **Detected**: ' + ((f.metadata && f.metadata.detected_at) || ''),
+          '',
+          '### Evidence',
+          '',
+          String(f.evidence || ''),
+          '',
+          '### Recommended fix',
+          '',
+          String(f.recommendation || ''),
+          '',
+          '_Opened by the weekly security assessment. Re-scans refresh this item;_',
+          '_it is NOT closed automatically when the finding disappears (v1)._'
+        ];
+        return { description: lines.join('\n') };
+
+  - id: create_item
+    type: module
+    plugin_type: np-action-item-create
+    name: "Create Action Item"
+    # The create call is the one side effect that must not be lost to a
+    # transient 5xx/timeout — with 5 ensure children in parallel the NP API
+    # sees bursts. Jitter avoids the retries themselves re-colliding.
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      categorySlug: "${{ workflow.inputs.category_slug }}"
+      createdBy: "agent:security-assessment"
+      nrn: "${{ workflow.inputs.finding.scope_nrn }}"
+      title: "[${{ workflow.inputs.finding.severity }}] ${{ workflow.inputs.finding.title }} (${{ workflow.inputs.finding.application }} / ${{ workflow.inputs.finding.scope_name }})"
+      priority: "${{ workflow.inputs.finding.priority }}"
+      value: "${{ workflow.inputs.finding.value }}"
+      dueDate: "${{ workflow.inputs.finding.due_date }}"
+      # Single-hop passthrough from build_description.
+      description: "${{ $item.description }}"
+      labels:
+        workflow_type: "security-assessment"
+        auto_detected: "true"
+      metadata: "${{ workflow.inputs.finding.metadata }}"
+
+  - id: stash_created
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: created"
+    inputs:
+      id: "${{ steps.create_item.outputs.actionItemId }}"
+    config:
+      path: result
+      value:
+        action: "created"
+        action_item_id: "${{ inputs.id }}"
+
+  # ── existing-item path ───────────────────────────────────────────────
+  - id: changed
+    type: decider
+    plugin_type: conditional
+    name: "Deployed Commit Changed?"
+    config:
+      expression: "variables.found.firstMatch.metadata.commit != workflow.inputs.finding.commit"
+
+  - id: update_item
+    type: module
+    plugin_type: np-action-item-update
+    name: "Refresh Item Metadata"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ variables.found.firstMatch.id }}"
+      metadata: "${{ workflow.inputs.finding.metadata }}"
+
+  - id: stash_updated
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: updated"
+    config:
+      path: result
+      value:
+        action: "updated"
+        action_item_id: "${{ variables.found.firstMatch.id }}"
+
+  - id: stash_unchanged
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: unchanged"
+    config:
+      path: result
+      value:
+        action: "unchanged"
+        action_item_id: "${{ variables.found.firstMatch.id }}"
+
+connections:
+  - { id: c1,  from: start,             to: find_existing }
+  - { id: c2,  from: find_existing,     to: stash_found }
+  - { id: c3,  from: stash_found,       to: missing }
+  - { id: c4,  from: missing,           to: build_description, source_port: "true" }
+  - { id: c5,  from: build_description, to: create_item }
+  - { id: c6,  from: create_item,       to: stash_created }
+  - { id: c7,  from: missing,           to: changed,           source_port: "false" }
+  - { id: c8,  from: changed,           to: update_item,       source_port: "true" }
+  - { id: c9,  from: update_item,       to: stash_updated }
+  - { id: c10, from: changed,           to: stash_unchanged,   source_port: "false" }
+
+outputs:
+  action:         "${{ variables.result.action }}"
+  action_item_id: "${{ variables.result.action_item_id }}"
+  finding_key:    "${{ workflow.inputs.finding.finding_key }}"

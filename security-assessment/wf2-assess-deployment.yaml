@@ -1,0 +1,450 @@
+# Sub-workflow: run the AI security assessment for ONE active deployment.
+#
+# build-context resolves the deployed repo+commit; the agent clones the repo at
+# that commit inside its sandbox (GITHUB_TOKEN env, github hosts allowlisted,
+# subprocess enabled for git) and returns schema-forced findings; normalize
+# computes the DETERMINISTIC finding_key (never trusting the agent) and fans
+# out one ensure sub-execution per finding.
+#
+# This workflow NEVER propagates failure to the scanner: build-context/agent
+# failures land on dedicated single-predecessor resolve nodes
+# (error_handling.fallback_step + declared condition:"false" edges) and the
+# run completes with status "failed" for the summary to count.
+#
+# Agent config rule: ${{ steps.* }} inside claude-code-agent config arrives as
+# the string "undefined" — ALL context enters via declared step inputs and the
+# prompts reference inputs.*.
+id: security_assess_deployment
+name: "Security Assessment — Assess Deployment"
+description: >
+  AI security assessment of one active deployment: resolves the deployed
+  repo+commit, has a sandboxed agent review code, dependencies and scope
+  configuration, and ensures one idempotent action item per finding.
+path: "/action-items/security-assessment"
+semantic_version: 1.0.0
+
+inputs:
+  deployment:
+    type: object
+    required: true
+    description: "Lake row: {deployment_id, scope_id, scope_name, scope_nrn, application, application_id, environment, deployed_at}"
+  min_severity:
+    type: string
+    required: false
+    description: "Minimum severity that becomes an action item (critical|high|medium|low; default medium)"
+  category_slug:
+    type: string
+    required: true
+    description: "Action item category slug"
+  organization_id:
+    type: string
+    required: true
+    description: "NP organization id"
+  due_days:
+    type: number
+    required: false
+    description: "Due-date offset in days for created items (default 14)"
+
+variables:
+  result:
+    initialValue:
+      status: "failed"
+      reason: "not_run"
+      total_findings: 0
+      created: 0
+      updated: 0
+      unchanged: 0
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Assesses one deployment (normally invoked by the weekly scanner)."
+      inputs:
+        deployment:
+          type: object
+          required: true
+          description: "Deployment row (see workflow description)"
+        min_severity:
+          type: string
+          required: false
+          description: "Minimum severity to materialize (default medium)"
+        category_slug:
+          type: string
+          required: true
+          description: "Action item category slug"
+        organization_id:
+          type: string
+          required: true
+          description: "NP organization id"
+        due_days:
+          type: number
+          required: false
+          description: "Due-date offset in days (default 14)"
+
+  - id: build_context
+    type: module
+    plugin_type: np-build-context
+    name: "Resolve Deployment Context"
+    error_handling:
+      fallback_step: resolve_ctx_failure
+    inputs:
+      scope_id: "${{ workflow.inputs.deployment.scope_id }}"
+      deployment_id: "${{ workflow.inputs.deployment.deployment_id }}"
+    config:
+      npApiKey: "${{ secrets.NP_API_KEY }}"
+
+  - id: extract_repo
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (Temporal sandbox
+    # cannot see executeMode "all").
+    metadata: { fanOutPerItem: false }
+    name: "Extract Repo + Commit"
+    inputs:
+      context: "${{ steps.build_context.outputs }}"
+      deployment: "${{ workflow.inputs.deployment }}"
+    config:
+      code: |
+        var c = inputs.context || {};
+        var app = c.application || {};
+        var build = c.build || {};
+        var release = c.release || {};
+        var asset = c.asset || {};
+        var scope = c.scope || {};
+        var repo = app.repository_url || '';
+        // The commit lives in different places depending on asset/build kind —
+        // probe the known candidates, first hit wins. Verified live during the
+        // pilot (Task 5 probes /build/{id} and extends this list if needed).
+        var commit =
+          (build.commit && (build.commit.sha || build.commit.id)) ||
+          build.commit_sha || build.commit_id || build.sha ||
+          (asset.metadata && asset.metadata.commit_sha) ||
+          (release.metadata && release.metadata.commit_sha) || '';
+        // Scope config summary for the agent: structure only, never values —
+        // env var VALUES may hold secrets; NAMES are enough to flag suspects.
+        var envVarNames = [];
+        var params = scope.parameters || scope.env_vars || {};
+        for (var k in params) envVarNames.push(k);
+        var summary = {
+          scope_type: scope.type || '',
+          provider: scope.provider || '',
+          visibility: scope.visibility || (scope.capabilities && scope.capabilities.visibility) || '',
+          domain: scope.domain || '',
+          env_var_names: envVarNames
+        };
+        var hasRepo = repo !== '';
+        if (!hasRepo) log.warn('No repository_url on application — skipping assessment', { deployment: inputs.deployment.deployment_id });
+        if (hasRepo && !commit) log.warn('No commit sha resolved — agent will assess the default branch HEAD', { repo: repo });
+        return {
+          has_repo: hasRepo,
+          repo: repo,
+          commit: String(commit || ''),
+          scope_summary: JSON.stringify(summary)
+        };
+
+  - id: has_repo
+    type: decider
+    plugin_type: conditional
+    name: "Repo Resolved?"
+    config:
+      expression: "steps.extract_repo.outputs.has_repo"
+
+  - id: run_agent
+    type: module
+    plugin_type: claude-code-agent
+    name: "AI Security Assessment"
+    error_handling:
+      fallback_step: resolve_agent_failure
+    inputs:
+      repo: "${{ steps.extract_repo.outputs.repo }}"
+      commit: "${{ steps.extract_repo.outputs.commit }}"
+      scope_summary: "${{ steps.extract_repo.outputs.scope_summary }}"
+      application: "${{ workflow.inputs.deployment.application }}"
+      scope_name: "${{ workflow.inputs.deployment.scope_name }}"
+      environment: "${{ workflow.inputs.deployment.environment }}"
+    config:
+      model: "${{ vars.SEC_AGENT_MODEL || 'claude-sonnet-5' }}"
+      maxIterations: 25
+      systemPrompt: |
+        You are a senior application security engineer running a scheduled
+        assessment of code that is CURRENTLY DEPLOYED to production
+        infrastructure. You work inside a sandbox with git available and a
+        GITHUB_TOKEN environment variable that can read the repository.
+
+        Method:
+        1. Clone ONLY the deployed revision:
+           mkdir work && cd work && git init -q
+           git remote add origin <repo URL with https://x-access-token:$GITHUB_TOKEN@github.com/...>
+           If a commit sha is provided: git fetch --depth 1 origin <sha> && git checkout -q FETCH_HEAD
+           If not: git fetch --depth 1 origin HEAD && git checkout -q FETCH_HEAD
+        2. Review the code for REAL, EVIDENCED vulnerabilities:
+           - hardcoded secrets/credentials/tokens (grep + manual review)
+           - vulnerable or abandoned dependencies (read lockfiles; flag known-bad majors)
+           - missing/broken authentication or authorization on exposed handlers
+           - injection (SQL, command, template), unsafe deserialization
+           - weak crypto (MD5/SHA1 for auth, ECB, hardcoded IVs, disabled TLS verification)
+           - dangerous configuration in the scope summary you receive
+             (publicly visible scope + suspicious env var names, debug flags in production)
+           - IaC issues in the repo (overly-permissive IAM, public buckets)
+        3. Weigh the environment: the same issue in production is one severity
+           step higher than in non-production (cap at critical).
+
+        Rules:
+        - Report ONLY findings with concrete evidence: file path + line or exact
+          snippet. No speculative, stylistic or "best practice" findings.
+        - severity is one of: critical, high, medium, low.
+        - rule_id is a stable kebab-case class, one per finding TYPE (e.g.
+          hardcoded-secret, vulnerable-dependency, missing-authz, sql-injection,
+          weak-crypto, insecure-scope-config, iac-misconfig). The SAME issue at
+          the SAME file must produce the SAME rule_id + file on every run —
+          fingerprints depend on it.
+        - file is the repo-relative path (or "global" for scope-level findings).
+        - NEVER include secret VALUES in evidence — mask all but the first 4 chars.
+      userPrompt: |
+        Assess the deployed code of application "${{ inputs.application }}"
+        (scope "${{ inputs.scope_name }}", environment "${{ inputs.environment }}").
+
+        Repository: ${{ inputs.repo }}
+        Deployed commit: ${{ inputs.commit }}
+        Scope configuration summary (JSON): ${{ inputs.scope_summary }}
+
+        Clone the repository at the deployed commit and perform the assessment.
+        Return every evidenced finding.
+      env:
+        GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+      sandbox:
+        blockSubprocess: false
+        allowedHosts:
+          - github.com
+          - api.github.com
+          - codeload.github.com
+          - objects.githubusercontent.com
+      outputSchema:
+        type: object
+        required: [findings, summary]
+        properties:
+          findings:
+            type: array
+            items:
+              type: object
+              required: [rule_id, title, severity, evidence, recommendation]
+              properties:
+                rule_id: { type: string }
+                title: { type: string }
+                severity: { type: string, enum: [critical, high, medium, low] }
+                file: { type: string }
+                evidence: { type: string }
+                recommendation: { type: string }
+          summary: { type: string }
+          repo: { type: string }
+          commit: { type: string }
+
+  - id: normalize
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (Temporal sandbox
+    # cannot see executeMode "all").
+    metadata: { fanOutPerItem: false }
+    name: "Normalize Findings"
+    inputs:
+      agent: "${{ steps.run_agent.outputs }}"
+      repo: "${{ steps.extract_repo.outputs.repo }}"
+      commit: "${{ steps.extract_repo.outputs.commit }}"
+      deployment: "${{ workflow.inputs.deployment }}"
+      min_severity: "${{ workflow.inputs.min_severity || 'medium' }}"
+      due_days: "${{ workflow.inputs.due_days || 14 }}"
+    config:
+      code: |
+        var RANK = { critical: 4, high: 3, medium: 2, low: 1 };
+        var PRIORITY = { critical: 'critical', high: 'high', medium: 'medium', low: 'low' };
+        var VALUE = { critical: 400, high: 300, medium: 200, low: 100 };
+        function slug(x) {
+          return String(x).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 160);
+        }
+        var d = inputs.deployment || {};
+        var raw = (inputs.agent && inputs.agent.findings) || [];
+        var minRank = RANK[String(inputs.min_severity)] || RANK.medium;
+        var due = new Date(Date.now() + Number(inputs.due_days) * 86400000).toISOString().slice(0, 10);
+        var detectedAt = new Date().toISOString();
+        var commit = String(inputs.commit || 'HEAD');
+        var byKey = {}; var order = [];
+        var dropped_severity = 0, dropped_invalid = 0;
+        for (var i = 0; i < raw.length; i++) {
+          var f = raw[i] || {};
+          var sev = String(f.severity || '').toLowerCase();
+          if (!RANK[sev] || !f.rule_id || !f.title) { dropped_invalid++; continue; }
+          if (RANK[sev] < minRank) { dropped_severity++; continue; }
+          var file = String(f.file || 'global');
+          var key = 'sec:' + d.scope_id + ':' + slug(String(f.rule_id) + ':' + file);
+          if (byKey[key]) continue; // agent emitted duplicates — first wins
+          order.push(key);
+          byKey[key] = {
+            finding_key: key,
+            scope_id: String(d.scope_id),
+            scope_name: String(d.scope_name || ''),
+            scope_nrn: String(d.scope_nrn || ''),
+            application: String(d.application || ''),
+            application_id: String(d.application_id || ''),
+            deployment_id: String(d.deployment_id),
+            rule_id: String(f.rule_id),
+            severity: sev,
+            priority: PRIORITY[sev],
+            value: VALUE[sev],
+            title: String(f.title).slice(0, 200),
+            file: file,
+            evidence: String(f.evidence || '').slice(0, 4000),
+            recommendation: String(f.recommendation || '').slice(0, 4000),
+            repo: String(inputs.repo || ''),
+            commit: commit,
+            due_date: due,
+            metadata: {
+              finding_key: key,
+              scope_id: String(d.scope_id),
+              deployment_id: String(d.deployment_id),
+              application_id: String(d.application_id || ''),
+              rule_id: String(f.rule_id),
+              severity: sev,
+              file: file,
+              commit: commit,
+              detected_at: detectedAt
+            }
+          };
+        }
+        var findings = [];
+        for (var j = 0; j < order.length; j++) findings.push(byKey[order[j]]);
+        log.info('Findings normalized', {
+          raw: raw.length, kept: findings.length,
+          dropped_below_min_severity: dropped_severity, dropped_invalid: dropped_invalid
+        });
+        return { findings: findings, dropped_severity: dropped_severity, dropped_invalid: dropped_invalid };
+
+  - id: ensure_items
+    type: module
+    plugin_type: sub-workflow
+    name: "Ensure Action Items"
+    forEach:
+      expression: "${{ steps.normalize.outputs.findings }}"
+      itemVariable: finding
+      parallel: true
+      maxConcurrency: 5
+    inputs:
+      category_slug: "${{ workflow.inputs.category_slug }}"
+      organization_id: "${{ workflow.inputs.organization_id }}"
+    config:
+      # Client key — the uploader rewrites this to the per-org wf_… id.
+      workflowId: security_ensure_action_item
+      waitForCompletion: true
+
+  - id: finalize
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (Temporal sandbox
+    # cannot see executeMode "all").
+    metadata: { fanOutPerItem: false }
+    name: "Count Ensure Results"
+    inputs:
+      ensured: "${{ steps.ensure_items.outputs.items }}"
+      total: "${{ steps.normalize.outputs.findings }}"
+    config:
+      code: |
+        var rows = inputs.ensured || [];
+        var counts = { created: 0, updated: 0, unchanged: 0 };
+        for (var i = 0; i < rows.length; i++) {
+          var a = (rows[i] || {}).action;
+          if (counts[a] !== undefined) counts[a]++;
+        }
+        return {
+          total_findings: (inputs.total || []).length,
+          created: counts.created,
+          updated: counts.updated,
+          unchanged: counts.unchanged
+        };
+
+  - id: stash_assessed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: assessed"
+    inputs:
+      counts: "${{ steps.finalize.outputs }}"
+    config:
+      path: result
+      value:
+        status: "assessed"
+        reason: ""
+        total_findings: "${{ inputs.counts.total_findings }}"
+        created: "${{ inputs.counts.created }}"
+        updated: "${{ inputs.counts.updated }}"
+        unchanged: "${{ inputs.counts.unchanged }}"
+
+  - id: skip_result
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: skipped (no repo)"
+    config:
+      path: result
+      value:
+        status: "skipped"
+        reason: "no_repo"
+        total_findings: 0
+        created: 0
+        updated: 0
+        unchanged: 0
+
+  # Dedicated single-predecessor failure resolvers (fallback arrives as a
+  # FAILED edge — never mix with completed edges on a join).
+  - id: resolve_ctx_failure
+    type: module
+    plugin_type: set-variable
+    name: "Resolve: build-context failed"
+    config:
+      path: result
+      value:
+        status: "failed"
+        reason: "build_context_failed"
+        total_findings: 0
+        created: 0
+        updated: 0
+        unchanged: 0
+
+  - id: resolve_agent_failure
+    type: module
+    plugin_type: set-variable
+    name: "Resolve: agent failed"
+    config:
+      path: result
+      value:
+        status: "failed"
+        reason: "agent_failed"
+        total_findings: 0
+        created: 0
+        updated: 0
+        unchanged: 0
+
+connections:
+  - { id: c1, from: start,         to: build_context }
+  - { id: c2, from: build_context, to: extract_repo }
+  - { id: c3, from: extract_repo,  to: has_repo }
+  - { id: c4, from: has_repo,      to: run_agent,   source_port: "true" }
+  - { id: c5, from: has_repo,      to: skip_result, source_port: "false" }
+  - { id: c6, from: run_agent,     to: normalize }
+  - { id: c7, from: normalize,     to: ensure_items }
+  - { id: c8, from: ensure_items,  to: finalize }
+  - { id: c9, from: finalize,      to: stash_assessed }
+  # Declared fallback edges (never traversed on success): they tell the graph
+  # the resolve nodes are reachable and not entry points.
+  - { id: c10, from: build_context, to: resolve_ctx_failure,   condition: "false" }
+  - { id: c11, from: run_agent,     to: resolve_agent_failure, condition: "false" }
+
+outputs:
+  status:         "${{ variables.result.status }}"
+  reason:         "${{ variables.result.reason }}"
+  total_findings: "${{ variables.result.total_findings }}"
+  created:        "${{ variables.result.created }}"
+  updated:        "${{ variables.result.updated }}"
+  unchanged:      "${{ variables.result.unchanged }}"
+  application:    "${{ workflow.inputs.deployment.application }}"
+  scope_name:     "${{ workflow.inputs.deployment.scope_name }}"
+  deployment_id:  "${{ workflow.inputs.deployment.deployment_id }}"

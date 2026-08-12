@@ -1,0 +1,264 @@
+# Weekly Security Assessment scanner — enumerates the ACTIVE deployment per
+# scope (all providers) from the lake, fans out one AI assessment per
+# deployment, and summarizes. Action items are created per finding by the
+# assess → ensure chain, idempotent on metadata.finding_key.
+#
+# Per-org configuration (config entries on folder /action-items/security-assessment):
+#   NP_API_KEY (secret)         — NP API key
+#   GITHUB_TOKEN (secret)       — token able to read the deployed repos
+#   NP_ORGANIZATION_ID (var)    — organization id
+#   SEC_CATEGORY_SLUG (var)     — action item category slug
+#   SEC_MIN_SEVERITY (var)      — minimum severity to materialize (default medium)
+#   SEC_DUE_DAYS (var)          — due-date offset in days (default 14)
+#   SEC_AGENT_MODEL (var)       — optional agent model override
+id: security_scanner
+name: "Security Assessment Scanner"
+description: >
+  Weekly scan (Mon 03:00, also manual) that runs an in-depth AI security
+  assessment of every active deployment (deployed code + scope configuration)
+  and ensures an idempotent action item per finding.
+path: "/action-items/security-assessment"
+semantic_version: 1.0.0
+
+inputs:
+  nrn:
+    type: string
+    required: false
+    description: "Only scan scopes under this NRN (prefix match; empty = whole organization)"
+  applications:
+    type: string
+    required: false
+    description: "Comma-separated application ids or names — only these apps are scanned (pilot runs)"
+  max_deployments:
+    type: number
+    required: false
+    description: "Hard cap on deployments assessed this run (cost control; dropped rows are logged)"
+  min_severity:
+    type: string
+    required: false
+    description: "Override for the minimum severity that becomes an action item"
+  due_days:
+    type: number
+    required: false
+    description: "Override for the action item due date offset in days"
+
+steps:
+  - id: start_manual
+    type: trigger
+    plugin_type: manual
+    name: "Run Assessment Now"
+    config:
+      description: "Runs the security assessment immediately."
+      inputs:
+        nrn:
+          type: string
+          required: false
+          description: "Only scan scopes under this NRN (prefix match)"
+          placeholder: "organization=…:account=…"
+        applications:
+          type: string
+          required: false
+          description: "Comma-separated application ids or names (empty = all)"
+          placeholder: "grafana, Services API"
+        max_deployments:
+          type: number
+          required: false
+          description: "Cap on deployments assessed this run"
+          placeholder: "5"
+        min_severity:
+          type: string
+          required: false
+          description: "critical | high | medium | low"
+          placeholder: "medium"
+        due_days:
+          type: number
+          required: false
+          description: "Due date offset in days for created action items"
+          placeholder: "14"
+
+  - id: start_cron
+    type: trigger
+    plugin_type: cron
+    name: "Weekly Scan"
+    config:
+      schedule: "0 3 * * 1"
+      timezone: "America/Argentina/Buenos_Aires"
+
+  # ── Current state: the active deployment per scope, ALL providers ──────
+  - id: lake_deployments
+    type: module
+    plugin_type: np-lake-query
+    name: "Active Deployments (lake)"
+    join_strategy: any
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      sql: |
+        SELECT d.id AS deployment_id, d.scope_id AS scope_id, s.name AS scope_name, s.nrn AS scope_nrn,
+               a.app_name AS application, toString(s.application_id) AS application_id,
+               toString(d.created_at) AS deployed_at,
+               dims.environment AS environment
+        FROM core_entities_deployment AS d FINAL
+        JOIN core_entities_scope AS s FINAL ON d.scope_id = s.id AND s._deleted = 0
+        JOIN core_entities_application AS a FINAL ON s.application_id = a.app_id AND a._deleted = 0
+        LEFT JOIN (
+          SELECT scope_id, anyIf(value_slug, dimension_slug = 'environment') AS environment
+          FROM core_entities_scope_dimension FINAL
+          WHERE _deleted = 0
+          GROUP BY scope_id
+        ) AS dims ON dims.scope_id = d.scope_id
+        WHERE d._deleted = 0
+          AND d.status_in_scope = 'active'
+          AND s.status = 'active'
+        LIMIT 5000
+
+  - id: filter_rows
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (Temporal sandbox
+    # cannot see executeMode "all").
+    metadata: { fanOutPerItem: false }
+    name: "Filter + Cap"
+    inputs:
+      rows: "${{ steps.lake_deployments.outputs.rows }}"
+      nrn: "${{ workflow.inputs.nrn }}"
+      applications: "${{ workflow.inputs.applications }}"
+      max_deployments: "${{ workflow.inputs.max_deployments }}"
+    config:
+      code: |
+        var rows = inputs.rows || [];
+        var nrn = String(inputs.nrn || '').trim();
+        var appsRaw = String(inputs.applications || '').trim();
+        var cap = Number(inputs.max_deployments) || 0;
+        var apps = [];
+        if (appsRaw) {
+          var parts = appsRaw.split(',');
+          for (var i = 0; i < parts.length; i++) {
+            var p = parts[i].trim().toLowerCase();
+            if (p) apps.push(p);
+          }
+        }
+        // One row per scope: keep the NEWEST active deployment (lake can carry
+        // several actives briefly mid-deploy).
+        var byScope = {}; var order = [];
+        for (var r = 0; r < rows.length; r++) {
+          var row = rows[r] || {};
+          var sid = String(row.scope_id);
+          var prior = byScope[sid];
+          if (prior && String(prior.deployed_at || '') >= String(row.deployed_at || '')) continue;
+          if (!prior) order.push(sid);
+          byScope[sid] = row;
+        }
+        var uniq = [];
+        for (var o = 0; o < order.length; o++) uniq.push(byScope[order[o]]);
+        var out = [];
+        for (var k = 0; k < uniq.length; k++) {
+          var row2 = uniq[k];
+          var s = String(row2.scope_nrn || '');
+          if (nrn && !(s === nrn || s.indexOf(nrn + ':') === 0)) continue;
+          if (apps.length > 0) {
+            var idMatch = apps.indexOf(String(row2.application_id)) >= 0;
+            var nameMatch = apps.indexOf(String(row2.application || '').toLowerCase()) >= 0;
+            if (!idMatch && !nameMatch) continue;
+          }
+          // Build a FRESH object rather than mutating the input row — inputs
+          // are frozen by the code-exec sandbox, so an in-place write is a
+          // silent no-op. Action-item NRN needs the scope segment; the lake
+          // row's nrn is the application's.
+          out.push({
+            deployment_id: row2.deployment_id,
+            scope_id: row2.scope_id,
+            scope_name: row2.scope_name,
+            scope_nrn: s + ':scope=' + String(row2.scope_id),
+            application: row2.application,
+            application_id: row2.application_id,
+            deployed_at: row2.deployed_at,
+            environment: row2.environment
+          });
+        }
+        var dropped_by_cap = 0;
+        if (cap > 0 && out.length > cap) {
+          dropped_by_cap = out.length - cap;
+          log.warn('max_deployments cap applied — NOT all deployments assessed', { cap: cap, dropped: dropped_by_cap });
+          out = out.slice(0, cap);
+        }
+        log.info('Deployments selected', { total_rows: rows.length, unique_scopes: uniq.length, selected: out.length, nrn_filter: nrn || null, app_filter: apps.length || null, dropped_by_cap: dropped_by_cap });
+        return { rows: out, selected: out.length, unique_scopes: uniq.length, dropped_by_cap: dropped_by_cap };
+
+  # One assessment per deployment. Agent runs are slow and expensive:
+  # maxConcurrency stays LOW. No streaming pagination (deployed engine does
+  # not re-enter streaming loops).
+  - id: assess
+    type: module
+    plugin_type: sub-workflow
+    name: "Assess Deployments"
+    forEach:
+      expression: "${{ steps.filter_rows.outputs.rows }}"
+      itemVariable: deployment
+      parallel: true
+      maxConcurrency: 2
+    inputs:
+      min_severity: "${{ workflow.inputs.min_severity || vars.SEC_MIN_SEVERITY || 'medium' }}"
+      category_slug: "${{ vars.SEC_CATEGORY_SLUG }}"
+      organization_id: "${{ vars.NP_ORGANIZATION_ID }}"
+      due_days: "${{ workflow.inputs.due_days || vars.SEC_DUE_DAYS || 14 }}"
+    config:
+      # Client key — the uploader rewrites this to the per-org wf_… id.
+      workflowId: security_assess_deployment
+      waitForCompletion: true
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    # Aggregate step: NEVER dispatch per upstream item (Temporal sandbox
+    # cannot see executeMode "all").
+    metadata: { fanOutPerItem: false }
+    name: "Build Summary"
+    inputs:
+      assessed: "${{ steps.assess.outputs.items }}"
+      selected: "${{ steps.filter_rows.outputs.selected }}"
+      dropped_by_cap: "${{ steps.filter_rows.outputs.dropped_by_cap }}"
+    config:
+      code: |
+        var rows = inputs.assessed || [];
+        var s = { assessed: 0, skipped: 0, failed: 0, total_findings: 0, created: 0, updated: 0, unchanged: 0 };
+        var failures = [];
+        for (var i = 0; i < rows.length; i++) {
+          var r = rows[i] || {};
+          if (r.status === 'assessed') s.assessed++;
+          else if (r.status === 'skipped') s.skipped++;
+          else { s.failed++; failures.push({ deployment_id: r.deployment_id, application: r.application, reason: r.reason }); }
+          s.total_findings += Number(r.total_findings) || 0;
+          s.created += Number(r.created) || 0;
+          s.updated += Number(r.updated) || 0;
+          s.unchanged += Number(r.unchanged) || 0;
+        }
+        log.info('Security assessment finished', {
+          selected: inputs.selected, assessed: s.assessed, skipped: s.skipped, failed: s.failed,
+          findings: s.total_findings, created: s.created, updated: s.updated, unchanged: s.unchanged,
+          dropped_by_cap: inputs.dropped_by_cap
+        });
+        if (failures.length > 0) log.warn('Deployments that could not be assessed', { failures: failures });
+        return {
+          selected: inputs.selected, dropped_by_cap: inputs.dropped_by_cap,
+          assessed: s.assessed, skipped: s.skipped, failed: s.failed,
+          total_findings: s.total_findings, created: s.created, updated: s.updated, unchanged: s.unchanged,
+          failures: failures
+        };
+
+connections:
+  - { id: c1, from: start_manual,     to: lake_deployments }
+  - { id: c2, from: start_cron,       to: lake_deployments }
+  - { id: c3, from: lake_deployments, to: filter_rows }
+  - { id: c4, from: filter_rows,      to: assess }
+  - { id: c5, from: assess,           to: summary }
+
+outputs:
+  selected:        "${{ steps.summary.outputs.selected }}"
+  dropped_by_cap:  "${{ steps.summary.outputs.dropped_by_cap }}"
+  assessed:        "${{ steps.summary.outputs.assessed }}"
+  skipped:         "${{ steps.summary.outputs.skipped }}"
+  failed:          "${{ steps.summary.outputs.failed }}"
+  total_findings:  "${{ steps.summary.outputs.total_findings }}"
+  created:         "${{ steps.summary.outputs.created }}"
+  updated:         "${{ steps.summary.outputs.updated }}"
+  unchanged:       "${{ steps.summary.outputs.unchanged }}"
