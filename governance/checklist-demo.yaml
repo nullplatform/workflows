@@ -111,18 +111,16 @@ steps:
       value: "${{ steps.wait_for_resolution.outputs.finalOutcome }}"
 
   # ── Branch on the outcome ─────────────────────────────────────────
+  # A `conditional` (true/false), not a `case`: approve and
+  # approve_with_override would both need to land on one "approved" port,
+  # and `case` requires a UNIQUE port per match. RAW expression (no
+  # ${{ }}) — deciders evaluate the expression themselves.
   - id: route_outcome
     type: decider
-    plugin_type: case
-    name: "Route on outcome"
+    plugin_type: conditional
+    name: "Approved?"
     config:
-      expression: "${{ variables.final_outcome }}"
-      cases:
-        approve: "approved"
-        approve_with_override: "approved"
-        fail: "rejected"
-        cancelled: "rejected"
-        expired: "rejected"
+      expression: "variables.final_outcome == 'approve' || variables.final_outcome == 'approve_with_override'"
 
   - id: log_approved
     type: module
@@ -146,5 +144,5 @@ connections:
   - { id: c3, from: stash_approval, to: wait_for_resolution }
   - { id: c4, from: wait_for_resolution, to: stash_outcome }
   - { id: c5, from: stash_outcome, to: route_outcome }
-  - { id: c6, from: route_outcome, to: log_approved, source_port: "approved" }
-  - { id: c7, from: route_outcome, to: log_rejected, source_port: "rejected" }
+  - { id: c6, from: route_outcome, to: log_approved, source_port: "true" }
+  - { id: c7, from: route_outcome, to: log_rejected, source_port: "false" }
