@@ -385,7 +385,7 @@ describe('audit-entity-check signals — probe verdicts', () => {
   });
 
   it('probes the two-segment entity names the enhancer really configures', async () => {
-    const withSlash = ['notification/channel', 'runtime_configuration/dimension'];
+    const withSlash = ['runtime_configuration/dimension', 'notification/channel'];
     // Both are keys of the real map, so neither may be treated as a bad name.
     expect(REAL_KEYS).toEqual(expect.arrayContaining(withSlash));
     const urls: string[] = [];
@@ -399,17 +399,19 @@ describe('audit-entity-check signals — probe verdicts', () => {
       },
       { urls },
     );
-    expect(out.probes.map((p) => p.verdict)).toEqual(['ok', 'ok']);
+    // The STANDARD one is fetched as GET /runtime_configuration/dimension/<id>,
+    // so the slash has to survive the escaping; the SELF_CONTAINED one is not
+    // fetched at all. Neither is a bad name.
+    const verdictOf = (entity: string) => out.probes.find((p) => p.entity === entity)?.verdict;
+    expect(verdictOf('runtime_configuration/dimension')).toBe('ok');
+    expect(verdictOf('notification/channel')).toBe('not_fetched_by_design');
+    expect(urls).toContain('https://api.nullplatform.io/runtime_configuration/dimension/id_1');
     expect(out.data_flags).toEqual([]);
     expect(out.degraded_sources).toEqual([]);
-    // The enhancer fetches these as GET /notification/channel/<id>, so the
-    // slash has to survive the escaping.
-    expect(urls).toContain('https://api.nullplatform.io/notification/channel/id_1');
-    expect(urls).toContain('https://api.nullplatform.io/runtime_configuration/dimension/id_1');
   });
 
   it('rejects traversal and malformed names, and escapes what it does probe', async () => {
-    const bad = ['user/../admin', 'a/b/c', 'user/', '/user', 'us..er', 'a//b'];
+    const bad = ['user/../admin', 'a/b/c', 'user/', '/user', 'us..er', 'a//b', '-foo', 'a/-b'];
     const urls: string[] = [];
     const out = await runSignals(
       {
@@ -432,13 +434,19 @@ describe('audit-entity-check signals — probe verdicts', () => {
     // Hypothetical three-segment key: legitimate by virtue of being configured,
     // yet outside what the probe can build a URL for.
     const appJs = REAL_APP_JS.replace('"nrn": {', '"a/b/c": {} ,\n        "nrn": {');
-    const out = await runSignals(
-      { new_entity_rows: [{ ...NEW_ENTITY, entity: 'a/b/c', sample_entity_id: 'x' }] },
-      { appJs },
-    );
+    const row = [{ ...NEW_ENTITY, entity: 'a/b/c', sample_entity_id: 'x' }];
+    const out = await runSignals({ new_entity_rows: row }, { appJs });
     expect(out.entity_config_trusted).toBe(true);
+    expect(out.probes.find((p) => p.entity === 'a/b/c')?.verdict).toBe('skipped_not_probeable');
     expect(out.data_flags).toEqual([]);
     expect(out.degraded_sources.join(' ')).toContain('configured in the enhancer');
+
+    // With the map untrusted the same name is a finding again: the carve-out
+    // only applies to names a map we believe actually configures.
+    const untrusted = await runSignals({ new_entity_rows: row }, { enhancerJs: null, appJs });
+    expect(untrusted.entity_config_trusted).toBe(false);
+    expect(untrusted.probes.find((p) => p.entity === 'a/b/c')?.verdict).toBe('skipped_unsafe_name');
+    expect(untrusted.data_flags.map((f) => f.entity)).toContain('a/b/c');
   });
 
   it('probes at most four entities and says how many it left out', async () => {
@@ -451,6 +459,59 @@ describe('audit-entity-check signals — probe verdicts', () => {
     expect(out.probes).toHaveLength(4);
     expect(out.degraded_sources.join(' ')).toContain('6 suspect entities but only 4 were probed');
     expect(out.signals_view).toContain('probed 4 of 6 suspect entities');
+  });
+});
+
+describe('audit-entity-check signals — entities the enhancer never fetches', () => {
+  /** Entries the real map resolves with selfContainedEnhancer or `ignore: true`. */
+  const SELF_CONTAINED = [
+    'service',
+    'workflow',
+    'notification/channel',
+    'action_item',
+    'login_success',
+    'agent',
+  ];
+
+  it('does not probe them and does not call their 404 a finding', async () => {
+    expect(REAL_KEYS).toEqual(expect.arrayContaining(SELF_CONTAINED));
+    const urls: string[] = [];
+    const out = await runSignals(
+      {
+        new_entity_rows: SELF_CONTAINED.map((entity) => ({
+          ...NEW_ENTITY,
+          entity,
+          sample_entity_id: 'id_1',
+        })),
+      },
+      // Every host 404s, which is exactly what a SELF_CONTAINED entity does.
+      { probe: () => 404, urls },
+    );
+    expect(out.probes).toHaveLength(SELF_CONTAINED.length);
+    expect(new Set(out.probes.map((p) => p.verdict))).toEqual(new Set(['not_fetched_by_design']));
+    expect(out.data_flags).toEqual([]);
+    expect(out.degraded_sources).toEqual([]);
+    // Not probing them also gives the 30s budget back.
+    expect(urls.filter((u) => u.includes('nullplatform.io/') && !u.includes('token'))).toEqual([]);
+  });
+
+  it('still probes a STANDARD entity, and its 404 everywhere is a finding', async () => {
+    const out = await runSignals(
+      { new_entity_rows: [{ ...NEW_ENTITY, entity: 'user', sample_entity_id: 'id_1' }] },
+      { probe: () => 404 },
+    );
+    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('id_or_endpoint_missing');
+    expect(out.data_flags.map((f) => f.entity)).toContain('user');
+  });
+
+  it('probes everything when the config could not be trusted', async () => {
+    // No classification without a trusted map: err towards looking.
+    const out = await runSignals(
+      { new_entity_rows: [{ ...NEW_ENTITY, entity: 'service', sample_entity_id: 'id_1' }] },
+      { enhancerJs: null, probe: () => 404 },
+    );
+    expect(out.entity_config_trusted).toBe(false);
+    expect(out.probes.find((p) => p.entity === 'service')?.verdict).toBe('id_or_endpoint_missing');
   });
 });
 
@@ -490,6 +551,29 @@ describe('audit-entity-check signals — anchor decoys', () => {
     expect(out.entity_config_keys).toEqual(REAL_KEYS);
     expect(out.entity_config_trusted).toBe(true);
     expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('answers_on_alt_host');
+  });
+
+  it('is not fooled by a regex literal holding a quote', async () => {
+    // A lone quote inside /['"]/ used to open a "string" that ran to the next
+    // quote in the file, blanking the anchor along with it.
+    const appJs = REAL_APP_JS.replace(
+      'const PARAMS_REGEX',
+      "const QUOTE_RE = /['\"]/;\nconst PARAMS_REGEX",
+    );
+    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
+    expect(out.entity_config_keys).toEqual(REAL_KEYS);
+    expect(out.entity_config_trusted).toBe(true);
+    expect(out.degraded_sources).toEqual([]);
+  });
+
+  it('degrades visibly on source it cannot scan at all', async () => {
+    // An unterminated block comment swallows the rest of the file. Nothing can
+    // be concluded from that, and the item says so instead of guessing.
+    const appJs = `/* oops\n${REAL_APP_JS}`;
+    const out = await runSignals({ new_entity_rows: [NEW_ENTITY] }, { appJs });
+    expect(out.entity_config_trusted).toBe(false);
+    expect(out.degraded_sources.join(' ')).toContain('entityConfig unavailable');
+    expect(out.data_flags).toEqual([]);
   });
 
   it('never escalates to wrong_host on a clients map it could not parse', async () => {
