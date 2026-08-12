@@ -1,0 +1,148 @@
+# Checklist Demo Workflow
+#
+# Demonstrates a human-in-the-loop approval gate driven by the NP
+# checklist API. Manual trigger → create (or attach to) a 2-item
+# checklist template → wait for the approval-request to resolve →
+# branch on the final outcome.
+#
+# Smallest end-to-end checklist experience: unlike the kind-routed
+# workflows in this folder (which RESOLVE items of an existing template,
+# see checklists/README.md), this one CREATES the template + associates it
+# and then waits on the outcome — useful as a sandbox to see the runner UI
+# without wiring an approval action by hand. Needs NP_API_TOKEN (or the
+# `np.api.token` secret); URLs default to https://api.nullplatform.com.
+
+id: checklist_demo
+name: "Checklist demo (NP approvals)"
+description: >
+  Build-and-deploy gate driven by an NP approval checklist. Creates a
+  2-item template (a manual ack + an external smoke check), associates
+  it with an approval action, then polls the approval-request until a
+  terminal outcome is reached.
+path: "/nullplatform/approvals"
+semantic_version: 1.0.0
+
+inputs:
+  approval_action_id:
+    type: string
+    required: true
+    description: "Approval-action id to associate the new checklist template with"
+  approval_request_id:
+    type: string
+    required: false
+    description: "Optional — when an approval is already in flight, attach to it instead of creating a new template"
+  nrn:
+    type: string
+    required: true
+    description: "NRN to scope the new checklist template under, e.g. organization=<org-id>"
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+variables:
+  approval_request_id: { initialValue: null }
+  final_outcome:        { initialValue: null }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start checklist demo"
+    config:
+      description: "Run a 2-item human-in-the-loop checklist gate."
+
+  # ── Create the checklist (Mode B) or attach (Mode A) ──────────────
+  - id: setup_checklist
+    type: module
+    plugin_type: np-checklist-create
+    name: "Setup checklist"
+    inputs:
+      approvalRequestId: "${{ workflow.inputs.approval_request_id }}"
+      actionId: "${{ workflow.inputs.approval_action_id }}"
+      nrn: "${{ workflow.inputs.nrn }}"
+    config:
+      template:
+        name: "demo-deploy-gate"
+        description: "Demo gate with one manual ack + one external smoke check"
+        definition:
+          items:
+            - id: "cab_review"
+              type: "manual"
+              behavior: "gate"
+              title: "CAB review acknowledged"
+              description: "Confirm the change advisory board has signed off."
+              require_comment: true
+            - id: "canary_smoke"
+              type: "external"
+              behavior: "gate"
+              title: "Canary smoke tests"
+              description: "Triggered on-demand by the deploy controller."
+              external:
+                channel: "http"
+                trigger: "on_demand"
+
+  - id: stash_approval
+    type: module
+    plugin_type: set-variable
+    name: "Stash approval_request_id"
+    config:
+      path: approval_request_id
+      value: "${{ steps.setup_checklist.outputs.approvalRequestId }}"
+
+  # ── Wait for the human + external item to resolve the run ─────────
+  - id: wait_for_resolution
+    type: module
+    plugin_type: np-checklist-wait
+    name: "Wait for checklist outcome"
+    inputs:
+      approvalRequestId: "${{ variables.approval_request_id }}"
+    config:
+      pollInterval: "30s"
+      timeout: "1h"
+      onTimeout: "fail"
+
+  - id: stash_outcome
+    type: module
+    plugin_type: set-variable
+    name: "Stash final outcome"
+    config:
+      path: final_outcome
+      value: "${{ steps.wait_for_resolution.outputs.finalOutcome }}"
+
+  # ── Branch on the outcome ─────────────────────────────────────────
+  # A `conditional` (true/false), not a `case`: approve and
+  # approve_with_override would both need to land on one "approved" port,
+  # and `case` requires a UNIQUE port per match. RAW expression (no
+  # ${{ }}) — deciders evaluate the expression themselves.
+  - id: route_outcome
+    type: decider
+    plugin_type: conditional
+    name: "Approved?"
+    config:
+      expression: "variables.final_outcome == 'approve' || variables.final_outcome == 'approve_with_override'"
+
+  - id: log_approved
+    type: module
+    plugin_type: log
+    name: "Log approval"
+    config:
+      level: "info"
+      message: "Checklist passed → outcome=${{ variables.final_outcome }}"
+
+  - id: log_rejected
+    type: module
+    plugin_type: log
+    name: "Log rejection"
+    config:
+      level: "warn"
+      message: "Checklist did not approve → outcome=${{ variables.final_outcome }}"
+
+connections:
+  - { id: c1, from: start, to: setup_checklist }
+  - { id: c2, from: setup_checklist, to: stash_approval }
+  - { id: c3, from: stash_approval, to: wait_for_resolution }
+  - { id: c4, from: wait_for_resolution, to: stash_outcome }
+  - { id: c5, from: stash_outcome, to: route_outcome }
+  - { id: c6, from: route_outcome, to: log_approved, source_port: "true" }
+  - { id: c7, from: route_outcome, to: log_rejected, source_port: "false" }

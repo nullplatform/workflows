@@ -1,0 +1,65 @@
+# Checklist template: deploy-gate
+#
+# Snapshot of the LIVE template (tmpl_9biefuuos8lbszqc, v2, 2026-05-23),
+# associated in production with the `deployment:create` approval action on
+# `dimensions.environment=production`. This is the template the governance
+# workflows in this folder resolve items for.
+#
+# External items on the NP dispatch path declare ONLY
+# `kind` + `inputs` + `timeout_seconds` + `trigger`. There is no
+# channel/url/method/headers here: routing is decided by the
+# notification_channel each workflow's `np-checklist-trigger` auto-registers
+# on alias activation (filtering on `source=checklist`,
+# `action=checklist:item:dispatched`, `context.kind=<kind>`). The
+# approval-api validator rejects the old url-bearing shape
+# (CHECKLIST_TEMPLATE.INVALID_EXTERNAL_SHAPE).
+#
+# `external.inputs` values are mustache placeholders resolved against the
+# run context at dispatch time — these KEEP the `context.` root (dispatch
+# payload, not the condition query language).
+#
+# Create + associate with the np-checklist skill (or the raw API):
+#   create_template.sh --nrn "organization=<org-id>" --name "deploy-gate" \
+#     --definition-file ./deploy-gate.yaml --created-by "<user>"
+#   set_action_template.sh --action-id <approval-action-id> --template-id <tmpl_…>
+items:
+  - id: epic_valid
+    type: external
+    behavior: gate
+    severity: critical
+    title: "Jira Epic is valid"
+    description: >-
+      Validates that deployment.metadata.jira_epic refers to a Jira Epic
+      currently In Progress / In Development. The Jira API error is passed
+      verbatim back to the run.
+    external:
+      kind: "validate-jira-epic"
+      inputs:
+        jira_epic: "{{ context.deployment.metadata.deployment.jira_epic }}"
+      trigger: auto
+      timeout_seconds: 60
+
+  - id: tests_confirmed
+    type: manual
+    behavior: gate
+    severity: minor
+    title: "I ran tests for this change"
+    description: "Confirm after running the full test suite locally or in CI."
+    require_comment: false
+
+  - id: release_passed_stage
+    type: external
+    behavior: gate
+    severity: critical
+    title: "Release was deployed to a stage scope"
+    description: >-
+      Searches the last 30 finalized deployments across scopes with
+      dimensions.environment=stage for this application; fails if the
+      current release id is not found.
+    external:
+      kind: "check-release-staged"
+      inputs:
+        release_id: "{{ context.release.id }}"
+        application_id: "{{ context.application.id }}"
+      trigger: auto
+      timeout_seconds: 60
