@@ -16,9 +16,11 @@
  * fixtures cover the variants the real files do not have.
  *
  * Covered:
- *  - the `entityConfig` / `clients` / `ENTITIES` extraction, and the sanity gate
- *    that refuses to compare against an incomplete key set,
- *  - the probe verdicts, including the `clients` lookup and unreachable hosts,
+ *  - the `entityConfig` / `clients` / `ENTITIES` extraction, the sanity gates
+ *    that refuse to conclude anything from an incomplete key set, and the
+ *    comment/string decoys an anchor must not fall for,
+ *  - the probe verdicts, including the `clients` lookup, the two-segment entity
+ *    names the enhancer configures, traversal attempts and unreachable hosts,
  *  - data flags vs degraded sources (missing config entries, lake errors),
  *  - the carry-over decision matrix of `gather`,
  *  - what both resolves PATCH back to the approval API.
@@ -382,22 +384,61 @@ describe('audit-entity-check signals — probe verdicts', () => {
     expect(out.data_flags.map((f) => f.entity)).toContain('user');
   });
 
-  it('rejects entity names that are not a single path segment and escapes the rest', async () => {
+  it('probes the two-segment entity names the enhancer really configures', async () => {
+    const withSlash = ['notification/channel', 'runtime_configuration/dimension'];
+    // Both are keys of the real map, so neither may be treated as a bad name.
+    expect(REAL_KEYS).toEqual(expect.arrayContaining(withSlash));
+    const urls: string[] = [];
+    const out = await runSignals(
+      {
+        new_entity_rows: withSlash.map((entity) => ({
+          ...NEW_ENTITY,
+          entity,
+          sample_entity_id: 'id_1',
+        })),
+      },
+      { urls },
+    );
+    expect(out.probes.map((p) => p.verdict)).toEqual(['ok', 'ok']);
+    expect(out.data_flags).toEqual([]);
+    expect(out.degraded_sources).toEqual([]);
+    // The enhancer fetches these as GET /notification/channel/<id>, so the
+    // slash has to survive the escaping.
+    expect(urls).toContain('https://api.nullplatform.io/notification/channel/id_1');
+    expect(urls).toContain('https://api.nullplatform.io/runtime_configuration/dimension/id_1');
+  });
+
+  it('rejects traversal and malformed names, and escapes what it does probe', async () => {
+    const bad = ['user/../admin', 'a/b/c', 'user/', '/user', 'us..er', 'a//b'];
     const urls: string[] = [];
     const out = await runSignals(
       {
         new_entity_rows: [
-          { ...NEW_ENTITY, entity: 'user/../admin', sample_entity_id: 'x' },
+          ...bad.map((entity) => ({ ...NEW_ENTITY, entity, sample_entity_id: 'x' })),
           { ...NEW_ENTITY, entity: 'parameter', sample_entity_id: 'a:b' },
         ],
       },
       { urls },
     );
-    expect(out.probes.find((p) => p.entity === 'user/../admin')?.verdict).toBe(
-      'skipped_unsafe_name',
-    );
+    for (const entity of bad) {
+      expect(out.probes.find((p) => p.entity === entity)?.verdict).toBe('skipped_unsafe_name');
+    }
     expect(urls.some((u) => u.includes('..'))).toBe(false);
+    expect(urls.some((u) => u.replace('https://', '').includes('//'))).toBe(false);
     expect(urls.some((u) => u.endsWith('/parameter/a%3Ab'))).toBe(true);
+  });
+
+  it('degrades instead of flagging a name the enhancer configures but cannot probe', async () => {
+    // Hypothetical three-segment key: legitimate by virtue of being configured,
+    // yet outside what the probe can build a URL for.
+    const appJs = REAL_APP_JS.replace('"nrn": {', '"a/b/c": {} ,\n        "nrn": {');
+    const out = await runSignals(
+      { new_entity_rows: [{ ...NEW_ENTITY, entity: 'a/b/c', sample_entity_id: 'x' }] },
+      { appJs },
+    );
+    expect(out.entity_config_trusted).toBe(true);
+    expect(out.data_flags).toEqual([]);
+    expect(out.degraded_sources.join(' ')).toContain('configured in the enhancer');
   });
 
   it('probes at most four entities and says how many it left out', async () => {
@@ -408,8 +449,58 @@ describe('audit-entity-check signals — probe verdicts', () => {
     }));
     const out = await runSignals({ new_entity_rows: rows });
     expect(out.probes).toHaveLength(4);
-    expect(out.degraded_sources.join(' ')).toContain('only the first 4 were probed');
-    expect(out.signals_view).toContain('4 of 6 suspect entities');
+    expect(out.degraded_sources.join(' ')).toContain('6 suspect entities but only 4 were probed');
+    expect(out.signals_view).toContain('probed 4 of 6 suspect entities');
+  });
+});
+
+describe('audit-entity-check signals — anchor decoys', () => {
+  const ALT = 'https://users.nullplatform.io';
+  const altHostProbe = (url: string) => (url.startsWith(ALT) ? 200 : 404);
+  const userRow = [{ ...NEW_ENTITY, entity: 'user', sample_entity_id: 'id_1' }];
+
+  it('ignores a clients map mentioned in a line comment', async () => {
+    // `user` HAS a real clients entry; anchoring on the comment would hide it
+    // and turn the probe into a wrong_host finding, with the decoy handed to
+    // the agent as the excerpt that "confirms" it.
+    const appJs = REAL_APP_JS.replace(
+      'const entityUtils = new EntityUtils({',
+      '// clients: { entity: axiosInstance } — one entry per non-default host\n'
+        + 'const entityUtils = new EntityUtils({',
+    );
+    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
+    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('answers_on_alt_host');
+    expect(out.signals_view).toContain('baseURL:"https://users.nullplatform.io"');
+    expect(out.signals_view).not.toContain('{ entity: axiosInstance }');
+  });
+
+  it('ignores an entityConfig mentioned in a string literal', async () => {
+    const appJs = `const msg = "entityConfig: { fake: 1 }";\n${REAL_APP_JS}`;
+    const out = await runSignals({}, { appJs });
+    expect(out.entity_config_keys).toEqual(REAL_KEYS);
+    expect(out.entity_config_trusted).toBe(true);
+  });
+
+  it('accepts a quoted property key as the anchor', async () => {
+    const appJs = REAL_APP_JS.replace('    entityConfig: {', '    "entityConfig": {').replace(
+      '    clients: {',
+      "    'clients': {",
+    );
+    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
+    expect(out.entity_config_keys).toEqual(REAL_KEYS);
+    expect(out.entity_config_trusted).toBe(true);
+    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('answers_on_alt_host');
+  });
+
+  it('never escalates to wrong_host on a clients map it could not parse', async () => {
+    const appJs = REAL_APP_JS.replace(
+      /const entityUtils = new EntityUtils\(\{[\s\S]*?\n\}\);/,
+      'const entityUtils = new EntityUtils({ clients: { widgets: onlyOne }, tokenGenerator });',
+    );
+    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
+    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('answers_on_alt_host');
+    expect(out.degraded_sources.join(' ')).toContain('clients map not parsed with confidence');
+    expect(out.degraded_sources.join(' ')).toContain('no "default" client');
   });
 });
 
