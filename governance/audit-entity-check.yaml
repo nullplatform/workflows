@@ -1,60 +1,73 @@
 # Audit Coverage — entity configuration checklist item resolver.
 #
 # Pairs with checklist external items of `kind: audit-entity-check`. ONE item
-# per deploy: it validates that the entities this application writes are
-# correctly wired into the HTTP audit pipeline (producer → audit-enhancer →
-# customers_lake), so misconfigured entities are caught at deploy time instead
-# of showing up later as DLQ messages or `degraded` enrichment in Datadog.
+# per deploy: it reads the code about to ship and the audit-enhancer's
+# configuration, and reports whether the entities this application writes are
+# wired into the HTTP audit pipeline (producer → audit-enhancer →
+# customers_lake).
+#
+# PREVENTIVE AND STATIC, ON PURPOSE. The gate reads source — this repository at
+# the commit being deployed, plus the enhancer's config in its own repo — and
+# calls nothing else. It does not query the lake and it does not probe any API.
+# That is a deliberate narrowing, and the reasoning matters for anyone tempted
+# to add a runtime signal back:
+#   - Runtime health (`degraded` enrichment, `dropped` events, DLQ depth) is
+#     already covered by the pipeline's own Datadog monitors, which watch it
+#     continuously and org-wide. A per-deploy gate re-reading the same data adds
+#     no coverage and reports it at the wrong moment, against the wrong owner.
+#   - Lake signals cannot be attributed to the deploy that gates on them. The
+#     `application` column is the CALLER of the audited request, not the service
+#     that produced the event, so for a producer API it points the wrong way;
+#     and the chronic degraded entities of the whole organization would land on
+#     every application's item as findings that are not theirs.
+#   - A pre-deploy probe of a NEW entity proves nothing: there is no traffic yet
+#     and the read endpoint is not deployed, so a 404 is the expected answer and
+#     says nothing about the configuration.
+# What genuinely cannot be verified before the deploy — the enhancer's read
+# grant, and what the first real write will do — is reported as unverified, and
+# picked up on the NEXT deploy through the checkpoint: by then the entity has
+# traffic and the monitors have had their say.
 #
 # An entity is "correctly configured" when three sides agree:
 #   A. the producer emits the audit event (framework-dependent: server-audit
 #      on Fastify is opt-in per route; np-api-js on Express is opt-out; the
 #      service-api and workflow-api derive names with hand-rolled rules),
-#   B. the enhancer knows the entity name (entityConfig in its app.js:
+#   B. the enhancer handles the entity name (entityConfig in its app.js:
 #      STANDARD / SELF_CONTAINED / NRN, plus clients map for non-default hosts),
 #   C. the enhancer's service account can read the entity (platform grant).
+# A and B are decidable from source. C is not, pre-deploy, and the report says
+# so instead of guessing.
 #
-# Deterministic signals gathered before any LLM call:
-#   - lake (two `np-lake-query` steps): entities first seen in the last 7 days
-#     and the per-entity empty-row rate (the real-world proxy of `degraded`),
-#     each carrying a sample entity_id for the probe,
-#   - enhancer entityConfig + clients keys, read out of `audit-ennhancer/app.js`
-#     in the enhancer repo. Both maps are properties of a constructor call and
-#     most entityConfig keys are computed (`[ENTITIES.USER]:`) or arrive through
-#     `...selfContained(…)`, so the ENTITIES map in `audit_enhancer.js` is read
-#     too and the key set is only used when every key position resolved,
-#   - fetch probe: replay the enhancer's own GET (same identity, same
-#     X-Enhanced header) against a real entity_id — the response code predicts
-#     exactly what production will do (200 ok / 404 host-or-id / 401-403 grant
-#     / 5xx DLQ).
-# The LLM covers what data cannot: write routes in the repo that produce NO
-# audit at all (the evidence is an absence), and predicting the entity name a
-# new route will emit under each framework's derivation rule.
+# The deterministic half (`enhancer_config`) reads the enhancer repo: the
+# entityConfig and clients maps out of `audit-ennhancer/app.js`. Both are
+# properties of a constructor call, most entityConfig keys are computed
+# (`[ENTITIES.USER]:`) or arrive through `...selfContained(…)`, so the ENTITIES
+# map in `audit_enhancer.js` is read too, and the key set is only used when
+# every key position resolved. Each entry is classified by the mechanism it
+# wires up — only a STANDARD entry makes the enhancer fetch the entity — which
+# is what tells the agent whether an entity has to be echoed by the write
+# instead. A source that cannot be read becomes a `degraded_source`: published
+# on the item, never fatal, and never a finding.
 #
-# Signals report through two separate channels, and the difference matters:
-#   - `data_flags`: anomalies in the pipeline. They are findings material and
-#     they force a fresh analysis.
-#   - `degraded_sources`: a source that could not be read (query failed,
-#     config entry missing, host unreachable). They are published on the item
-#     but never drive the incremental decision — otherwise one broken
-#     credential would disable the carry-over path forever and in silence.
+# The LLM covers what static config cannot: write routes that produce NO audit
+# event (the evidence is an absence), the entity name each route will emit under
+# its framework's derivation rule, and whether a SELF_CONTAINED entity is really
+# echoed back by the write that produces it.
 #
 # Incremental strategy (same as arch-rule-check): past checklist runs are the
-# checkpoint store. Carry over the previous verdict only when the code diff
-# has no audit-relevant changes AND the deterministic signals raised no data
-# flags for an entity this application emits. Fail open towards FULL analysis,
-# never towards skipping.
+# checkpoint store. Carry over the previous verdict when the code diff has no
+# audit-relevant changes. Fail open towards FULL analysis, never towards
+# skipping.
 id: audit-entity-check
 key: audit-entity-check
 name: "Audit Coverage — Entity Config Check"
 description: >
-  Validates that the entities written by this application are correctly
-  configured for the HTTP audit pipeline: producer emits the event, the
-  audit-enhancer has config for the entity name, and the enhancer's service
-  account can fetch it. Combines deterministic signals (lake queries, enhancer
-  config, fetch probe) with an LLM pass over the repository for write routes
-  that do not audit. One execution per checklist item
-  (kind: audit-entity-check).
+  Static, preventive check that the entities written by this application are
+  configured for the HTTP audit pipeline: the write produces an audit event, and
+  the audit-enhancer handles the entity name (fetching it, or relying on the
+  write to echo it). Reads this repository and the enhancer's configuration —
+  no lake queries, no live probes; runtime health is covered by the pipeline's
+  monitors. One execution per checklist item (kind: audit-entity-check).
 semantic_version: 1.0.0
 path: "/checklist/audit"
 
@@ -62,12 +75,6 @@ inputs:
   triggerPayload:
     type: object
     default: {}
-
-variables:
-  # Set only when the corresponding lake query fails, so the execution state
-  # records which source degraded even though the run carried on.
-  lake_new_entities_error: { initialValue: "" }
-  lake_empty_rows_error: { initialValue: "" }
 
 steps:
   - id: trigger
@@ -89,154 +96,32 @@ steps:
   - id: progress
     type: module
     plugin_type: np-checklist-item-progress
-    name: "Heartbeat: collecting audit signals"
+    name: "Heartbeat: reading the enhancer configuration"
     inputs:
       callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
       callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
-      message:       "Collecting audit pipeline signals (lake, enhancer config, fetch probe)…"
+      message:       "Reading the audit-enhancer entity configuration…"
 
-  # Neither lake query may fail the run, and neither may take the other down
-  # with it: a missing signal forces analysis, it never blocks the checklist.
-  # Each query falls back to its own re-entry node, which continues to the SAME
-  # successor the query has on the happy path — so a failed query 1 still lets
-  # query 2 run, and `signals` sees the absent `rows` input either way and
-  # records a degraded source. Every join point downstream therefore has exactly
-  # two predecessors of which exactly one ever completes, which is what makes
-  # `join_strategy: any` unambiguous there (see governance/README.md).
-  - id: lake_new_entities
-    type: module
-    plugin_type: np-lake-query
-    name: "Lake: entities first seen in the last 7 days"
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      sql: |
-        -- audit_events is partitioned by day and must always be date-bounded,
-        -- so `first_seen` means "first seen inside the 90-day window", not
-        -- "first seen ever" — an entity dormant for more than 90 days reads as
-        -- new here, which errs towards analysing it again.
-        SELECT entity,
-               toString(min(date)) AS first_seen,
-               count() AS writes,
-               groupUniqArray(10)(method) AS methods,
-               argMaxIf(entity_id, date, entity_id != '') AS sample_entity_id
-        FROM audit_events
-        WHERE date > now() - INTERVAL 90 DAY
-          AND method != 'GET'
-        GROUP BY entity
-        HAVING min(date) > now() - INTERVAL 7 DAY
-        ORDER BY writes DESC
-        LIMIT 20
-    error_handling:
-      fallback_step: lake_new_degraded
-
-  - id: lake_empty_rows
-    type: module
-    plugin_type: np-lake-query
-    name: "Lake: entities with empty enrichment rows (degraded proxy)"
-    # Runs whether query 1 succeeded or degraded — exactly one of those two
-    # predecessors ever completes.
-    join_strategy: any
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      sql: |
-        -- Empty-row detector: buildResp always injects `version`, so an
-        -- enriched row has at least one other key in entity_data.
-        SELECT entity,
-               count() AS total,
-               countIf(JSONAllPaths(entity_data) = ['version']
-                       AND toString(entity_context) = '{}') AS empty_rows,
-               round(100 * empty_rows / total, 1) AS pct_empty,
-               argMaxIf(entity_id, date, entity_id != '') AS sample_entity_id
-        FROM audit_events
-        WHERE date > now() - INTERVAL 7 DAY
-          AND method != 'GET'
-        GROUP BY entity
-        HAVING total > 20 AND pct_empty > 5
-        ORDER BY pct_empty DESC
-        LIMIT 20
-    error_handling:
-      fallback_step: lake_empty_degraded
-
-  # Re-entry nodes for a failed lake query, one per query: a failing step can
-  # only hand control to a node whose predecessors are ALL settled, so a shared
-  # node would hang on the query that never ran (same reason the failure-resolve
-  # tails are separate). Each one records the error in the execution state and
-  # continues where its query would have; `signals` reads the error message
-  # straight off the failed step.
-  - id: lake_new_degraded
-    type: module
-    plugin_type: set-variable
-    name: "Record the degraded new-entities query"
-    config:
-      path: lake_new_entities_error
-      value: "${{ steps.lake_new_entities.error.message }}"
-
-  - id: lake_empty_degraded
-    type: module
-    plugin_type: set-variable
-    name: "Record the degraded empty-rows query"
-    config:
-      path: lake_empty_rows_error
-      value: "${{ steps.lake_empty_rows.error.message }}"
-
-  - id: signals
+  - id: enhancer_config
     type: module
     plugin_type: code-exec
-    name: "Deterministic signals: enhancer config + probe over the lake rows"
-    # Runs whether query 2 succeeded or degraded — exactly one of those two
-    # predecessors ever completes.
-    join_strategy: any
+    name: "Enhancer entity configuration (side B)"
     inputs:
-      github_token:       "${{ secrets.GITHUB_TOKEN }}"
-      enhancer_api_key:   "${{ secrets.ENHANCER_API_KEY }}"
-      enhancer_repo:      "nullplatform/data-audit-stream-enhancer"
-      new_entity_rows:    "${{ steps.lake_new_entities.outputs.rows }}"
-      empty_row_rows:     "${{ steps.lake_empty_rows.outputs.rows }}"
-      new_entities_error: "${{ steps.lake_new_entities.error.message }}"
-      empty_rows_error:   "${{ steps.lake_empty_rows.error.message }}"
+      github_token:  "${{ secrets.GITHUB_TOKEN }}"
+      enhancer_repo: "nullplatform/data-audit-stream-enhancer"
     config:
       network:
-        allowedHosts:
-          - "api.github.com"
-          - "authz.nullplatform.io"
-          - "api.nullplatform.io"
-          - "users.nullplatform.io"
-          - "params.nullplatform.io"
-          - "providers.nullplatform.io"
-          - "approvals.nullplatform.io"
-          - "notifications.nullplatform.io"
-          - "governance-action-items-api-production-ufjmx.prod.nullapps.io"
+        allowedHosts: ["api.github.com"]
       code: |
-        const { github_token, enhancer_api_key, enhancer_repo,
-                new_entity_rows, empty_row_rows,
-                new_entities_error, empty_rows_error } = $item;
+        const { github_token, enhancer_repo } = $item;
 
-        // Anomalies of the audited pipeline: they force a fresh analysis. Each
-        // one records the entity it is about (null when it is not about one) so
-        // the incremental decision can tell this application's entities from
-        // the rest of the organization's.
-        const data_flags = [];
-        // Sources that could not be read. Published, never decisive.
+        // Sources that could not be read. Published on the item so the report
+        // says what it could not check, never fatal and never a finding.
         const degraded_sources = [];
-        const flag = (entity, text) => data_flags.push({ entity: entity || null, text });
         // A config entry that does not exist is absent from $item altogether,
         // so an unset secret would otherwise reach fetch() as "undefined".
         const isSet = (v) => typeof v === "string" && v.trim().length > 0;
 
-        // Extracts the top-level keys of an object literal, plus the raw source
-        // text of each value and of the literal itself. The name is matched
-        // either as an assignment (`const X = { … }`) or as a property
-        // (`new Thing({ X: { … } })`) — the enhancer builds its maps the second
-        // way. Comments and strings are skipped, so a `word:` inside a comment
-        // is not a key and a brace inside a comment or a string neither opens
-        // nor closes the object.
-        //
-        // Two shapes need `resolveRef` to be named at all: computed keys
-        // (`[ENTITIES.USER]:`) and spreads of a helper call
-        // (`...selfContained(ENTITIES.LINK, …)`). `unresolved` counts the key
-        // positions that could not be named — a non-zero count means the key
-        // list is INCOMPLETE, which is the difference between "this entity is
-        // not configured" and "we did not read the whole map".
         // Marks every offset of `src` that is real code. Everything inside a
         // comment or inside a string literal is not — the delimiters themselves
         // still are, so a quoted property key can anchor while a string that
@@ -278,6 +163,18 @@ steps:
           return isCode;
         };
 
+        // Extracts the top-level keys of an object literal, plus the source text
+        // of each value and of the literal itself. The name is matched either as
+        // an assignment (`const X = { … }`) or as a property
+        // (`new Thing({ X: { … } })`) — the enhancer builds its maps the second
+        // way.
+        //
+        // Two shapes need `resolveRef` to be named at all: computed keys
+        // (`[ENTITIES.USER]:`) and spreads of a helper call
+        // (`...selfContained(ENTITIES.LINK, …)`). `unresolved` counts the key
+        // positions that could not be named — a non-zero count means the key
+        // list is INCOMPLETE, which is the difference between "this entity is
+        // not configured" and "we did not read the whole map".
         const extractObjectLiteral = (src, name, resolveRef) => {
           const resolve = resolveRef || (() => undefined);
           // The name may be quoted when it is a property key. A quoted key
@@ -400,7 +297,6 @@ steps:
           return { keys, entries, codeEntries, unresolved, block: src.slice(open, end + 1) };
         };
 
-        // --- Source 1: enhancer entityConfig + clients map (side B) ---
         // Both maps live in `audit-ennhancer/app.js` — that directory name is
         // spelled with a double n in the enhancer repo.
         const ENHANCER_DIR = "audit-ennhancer";
@@ -408,25 +304,29 @@ steps:
         let entityConfigTrusted = false;
         let clientsKeys = null;
         let appJsExcerpt = "";
-        // Entities the enhancer deliberately never fetches. `getEntityData` in
-        // its entity_enhancer.js dispatches on ENTITY_TYPE, and only STANDARD
-        // issues the `GET /<entity>/<id>` this probe replays: SELF_CONTAINED
-        // enriches from the event body, NRN resolves the nrn's own parts, and an
-        // `ignore: true` entry is skipped outright. For those a 404 is the
-        // designed behaviour, and calling it a defect both invents a finding and
-        // (being a data flag) disables the carry-over for every application
-        // writing them.
+        // How the enhancer will treat each configured entity. `getEntityData` in
+        // its entity_enhancer.js dispatches on ENTITY_TYPE, and the mode decides
+        // where the enriched data comes from — which is what the agent needs to
+        // know to judge the write route:
+        //   standard       → the enhancer FETCHES `GET /<entity>/<id>`,
+        //   self_contained → it does not fetch; the event body must carry the
+        //                    entity (an echo, or an entity_snapshot),
+        //   nrn            → it resolves the nrn's own parts, no entity read,
+        //   ignored        → the entry opts out of enrichment entirely.
         //
-        // The alternatives match the mechanism, never the prose: entries carry
-        // `expandNRN: true` and comments that discuss self-containedness, so a
-        // loose match would silence a STANDARD entity — the failure direction
-        // that hides real misconfiguration.
-        const NOT_FETCHED = new RegExp(
-          "\\.\\.\\.[A-Za-z_$]*self[_-]?contained"
-          + "|self[_-]?contained[A-Za-z_$]*enhancer"
-          + "|entityType\\s*:\\s*ENTITY_TYPE\\.(?:SELF_CONTAINED|NRN)"
-          + "|\\bignore\\s*:\\s*true\\b", "i");
-        const notFetched = new Set();
+        // The patterns match the mechanism, never the prose: entries carry
+        // `expandNRN: true` and comments that discuss self-containedness at
+        // length, so a loose match would mislabel a STANDARD entity — the
+        // failure direction that hides real misconfiguration.
+        const ENTRY_MODES = [
+          ["ignored", /\bignore\s*:\s*true\b/i],
+          ["self_contained", new RegExp(
+            "\\.\\.\\.[A-Za-z_$]*self[_-]?contained"
+            + "|self[_-]?contained[A-Za-z_$]*enhancer"
+            + "|entityType\\s*:\\s*ENTITY_TYPE\\.SELF_CONTAINED", "i")],
+          ["nrn", /entityType\s*:\s*ENTITY_TYPE\.NRN/i],
+        ];
+        const entityModes = {};
         if (!isSet(github_token)) {
           degraded_sources.push("config entry GITHUB_TOKEN missing — enhancer entityConfig not read");
         } else {
@@ -468,10 +368,10 @@ steps:
             if (!cfg) throw new Error(`no entityConfig object literal in ${ENHANCER_DIR}/app.js`);
             entityConfigKeys = cfg.keys;
             // The clients map gets its own confidence gate, for the same reason
-            // entityConfig has one: `clientsDeclares` returning false is what
-            // escalates a probe to `wrong_host`, so a mis-parsed key list would
-            // turn healthy entities into findings. The real map always routes
-            // `default`, which makes it a usable anchor.
+            // entityConfig has one: the agent is told to conclude from these key
+            // lists, so a mis-parsed one would turn healthy entities into
+            // findings. The real map always routes `default`, which makes it a
+            // usable anchor.
             const clients = extractObjectLiteral(appJs, "clients", resolveRef);
             const clientsDoubts = [];
             if (!clients) clientsDoubts.push("no clients object literal found");
@@ -484,7 +384,7 @@ steps:
             if (clientsDoubts.length) {
               degraded_sources.push(
                 `enhancer clients map not parsed with confidence (${clientsDoubts.join("; ")})`
-                + ` — alternate-host verdicts left to the agent`);
+                + ` — non-default hosts cannot be cross-checked`);
             }
             // Sanity gate before any comparison. An incomplete key set is the
             // dangerous one: comparing against it reports entities that ARE
@@ -503,11 +403,13 @@ steps:
                 + ` — per-entity comparison skipped`);
             } else {
               // Classified on the entry's code, with comments and strings
-              // blanked. An entry whose code does not say either way is left
-              // out, so the entity gets probed: erring towards looking, not
-              // towards excusing.
+              // blanked. An entry whose code says none of the three is STANDARD
+              // by elimination, which is also the mode that demands the most of
+              // the pipeline — erring towards checking, not towards excusing.
               for (const k of entityConfigKeys) {
-                if (NOT_FETCHED.test(cfg.codeEntries[k] || "")) notFetched.add(k);
+                const code = cfg.codeEntries[k] || "";
+                const hit = ENTRY_MODES.find(([, re]) => re.test(code));
+                entityModes[k] = hit ? hit[0] : "standard";
               }
             }
             appJsExcerpt = [
@@ -522,216 +424,53 @@ steps:
           }
         }
 
-        // --- Source 2: the lake (sides A+B observed in the wild) ---
-        // Both queries are organization-wide: audit_events has no application
-        // column, so these rows describe every team. `gather` narrows the
-        // flags down to this application before deciding anything.
-        const newEntities = Array.isArray(new_entity_rows) ? new_entity_rows : [];
-        const degradedEntities = Array.isArray(empty_row_rows) ? empty_row_rows : [];
-        // No rows input means the query step did not deliver: it either failed
-        // (its error travels here) or never ran at all. Those read very
-        // differently on the item, so keep them apart.
-        const lakeDegraded = (label, error) => degraded_sources.push(
-          isSet(error)
-            ? `lake unavailable (${label}): the query failed — ${error}`
-            : `lake unavailable (${label}): the query did not run`);
-        if (!Array.isArray(new_entity_rows)) lakeDegraded("new entities", new_entities_error);
-        if (!Array.isArray(empty_row_rows)) lakeDegraded("empty rows", empty_rows_error);
-
-        // entityConfig has a `default` entry, so an absent entity is not
-        // misconfigured by itself: it gets the default STANDARD treatment, which
-        // only works if the enhancer can GET it. Say that instead of claiming a
-        // missing configuration the absence does not prove.
+        const classified = Object.keys(entityModes).length > 0;
+        const byMode = (mode) => Object.keys(entityModes).filter(k => entityModes[k] === mode);
+        // entityConfig has a `default` entry, so an entity absent from the map is
+        // not misconfigured by itself: it gets the default STANDARD treatment.
         const hasDefaultConfig = entityConfigKeys.includes("default");
-        if (entityConfigTrusted) {
-          for (const e of newEntities) {
-            if (entityConfigKeys.includes(e.entity)) continue;
-            flag(e.entity, hasDefaultConfig
-              ? `new entity "${e.entity}" (first seen ${e.first_seen}) has no dedicated enhancer entityConfig entry, so it falls back to "default" (STANDARD): GET /${e.entity}/<id> has to answer for the enhancer's own identity`
-              : `new entity "${e.entity}" (first seen ${e.first_seen}) is missing from the enhancer entityConfig`);
-          }
-        }
-        for (const e of degradedEntities) {
-          flag(e.entity, `entity "${e.entity}" has ${e.pct_empty}% empty rows in the lake (${e.empty_rows}/${e.total}, last 7d)`);
-        }
 
-        // --- Source 3: fetch probe (side C) ---
-        // Replays the enhancer's own enrichment GET with ITS identity, so
-        // every response code is conclusive about what production will do.
-        const HOSTS = [
-          "https://api.nullplatform.io",
-          "https://users.nullplatform.io",
-          "https://params.nullplatform.io",
-          "https://providers.nullplatform.io",
-          "https://approvals.nullplatform.io",
-          "https://notifications.nullplatform.io",
-          "https://governance-action-items-api-production-ufjmx.prod.nullapps.io",
-        ];
-        // A 404 on the default host with a 200 elsewhere is only a
-        // misconfiguration when the entity has NO `clients` entry: that map is
-        // what routes an entity off the default host, and plenty of entities
-        // legitimately live elsewhere — which is why HOSTS has six alternates.
-        // It is keyed by entity name.
-        //   true  → declared, so answering elsewhere is expected
-        //   false → no entry, so the enhancer only ever calls the default host
-        //   null  → map unavailable; nothing can be concluded from the probe
-        const clientsDeclares = (entity) => (clientsKeys ? clientsKeys.includes(entity) : null);
-        const PROBE_VERDICT = (code, altHit, clientsEntry) => {
-          // No HTTP response at all: sandbox egress or a network blip, not a
-          // statement about the entity.
-          if (code === 0) return "probe_unreachable";
-          if (code === 200) return "ok";
-          if (altHit) return clientsEntry === false ? "wrong_host" : "answers_on_alt_host";
-          if (code === 404) return "id_or_endpoint_missing";
-          if (code === 401 || code === 403) return "missing_grant";
-          return "upstream_error_dlq_risk";
-        };
-
-        // Entity names derive from request URL segments, so they are
-        // attacker-influenced and only allowlisted ones reach a probe URL. Two
-        // segments are allowed because real names have them —
-        // `notification/channel`, `runtime_configuration/dimension` — and the
-        // enhancer fetches them as `GET /notification/channel/<id>`. No dot is
-        // in the charset and no segment may be empty or start with a dash, so
-        // `..` and `//` cannot appear.
-        const SAFE_ENTITY = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}(\/[A-Za-z0-9_][A-Za-z0-9_-]{0,63})?$/;
-        const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
-        const MAX_PROBES = 4;
-        const samples = new Map();
-        for (const row of [...newEntities, ...degradedEntities]) {
-          if (!row || !row.entity || samples.has(row.entity)) continue;
-          samples.set(row.entity, row.sample_entity_id || "");
-        }
-        const probes = [];
-        const probeable = [];
-        for (const entity of samples.keys()) {
-          if (notFetched.has(entity)) {
-            // Information for the agent, never a finding: production issues no
-            // GET for these, so a probe result would say nothing about them.
-            probes.push({ entity, verdict: "not_fetched_by_design" });
-          } else if (!SAFE_ENTITY.test(entity)) {
-            const shown = String(entity).slice(0, 40);
-            if (entityConfigTrusted && entityConfigKeys.includes(entity)) {
-              // The enhancer configures this name, so it is legitimate by
-              // definition: not being able to probe it is a gap in this check,
-              // not a finding about the application.
-              probes.push({ entity: shown, verdict: "skipped_not_probeable" });
-              degraded_sources.push(`probe: entity ${JSON.stringify(shown)} is configured in the enhancer but its name is outside what this probe builds URLs for — not probed`);
-            } else {
-              probes.push({ entity: shown, verdict: "skipped_unsafe_name" });
-              flag(entity, `probe: entity name ${JSON.stringify(shown)} skipped (characters outside the audit naming convention — itself a finding)`);
-            }
-          } else {
-            probeable.push(entity);
-          }
-        }
-        const suspects = probeable.slice(0, MAX_PROBES);
-        // The probe table must never read as exhaustive when it is not, and the
-        // honest total is every suspect, not only the probeable ones.
-        if (probeable.length > MAX_PROBES) {
-          degraded_sources.push(`probe: ${samples.size} suspect entities but only ${MAX_PROBES} were probed (sandbox time budget) — the rest are unverified`);
-        }
-
-        if (suspects.length && !isSet(enhancer_api_key)) {
-          degraded_sources.push("config entry ENHANCER_API_KEY missing — fetch probe skipped");
-        } else if (suspects.length) {
-          try {
-            const tokRes = await fetch("https://authz.nullplatform.io/token", {
-              method: "POST",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ apikey: enhancer_api_key }),
-            });
-            if (!tokRes.ok) throw new Error(`enhancer token exchange → ${tokRes.status}`);
-            const token = (await tokRes.json()).access_token;
-            // Each segment is escaped on its own so a two-segment entity keeps
-            // the slash the enhancer's own GET uses.
-            const get = async (host, entity, id) => {
-              const path = entity.split("/").map(encodeURIComponent).join("/");
-              const r = await fetch(`${host}/${path}/${encodeURIComponent(id)}`, {
-                headers: { authorization: `Bearer ${token}`, "X-Enhanced": "true" },
-              }).catch(() => null);
-              return r ? r.status : 0;
-            };
-            // The sandbox budget is 30s and not configurable, so the probes run
-            // as one batch and each alternate-host sweep as another: a
-            // sequential 4×7 sweep would not fit.
-            const results = await Promise.all(suspects.map(async (entity) => {
-              const id = samples.get(entity);
-              if (!id) return { entity, verdict: "no_sample_id" };
-              if (!SAFE_ID.test(id)) {
-                return { entity, entity_id: String(id).slice(0, 40), verdict: "skipped_unsafe_id" };
-              }
-              const code = await get(HOSTS[0], entity, id);
-              let altHit = null;
-              if (code === 404) {
-                const alts = await Promise.all(HOSTS.slice(1).map(async (h) => [h, await get(h, entity, id)]));
-                const hit = alts.find(([, c]) => c === 200);
-                altHit = hit ? hit[0] : null;
-              }
-              return {
-                entity, entity_id: id, status: code, alt_host: altHit,
-                verdict: PROBE_VERDICT(code, altHit, clientsDeclares(entity)),
-              };
-            }));
-            probes.push(...results);
-            for (const p of results) {
-              if (p.verdict === "ok") continue;
-              if (p.verdict === "probe_unreachable") {
-                degraded_sources.push(`probe: entity "${p.entity}" got no HTTP response (sandbox egress or network)`);
-              } else if (p.verdict === "no_sample_id") {
-                degraded_sources.push(`probe: entity "${p.entity}" has no sample entity_id in the lake window`);
-              } else if (p.verdict === "skipped_unsafe_id") {
-                flag(p.entity, `probe: entity "${p.entity}" has a sample entity_id with unexpected characters (${JSON.stringify(p.entity_id)}) — itself a finding`);
-              } else {
-                flag(p.entity, `probe: entity "${p.entity}" → HTTP ${p.status}${p.alt_host ? `, 200 on ${p.alt_host}` : ""} (${p.verdict})`);
-              }
-            }
-          } catch (e) {
-            degraded_sources.push(`fetch probe unavailable: ${e.message}`);
-          }
-        }
-
-        const signals_view = [
-          `### Enhancer entityConfig keys (${entityConfigKeys.length}${entityConfigTrusted ? "" : ", NOT trusted — see degraded sources"})`,
+        const config_view = [
+          `### Enhancer entityConfig keys (${entityConfigKeys.length}${entityConfigTrusted ? "" : ", NOT trusted — see unverified sources"})`,
           entityConfigKeys.length ? "```\n" + entityConfigKeys.join(", ") + "\n```" : "(unavailable)",
+          ``,
+          hasDefaultConfig
+            ? `The map has a \`default\` entry: an entity with no entry of its own is enriched by the default STANDARD path (the enhancer fetches \`GET /<entity>/<id>\`).`
+            : `The map has NO \`default\` entry.`,
+          ``,
+          `### How the enhancer will treat each configured entity`,
+          classified
+            ? [
+                `- STANDARD (the enhancer fetches the entity): ${byMode("standard").join(", ") || "(none)"}`,
+                `- SELF_CONTAINED (no fetch — the WRITE must carry the entity): ${byMode("self_contained").join(", ") || "(none)"}`,
+                `- NRN (only the nrn is resolved): ${byMode("nrn").join(", ") || "(none)"}`,
+                `- IGNORED (opted out of enrichment): ${byMode("ignored").join(", ") || "(none)"}`,
+              ].join("\n")
+            : "(not classified — the key set could not be trusted)",
+          ``,
+          `### Enhancer clients map (entities routed to a non-default host)`,
+          clientsKeys ? "```\n" + clientsKeys.join(", ") + "\n```" : "(could not be read with confidence)",
           ``,
           `### Enhancer app.js excerpt (entityConfig + clients)`,
           appJsExcerpt ? "```js\n" + appJsExcerpt + "\n```" : "(unavailable)",
           ``,
-          `### Entities first seen in the lake in the last 7 days (organization-wide)`,
-          newEntities.length
-            ? newEntities.map(e => `- ${e.entity} — first seen ${e.first_seen}, ${e.writes} writes, methods: ${(e.methods || []).join("/")}`).join("\n")
-            : "(none)",
-          ``,
-          `### Entities with empty enrichment rows (degraded proxy, last 7 days, organization-wide)`,
-          degradedEntities.length
-            ? degradedEntities.map(e => `- ${e.entity} — ${e.pct_empty}% empty (${e.empty_rows}/${e.total})`).join("\n")
-            : "(none)",
-          ``,
-          `### Fetch probe (enhancer identity, probed ${suspects.length} of ${samples.size} suspect entities)`,
-          probes.length
-            ? probes.map(p => `- ${p.entity} (id ${p.entity_id || "?"}) → HTTP ${p.status ?? "-"}${p.alt_host ? `, 200 on ${p.alt_host}` : ""} → ${p.verdict}`).join("\n")
-            : "(no suspect entities probed)",
-          ``,
-          `### Data flags (${data_flags.length})`,
-          data_flags.length ? data_flags.map(f => `- ${f.text}`).join("\n") : "(none)",
-          ``,
-          `### Degraded sources (${degraded_sources.length}) — could not be read, not findings`,
+          `### Sources that could not be read (${degraded_sources.length}) — not findings`,
           degraded_sources.length ? degraded_sources.map(f => `- ${f}`).join("\n") : "(none)",
         ].join("\n");
 
         return {
-          data_flags,
           degraded_sources,
           entity_config_keys: entityConfigKeys,
           entity_config_trusted: entityConfigTrusted,
-          new_entities: newEntities,
-          degraded_entities: degradedEntities,
-          probes,
-          signals_view,
+          entity_modes: entityModes,
+          self_contained_entities: byMode("self_contained"),
+          clients_keys: clientsKeys,
+          has_default_config: hasDefaultConfig,
+          config_view,
         };
+
     error_handling:
-      fallback_step: resolve_failure_signals
+      fallback_step: resolve_failure_config
 
   - id: gather
     type: module
@@ -745,7 +484,6 @@ steps:
       item_id:        "${{ steps.trigger.outputs.itemId }}"
       force_full:     "${{ steps.trigger.outputs.inputs.force_full }}"
       callbackUrl:    "${{ steps.trigger.outputs.callbackUrl }}"
-      data_flags:     "${{ steps.signals.outputs.data_flags }}"
       np_api_key:     "${{ secrets.NP_API_KEY }}"
       github_token:   "${{ secrets.GITHUB_TOKEN }}"
     config:
@@ -753,7 +491,7 @@ steps:
         allowedHosts: ["api.nullplatform.com", "api.github.com"]
       code: |
         const { application_id, release_id, trigger_build, check_id, item_id,
-                force_full, callbackUrl, data_flags, np_api_key, github_token } = $item;
+                force_full, callbackUrl, np_api_key, github_token } = $item;
         // The dispatch carries the item id first-class; `check_id` in the item
         // inputs stays supported as an override.
         const itemId = check_id || item_id || "audit_entity_check";
@@ -845,17 +583,10 @@ steps:
         // --- Decision: carry_over vs analyze (full | diff | verify_fix) ---
         // Audit wiring lives in source code (routes, audit config), so any
         // changed source file is relevant; docs/tests/lockfiles are not.
+        // The check is static, so the code diff is the whole input to this
+        // decision: nothing outside the repository can change the verdict
+        // between two deploys of the same commit.
         const forceFull = String(force_full || "") === "true";
-        const allFlags = Array.isArray(data_flags) ? data_flags : [];
-        // The lake queries are organization-wide, so another team's entity
-        // must not force a re-analysis here. The entities the previous run
-        // recorded for this application are the filter; with no such list
-        // every flag counts, which errs towards analysing.
-        const knownEntities = (checkpoint && checkpoint.entities || [])
-          .map(e => e && e.entity).filter(Boolean);
-        const ownFlags = knownEntities.length
-          ? allFlags.filter(f => !f || !f.entity || knownEntities.includes(f.entity))
-          : allFlags;
         const RELEVANT = /\.([cm]?[jt]sx?|py|go|rb|java|kt|rs|php|cs)$|(^|\/)(null(app)?\.ya?ml|\.nullplatform\/[^/]+)$/i;
         const IRRELEVANT = /(^|\/)(__tests__|__mocks__|tests?|docs?)\/|\.(md|txt|snap)$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
         let mode = "analyze", scope = "full", changed = null;
@@ -864,8 +595,7 @@ steps:
           if (checkpoint.sha === currentSha) {
             changed = [];
             if (checkpoint.status === "failed") { mode = "analyze"; scope = "verify_fix"; }
-            else if (ownFlags.length === 0) { mode = "carry_over"; }
-            else { mode = "analyze"; scope = "diff"; }
+            else { mode = "carry_over"; }
           } else {
             try {
               const cmp = await ghJson(`/repos/${repo}/compare/${checkpoint.sha}...${currentSha}`);
@@ -874,7 +604,7 @@ steps:
               const relevant = changed.filter(p => RELEVANT.test(p) && !IRRELEVANT.test(p));
               if (tooBig) { mode = "analyze"; scope = "full"; }
               else if (checkpoint.status === "failed") { mode = "analyze"; scope = "verify_fix"; }
-              else if (relevant.length === 0 && ownFlags.length === 0) { mode = "carry_over"; }
+              else if (relevant.length === 0) { mode = "carry_over"; }
               else { mode = "analyze"; scope = "diff"; }
             } catch (e) {
               // compare failed (force-push, divergent history) → full, never skip
@@ -935,7 +665,7 @@ steps:
           ? "FULL AUDIT: no previous checkpoint (or forced)."
           : scope === "verify_fix"
             ? `FIX VERIFICATION: this check FAILED at commit ${checkpoint.sha.slice(0,7)}. Changed files since then: ${(changed||[]).join(", ") || "(none)"}.`
-            : `DIFF-SCOPED AUDIT: check passed at ${checkpoint.sha.slice(0,7)}; re-checking because of ${(changed||[]).length} changed file(s) and/or ${ownFlags.length} data flag(s).`;
+            : `DIFF-SCOPED AUDIT: check passed at ${checkpoint.sha.slice(0,7)}; re-checking because of ${(changed||[]).length} changed file(s).`;
         const llm_view = [
           `## Repository: ${repo} (branch: ${branch}, commit: ${currentSha.slice(0,7)}) — application "${app.name}"`,
           ``, `### Analysis scope`, scopeNote, ``,
@@ -984,10 +714,18 @@ steps:
         platform. Every HTTP write (POST/PUT/PATCH/DELETE) served by an
         internal API must produce an audit event that flows producer →
         audit-enhancer → customers_lake. Your job: given ONE application's
-        repository snapshot plus deterministic pipeline signals, decide
-        whether the entities this application writes are correctly configured
-        for auditing. Do not use tools; respond directly with your final
-        answer.
+        repository snapshot plus the audit-enhancer's entity configuration,
+        decide whether the entities this application writes are configured for
+        auditing. Do not use tools; respond directly with your final answer.
+
+        This is a PREVENTIVE, STATIC review, run before the code ships. You are
+        reading source: this repository at the commit being deployed, and the
+        enhancer's configuration. There is no runtime evidence in front of you —
+        no traffic, no lake rows, no live responses — because a new entity has
+        none yet, and the pipeline's own monitors already watch what happens
+        after the deploy. So: conclude from code, and where code cannot decide,
+        say the side is unverified rather than guessing. Never describe runtime
+        behaviour as if you had observed it.
 
         How entity names are derived (framework-specific — identify which one
         this repo uses before judging):
@@ -1006,69 +744,65 @@ steps:
           `workflow_<segment>` fallback for unmatched paths.
 
         An entity is correctly configured when three sides agree:
-        A. producer emits the event with mandatory fields,
-        B. the enhancer's entityConfig handles the name (STANDARD needs a
-           readable GET /<entity>/<id>; SELF_CONTAINED enriches from the
-           body/snapshot; NRN from the nrn), plus a `clients` entry when the
-           entity lives on a non-default host. Note the map has a `default`
-           entry: an entity with no entry of its own is NOT automatically
-           misconfigured, it gets the default STANDARD treatment — the finding
-           is only real when that GET cannot work (no read endpoint, no grant,
-           wrong host),
-        C. the enhancer's service account holds a read grant (the probe
-           results are the ground truth for this side — trust them over any
-           inference).
+        A. the producer emits the event with its mandatory fields — decidable
+           from this repository,
+        B. the enhancer handles the entity name, and the way it handles it
+           matches what the write actually provides — decidable from the
+           entityConfig section below,
+        C. the enhancer's service account can read the entity — NOT decidable
+           before the deploy. Do not claim it either way.
+
+        The entityConfig section tells you how the enhancer will treat each
+        configured entity, and each mode demands something different of the
+        write route:
+        - STANDARD: the enhancer will fetch `GET /<entity>/<id>` with its own
+          identity. The entity therefore needs a read endpoint, and the audited
+          `entity_id` has to be the id that endpoint accepts (a write on a
+          sub-resource audits the sub-resource id, which the parent's GET cannot
+          resolve — that is what an `idRemapper` is for).
+        - SELF_CONTAINED: the enhancer will NOT fetch anything. The event itself
+          has to carry the entity, so the write route must echo the entity in
+          its response body or attach an `entity_snapshot`. VERIFY THIS IN THE
+          CODE for every SELF_CONTAINED entity this application writes: find the
+          handler, and check what it returns. A 204, an empty body, a bare
+          `{ id }`, or a response that omits the audited fields means the lake
+          row will be empty forever, silently. That is a
+          `self_contained_no_echo` finding, and it is the most valuable thing
+          you can catch here.
+        - NRN: only the nrn is resolved; the entity itself is never read.
+        - IGNORED: the entry opts out of enrichment on purpose. Not a finding.
+        - An entity with NO entry of its own is not automatically
+          misconfigured: when the map has a `default` entry it gets the default
+          STANDARD treatment, so judge it as STANDARD. Report a finding only
+          when that path cannot work — no read endpoint, or the entity is served
+          on a non-default host with no `clients` entry to route it there.
 
         The snapshot header states the ANALYSIS SCOPE:
         - FULL AUDIT: judge the whole repo.
         - DIFF-SCOPED AUDIT: the check passed at a previous commit; focus on
-          whether the CHANGED files (new/modified routes) break audit
-          coverage, and on the data flags. Do not re-litigate unchanged code.
+          whether the CHANGED files (new/modified routes) break audit coverage.
+          Do not re-litigate unchanged code.
         - FIX VERIFICATION: the check previously FAILED with the findings
           listed; your PRIMARY job is deciding whether each was resolved,
           filling `resolved_findings`, then checking for new issues.
 
         Judgment guidelines:
-        - The single most important thing data cannot see: write routes that
-          produce NO audit event. Enumerate the repo's write routes, apply the
-          framework's derivation rule, and predict the entity name each will
-          emit. Cross-check predicted names against the enhancer
-          entityConfig keys — but only when the signals do NOT report the
-          entityConfig as untrusted or unavailable; when they do, the key list
-          proves nothing and absence is not evidence.
-        - How to read the probe table. Every verdict it can carry:
-          - `ok`: 200 on the default host, side C proven.
-          - `answers_on_alt_host`: 404 on the default host, 200 on another one.
-            Legitimate when the enhancer has a `clients` entry routing the
-            entity there — confirm on the app.js excerpt, and report a finding
-            only when the excerpt IS present and shows no such entry. If the
-            excerpt is unavailable this stays unverified and is not a finding.
-          - `wrong_host`: the clients map was read and has no entry for this
-            entity, so the enhancer will only ever call the default host, which
-            404s. This one is a finding.
-          - `id_or_endpoint_missing`: 404 everywhere — wrong entity_id or no
-            read endpoint (needs an idRemapper, or a SELF_CONTAINED entry).
-          - `missing_grant`: 401/403, the service account cannot read it.
-          - `upstream_error_dlq_risk`: 5xx, the most urgent finding.
-          - `not_fetched_by_design`: the entityConfig entry is SELF_CONTAINED,
-            NRN, or `ignore: true`, so the enhancer never issues this GET — only
-            a STANDARD entry does. NOT probed and NOT a finding: enrichment comes
-            from the event body, or from resolving the nrn. Do not claim a
-            missing read endpoint for these; a 404 would be expected.
-          - `probe_unreachable`, `no_sample_id`, `skipped_unsafe_id`,
-            `skipped_not_probeable`: the probe could not run (no HTTP response,
-            no sample id in the lake window, an id or a name this check cannot
-            put in a URL). Side C is UNVERIFIED for that entity — say so, do
-            not read it as either healthy or broken.
-          - `skipped_unsafe_name`: the entity name carries characters outside
-            the audit naming convention AND the enhancer does not configure it.
-            That name itself is the finding.
-        - Degraded sources are NOT findings. They say a source could not be
-          read; treat those sides as unverified and say so. The probe table is
-          only exhaustive if no degraded source says otherwise.
-        - The lake signals are organization-wide: an entity in them that this
-          application does not write is context, not a finding against it.
-        - Tolerated-401 configs (ignoreStatusCodes) avoid the DLQ but leave
+        - Enumerate the repository's write routes, apply the framework's
+          derivation rule, and predict the entity name each one will emit. Two
+          checks follow from that list: routes that produce NO audit event at
+          all (the evidence is an absence — nothing else can see this), and each
+          predicted name against the entityConfig keys and the modes above.
+        - Cross-check names against the entityConfig keys ONLY while the section
+          does not report the key set as untrusted or unavailable. When it does,
+          the list proves nothing and absence is not evidence.
+        - Side C (the read grant) and what the first real write will do are not
+          verifiable before the deploy. State that plainly, once, without
+          dramatising it: verdict `unverified` in the entities table for the
+          entities whose enrichment depends on it, and one sentence in the
+          summary. It is not a finding and it must not turn the item red.
+        - A source that could not be read is not a finding either. Treat the
+          side it covers as unverified and say which one.
+        - Tolerated-401 configs (`ignoreStatusCodes`) avoid the DLQ but leave
           the entity degraded forever — flag them as findings, not as ok.
         - If this application serves no HTTP writes at all (worker, frontend),
           answer not_applicable and say why in one sentence.
@@ -1085,9 +819,9 @@ steps:
         Previous findings (relevant in FIX VERIFICATION scope):
         ${{ steps.gather.outputs.prev_findings_view }}
 
-        Deterministic pipeline signals (enhancer config, lake, probe):
+        Audit-enhancer entity configuration (side B, read from its repository):
 
-        ${{ steps.signals.outputs.signals_view }}
+        ${{ steps.enhancer_config.outputs.config_view }}
 
         Repository snapshot:
 
@@ -1104,7 +838,11 @@ steps:
               type: object
               required: [issue, fix]
               properties:
-                area: { type: string, enum: [unaudited_route, name_mismatch, missing_entity_config, missing_grant, wrong_host, needs_id_remapper, needs_self_contained, degraded_entity, dlq_risk, missing_mandatory_field, other] }
+                # Only areas a static reading of the code can establish. The
+                # ones that used to come from the live probe (missing_grant,
+                # wrong_host, dlq_risk) and from the lake (degraded_entity) are
+                # gone with it — runtime is the monitors' job.
+                area: { type: string, enum: [unaudited_route, name_mismatch, missing_entity_config, needs_id_remapper, needs_self_contained, self_contained_no_echo, missing_mandatory_field, other] }
                 entity: { type: string }
                 file: { type: string }
                 issue: { type: string }
@@ -1128,7 +866,7 @@ steps:
               properties:
                 entity: { type: string }
                 source: { type: string, description: "route or mechanism that produces it" }
-                verdict: { type: string, enum: [ok, unaudited, misconfigured, unverified] }
+                verdict: { type: string, description: "`unverified` is the honest answer whenever the entity's enrichment depends on something only the deploy can settle", enum: [ok, unaudited, misconfigured, unverified] }
           fix_instructions_md: { type: string }
     error_handling:
       fallback_step: resolve_failure_agent
@@ -1147,14 +885,13 @@ steps:
       scope:            "${{ steps.gather.outputs.scope }}"
       analyzed_sha:     "${{ steps.gather.outputs.analyzed_sha }}"
       changed_count:    "${{ steps.gather.outputs.changed_count }}"
-      data_flags:       "${{ steps.signals.outputs.data_flags }}"
-      degraded_sources: "${{ steps.signals.outputs.degraded_sources }}"
+      unverified:       "${{ steps.enhancer_config.outputs.degraded_sources }}"
     config:
       network:
         allowedHosts: ["api.nullplatform.com"]
       code: |
         const { callbackUrl, callbackToken, check_id, item_id, verdict, repo,
-                scope, analyzed_sha, changed_count, data_flags, degraded_sources } = $item;
+                scope, analyzed_sha, changed_count, unverified } = $item;
         const itemId = check_id || item_id || "audit_entity_check";
         const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
         const post = (url, body) => fetch(url, { method: "POST", headers: H, body: JSON.stringify(body) });
@@ -1166,8 +903,7 @@ steps:
         const findings = v.findings || [];
         const resolved = v.resolved_findings || [];
         const entities = v.entities || [];
-        const dataFlags = Array.isArray(data_flags) ? data_flags : [];
-        const degraded = Array.isArray(degraded_sources) ? degraded_sources : [];
+        const unread = Array.isArray(unverified) ? unverified : [];
         const analysisScope = scope || "full";
         const sha7 = (analyzed_sha || "").slice(0, 7);
 
@@ -1180,8 +916,8 @@ steps:
             message: `[${f.area || "other"}] ${f.entity || f.file || ""}: ${f.issue} — Fix: ${f.fix}`,
           }).catch(() => null);
         }
-        for (const d of degraded) {
-          await post(`${callbackUrl}/log`, { level: "warning", message: `Degraded signal source: ${d}` }).catch(() => null);
+        for (const d of unread) {
+          await post(`${callbackUrl}/log`, { level: "warning", message: `Could not be read: ${d}` }).catch(() => null);
         }
         await post(`${callbackUrl}/log`, {
           level: "info",
@@ -1199,12 +935,13 @@ steps:
         const mdFindings = findings.length
           ? "\n**Findings:**\n" + findings.map(f => `- \`${f.entity || f.file || ""}\` [${f.area || "other"}] — ${f.issue}\n  - **Fix:** ${f.fix}`).join("\n")
           : "";
-        const mdFlags = dataFlags.length
-          ? "\n**Señales determinísticas:**\n" + dataFlags.map(f => `- ${f.text}`).join("\n")
-          : "";
-        const mdDegraded = degraded.length
-          ? "\n**Fuentes degradadas** (no se pudieron leer; los lados que cubren quedan sin verificar):\n" + degraded.map(f => `- ${f}`).join("\n")
-          : "";
+        // The report always says what it could not settle: the grant side is
+        // not decidable before the deploy, plus whatever source failed to read.
+        const mdUnverified = [
+          "\n**Sin verificar** (chequeo estático previo al deploy):",
+          "- El grant de lectura del enhancer y el comportamiento del primer write real se verifican recién en el próximo deploy; el runtime lo cubren los monitores del pipeline.",
+          ...unread.map(f => `- ${f}`),
+        ].join("\n");
         const mdFix = (status === "failed" && v.fix_instructions_md)
           ? `\n\n#### How to fix\n${v.fix_instructions_md}`
           : "";
@@ -1217,7 +954,7 @@ steps:
           `Repo: \`${repo}\` · 🔎 ${scopeLabel} @ \`${sha7}\``,
           ``,
           v.summary || "",
-          mdEntities, mdFlags, mdDegraded, mdResolved, mdFindings, mdFix,
+          mdEntities, mdResolved, mdFindings, mdFix, mdUnverified,
         ].join("\n");
 
         const message = na
@@ -1237,7 +974,7 @@ steps:
   - id: resolve_carryover
     type: module
     plugin_type: code-exec
-    name: "Carry over previous verdict (no relevant changes, no data flags)"
+    name: "Carry over previous verdict (no audit-relevant changes)"
     inputs:
       callbackUrl:      "${{ steps.trigger.outputs.callbackUrl }}"
       callbackToken:    "${{ steps.trigger.outputs.callbackToken }}"
@@ -1247,13 +984,13 @@ steps:
       analyzed_sha:     "${{ steps.gather.outputs.analyzed_sha }}"
       changed_count:    "${{ steps.gather.outputs.changed_count }}"
       prev:             "${{ steps.gather.outputs.prev }}"
-      degraded_sources: "${{ steps.signals.outputs.degraded_sources }}"
+      unverified:       "${{ steps.enhancer_config.outputs.degraded_sources }}"
     config:
       network:
         allowedHosts: ["api.nullplatform.com"]
       code: |
         const { callbackUrl, callbackToken, check_id, item_id, repo,
-                analyzed_sha, changed_count, prev, degraded_sources } = $item;
+                analyzed_sha, changed_count, prev, unverified } = $item;
         const itemId = check_id || item_id || "audit_entity_check";
         const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
         const p = prev || {};
@@ -1263,17 +1000,17 @@ steps:
         const sha7 = (analyzed_sha || "").slice(0, 7);
         const prev7 = (p.sha || "").slice(0, 7);
         const n = changed_count || 0;
-        const degraded = Array.isArray(degraded_sources) ? degraded_sources : [];
+        const unread = Array.isArray(unverified) ? unverified : [];
 
-        const message = `≡ Sin cambios relevantes ni señales nuevas desde ${prev7} (${n} archivo(s) tocados) — se mantiene ${prevStatus.toUpperCase()}`;
-        const mdDegraded = degraded.length
-          ? "\n**Fuentes degradadas** (no se pudieron leer; no afectan el carry-over):\n" + degraded.map(f => `- ${f}`).join("\n") + "\n"
+        const message = `≡ Sin cambios relevantes desde ${prev7} (${n} archivo(s) tocados) — se mantiene ${prevStatus.toUpperCase()}`;
+        const mdUnread = unread.length
+          ? "\n**No se pudo leer** (no afecta el carry-over):\n" + unread.map(f => `- ${f}`).join("\n") + "\n"
           : "";
         const markdown = [
           `### Audit coverage — ${prevStatus.toUpperCase()} (carry-over)`,
           ``,
-          `Repo: \`${repo}\` · ≡ sin re-análisis: los ${n} archivo(s) cambiados desde \`${prev7}\` no tocan el wiring de audit y no hay señales nuevas del pipeline.`,
-          mdDegraded,
+          `Repo: \`${repo}\` · ≡ sin re-análisis: los ${n} archivo(s) cambiados desde \`${prev7}\` no tocan el wiring de audit. El chequeo es estático, así que el mismo código da el mismo veredicto.`,
+          mdUnread,
           ``,
           `_Último análisis real (@ \`${prev7}\`):_`,
           ``,
@@ -1281,7 +1018,7 @@ steps:
         ].join("\n");
 
         await fetch(`${callbackUrl}/log`, { method: "POST", headers: H, body: JSON.stringify({
-          level: "info", message: `Carry-over from approval ${p.approval_id} @ ${prev7}: ${n} changed file(s), none audit-relevant, no data flags.`,
+          level: "info", message: `Carry-over from approval ${p.approval_id} @ ${prev7}: ${n} changed file(s), none audit-relevant.`,
         }) }).catch(() => null);
 
         const r = await fetch(callbackUrl, { method: "PATCH", headers: H, body: JSON.stringify({
@@ -1296,20 +1033,20 @@ steps:
         return { resolved: true, status: prevStatus, scope: "carry_over" };
 
   # Fallbacks — the item resolves with the raw error so the run never hangs.
-  - id: resolve_failure_signals
+  - id: resolve_failure_config
     type: module
     plugin_type: np-checklist-item-resolve
-    name: "Resolve skipped (signal collection crashed)"
+    name: "Resolve skipped (enhancer config unreadable)"
     inputs:
       callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
       callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
-      # `skipped`, not `failed`: what broke is this workflow's auxiliary
-      # collector, and an application must not fail an audit-coverage gate
-      # because a signal source was unavailable.
+      # `skipped`, not `failed`: what broke is this workflow's own reading of a
+      # third repository, and an application must not fail an audit-coverage gate
+      # because of that.
       status:        skipped
-      message:       "Audit-coverage check skipped: pipeline signals could not be collected: ${{ steps.signals.error.message }}"
+      message:       "Audit-coverage check skipped: the enhancer configuration could not be read: ${{ steps.enhancer_config.error.message }}"
       details:
-        markdown: "Signal collection (enhancer config / lake / probe) crashed before the audit ran, so the check could not be evaluated. Error: ${{ steps.signals.error.message }}"
+        markdown: "Reading the audit-enhancer entity configuration crashed before the audit ran, so the check could not be evaluated. Error: ${{ steps.enhancer_config.error.message }}"
 
   - id: resolve_failure_gather
     type: module
@@ -1337,24 +1074,16 @@ steps:
 
 connections:
   - { id: c1, from: trigger,            to: progress }
-  - { id: c2, from: progress,           to: lake_new_entities }
-  - { id: c3, from: lake_new_entities,  to: lake_empty_rows }
-  - { id: c4, from: lake_empty_rows,    to: signals }
-  # Each degraded re-entry continues to its query's own successor, so one dead
-  # lake query never takes the other one (or the run) with it.
-  - { id: c5, from: lake_new_degraded,  to: lake_empty_rows }
-  - { id: c6, from: lake_empty_degraded, to: signals }
-  - { id: c7, from: signals,            to: gather }
-  - { id: c8, from: gather,             to: route }
-  - { id: c9, from: route,              to: progress_analyzing, source_port: "true" }
-  - { id: c10, from: route,             to: resolve_carryover,  source_port: "false" }
-  - { id: c11, from: progress_analyzing, to: audit_agent }
-  - { id: c12, from: audit_agent,       to: resolve }
+  - { id: c2, from: progress,           to: enhancer_config }
+  - { id: c3, from: enhancer_config,    to: gather }
+  - { id: c4, from: gather,             to: route }
+  - { id: c5, from: route,              to: progress_analyzing, source_port: "true" }
+  - { id: c6, from: route,              to: resolve_carryover,  source_port: "false" }
+  - { id: c7, from: progress_analyzing, to: audit_agent }
+  - { id: c8, from: audit_agent,        to: resolve }
   # Dormant edges: a fallback only routes over a DECLARED connection, and
   # `condition: "false"` keeps the edge from firing on the happy path (it also
   # keeps the fallback tails out of the entry-point set).
-  - { id: c13, from: lake_new_entities, to: lake_new_degraded,   condition: "false" }
-  - { id: c14, from: lake_empty_rows,   to: lake_empty_degraded, condition: "false" }
-  - { id: c15, from: signals,     to: resolve_failure_signals, condition: "false" }
-  - { id: c16, from: gather,      to: resolve_failure_gather,  condition: "false" }
-  - { id: c17, from: audit_agent, to: resolve_failure_agent,   condition: "false" }
+  - { id: c9,  from: enhancer_config, to: resolve_failure_config, condition: "false" }
+  - { id: c10, from: gather,          to: resolve_failure_gather, condition: "false" }
+  - { id: c11, from: audit_agent,     to: resolve_failure_agent,  condition: "false" }
