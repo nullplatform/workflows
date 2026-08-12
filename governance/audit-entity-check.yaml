@@ -597,9 +597,16 @@ steps:
         let checkpoint = null;
         const appNrn = encodeURIComponent(app.nrn);
         const prior = await npTry(`/approval?nrn=${appNrn}&limit=10`);
+        // GET /approval returns its results ASCENDING by created_at (verified
+        // against the API), so iterating them as they arrive picks the OLDEST
+        // stamped verdict as the checkpoint — which compares this run against an
+        // ancient sha and fingerprint and re-analyses every time. Sort newest
+        // first here rather than relying on the API's order ever changing.
+        const priorRows = (prior && prior.results || []).slice().sort((a, b) =>
+          String(b.created_at || "").localeCompare(String(a.created_at || "")));
         // Cancelled approvals are VALID checkpoints — the natural loop is
         // cancel → fix → redeploy. What matters is the stamped analyzed_sha.
-        for (const row of (prior && prior.results || [])) {
+        for (const row of priorRows) {
           if (String(row.id) === String(myApproval)) continue;
           if (row.mode !== "checklist") continue;
           const run = await npTry(`/approval/${row.id}/checklist`);

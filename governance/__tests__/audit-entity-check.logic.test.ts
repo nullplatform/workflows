@@ -628,7 +628,23 @@ interface GatherOutput {
   repo: string;
   analyzed_sha: string;
   changed_count: number | null;
-  prev: { status: string; sha: string; entities?: Array<{ entity: string }> } | null;
+  prev: {
+    approval_id?: number;
+    status: string;
+    sha: string;
+    config_fingerprint?: string;
+    entities?: Array<{ entity: string }>;
+  } | null;
+}
+
+/** One row of `GET /approval?nrn=…`, with the verdict stamped on its item. */
+interface PriorApproval {
+  id: number;
+  created_at: string;
+  sha?: string;
+  /** Omit to model a verdict stamped before fingerprints existed. */
+  fingerprint?: string;
+  status?: string;
 }
 
 interface GatherFetchOptions {
@@ -636,6 +652,8 @@ interface GatherFetchOptions {
   prevStatus?: string;
   prevSha?: string;
   prevFingerprint?: string;
+  /** Several prior approvals, in the order the API returns them. */
+  priorApprovals?: PriorApproval[];
   prevEntities?: Array<{ entity: string }>;
   changedFiles?: string[];
   /** Omit to have the prior approval list come back empty (no checkpoint). */
@@ -649,6 +667,15 @@ function gatherFetch(opts: GatherFetchOptions): FakeFetch {
   if (opts.prevFingerprint === undefined && !('prevFingerprint' in opts)) {
     opts.prevFingerprint = 'aaaaaaaa';
   }
+  const priors: PriorApproval[] = opts.priorApprovals ?? [
+    {
+      id: 8000,
+      created_at: '2026-08-01T00:00:00.000Z',
+      sha: opts.prevSha ?? SHA_PREV,
+      fingerprint: opts.prevFingerprint,
+      status: opts.prevStatus ?? 'passed',
+    },
+  ];
   return async (url) => {
     if (url === 'https://api.nullplatform.com/token') return res(200, { access_token: 'np_tok' });
     if (url.includes('/application/')) {
@@ -660,22 +687,28 @@ function gatherFetch(opts: GatherFetchOptions): FakeFetch {
     }
     if (url.includes('/approval?nrn=')) {
       return res(200, {
-        results: opts.withCheckpoint === false ? [] : [{ id: 8000, mode: 'checklist' }],
+        results:
+          opts.withCheckpoint === false
+            ? []
+            : priors.map((a) => ({ id: a.id, mode: 'checklist', created_at: a.created_at })),
       });
     }
-    if (url.includes('/approval/8000/checklist')) {
+    const checklist = /\/approval\/(\d+)\/checklist/.exec(url);
+    if (checklist) {
+      const approval = priors.find((a) => String(a.id) === checklist[1]);
+      if (!approval) return res(404, {});
       return res(200, {
         items: [
           {
             id: itemId,
-            status: opts.prevStatus ?? 'passed',
+            status: approval.status ?? 'passed',
             details: {
-              analyzed_sha: opts.prevSha ?? SHA_PREV,
+              analyzed_sha: approval.sha ?? SHA_PREV,
               findings: [],
               entities: opts.prevEntities ?? [],
-              ...(opts.prevFingerprint === undefined
+              ...(approval.fingerprint === undefined
                 ? {}
-                : { config_fingerprint: opts.prevFingerprint }),
+                : { config_fingerprint: approval.fingerprint }),
               markdown: '### Audit coverage — PASSED',
             },
           },
@@ -729,6 +762,41 @@ describe('audit-entity-check gather — carry-over decision', () => {
       { data_flags: [{ entity: 'anything', text: 'ignored input' }] },
       { prevSha: SHA_CURRENT },
     );
+    expect(out.mode).toBe('carry_over');
+  });
+
+  it('takes the most recent stamped verdict, not the first row the API returns', async () => {
+    // `GET /approval` answers ASCENDING by created_at, so iterating the results
+    // as they arrive picked the OLDEST verdict: one stamped before fingerprints
+    // existed. Its empty fingerprint then read as "the configuration changed"
+    // and a run with nothing to re-analyse was analysed anyway. Ids are not
+    // monotonic with time here either — the older approval has the higher id —
+    // so the order has to come from created_at.
+    const out = await runGather(
+      { config_fingerprint: 'ed4c03e4' },
+      {
+        priorApprovals: [
+          {
+            id: 1269727654,
+            created_at: '2026-08-05T12:00:00.000Z',
+            sha: SHA_PREV,
+            fingerprint: undefined,
+            status: 'passed',
+          },
+          {
+            id: 1044939642,
+            created_at: '2026-08-12T12:00:00.000Z',
+            sha: SHA_CURRENT,
+            fingerprint: 'ed4c03e4',
+            status: 'passed',
+          },
+        ],
+      },
+    );
+    expect(out.prev?.approval_id).toBe(1044939642);
+    expect(out.prev?.sha).toBe(SHA_CURRENT);
+    expect(out.prev?.config_fingerprint).toBe('ed4c03e4');
+    // Same commit, same configuration: there is nothing to analyse.
     expect(out.mode).toBe('carry_over');
   });
 
