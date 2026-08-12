@@ -9,7 +9,8 @@
  *   - gather → mode=carry_over  → resolve_carryover, agent NEVER runs.
  *   - gather → mode=analyze     → claude-code-agent → resolve.
  *   - the lake queries and signals always run before gather.
- *   - a lake query failure lands on `signals` instead of failing the run.
+ *   - a lake query failure degrades that ONE source: the other query still
+ *     runs and the execution carries on to `signals`.
  *   - each `error_handling.fallback_step` resolves the item on its own node.
  *
  * The bodies of those `code-exec` steps are covered separately, against the
@@ -62,7 +63,7 @@ const LAKE_ROWS = [
 const SIGNALS_CLEAN = {
   data_flags: [],
   degraded_sources: [],
-  entity_config_keys: ['user', 'application', 'notification'],
+  entity_config_keys: ['user', 'parameter', 'notification', 'nrn', 'default'],
   entity_config_trusted: true,
   new_entities: LAKE_ROWS,
   degraded_entities: [],
@@ -151,28 +152,24 @@ const TRIGGER_STUB = {
   registryType: 'trigger' as const,
 };
 
-const LAKE_STUB = () => ({
-  status: 'success' as const,
-  outputs: { rows: LAKE_ROWS, rowCount: LAKE_ROWS.length },
-  items: LAKE_ROWS,
-  activePorts: ['default'],
-});
-
 /** A step stub that fails, so `error_handling.fallback_step` takes over. */
 const failure = (message: string): IStepResult => ({
   status: 'failure',
   error: { message, code: 'CODE_EXEC_ERROR', retryable: false },
 });
 
+const LAKE_ERROR = 'NP_LAKE_5XX: gateway timeout';
+
 interface RunOptions {
   gatherOutput?: Record<string, unknown>;
   /** Step id whose stub must fail (`signals`, `gather` or `audit_agent`). */
   failStep?: string;
-  lakeStub?: () => IStepResult;
+  /** Lake step ids whose query must fail. */
+  lakeFailures?: string[];
 }
 
 async function run(options: RunOptions = {}): Promise<CapturedResolves> {
-  const { gatherOutput = GATHER_ANALYZE, failStep, lakeStub = LAKE_STUB } = options;
+  const { gatherOutput = GATHER_ANALYZE, failStep, lakeFailures = [] } = options;
   const captured: Partial<CapturedResolves> = { signalsRan: false, agentRan: false };
   const result = await runWorkflowE2E({
     yamlPath: WF_PATH,
@@ -181,7 +178,16 @@ async function run(options: RunOptions = {}): Promise<CapturedResolves> {
       'np-checklist-trigger': TRIGGER_STUB,
       'np-checklist-item-progress': OK_STUB,
       'np-checklist-item-resolve': OK_STUB,
-      'np-lake-query': lakeStub,
+      'np-lake-query': (ctx: StepCtx): IStepResult => {
+        const stepId = ctx.stepId ?? ctx.step?.id;
+        if (stepId !== undefined && lakeFailures.includes(stepId)) return failure(LAKE_ERROR);
+        return {
+          status: 'success',
+          outputs: { rows: LAKE_ROWS, rowCount: LAKE_ROWS.length },
+          items: LAKE_ROWS,
+          activePorts: ['default'],
+        };
+      },
       // `set-variable` is left unstubbed on purpose: the real plugin runs, so
       // the degraded-source variable is asserted against real behaviour.
       'code-exec': (ctx: StepCtx): IStepResult => {
@@ -235,23 +241,41 @@ describe('audit-entity-check — routing', () => {
     expect(stepRan(captured.snapshot, 'signals')).toBe(true);
   });
 
-  it('reaches signals anyway when a lake query fails', async () => {
-    const captured = await run({
-      lakeStub: () => failure('NP_LAKE_5XX: gateway timeout'),
-    });
+  it('runs the second lake query even when the first one fails', async () => {
+    const captured = await run({ lakeFailures: ['lake_new_entities'] });
     expect(stepRan(captured.snapshot, 'lake_new_degraded')).toBe(true);
+    // The independent source must survive its sibling's outage.
+    expect(stepRan(captured.snapshot, 'lake_empty_rows')).toBe(true);
     expect(captured.signalsRan).toBe(true);
     expect(captured.resolve).toBeTruthy();
     expect(stepRan(captured.snapshot, 'resolve_failure_signals')).toBe(false);
     // The error survives into the execution state, and signals gets it as an
     // input so it can report the degraded source.
-    expect(captured.snapshot.variables?.['lake_new_entities_error']).toBe(
-      'NP_LAKE_5XX: gateway timeout',
-    );
-    expect(captured.snapshot.steps['signals']?.inputs?.['new_entities_error']).toBe(
-      'NP_LAKE_5XX: gateway timeout',
-    );
-    expect(captured.snapshot.steps['signals']?.inputs?.['new_entity_rows']).toBeUndefined();
+    expect(captured.snapshot.variables?.['lake_new_entities_error']).toBe(LAKE_ERROR);
+    const signalsInputs = captured.snapshot.steps['signals']?.inputs ?? {};
+    expect(signalsInputs['new_entities_error']).toBe(LAKE_ERROR);
+    expect(signalsInputs['new_entity_rows']).toBeUndefined();
+    expect(signalsInputs['empty_row_rows']).toEqual(LAKE_ROWS);
+  });
+
+  it('keeps the first lake query when the second one fails', async () => {
+    const captured = await run({ lakeFailures: ['lake_empty_rows'] });
+    expect(stepRan(captured.snapshot, 'lake_empty_degraded')).toBe(true);
+    expect(stepRan(captured.snapshot, 'lake_new_degraded')).toBe(false);
+    expect(captured.signalsRan).toBe(true);
+    expect(captured.snapshot.variables?.['lake_empty_rows_error']).toBe(LAKE_ERROR);
+    const signalsInputs = captured.snapshot.steps['signals']?.inputs ?? {};
+    expect(signalsInputs['new_entity_rows']).toEqual(LAKE_ROWS);
+    expect(signalsInputs['empty_rows_error']).toBe(LAKE_ERROR);
+    expect(signalsInputs['empty_row_rows']).toBeUndefined();
+  });
+
+  it('still reaches signals when both lake queries fail', async () => {
+    const captured = await run({ lakeFailures: ['lake_new_entities', 'lake_empty_rows'] });
+    expect(stepRan(captured.snapshot, 'lake_new_degraded')).toBe(true);
+    expect(stepRan(captured.snapshot, 'lake_empty_degraded')).toBe(true);
+    expect(captured.signalsRan).toBe(true);
+    expect(captured.resolve).toBeTruthy();
   });
 });
 

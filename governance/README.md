@@ -34,9 +34,14 @@ channel on alias activation, receives the dispatch (with a `callbackUrl` /
 - **A fallback needs a declared edge** (`condition: "false"` keeps it dormant),
   and it can only fire into a node whose predecessors are *all* settled. When a
   failed step must rejoin the main path instead of resolving the item — the two
-  lake queries in `audit-entity-check` — it gets its own single-predecessor
-  re-entry node, and the shared target declares `join_strategy: any` so the
-  first completed edge starts it.
+  lake queries in `audit-entity-check` — give it its own single-predecessor
+  re-entry node that continues to the **same successor the failed step had**.
+  Every join point then has two predecessors of which exactly one ever
+  completes, which is the only shape `join_strategy: any` resolves without a
+  race (`any` fires on the *first* completed edge, so two edges that can both
+  complete would start the target too early). Chaining the re-entry into the
+  next step, rather than skipping to the end, is what keeps one dead source from
+  taking its independent siblings down with it.
 - **Degraded sources are not findings** (`audit-entity-check`): signal
   collection reports anomalies of the audited system and failures to read a
   source on two separate channels. Only the former may force an analysis;
