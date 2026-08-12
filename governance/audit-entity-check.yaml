@@ -297,11 +297,20 @@ steps:
           const open = decl.index + decl[0].length - 1;
           const keys = [];
           const entries = {};
+          const codeEntries = {};
           let depth = 0, end = -1, expectKey = false, unresolved = 0;
           let pendingKey = null, valueStart = -1;
+          // Two views of every value: `entries` is the source text (a caller
+          // reading a string literal out of it needs the literal intact), and
+          // `codeEntries` has comments and string contents blanked, for callers
+          // that classify an entry by the mechanism it wires up — prose that
+          // merely mentions that mechanism must not count.
           const closeEntry = (at) => {
             if (pendingKey !== null && valueStart >= 0) {
               entries[pendingKey] = src.slice(valueStart, at).trim();
+              let masked = "";
+              for (let i = valueStart; i < at; i++) masked += isCode[i] ? src[i] : " ";
+              codeEntries[pendingKey] = masked.trim();
             }
             pendingKey = null; valueStart = -1;
           };
@@ -335,7 +344,11 @@ steps:
                     if (!arg) continue;
                     const k = resolve(arg);
                     if (k === undefined) unresolved++;
-                    else { keys.push(k); entries[k] = `...${call[1]}(…)`; }
+                    else {
+                      keys.push(k);
+                      entries[k] = `...${call[1]}(…)`;
+                      codeEntries[k] = entries[k];
+                    }
                   }
                   i += call[0].length - 1;
                   continue;
@@ -384,7 +397,7 @@ steps:
             if (c === "," && depth === 1) { closeEntry(i); expectKey = true; continue; }
           }
           if (end < 0) return null;
-          return { keys, entries, unresolved, block: src.slice(open, end + 1) };
+          return { keys, entries, codeEntries, unresolved, block: src.slice(open, end + 1) };
         };
 
         // --- Source 1: enhancer entityConfig + clients map (side B) ---
@@ -395,13 +408,24 @@ steps:
         let entityConfigTrusted = false;
         let clientsKeys = null;
         let appJsExcerpt = "";
-        // Entities the enhancer deliberately never fetches: a SELF_CONTAINED
-        // entry enriches from the event body and an `ignore: true` entry is
-        // skipped outright. The GET the probe replays does not happen in
-        // production for them, so their 404 is the designed behaviour and saying
-        // otherwise both invents a finding and (being a data flag) disables the
-        // carry-over for every application writing those entities.
-        const NOT_FETCHED = /self[_-]?contained|\bignore\s*:\s*true/i;
+        // Entities the enhancer deliberately never fetches. `getEntityData` in
+        // its entity_enhancer.js dispatches on ENTITY_TYPE, and only STANDARD
+        // issues the `GET /<entity>/<id>` this probe replays: SELF_CONTAINED
+        // enriches from the event body, NRN resolves the nrn's own parts, and an
+        // `ignore: true` entry is skipped outright. For those a 404 is the
+        // designed behaviour, and calling it a defect both invents a finding and
+        // (being a data flag) disables the carry-over for every application
+        // writing them.
+        //
+        // The alternatives match the mechanism, never the prose: entries carry
+        // `expandNRN: true` and comments that discuss self-containedness, so a
+        // loose match would silence a STANDARD entity — the failure direction
+        // that hides real misconfiguration.
+        const NOT_FETCHED = new RegExp(
+          "\\.\\.\\.[A-Za-z_$]*self[_-]?contained"
+          + "|self[_-]?contained[A-Za-z_$]*enhancer"
+          + "|entityType\\s*:\\s*ENTITY_TYPE\\.(?:SELF_CONTAINED|NRN)"
+          + "|\\bignore\\s*:\\s*true\\b", "i");
         const notFetched = new Set();
         if (!isSet(github_token)) {
           degraded_sources.push("config entry GITHUB_TOKEN missing — enhancer entityConfig not read");
@@ -478,10 +502,12 @@ steps:
                 `enhancer entityConfig not parsed with confidence (${doubts.join("; ")})`
                 + ` — per-entity comparison skipped`);
             } else {
-              // An entry whose text does not say either way is left out, so the
-              // entity gets probed: erring towards looking, not towards excusing.
+              // Classified on the entry's code, with comments and strings
+              // blanked. An entry whose code does not say either way is left
+              // out, so the entity gets probed: erring towards looking, not
+              // towards excusing.
               for (const k of entityConfigKeys) {
-                if (NOT_FETCHED.test(cfg.entries[k] || "")) notFetched.add(k);
+                if (NOT_FETCHED.test(cfg.codeEntries[k] || "")) notFetched.add(k);
               }
             }
             appJsExcerpt = [
@@ -1024,10 +1050,11 @@ steps:
             read endpoint (needs an idRemapper, or a SELF_CONTAINED entry).
           - `missing_grant`: 401/403, the service account cannot read it.
           - `upstream_error_dlq_risk`: 5xx, the most urgent finding.
-          - `not_fetched_by_design`: the entityConfig entry is SELF_CONTAINED or
-            `ignore: true`, so the enhancer never issues this GET. NOT probed
-            and NOT a finding — enrichment comes from the event body. Do not
-            claim a missing read endpoint for these; a 404 would be expected.
+          - `not_fetched_by_design`: the entityConfig entry is SELF_CONTAINED,
+            NRN, or `ignore: true`, so the enhancer never issues this GET — only
+            a STANDARD entry does. NOT probed and NOT a finding: enrichment comes
+            from the event body, or from resolving the nrn. Do not claim a
+            missing read endpoint for these; a 404 would be expected.
           - `probe_unreachable`, `no_sample_id`, `skipped_unsafe_id`,
             `skipped_not_probeable`: the probe could not run (no HTTP response,
             no sample id in the lake window, an id or a name this check cannot
