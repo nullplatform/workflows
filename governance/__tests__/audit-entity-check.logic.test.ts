@@ -463,36 +463,105 @@ describe('audit-entity-check signals — probe verdicts', () => {
 });
 
 describe('audit-entity-check signals — entities the enhancer never fetches', () => {
-  /** Entries the real map resolves with selfContainedEnhancer or `ignore: true`. */
-  const SELF_CONTAINED = [
+  /**
+   * Entries the real map resolves with selfContainedEnhancer, `ignore: true` or
+   * ENTITY_TYPE.NRN. Only a STANDARD entry makes the enhancer issue
+   * `GET /<entity>/<id>` (its entity_enhancer.js dispatches on ENTITY_TYPE).
+   */
+  const NOT_FETCHED_ENTITIES = [
     'service',
     'workflow',
     'notification/channel',
     'action_item',
     'login_success',
     'agent',
+    'nrn',
+  ];
+
+  /** The only entries of the real map that ARE fetched. */
+  const FETCHED_ENTITIES = [
+    'user',
+    'parameter',
+    'runtime_configuration',
+    'runtime_configuration/dimension',
+    'dimension',
+    'action_item_category',
+    'default',
   ];
 
   it('does not probe them and does not call their 404 a finding', async () => {
-    expect(REAL_KEYS).toEqual(expect.arrayContaining(SELF_CONTAINED));
+    expect(REAL_KEYS).toEqual(expect.arrayContaining(NOT_FETCHED_ENTITIES));
     const urls: string[] = [];
     const out = await runSignals(
       {
-        new_entity_rows: SELF_CONTAINED.map((entity) => ({
+        new_entity_rows: NOT_FETCHED_ENTITIES.map((entity) => ({
           ...NEW_ENTITY,
           entity,
           sample_entity_id: 'id_1',
         })),
       },
-      // Every host 404s, which is exactly what a SELF_CONTAINED entity does.
+      // Every host 404s, which is exactly what these entities do.
       { probe: () => 404, urls },
     );
-    expect(out.probes).toHaveLength(SELF_CONTAINED.length);
+    expect(out.probes).toHaveLength(NOT_FETCHED_ENTITIES.length);
     expect(new Set(out.probes.map((p) => p.verdict))).toEqual(new Set(['not_fetched_by_design']));
     expect(out.data_flags).toEqual([]);
     expect(out.degraded_sources).toEqual([]);
     // Not probing them also gives the 30s budget back.
     expect(urls.filter((u) => u.includes('nullplatform.io/') && !u.includes('token'))).toEqual([]);
+  });
+
+  it('splits the whole real key set into fetched and not, and only those seven are probed', async () => {
+    const out = await runSignals(
+      { new_entity_rows: REAL_KEYS.map((entity) => ({ ...NEW_ENTITY, entity, sample_entity_id: 'x' })) },
+      { probe: () => 404 },
+    );
+    const notFetched = out.probes
+      .filter((p) => p.verdict === 'not_fetched_by_design')
+      .map((p) => p.entity);
+    expect(new Set(notFetched)).toEqual(new Set(REAL_KEYS.filter((k) => !FETCHED_ENTITIES.includes(k))));
+    expect(notFetched).toHaveLength(REAL_KEYS.length - FETCHED_ENTITIES.length);
+  });
+
+  it('never treats an nrn entity_id as a bad id', async () => {
+    // A real nrn always carries `=`, which SAFE_ID does not allow — it used to
+    // come out as "unexpected characters — itself a finding" on ids that are
+    // legitimate by definition.
+    const out = await runSignals(
+      {
+        new_entity_rows: [
+          { ...NEW_ENTITY, entity: 'nrn', sample_entity_id: 'organization=1:account=2' },
+        ],
+      },
+      { probe: () => 404 },
+    );
+    expect(out.probes.find((p) => p.entity === 'nrn')?.verdict).toBe('not_fetched_by_design');
+    expect(out.data_flags).toEqual([]);
+  });
+
+  it('keeps probing a STANDARD entity whose entry merely talks about the others', async () => {
+    // Classification reads the entry's code, not its prose: a comment that
+    // mentions the mechanism must not silence a fetched entity, because that
+    // hides real misconfiguration instead of inventing one.
+    const trolls = [
+      '// not self-contained: this one IS fetched',
+      '// unlike the self_contained ones above',
+      '// see selfContainedEnhancer for the other case',
+      '// entityType: ENTITY_TYPE.NRN is handled elsewhere',
+    ];
+    for (const troll of trolls) {
+      const appJs = REAL_APP_JS.replace(
+        '        [ENTITIES.USER] : {\n',
+        `        [ENTITIES.USER] : {\n            ${troll}\n`,
+      );
+      const out = await runSignals(
+        { new_entity_rows: [{ ...NEW_ENTITY, entity: 'user', sample_entity_id: 'id_1' }] },
+        { appJs, probe: () => 404 },
+      );
+      expect(out.probes.find((p) => p.entity === 'user')?.verdict, troll).toBe(
+        'id_or_endpoint_missing',
+      );
+    }
   });
 
   it('still probes a STANDARD entity, and its 404 everywhere is a finding', async () => {
