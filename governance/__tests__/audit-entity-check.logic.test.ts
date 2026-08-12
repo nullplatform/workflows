@@ -1,7 +1,7 @@
 /**
  * @file Unit tests for the deterministic JavaScript of `audit-entity-check`.
  *
- * The E2E suite stubs `code-exec` by step id, so the bodies of `signals`,
+ * The E2E suite stubs `code-exec` by step id, so the bodies of `enhancer_config`,
  * `gather`, `resolve` and `resolve_carryover` never run there. They are pure
  * functions of their `$item` plus HTTP, so here the `config.code` block is read
  * straight out of the YAML and executed with a fake `fetch` — no network, and
@@ -19,9 +19,9 @@
  *  - the `entityConfig` / `clients` / `ENTITIES` extraction, the sanity gates
  *    that refuse to conclude anything from an incomplete key set, and the
  *    comment/string decoys an anchor must not fall for,
- *  - the probe verdicts, including the `clients` lookup, the two-segment entity
- *    names the enhancer configures, traversal attempts and unreachable hosts,
- *  - data flags vs degraded sources (missing config entries, lake errors),
+ *  - the per-entity mode classification (STANDARD / SELF_CONTAINED / NRN /
+ *    IGNORED), which is what tells the agent whether a write has to echo the
+ *    entity back,
  *  - the carry-over decision matrix of `gather`,
  *  - what both resolves PATCH back to the approval API.
  */
@@ -42,12 +42,15 @@ const REAL_ENHANCER_JS = readFileSync(
 );
 
 interface WorkflowDoc {
-  steps: Array<{ id: string; config?: { code?: string } }>;
+  steps: Array<{ id: string; config?: { code?: string; systemPrompt?: string } }>;
+}
+
+function workflow(): WorkflowDoc {
+  return parse(readFileSync(WF_PATH, 'utf8')) as WorkflowDoc;
 }
 
 function stepCode(stepId: string): string {
-  const doc = parse(readFileSync(WF_PATH, 'utf8')) as WorkflowDoc;
-  const code = doc.steps.find((s) => s.id === stepId)?.config?.code;
+  const code = workflow().steps.find((s) => s.id === stepId)?.config?.code;
   if (typeof code !== 'string') throw new Error(`step "${stepId}" has no config.code`);
   return code;
 }
@@ -84,80 +87,63 @@ async function runStepCode<T>(
 }
 
 // --------------------------------------------------------------------------
-// signals
+// enhancer_config
 // --------------------------------------------------------------------------
 
-const SIGNALS_CODE = stepCode('signals');
+const CONFIG_CODE = stepCode('enhancer_config');
 
-interface DataFlag {
-  entity: string | null;
-  text: string;
-}
+type EntityMode = 'standard' | 'self_contained' | 'nrn' | 'ignored';
 
-interface Probe {
-  entity: string;
-  entity_id?: string;
-  status?: number;
-  alt_host?: string | null;
-  verdict: string;
-}
-
-interface SignalsOutput {
-  data_flags: DataFlag[];
+interface ConfigOutput {
   degraded_sources: string[];
   entity_config_keys: string[];
   entity_config_trusted: boolean;
-  probes: Probe[];
-  signals_view: string;
+  entity_modes: Record<string, EntityMode>;
+  self_contained_entities: string[];
+  clients_keys: string[] | null;
+  has_default_config: boolean;
+  config_view: string;
 }
 
-const DEFAULT_ITEM = {
-  github_token: 'gh_token',
-  enhancer_api_key: 'enh_key',
-  enhancer_repo: 'nullplatform/data-audit-stream-enhancer',
-  new_entity_rows: [],
-  empty_row_rows: [],
-};
-
-interface SignalsFetchOptions {
+interface ConfigFetchOptions {
   /** Served for `audit-ennhancer/app.js`; defaults to the real file. */
   appJs?: string;
   /** Served for `audit-ennhancer/audit_enhancer.js`; null answers 404. */
   enhancerJs?: string | null;
-  /** Status per probe URL; 'throw' simulates no HTTP response at all. */
-  probe?: (url: string) => number | 'throw';
   urls?: string[];
 }
 
-function signalsFetch(opts: SignalsFetchOptions): FakeFetch {
+function configFetch(opts: ConfigFetchOptions): FakeFetch {
   return async (url) => {
     opts.urls?.push(url);
     if (url.endsWith('/audit_enhancer.js')) {
       const body = opts.enhancerJs === undefined ? REAL_ENHANCER_JS : opts.enhancerJs;
       return body === null ? res(404, 'Not Found') : res(200, body);
     }
-    if (url.startsWith('https://api.github.com/')) {
-      return res(200, opts.appJs ?? REAL_APP_JS);
-    }
-    if (url === 'https://authz.nullplatform.io/token') {
-      return res(200, { access_token: 'probe_tok' });
-    }
-    const code = opts.probe ? opts.probe(url) : 200;
-    if (code === 'throw') throw new Error('connect ECONNREFUSED');
-    return res(code, {});
+    return res(200, opts.appJs ?? REAL_APP_JS);
   };
 }
 
-const runSignals = (
+const runConfig = (
   item: Record<string, unknown> = {},
-  opts: SignalsFetchOptions = {},
-): Promise<SignalsOutput> =>
-  runStepCode<SignalsOutput>(SIGNALS_CODE, { ...DEFAULT_ITEM, ...item }, signalsFetch(opts));
+  opts: ConfigFetchOptions = {},
+): Promise<ConfigOutput> =>
+  runStepCode<ConfigOutput>(
+    CONFIG_CODE,
+    {
+      github_token: 'gh_token',
+      enhancer_repo: 'nullplatform/data-audit-stream-enhancer',
+      ...item,
+    },
+    configFetch(opts),
+  );
 
 /** Declaration form, section comments between entries. */
 const APP_JS_SECTION_COMMENTS = `
 const clients = {
+  default: apiClient,
   user: usersClient,
+  parameter: paramsClient,
 };
 
 const entityConfig = {
@@ -165,8 +151,8 @@ const entityConfig = {
   user: { type: STANDARD },
   parameter: { type: STANDARD },
   // SELF_CONTAINED: enriched from the body
-  service: { type: SELF_CONTAINED },
-  nrn: { type: NRN },
+  service: { entityClient: selfContainedEnhancer },
+  nrn: { entityType: ENTITY_TYPE.NRN },
   default: { type: STANDARD },
 };
 `;
@@ -186,8 +172,8 @@ const entityConfig = {
   "user": { type: STANDARD },
   'parameter': { type: STANDARD },
   /* } */
-  service: { type: SELF_CONTAINED, path: "/service/{id}" },
-  "notification/channel": { type: SELF_CONTAINED },
+  service: { entityClient: selfContainedEnhancer, path: "/service/{id}" },
+  "notification/channel": { entityClient: selfContainedEnhancer },
   default: { type: STANDARD },
 };
 `;
@@ -201,14 +187,6 @@ const entityConfig = {
   default: { type: STANDARD },
 };
 `;
-
-const NEW_ENTITY = {
-  entity: 'runbook',
-  first_seen: '2026-08-01',
-  writes: 12,
-  methods: ['POST'],
-  sample_entity_id: 'rb_1',
-};
 
 /** The keys of the real entityConfig, in source order. */
 const REAL_KEYS = [
@@ -244,10 +222,21 @@ const REAL_KEYS = [
   'default',
 ];
 
-describe('audit-entity-check signals — entityConfig extraction (real enhancer)', () => {
+/** The only entries of the real map the enhancer actually fetches. */
+const REAL_STANDARD = [
+  'user',
+  'parameter',
+  'runtime_configuration',
+  'runtime_configuration/dimension',
+  'dimension',
+  'action_item_category',
+  'default',
+];
+
+describe('audit-entity-check enhancer_config — extraction (real enhancer)', () => {
   it('reads both maps out of the real app.js, resolving computed keys and spreads', async () => {
     const urls: string[] = [];
-    const out = await runSignals({}, { urls });
+    const out = await runConfig({}, { urls });
     // The sources live under audit-ennhancer/ (double n in the repo).
     expect(urls).toContain(
       'https://api.github.com/repos/nullplatform/data-audit-stream-enhancer/contents/audit-ennhancer/app.js',
@@ -260,48 +249,49 @@ describe('audit-entity-check signals — entityConfig extraction (real enhancer)
     // Computed key resolved through ENTITIES, and one of the 16 spread ones.
     expect(out.entity_config_keys).toContain('notification/channel');
     expect(out.entity_config_keys).toContain('workflow_webhook');
-    expect(out.signals_view).toContain('--- clients ---');
-    expect(out.signals_view).toContain('entity_hook');
+    expect(out.degraded_sources).toEqual([]);
+  });
+
+  it('reads the clients map and publishes it for the cross-check', async () => {
+    const out = await runConfig();
+    expect(out.clients_keys).toContain('default');
+    expect(out.clients_keys).toContain('entity_hook');
+    expect(out.clients_keys).toHaveLength(13);
+    expect(out.config_view).toContain('--- clients ---');
+    expect(out.config_view).toContain('entity_hook');
+  });
+
+  it('reports that an unlisted entity falls back to the default STANDARD path', async () => {
+    const out = await runConfig();
+    expect(out.has_default_config).toBe(true);
+    expect(out.config_view).toContain('The map has a `default` entry');
   });
 
   it('distrusts the key set when the ENTITIES map cannot be read', async () => {
-    const out = await runSignals({ new_entity_rows: [NEW_ENTITY] }, { enhancerJs: null });
+    const out = await runConfig({}, { enhancerJs: null });
     expect(out.entity_config_trusted).toBe(false);
     expect(out.degraded_sources.join(' ')).toContain('key position(s) unresolved');
-    // An incomplete key set must not produce "not configured" flags.
-    expect(out.data_flags.filter((f) => f.text.includes('entityConfig'))).toEqual([]);
-  });
-
-  it('does not flag an entity the real map configures', async () => {
-    const out = await runSignals({
-      new_entity_rows: [{ ...NEW_ENTITY, entity: 'workflow_secret' }],
-    });
-    expect(out.data_flags.filter((f) => f.text.includes('entityConfig'))).toEqual([]);
-  });
-
-  it('reports an unlisted entity as falling back to the default entry', async () => {
-    const out = await runSignals({ new_entity_rows: [NEW_ENTITY] });
-    const flag = out.data_flags.find((f) => f.entity === 'runbook');
-    expect(flag?.text).toContain('no dedicated enhancer entityConfig entry');
-    expect(flag?.text).toContain('falls back to "default"');
+    // An incomplete key set is not classified at all, and the view says so.
+    expect(out.entity_modes).toEqual({});
+    expect(out.config_view).toContain('not classified');
   });
 });
 
-describe('audit-entity-check signals — entityConfig extraction (other shapes)', () => {
+describe('audit-entity-check enhancer_config — extraction (other shapes)', () => {
   it('keeps the real keys when section comments sit between entries', async () => {
-    const out = await runSignals({}, { appJs: APP_JS_SECTION_COMMENTS });
+    const out = await runConfig({}, { appJs: APP_JS_SECTION_COMMENTS });
     expect(out.entity_config_keys).toEqual(['user', 'parameter', 'service', 'nrn', 'default']);
     expect(out.entity_config_trusted).toBe(true);
   });
 
   it('anchors on the declaration, not on an earlier read of the name', async () => {
-    const out = await runSignals({}, { appJs: APP_JS_READ_BEFORE_DECL });
+    const out = await runConfig({}, { appJs: APP_JS_READ_BEFORE_DECL });
     expect(out.entity_config_keys).toEqual(['user', 'parameter', 'service', 'nrn', 'default']);
     expect(out.entity_config_trusted).toBe(true);
   });
 
   it('reads quoted keys and ignores braces inside comments and strings', async () => {
-    const out = await runSignals({}, { appJs: APP_JS_QUOTED_KEYS });
+    const out = await runConfig({}, { appJs: APP_JS_QUOTED_KEYS });
     expect(out.entity_config_keys).toEqual([
       'user',
       'parameter',
@@ -313,235 +303,77 @@ describe('audit-entity-check signals — entityConfig extraction (other shapes)'
   });
 
   it('distrusts a literal that spreads an unknown object', async () => {
-    const out = await runSignals({ new_entity_rows: [NEW_ENTITY] }, { appJs: APP_JS_BARE_SPREAD });
+    const out = await runConfig({}, { appJs: APP_JS_BARE_SPREAD });
     expect(out.entity_config_trusted).toBe(false);
     expect(out.degraded_sources.join(' ')).toContain('1 key position(s) unresolved');
-    expect(out.data_flags.filter((f) => f.text.includes('entityConfig'))).toEqual([]);
+    expect(out.entity_modes).toEqual({});
   });
 
   it('distrusts a key set that lacks the entities the enhancer always configures', async () => {
-    const out = await runSignals(
-      { new_entity_rows: [NEW_ENTITY] },
+    const out = await runConfig(
+      {},
       { appJs: 'const entityConfig = { widget: { type: STANDARD } };' },
     );
     expect(out.entity_config_trusted).toBe(false);
     expect(out.degraded_sources.join(' ')).toContain('no "user" key');
     expect(out.degraded_sources.join(' ')).toContain('no "parameter" key');
-    expect(out.data_flags.filter((f) => f.text.includes('entityConfig'))).toEqual([]);
   });
 
   it('degrades when app.js has no entityConfig at all', async () => {
-    const out = await runSignals({}, { appJs: 'module.exports = {};' });
+    const out = await runConfig({}, { appJs: 'module.exports = {};' });
     expect(out.entity_config_trusted).toBe(false);
     expect(out.degraded_sources.join(' ')).toContain('entityConfig unavailable');
   });
 
-  it('says so in the excerpt when there is no clients map', async () => {
-    const out = await runSignals({}, { appJs: APP_JS_QUOTED_KEYS });
-    expect(out.signals_view).toContain('no clients object literal found');
+  it('says so in the view when there is no clients map', async () => {
+    const out = await runConfig({}, { appJs: APP_JS_QUOTED_KEYS });
+    expect(out.clients_keys).toBeNull();
+    expect(out.degraded_sources.join(' ')).toContain('no clients object literal found');
+    expect(out.config_view).toContain('no clients object literal found');
   });
 });
 
-describe('audit-entity-check signals — probe verdicts', () => {
-  const ALT = 'https://users.nullplatform.io';
-  const rowsFor = (entity: string) => [{ ...NEW_ENTITY, entity, sample_entity_id: 'id_1' }];
-  /** 404 on the default host, 200 on users.nullplatform.io. */
-  const altHostProbe = (url: string) => (url.startsWith(ALT) ? 200 : 404);
-
-  it('accepts an alternate host for an entity the real clients map declares', async () => {
-    const out = await runSignals({ new_entity_rows: rowsFor('user') }, { probe: altHostProbe });
-    const probe = out.probes.find((p) => p.entity === 'user');
-    expect(probe?.verdict).toBe('answers_on_alt_host');
-    expect(probe?.alt_host).toBe(ALT);
-  });
-
-  it('escalates to wrong_host for an entity absent from the clients map', async () => {
-    // The real clients map mentions users.nullplatform.io for ANOTHER entity;
-    // that must not excuse this one, which has no entry of its own.
-    expect(REAL_APP_JS).toContain('https://users.nullplatform.io');
-    const out = await runSignals({ new_entity_rows: rowsFor('widget') }, { probe: altHostProbe });
-    expect(out.probes.find((p) => p.entity === 'widget')?.verdict).toBe('wrong_host');
-  });
-
-  it('stays on answers_on_alt_host when there is no clients map to check', async () => {
-    const out = await runSignals(
-      { new_entity_rows: rowsFor('widget') },
-      { appJs: APP_JS_QUOTED_KEYS, probe: altHostProbe },
+describe('audit-entity-check enhancer_config — per-entity mode', () => {
+  it('classifies the whole real map the way the enhancer dispatches it', async () => {
+    const out = await runConfig();
+    const byMode = (mode: EntityMode) =>
+      Object.keys(out.entity_modes).filter((k) => out.entity_modes[k] === mode);
+    // Only STANDARD makes the enhancer fetch the entity; getEntityData in its
+    // entity_enhancer.js dispatches on ENTITY_TYPE.
+    expect(byMode('standard')).toEqual(REAL_STANDARD);
+    expect(byMode('nrn')).toEqual(['nrn']);
+    expect(byMode('ignored')).toEqual(['agent']);
+    expect(new Set(byMode('self_contained'))).toEqual(
+      new Set(REAL_KEYS.filter((k) => !REAL_STANDARD.includes(k) && k !== 'nrn' && k !== 'agent')),
     );
-    expect(out.probes.find((p) => p.entity === 'widget')?.verdict).toBe('answers_on_alt_host');
+    // The list the agent needs for the echo check.
+    expect(out.self_contained_entities).toEqual(byMode('self_contained'));
+    expect(out.self_contained_entities).toContain('service');
+    expect(out.self_contained_entities).toContain('notification/channel');
   });
 
-  it('reports a failed request as an unreachable probe, not as a DLQ risk', async () => {
-    const out = await runSignals({ new_entity_rows: rowsFor('user') }, { probe: () => 'throw' });
-    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('probe_unreachable');
-    expect(out.degraded_sources.join(' ')).toContain('no HTTP response');
-    expect(out.data_flags).toEqual([]);
+  it('spells the modes out for the agent, naming what each one demands', async () => {
+    const out = await runConfig();
+    expect(out.config_view).toContain('STANDARD (the enhancer fetches the entity)');
+    expect(out.config_view).toContain('SELF_CONTAINED (no fetch — the WRITE must carry the entity)');
+    expect(out.config_view).toContain('NRN (only the nrn is resolved)');
+    expect(out.config_view).toContain('IGNORED (opted out of enrichment)');
   });
 
-  it('still calls a 5xx a DLQ risk', async () => {
-    const out = await runSignals({ new_entity_rows: rowsFor('user') }, { probe: () => 503 });
-    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('upstream_error_dlq_risk');
-    expect(out.data_flags.map((f) => f.entity)).toContain('user');
+  it('classifies the synthetic shapes too', async () => {
+    const out = await runConfig({}, { appJs: APP_JS_SECTION_COMMENTS });
+    expect(out.entity_modes).toEqual({
+      user: 'standard',
+      parameter: 'standard',
+      service: 'self_contained',
+      nrn: 'nrn',
+      default: 'standard',
+    });
   });
 
-  it('probes the two-segment entity names the enhancer really configures', async () => {
-    const withSlash = ['runtime_configuration/dimension', 'notification/channel'];
-    // Both are keys of the real map, so neither may be treated as a bad name.
-    expect(REAL_KEYS).toEqual(expect.arrayContaining(withSlash));
-    const urls: string[] = [];
-    const out = await runSignals(
-      {
-        new_entity_rows: withSlash.map((entity) => ({
-          ...NEW_ENTITY,
-          entity,
-          sample_entity_id: 'id_1',
-        })),
-      },
-      { urls },
-    );
-    // The STANDARD one is fetched as GET /runtime_configuration/dimension/<id>,
-    // so the slash has to survive the escaping; the SELF_CONTAINED one is not
-    // fetched at all. Neither is a bad name.
-    const verdictOf = (entity: string) => out.probes.find((p) => p.entity === entity)?.verdict;
-    expect(verdictOf('runtime_configuration/dimension')).toBe('ok');
-    expect(verdictOf('notification/channel')).toBe('not_fetched_by_design');
-    expect(urls).toContain('https://api.nullplatform.io/runtime_configuration/dimension/id_1');
-    expect(out.data_flags).toEqual([]);
-    expect(out.degraded_sources).toEqual([]);
-  });
-
-  it('rejects traversal and malformed names, and escapes what it does probe', async () => {
-    const bad = ['user/../admin', 'a/b/c', 'user/', '/user', 'us..er', 'a//b', '-foo', 'a/-b'];
-    const urls: string[] = [];
-    const out = await runSignals(
-      {
-        new_entity_rows: [
-          ...bad.map((entity) => ({ ...NEW_ENTITY, entity, sample_entity_id: 'x' })),
-          { ...NEW_ENTITY, entity: 'parameter', sample_entity_id: 'a:b' },
-        ],
-      },
-      { urls },
-    );
-    for (const entity of bad) {
-      expect(out.probes.find((p) => p.entity === entity)?.verdict).toBe('skipped_unsafe_name');
-    }
-    expect(urls.some((u) => u.includes('..'))).toBe(false);
-    expect(urls.some((u) => u.replace('https://', '').includes('//'))).toBe(false);
-    expect(urls.some((u) => u.endsWith('/parameter/a%3Ab'))).toBe(true);
-  });
-
-  it('degrades instead of flagging a name the enhancer configures but cannot probe', async () => {
-    // Hypothetical three-segment key: legitimate by virtue of being configured,
-    // yet outside what the probe can build a URL for.
-    const appJs = REAL_APP_JS.replace('"nrn": {', '"a/b/c": {} ,\n        "nrn": {');
-    const row = [{ ...NEW_ENTITY, entity: 'a/b/c', sample_entity_id: 'x' }];
-    const out = await runSignals({ new_entity_rows: row }, { appJs });
-    expect(out.entity_config_trusted).toBe(true);
-    expect(out.probes.find((p) => p.entity === 'a/b/c')?.verdict).toBe('skipped_not_probeable');
-    expect(out.data_flags).toEqual([]);
-    expect(out.degraded_sources.join(' ')).toContain('configured in the enhancer');
-
-    // With the map untrusted the same name is a finding again: the carve-out
-    // only applies to names a map we believe actually configures.
-    const untrusted = await runSignals({ new_entity_rows: row }, { enhancerJs: null, appJs });
-    expect(untrusted.entity_config_trusted).toBe(false);
-    expect(untrusted.probes.find((p) => p.entity === 'a/b/c')?.verdict).toBe('skipped_unsafe_name');
-    expect(untrusted.data_flags.map((f) => f.entity)).toContain('a/b/c');
-  });
-
-  it('probes at most four entities and says how many it left out', async () => {
-    const rows = ['a1', 'a2', 'a3', 'a4', 'a5', 'a6'].map((entity) => ({
-      ...NEW_ENTITY,
-      entity,
-      sample_entity_id: 'id',
-    }));
-    const out = await runSignals({ new_entity_rows: rows });
-    expect(out.probes).toHaveLength(4);
-    expect(out.degraded_sources.join(' ')).toContain('6 suspect entities but only 4 were probed');
-    expect(out.signals_view).toContain('probed 4 of 6 suspect entities');
-  });
-});
-
-describe('audit-entity-check signals — entities the enhancer never fetches', () => {
-  /**
-   * Entries the real map resolves with selfContainedEnhancer, `ignore: true` or
-   * ENTITY_TYPE.NRN. Only a STANDARD entry makes the enhancer issue
-   * `GET /<entity>/<id>` (its entity_enhancer.js dispatches on ENTITY_TYPE).
-   */
-  const NOT_FETCHED_ENTITIES = [
-    'service',
-    'workflow',
-    'notification/channel',
-    'action_item',
-    'login_success',
-    'agent',
-    'nrn',
-  ];
-
-  /** The only entries of the real map that ARE fetched. */
-  const FETCHED_ENTITIES = [
-    'user',
-    'parameter',
-    'runtime_configuration',
-    'runtime_configuration/dimension',
-    'dimension',
-    'action_item_category',
-    'default',
-  ];
-
-  it('does not probe them and does not call their 404 a finding', async () => {
-    expect(REAL_KEYS).toEqual(expect.arrayContaining(NOT_FETCHED_ENTITIES));
-    const urls: string[] = [];
-    const out = await runSignals(
-      {
-        new_entity_rows: NOT_FETCHED_ENTITIES.map((entity) => ({
-          ...NEW_ENTITY,
-          entity,
-          sample_entity_id: 'id_1',
-        })),
-      },
-      // Every host 404s, which is exactly what these entities do.
-      { probe: () => 404, urls },
-    );
-    expect(out.probes).toHaveLength(NOT_FETCHED_ENTITIES.length);
-    expect(new Set(out.probes.map((p) => p.verdict))).toEqual(new Set(['not_fetched_by_design']));
-    expect(out.data_flags).toEqual([]);
-    expect(out.degraded_sources).toEqual([]);
-    // Not probing them also gives the 30s budget back.
-    expect(urls.filter((u) => u.includes('nullplatform.io/') && !u.includes('token'))).toEqual([]);
-  });
-
-  it('splits the whole real key set into fetched and not, and only those seven are probed', async () => {
-    const out = await runSignals(
-      { new_entity_rows: REAL_KEYS.map((entity) => ({ ...NEW_ENTITY, entity, sample_entity_id: 'x' })) },
-      { probe: () => 404 },
-    );
-    const notFetched = out.probes
-      .filter((p) => p.verdict === 'not_fetched_by_design')
-      .map((p) => p.entity);
-    expect(new Set(notFetched)).toEqual(new Set(REAL_KEYS.filter((k) => !FETCHED_ENTITIES.includes(k))));
-    expect(notFetched).toHaveLength(REAL_KEYS.length - FETCHED_ENTITIES.length);
-  });
-
-  it('never treats an nrn entity_id as a bad id', async () => {
-    // A real nrn always carries `=`, which SAFE_ID does not allow — it used to
-    // come out as "unexpected characters — itself a finding" on ids that are
-    // legitimate by definition.
-    const out = await runSignals(
-      {
-        new_entity_rows: [
-          { ...NEW_ENTITY, entity: 'nrn', sample_entity_id: 'organization=1:account=2' },
-        ],
-      },
-      { probe: () => 404 },
-    );
-    expect(out.probes.find((p) => p.entity === 'nrn')?.verdict).toBe('not_fetched_by_design');
-    expect(out.data_flags).toEqual([]);
-  });
-
-  it('keeps probing a STANDARD entity whose entry merely talks about the others', async () => {
+  it('keeps a STANDARD entity standard when its entry merely talks about the others', async () => {
     // Classification reads the entry's code, not its prose: a comment that
-    // mentions the mechanism must not silence a fetched entity, because that
+    // mentions the mechanism must not mislabel a fetched entity, because that
     // hides real misconfiguration instead of inventing one.
     const trolls = [
       '// not self-contained: this one IS fetched',
@@ -554,59 +386,30 @@ describe('audit-entity-check signals — entities the enhancer never fetches', (
         '        [ENTITIES.USER] : {\n',
         `        [ENTITIES.USER] : {\n            ${troll}\n`,
       );
-      const out = await runSignals(
-        { new_entity_rows: [{ ...NEW_ENTITY, entity: 'user', sample_entity_id: 'id_1' }] },
-        { appJs, probe: () => 404 },
-      );
-      expect(out.probes.find((p) => p.entity === 'user')?.verdict, troll).toBe(
-        'id_or_endpoint_missing',
-      );
+      const out = await runConfig({}, { appJs });
+      expect(out.entity_modes['user'], troll).toBe('standard');
     }
-  });
-
-  it('still probes a STANDARD entity, and its 404 everywhere is a finding', async () => {
-    const out = await runSignals(
-      { new_entity_rows: [{ ...NEW_ENTITY, entity: 'user', sample_entity_id: 'id_1' }] },
-      { probe: () => 404 },
-    );
-    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('id_or_endpoint_missing');
-    expect(out.data_flags.map((f) => f.entity)).toContain('user');
-  });
-
-  it('probes everything when the config could not be trusted', async () => {
-    // No classification without a trusted map: err towards looking.
-    const out = await runSignals(
-      { new_entity_rows: [{ ...NEW_ENTITY, entity: 'service', sample_entity_id: 'id_1' }] },
-      { enhancerJs: null, probe: () => 404 },
-    );
-    expect(out.entity_config_trusted).toBe(false);
-    expect(out.probes.find((p) => p.entity === 'service')?.verdict).toBe('id_or_endpoint_missing');
   });
 });
 
-describe('audit-entity-check signals — anchor decoys', () => {
-  const ALT = 'https://users.nullplatform.io';
-  const altHostProbe = (url: string) => (url.startsWith(ALT) ? 200 : 404);
-  const userRow = [{ ...NEW_ENTITY, entity: 'user', sample_entity_id: 'id_1' }];
-
+describe('audit-entity-check enhancer_config — anchor decoys', () => {
   it('ignores a clients map mentioned in a line comment', async () => {
-    // `user` HAS a real clients entry; anchoring on the comment would hide it
-    // and turn the probe into a wrong_host finding, with the decoy handed to
-    // the agent as the excerpt that "confirms" it.
+    // Anchoring on the comment would publish a bogus key list and hand the
+    // decoy to the agent as the excerpt it is told to conclude from.
     const appJs = REAL_APP_JS.replace(
       'const entityUtils = new EntityUtils({',
       '// clients: { entity: axiosInstance } — one entry per non-default host\n'
         + 'const entityUtils = new EntityUtils({',
     );
-    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
-    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('answers_on_alt_host');
-    expect(out.signals_view).toContain('baseURL:"https://users.nullplatform.io"');
-    expect(out.signals_view).not.toContain('{ entity: axiosInstance }');
+    const out = await runConfig({}, { appJs });
+    expect(out.clients_keys).toHaveLength(13);
+    expect(out.config_view).toContain('baseURL:"https://users.nullplatform.io"');
+    expect(out.config_view).not.toContain('{ entity: axiosInstance }');
   });
 
   it('ignores an entityConfig mentioned in a string literal', async () => {
     const appJs = `const msg = "entityConfig: { fake: 1 }";\n${REAL_APP_JS}`;
-    const out = await runSignals({}, { appJs });
+    const out = await runConfig({}, { appJs });
     expect(out.entity_config_keys).toEqual(REAL_KEYS);
     expect(out.entity_config_trusted).toBe(true);
   });
@@ -616,10 +419,10 @@ describe('audit-entity-check signals — anchor decoys', () => {
       '    clients: {',
       "    'clients': {",
     );
-    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
+    const out = await runConfig({}, { appJs });
     expect(out.entity_config_keys).toEqual(REAL_KEYS);
     expect(out.entity_config_trusted).toBe(true);
-    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('answers_on_alt_host');
+    expect(out.clients_keys).toHaveLength(13);
   });
 
   it('is not fooled by a regex literal holding a quote', async () => {
@@ -629,7 +432,7 @@ describe('audit-entity-check signals — anchor decoys', () => {
       'const PARAMS_REGEX',
       "const QUOTE_RE = /['\"]/;\nconst PARAMS_REGEX",
     );
-    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
+    const out = await runConfig({}, { appJs });
     expect(out.entity_config_keys).toEqual(REAL_KEYS);
     expect(out.entity_config_trusted).toBe(true);
     expect(out.degraded_sources).toEqual([]);
@@ -639,55 +442,80 @@ describe('audit-entity-check signals — anchor decoys', () => {
     // An unterminated block comment swallows the rest of the file. Nothing can
     // be concluded from that, and the item says so instead of guessing.
     const appJs = `/* oops\n${REAL_APP_JS}`;
-    const out = await runSignals({ new_entity_rows: [NEW_ENTITY] }, { appJs });
+    const out = await runConfig({}, { appJs });
     expect(out.entity_config_trusted).toBe(false);
     expect(out.degraded_sources.join(' ')).toContain('entityConfig unavailable');
-    expect(out.data_flags).toEqual([]);
   });
 
-  it('never escalates to wrong_host on a clients map it could not parse', async () => {
+  it('publishes no clients key list it cannot trust', async () => {
     const appJs = REAL_APP_JS.replace(
       /const entityUtils = new EntityUtils\(\{[\s\S]*?\n\}\);/,
       'const entityUtils = new EntityUtils({ clients: { widgets: onlyOne }, tokenGenerator });',
     );
-    const out = await runSignals({ new_entity_rows: userRow }, { appJs, probe: altHostProbe });
-    expect(out.probes.find((p) => p.entity === 'user')?.verdict).toBe('answers_on_alt_host');
+    const out = await runConfig({}, { appJs });
+    expect(out.clients_keys).toBeNull();
     expect(out.degraded_sources.join(' ')).toContain('clients map not parsed with confidence');
     expect(out.degraded_sources.join(' ')).toContain('no "default" client');
   });
 });
 
-describe('audit-entity-check signals — degraded sources', () => {
+describe('audit-entity-check enhancer_config — sources it could not read', () => {
   it('reports a missing config entry instead of calling out with "undefined"', async () => {
     const urls: string[] = [];
-    const out = await runSignals(
-      { github_token: undefined, enhancer_api_key: '', new_entity_rows: [NEW_ENTITY] },
-      { urls },
-    );
+    const out = await runConfig({ github_token: undefined }, { urls });
     expect(out.degraded_sources).toContain(
       'config entry GITHUB_TOKEN missing — enhancer entityConfig not read',
     );
-    expect(out.degraded_sources).toContain(
-      'config entry ENHANCER_API_KEY missing — fetch probe skipped',
-    );
     expect(urls).toEqual([]);
-    expect(out.data_flags).toEqual([]);
+    expect(out.entity_config_trusted).toBe(false);
+  });
+});
+
+// --------------------------------------------------------------------------
+// audit_agent prompt
+// --------------------------------------------------------------------------
+
+describe('audit-entity-check audit_agent', () => {
+  /** The prompt is hard-wrapped, so phrases are matched on one flat line. */
+  const systemPrompt = () => {
+    const prompt = workflow().steps.find((s) => s.id === 'audit_agent')?.config?.systemPrompt;
+    if (typeof prompt !== 'string') throw new Error('audit_agent has no systemPrompt');
+    return prompt.replace(/\s+/g, ' ');
+  };
+
+  it('asks for the self-contained echo check by name', () => {
+    const prompt = systemPrompt();
+    expect(prompt).toContain('the write route must echo the entity in its response body');
+    expect(prompt).toContain('VERIFY THIS IN THE CODE for every SELF_CONTAINED entity');
+    expect(prompt).toContain('entity_snapshot');
+    expect(prompt).toContain('self_contained_no_echo');
   });
 
-  it('tells a failed lake query apart from one that never ran', async () => {
-    const failed = await runSignals({
-      new_entity_rows: undefined,
-      new_entities_error: 'NP_LAKE_5XX: gateway timeout',
-    });
-    expect(failed.degraded_sources).toContain(
-      'lake unavailable (new entities): the query failed — NP_LAKE_5XX: gateway timeout',
-    );
-    expect(failed.data_flags).toEqual([]);
+  it('tells the agent the grant side is not verifiable before the deploy', () => {
+    const prompt = systemPrompt();
+    expect(prompt).toContain('NOT decidable before the deploy');
+    expect(prompt).toContain('are not verifiable before the deploy');
+    expect(prompt).toContain('must not turn the item red');
+    expect(prompt).toContain('This is a PREVENTIVE, STATIC review');
+  });
 
-    const neverRan = await runSignals({ empty_row_rows: undefined });
-    expect(neverRan.degraded_sources).toContain(
-      'lake unavailable (empty rows): the query did not run',
+  it('no longer describes a live probe or lake rows as evidence', () => {
+    const prompt = systemPrompt();
+    expect(prompt).not.toContain('probe table');
+    expect(prompt).not.toContain('answers_on_alt_host');
+    expect(prompt).not.toContain('data flags');
+  });
+
+  it('only allows finding areas a static reading can establish', () => {
+    const areas = String(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (workflow().steps.find((s) => s.id === 'audit_agent') as any).config.outputSchema.properties
+        .findings.items.properties.area.enum,
     );
+    expect(areas).toContain('self_contained_no_echo');
+    for (const gone of ['missing_grant', 'wrong_host', 'dlq_risk', 'degraded_entity']) {
+      expect(areas).not.toContain(gone);
+    }
   });
 });
 
@@ -772,7 +600,6 @@ const GATHER_ITEM = {
   trigger_build: { branch: 'main', commit: { id: SHA_CURRENT } },
   item_id: 'audit_entity_check',
   callbackUrl: 'https://approval-api.test/approval/9001/checklist/items/audit_entity_check',
-  data_flags: [] as DataFlag[],
   np_api_key: 'np_key',
   github_token: 'gh_token',
 };
@@ -784,10 +611,21 @@ const runGather = (
   runStepCode<GatherOutput>(GATHER_CODE, { ...GATHER_ITEM, ...item }, gatherFetch(opts));
 
 describe('audit-entity-check gather — carry-over decision', () => {
-  it('carries over when the sha is unchanged and there are no data flags', async () => {
+  it('carries over when the sha is unchanged', async () => {
     const out = await runGather({}, { prevSha: SHA_CURRENT });
     expect(out.mode).toBe('carry_over');
     expect(out.prev?.status).toBe('passed');
+  });
+
+  it('decides on the diff alone — the check is static', async () => {
+    // Nothing outside the repository can change the verdict between two deploys
+    // of the same commit, so no external signal is consulted here.
+    expect(GATHER_CODE).not.toContain('data_flags');
+    const out = await runGather(
+      { data_flags: [{ entity: 'anything', text: 'ignored input' }] },
+      { prevSha: SHA_CURRENT },
+    );
+    expect(out.mode).toBe('carry_over');
   });
 
   it('re-analyses in verify_fix mode when the previous verdict failed', async () => {
@@ -814,32 +652,6 @@ describe('audit-entity-check gather — carry-over decision', () => {
 
   it('treats a .cjs source file as audit-relevant', async () => {
     const out = await runGather({}, { changedFiles: ['src/routes/runbook.cjs'] });
-    expect(out.mode).toBe('analyze');
-    expect(out.scope).toBe('diff');
-  });
-
-  it('ignores a data flag about an entity this application does not write', async () => {
-    const out = await runGather(
-      { data_flags: [{ entity: 'someone_elses_entity', text: 'organization-wide noise' }] },
-      { prevSha: SHA_CURRENT, prevEntities: [{ entity: 'runbook' }] },
-    );
-    expect(out.mode).toBe('carry_over');
-  });
-
-  it('re-analyses on a data flag about an entity this application writes', async () => {
-    const out = await runGather(
-      { data_flags: [{ entity: 'runbook', text: 'runbook has 40% empty rows' }] },
-      { prevSha: SHA_CURRENT, prevEntities: [{ entity: 'runbook' }] },
-    );
-    expect(out.mode).toBe('analyze');
-    expect(out.scope).toBe('diff');
-  });
-
-  it('re-analyses on any data flag while no entity list is known yet', async () => {
-    const out = await runGather(
-      { data_flags: [{ entity: 'someone_elses_entity', text: 'organization-wide noise' }] },
-      { prevSha: SHA_CURRENT, prevEntities: [] },
-    );
     expect(out.mode).toBe('analyze');
     expect(out.scope).toBe('diff');
   });
@@ -913,30 +725,32 @@ const RESOLVE_ITEM = {
   item_id: 'audit_entity_check',
   verdict: {
     status: 'failed',
-    summary: 'One route emits an entity the enhancer cannot fetch.',
+    summary: 'A write route emits a self-contained entity without echoing it.',
     findings: [
       {
-        area: 'missing_grant',
+        area: 'self_contained_no_echo',
         entity: 'runbook',
         file: 'src/routes/runbook.ts',
-        issue: 'GET /runbook/<id> answers 403 to the enhancer',
-        fix: 'Grant the enhancer service account read access to runbook',
+        issue: 'POST /runbook answers 204, so the enhancer has nothing to enrich from',
+        fix: 'Return the created runbook in the response body',
       },
     ],
     resolved_findings: [{ entity: 'widget', issue: 'was unaudited', resolution: 'audit added' }],
-    entities: [{ entity: 'runbook', source: 'POST /runbook', verdict: 'misconfigured' }],
-    fix_instructions_md: 'Add the grant.',
+    entities: [
+      { entity: 'runbook', source: 'POST /runbook', verdict: 'misconfigured' },
+      { entity: 'widget', source: 'POST /widget', verdict: 'unverified' },
+    ],
+    fix_instructions_md: 'Return the entity.',
   },
   repo: 'nullplatform/some-api',
   scope: 'diff',
   analyzed_sha: SHA_CURRENT,
   changed_count: 3,
-  data_flags: [{ entity: 'runbook', text: 'runbook has 40% empty rows in the lake' }],
-  degraded_sources: ['lake unavailable (empty rows): the query failed — NP_LAKE_5XX'],
+  unverified: ['enhancer clients map not parsed with confidence (no "default" client)'],
 };
 
 describe('audit-entity-check resolve', () => {
-  it('resolves the item with the verdict, both signal channels and the checkpoint stamp', async () => {
+  it('resolves the item with the verdict and the checkpoint stamp', async () => {
     const capture: ResolveCapture = { logs: [] };
     await runStepCode(RESOLVE_CODE, RESOLVE_ITEM, resolveFetch(capture));
 
@@ -947,20 +761,30 @@ describe('audit-entity-check resolve', () => {
     expect(capture.patched?.details.analyzed_sha).toBe(SHA_CURRENT);
     expect(capture.patched?.details.scope).toBe('diff');
     expect(capture.patched?.details.findings).toHaveLength(1);
-    // details.entities feeds the next run's own-entity filter.
-    expect(capture.patched?.details.entities).toEqual([
-      { entity: 'runbook', source: 'POST /runbook', verdict: 'misconfigured' },
-    ]);
+    expect(capture.patched?.details.entities).toHaveLength(2);
 
     const markdown = capture.patched?.details.markdown ?? '';
-    expect(markdown).toContain('runbook has 40% empty rows in the lake');
-    expect(markdown).toContain('Fuentes degradadas');
-    expect(markdown).toContain('NP_LAKE_5XX');
+    expect(markdown).toContain('self_contained_no_echo');
     expect(markdown).toContain('#### How to fix');
-    // A degraded source is logged as a warning, never as a finding.
-    expect(capture.logs.some((l) => l.startsWith('Degraded signal source:'))).toBe(true);
-    expect(capture.logs.some((l) => l.includes('[missing_grant]'))).toBe(true);
+    expect(capture.logs.some((l) => l.includes('[self_contained_no_echo]'))).toBe(true);
     expect(capture.logs.some((l) => l.startsWith('Resolved: widget'))).toBe(true);
+  });
+
+  it('always says what a pre-deploy check could not settle', async () => {
+    const capture: ResolveCapture = { logs: [] };
+    await runStepCode(RESOLVE_CODE, RESOLVE_ITEM, resolveFetch(capture));
+    const markdown = capture.patched?.details.markdown ?? '';
+    expect(markdown).toContain('**Sin verificar**');
+    expect(markdown).toContain('los monitores del pipeline');
+    // A source that could not be read is listed there, and logged as a warning
+    // rather than as a finding.
+    expect(markdown).toContain('clients map not parsed with confidence');
+    expect(capture.logs.some((l) => l.startsWith('Could not be read:'))).toBe(true);
+
+    // With every source readable the caveat about the grant is still there.
+    const clean: ResolveCapture = { logs: [] };
+    await runStepCode(RESOLVE_CODE, { ...RESOLVE_ITEM, unverified: [] }, resolveFetch(clean));
+    expect(clean.patched?.details.markdown).toContain('**Sin verificar**');
   });
 
   it('treats a not_applicable verdict as passed', async () => {
@@ -1000,7 +824,7 @@ describe('audit-entity-check resolve_carryover', () => {
       entities: [{ entity: 'runbook', verdict: 'ok' }],
       markdown: '### Audit coverage — PASSED',
     },
-    degraded_sources: ['probe: entity "runbook" got no HTTP response (sandbox egress or network)'],
+    unverified: ['config entry GITHUB_TOKEN missing — enhancer entityConfig not read'],
   };
 
   it('re-applies the previous verdict and carries the checkpoint forward', async () => {
@@ -1011,13 +835,13 @@ describe('audit-entity-check resolve_carryover', () => {
     expect(capture.patched?.details.scope).toBe('carry_over');
     expect(capture.patched?.details.carried_from).toBe(SHA_PREV);
     expect(capture.patched?.details.analyzed_sha).toBe(SHA_CURRENT);
-    // Findings and entities survive a chain of carry-overs, so the own-entity
-    // filter keeps working without a fresh analysis.
+    // Findings and entities survive a chain of carry-overs.
     expect(capture.patched?.details.findings).toHaveLength(1);
     expect(capture.patched?.details.entities).toEqual([{ entity: 'runbook', verdict: 'ok' }]);
     const markdown = capture.patched?.details.markdown ?? '';
     expect(markdown).toContain('(carry-over)');
-    expect(markdown).toContain('Fuentes degradadas');
+    expect(markdown).toContain('El chequeo es estático');
+    expect(markdown).toContain('GITHUB_TOKEN');
     expect(markdown).toContain('### Audit coverage — PASSED');
   });
 

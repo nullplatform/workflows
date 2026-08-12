@@ -1,16 +1,14 @@
 /**
  * @file E2E for `audit-entity-check` (audit-coverage checklist gate).
  *
- * The deterministic logic lives in `code-exec` steps (signals / gather /
+ * The deterministic logic lives in `code-exec` steps (enhancer_config / gather /
  * resolve / resolve_carryover) — network access to GitHub and the NP APIs — so
  * these tests stub `code-exec` BY STEP ID and assert the graph routing the
  * design relies on, plus the payload each resolve receives:
  *
  *   - gather → mode=carry_over  → resolve_carryover, agent NEVER runs.
  *   - gather → mode=analyze     → claude-code-agent → resolve.
- *   - the lake queries and signals always run before gather.
- *   - a lake query failure degrades that ONE source: the other query still
- *     runs and the execution carries on to `signals`.
+ *   - enhancer_config always runs before gather.
  *   - each `error_handling.fallback_step` resolves the item on its own node.
  *
  * The bodies of those `code-exec` steps are covered separately, against the
@@ -18,7 +16,6 @@
  *
  * Stubs:
  *   - `np-checklist-trigger` passthrough (workflow inputs flow through).
- *   - `np-lake-query` returns canned rows.
  *   - `code-exec` switched on ctx step id; captures the resolve inputs.
  *   - `claude-code-agent` returns a canned verdict.
  *   - `np-checklist-item-progress` / `np-checklist-item-resolve` passthrough.
@@ -50,25 +47,15 @@ const TRIGGER_OUTPUTS = {
   nrn: 'organization=<org-id>:account=<account-id>:namespace=<ns-id>:application=924036609',
 };
 
-const LAKE_ROWS = [
-  {
-    entity: 'runbook',
-    first_seen: '2026-08-01',
-    writes: 12,
-    methods: ['POST'],
-    sample_entity_id: 'rb_1',
-  },
-];
-
-const SIGNALS_CLEAN = {
-  data_flags: [],
+const CONFIG_CLEAN = {
   degraded_sources: [],
   entity_config_keys: ['user', 'parameter', 'notification', 'nrn', 'default'],
   entity_config_trusted: true,
-  new_entities: LAKE_ROWS,
-  degraded_entities: [],
-  probes: [],
-  signals_view: '### Data flags (0)\n(none)',
+  entity_modes: { user: 'standard', notification: 'self_contained', nrn: 'nrn' },
+  self_contained_entities: ['notification'],
+  clients_keys: ['default', 'user', 'notification'],
+  has_default_config: true,
+  config_view: '### Enhancer entityConfig keys (5)',
 };
 
 const GATHER_CARRY_OVER = {
@@ -125,7 +112,7 @@ interface StepCtx {
 interface CapturedResolves {
   resolve?: Record<string, unknown>;
   resolve_carryover?: Record<string, unknown>;
-  signalsRan: boolean;
+  configRan: boolean;
   agentRan: boolean;
   snapshot: IWorkflowContextSnapshot;
 }
@@ -158,19 +145,15 @@ const failure = (message: string): IStepResult => ({
   error: { message, code: 'CODE_EXEC_ERROR', retryable: false },
 });
 
-const LAKE_ERROR = 'NP_LAKE_5XX: gateway timeout';
-
 interface RunOptions {
   gatherOutput?: Record<string, unknown>;
-  /** Step id whose stub must fail (`signals`, `gather` or `audit_agent`). */
+  /** Step id whose stub must fail (`enhancer_config`, `gather`, `audit_agent`). */
   failStep?: string;
-  /** Lake step ids whose query must fail. */
-  lakeFailures?: string[];
 }
 
 async function run(options: RunOptions = {}): Promise<CapturedResolves> {
-  const { gatherOutput = GATHER_ANALYZE, failStep, lakeFailures = [] } = options;
-  const captured: Partial<CapturedResolves> = { signalsRan: false, agentRan: false };
+  const { gatherOutput = GATHER_ANALYZE, failStep } = options;
+  const captured: Partial<CapturedResolves> = { configRan: false, agentRan: false };
   const result = await runWorkflowE2E({
     yamlPath: WF_PATH,
     inputs: TRIGGER_OUTPUTS,
@@ -178,24 +161,12 @@ async function run(options: RunOptions = {}): Promise<CapturedResolves> {
       'np-checklist-trigger': TRIGGER_STUB,
       'np-checklist-item-progress': OK_STUB,
       'np-checklist-item-resolve': OK_STUB,
-      'np-lake-query': (ctx: StepCtx): IStepResult => {
-        const stepId = ctx.stepId ?? ctx.step?.id;
-        if (stepId !== undefined && lakeFailures.includes(stepId)) return failure(LAKE_ERROR);
-        return {
-          status: 'success',
-          outputs: { rows: LAKE_ROWS, rowCount: LAKE_ROWS.length },
-          items: LAKE_ROWS,
-          activePorts: ['default'],
-        };
-      },
-      // `set-variable` is left unstubbed on purpose: the real plugin runs, so
-      // the degraded-source variable is asserted against real behaviour.
       'code-exec': (ctx: StepCtx): IStepResult => {
         const stepId = ctx.stepId ?? ctx.step?.id;
         if (stepId === failStep) return failure(`boom ${stepId}`);
-        if (stepId === 'signals') {
-          captured.signalsRan = true;
-          return { status: 'success', outputs: SIGNALS_CLEAN, activePorts: ['default'] };
+        if (stepId === 'enhancer_config') {
+          captured.configRan = true;
+          return { status: 'success', outputs: CONFIG_CLEAN, activePorts: ['default'] };
         }
         if (stepId === 'gather') {
           return { status: 'success', outputs: gatherOutput, activePorts: ['default'] };
@@ -218,7 +189,7 @@ async function run(options: RunOptions = {}): Promise<CapturedResolves> {
 describe('audit-entity-check — routing', () => {
   it('carry_over skips the agent and resolves via resolve_carryover', async () => {
     const captured = await run({ gatherOutput: GATHER_CARRY_OVER });
-    expect(captured.signalsRan).toBe(true);
+    expect(captured.configRan).toBe(true);
     expect(captured.resolve_carryover).toBeTruthy();
     expect(captured.resolve).toBeUndefined();
     expect(captured.agentRan).toBe(false);
@@ -227,55 +198,29 @@ describe('audit-entity-check — routing', () => {
 
   it('analyze routes through the audit agent to resolve', async () => {
     const captured = await run();
-    expect(captured.signalsRan).toBe(true);
+    expect(captured.configRan).toBe(true);
     expect(captured.agentRan).toBe(true);
     expect(captured.resolve).toBeTruthy();
     expect(captured.resolve_carryover).toBeUndefined();
     expect(erroredSteps(captured.snapshot)).toEqual([]);
   });
 
-  it('runs both lake queries before signals', async () => {
+  it('runs the enhancer config read before gather, and nothing else', async () => {
     const captured = await run();
-    expect(stepRan(captured.snapshot, 'lake_new_entities')).toBe(true);
-    expect(stepRan(captured.snapshot, 'lake_empty_rows')).toBe(true);
-    expect(stepRan(captured.snapshot, 'signals')).toBe(true);
-  });
-
-  it('runs the second lake query even when the first one fails', async () => {
-    const captured = await run({ lakeFailures: ['lake_new_entities'] });
-    expect(stepRan(captured.snapshot, 'lake_new_degraded')).toBe(true);
-    // The independent source must survive its sibling's outage.
-    expect(stepRan(captured.snapshot, 'lake_empty_rows')).toBe(true);
-    expect(captured.signalsRan).toBe(true);
-    expect(captured.resolve).toBeTruthy();
-    expect(stepRan(captured.snapshot, 'resolve_failure_signals')).toBe(false);
-    // The error survives into the execution state, and signals gets it as an
-    // input so it can report the degraded source.
-    expect(captured.snapshot.variables?.['lake_new_entities_error']).toBe(LAKE_ERROR);
-    const signalsInputs = captured.snapshot.steps['signals']?.inputs ?? {};
-    expect(signalsInputs['new_entities_error']).toBe(LAKE_ERROR);
-    expect(signalsInputs['new_entity_rows']).toBeUndefined();
-    expect(signalsInputs['empty_row_rows']).toEqual(LAKE_ROWS);
-  });
-
-  it('keeps the first lake query when the second one fails', async () => {
-    const captured = await run({ lakeFailures: ['lake_empty_rows'] });
-    expect(stepRan(captured.snapshot, 'lake_empty_degraded')).toBe(true);
-    expect(stepRan(captured.snapshot, 'lake_new_degraded')).toBe(false);
-    expect(captured.signalsRan).toBe(true);
-    expect(captured.snapshot.variables?.['lake_empty_rows_error']).toBe(LAKE_ERROR);
-    const signalsInputs = captured.snapshot.steps['signals']?.inputs ?? {};
-    expect(signalsInputs['new_entity_rows']).toEqual(LAKE_ROWS);
-    expect(signalsInputs['empty_rows_error']).toBe(LAKE_ERROR);
-    expect(signalsInputs['empty_row_rows']).toBeUndefined();
-  });
-
-  it('still reaches signals when both lake queries fail', async () => {
-    const captured = await run({ lakeFailures: ['lake_new_entities', 'lake_empty_rows'] });
-    expect(stepRan(captured.snapshot, 'lake_new_degraded')).toBe(true);
-    expect(stepRan(captured.snapshot, 'lake_empty_degraded')).toBe(true);
-    expect(captured.signalsRan).toBe(true);
-    expect(captured.resolve).toBeTruthy();
+    expect(stepRan(captured.snapshot, 'enhancer_config')).toBe(true);
+    expect(stepRan(captured.snapshot, 'gather')).toBe(true);
+    // The graph is exactly the static path: no lake query, no probe, no
+    // re-entry node left over from the runtime signals it used to collect.
+    expect(Object.keys(captured.snapshot.steps).sort()).toEqual([
+      'audit_agent',
+      'enhancer_config',
+      'gather',
+      'progress',
+      'progress_analyzing',
+      'resolve',
+      'route',
+      'trigger',
+    ]);
   });
 });
 
@@ -286,8 +231,7 @@ describe('audit-entity-check — resolve payloads', () => {
       verdict?: { status?: string; findings?: unknown[] };
       scope?: string;
       analyzed_sha?: string;
-      data_flags?: unknown[];
-      degraded_sources?: unknown[];
+      unverified?: unknown[];
       item_id?: string;
     };
     expect(inputs.verdict?.status).toBe('failed');
@@ -295,9 +239,8 @@ describe('audit-entity-check — resolve payloads', () => {
     expect(inputs.scope).toBe('diff');
     expect(inputs.analyzed_sha).toBe(GATHER_ANALYZE.analyzed_sha);
     expect(inputs.item_id).toBe('audit_entity_check');
-    // Both signal channels reach the item, not just the data flags.
-    expect(inputs.data_flags).toEqual([]);
-    expect(inputs.degraded_sources).toEqual([]);
+    // Whatever could not be read reaches the item, so the report can say so.
+    expect(inputs.unverified).toEqual([]);
   });
 
   it('hands the previous verdict to resolve_carryover', async () => {
@@ -305,25 +248,25 @@ describe('audit-entity-check — resolve payloads', () => {
     const inputs = captured.resolve_carryover as {
       prev?: { status?: string; sha?: string };
       changed_count?: number;
-      degraded_sources?: unknown[];
+      unverified?: unknown[];
     };
     expect(inputs.prev?.status).toBe('passed');
     expect(inputs.prev?.sha).toBe(GATHER_CARRY_OVER.prev.sha);
     expect(inputs.changed_count).toBe(2);
-    expect(inputs.degraded_sources).toEqual([]);
+    expect(inputs.unverified).toEqual([]);
   });
 });
 
 describe('audit-entity-check — failure fallbacks', () => {
-  it('skips the item when signal collection crashes', async () => {
-    const captured = await run({ failStep: 'signals' });
-    expect(stepRan(captured.snapshot, 'resolve_failure_signals')).toBe(true);
+  it('skips the item when the enhancer configuration cannot be read', async () => {
+    const captured = await run({ failStep: 'enhancer_config' });
+    expect(stepRan(captured.snapshot, 'resolve_failure_config')).toBe(true);
     expect(stepRan(captured.snapshot, 'gather')).toBe(false);
     expect(captured.agentRan).toBe(false);
     expect(captured.resolve).toBeUndefined();
-    expect(captured.snapshot.steps['resolve_failure_signals']?.inputs?.['status']).toBe('skipped');
-    expect(String(captured.snapshot.steps['resolve_failure_signals']?.inputs?.['message'])).toContain(
-      'boom signals',
+    expect(captured.snapshot.steps['resolve_failure_config']?.inputs?.['status']).toBe('skipped');
+    expect(String(captured.snapshot.steps['resolve_failure_config']?.inputs?.['message'])).toContain(
+      'boom enhancer_config',
     );
   });
 
