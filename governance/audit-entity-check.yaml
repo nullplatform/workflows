@@ -237,11 +237,52 @@ steps:
         // positions that could not be named — a non-zero count means the key
         // list is INCOMPLETE, which is the difference between "this entity is
         // not configured" and "we did not read the whole map".
+        // Marks every offset of `src` that is real code. Everything inside a
+        // comment or inside a string literal is not — the delimiters themselves
+        // still are, so a quoted property key can anchor while a string that
+        // merely mentions the map cannot.
+        const codeOffsets = (src) => {
+          const isCode = new Array(src.length).fill(true);
+          for (let i = 0; i < src.length; i++) {
+            const c = src[i], next = src[i + 1];
+            if (c === "/" && next === "/") {
+              while (i < src.length && src[i] !== "\n") { isCode[i] = false; i++; }
+              continue;
+            }
+            if (c === "/" && next === "*") {
+              const close = src.indexOf("*/", i + 2);
+              const stop = close < 0 ? src.length : close + 2;
+              while (i < stop) { isCode[i] = false; i++; }
+              i--; continue;
+            }
+            if (c === '"' || c === "'" || c === "`") {
+              let j = i + 1;
+              while (j < src.length && src[j] !== c) {
+                isCode[j] = false;
+                if (src[j] === "\\" && j + 1 < src.length) { isCode[j + 1] = false; j++; }
+                j++;
+              }
+              i = j; continue;
+            }
+          }
+          return isCode;
+        };
+
         const extractObjectLiteral = (src, name, resolveRef) => {
           const resolve = resolveRef || (() => undefined);
+          // The name may be quoted when it is a property key. A quoted key
+          // closes its quote right after the name, which is what tells it apart
+          // from a string literal that happens to contain `name: {`.
           const anchor = new RegExp(
-            "(?:(?:const|let|var)\\s+" + name + "\\s*=|\\b" + name + "\\s*:)\\s*\\{");
-          const decl = anchor.exec(src);
+            "(?:(?:const|let|var)\\s+" + name + "\\s*=|\"" + name + "\"\\s*:|'" + name + "'\\s*:"
+            + "|\\b" + name + "\\s*:)\\s*\\{", "g");
+          // An anchor found in a comment or inside a string is a decoy: it would
+          // hand the caller (and the LLM excerpt) a completely unrelated object.
+          const isCode = codeOffsets(src);
+          let decl = null, candidate = null;
+          while ((candidate = anchor.exec(src)) !== null) {
+            if (isCode[candidate.index]) { decl = candidate; break; }
+          }
           if (!decl) return null;
           const open = decl.index + decl[0].length - 1;
           const keys = [];
@@ -382,8 +423,25 @@ steps:
             const cfg = extractObjectLiteral(appJs, "entityConfig", resolveRef);
             if (!cfg) throw new Error(`no entityConfig object literal in ${ENHANCER_DIR}/app.js`);
             entityConfigKeys = cfg.keys;
+            // The clients map gets its own confidence gate, for the same reason
+            // entityConfig has one: `clientsDeclares` returning false is what
+            // escalates a probe to `wrong_host`, so a mis-parsed key list would
+            // turn healthy entities into findings. The real map always routes
+            // `default`, which makes it a usable anchor.
             const clients = extractObjectLiteral(appJs, "clients", resolveRef);
-            clientsKeys = clients ? clients.keys : null;
+            const clientsDoubts = [];
+            if (!clients) clientsDoubts.push("no clients object literal found");
+            else {
+              if (clients.unresolved > 0) clientsDoubts.push(`${clients.unresolved} key position(s) unresolved`);
+              if (!clients.keys.includes("default")) clientsDoubts.push('no "default" client');
+              if (clients.keys.length < 3) clientsDoubts.push(`only ${clients.keys.length} client(s) parsed`);
+            }
+            clientsKeys = clientsDoubts.length === 0 ? clients.keys : null;
+            if (clientsDoubts.length) {
+              degraded_sources.push(
+                `enhancer clients map not parsed with confidence (${clientsDoubts.join("; ")})`
+                + ` — alternate-host verdicts left to the agent`);
+            }
             // Sanity gate before any comparison. An incomplete key set is the
             // dangerous one: comparing against it reports entities that ARE
             // configured as missing, so the gate demands every key position
@@ -478,9 +536,13 @@ steps:
         };
 
         // Entity names derive from request URL segments, so they are
-        // attacker-influenced: real names are a single path segment, and only
-        // those reach a probe URL.
-        const SAFE_ENTITY = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$/;
+        // attacker-influenced and only allowlisted ones reach a probe URL. Two
+        // segments are allowed because real names have them —
+        // `notification/channel`, `runtime_configuration/dimension` — and the
+        // enhancer fetches them as `GET /notification/channel/<id>`. No dot is
+        // in the charset and no segment may be empty, so `..` and `//` cannot
+        // appear.
+        const SAFE_ENTITY = /^[A-Za-z0-9_-]{1,64}(\/[A-Za-z0-9_-]{1,64})?$/;
         const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
         const MAX_PROBES = 4;
         const samples = new Map();
@@ -492,13 +554,21 @@ steps:
         for (const entity of [...samples.keys()].filter(e => !SAFE_ENTITY.test(e))) {
           const shown = String(entity).slice(0, 40);
           probes.push({ entity: shown, verdict: "skipped_unsafe_name" });
-          flag(entity, `probe: entity name ${JSON.stringify(shown)} skipped (characters outside the audit naming convention — itself a finding)`);
+          if (entityConfigTrusted && entityConfigKeys.includes(entity)) {
+            // The enhancer configures this name, so it is legitimate by
+            // definition: not being able to probe it is a gap in this check, not
+            // a finding about the application.
+            degraded_sources.push(`probe: entity ${JSON.stringify(shown)} is configured in the enhancer but its name is outside what this probe builds URLs for — not probed`);
+          } else {
+            flag(entity, `probe: entity name ${JSON.stringify(shown)} skipped (characters outside the audit naming convention — itself a finding)`);
+          }
         }
         const probeable = [...samples.keys()].filter(e => SAFE_ENTITY.test(e));
         const suspects = probeable.slice(0, MAX_PROBES);
-        // The probe table must never read as exhaustive when it is not.
+        // The probe table must never read as exhaustive when it is not, and the
+        // honest total is every suspect, not only the probeable ones.
         if (probeable.length > MAX_PROBES) {
-          degraded_sources.push(`probe: ${probeable.length} suspect entities but only the first ${MAX_PROBES} were probed (sandbox time budget) — the rest are unverified`);
+          degraded_sources.push(`probe: ${samples.size} suspect entities but only ${MAX_PROBES} were probed (sandbox time budget) — the rest are unverified`);
         }
 
         if (suspects.length && !isSet(enhancer_api_key)) {
@@ -512,8 +582,11 @@ steps:
             });
             if (!tokRes.ok) throw new Error(`enhancer token exchange → ${tokRes.status}`);
             const token = (await tokRes.json()).access_token;
+            // Each segment is escaped on its own so a two-segment entity keeps
+            // the slash the enhancer's own GET uses.
             const get = async (host, entity, id) => {
-              const r = await fetch(`${host}/${encodeURIComponent(entity)}/${encodeURIComponent(id)}`, {
+              const path = entity.split("/").map(encodeURIComponent).join("/");
+              const r = await fetch(`${host}/${path}/${encodeURIComponent(id)}`, {
                 headers: { authorization: `Bearer ${token}`, "X-Enhanced": "true" },
               }).catch(() => null);
               return r ? r.status : 0;
@@ -574,7 +647,7 @@ steps:
             ? degradedEntities.map(e => `- ${e.entity} — ${e.pct_empty}% empty (${e.empty_rows}/${e.total})`).join("\n")
             : "(none)",
           ``,
-          `### Fetch probe (enhancer identity, ${suspects.length} of ${probeable.length} suspect entities)`,
+          `### Fetch probe (enhancer identity, probed ${suspects.length} of ${samples.size} suspect entities)`,
           probes.length
             ? probes.map(p => `- ${p.entity} (id ${p.entity_id || "?"}) → HTTP ${p.status ?? "-"}${p.alt_host ? `, 200 on ${p.alt_host}` : ""} → ${p.verdict}`).join("\n")
             : "(no suspect entities probed)",
