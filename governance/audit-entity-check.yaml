@@ -1,0 +1,855 @@
+# Audit Coverage — entity configuration checklist item resolver.
+#
+# Pairs with checklist external items of `kind: audit-entity-check`. ONE item
+# per deploy: it validates that the entities this application writes are
+# correctly wired into the HTTP audit pipeline (producer → audit-enhancer →
+# customers_lake), so misconfigured entities are caught at deploy time instead
+# of showing up later as DLQ messages or `degraded` enrichment in Datadog.
+#
+# An entity is "correctly configured" when three sides agree:
+#   A. the producer emits the audit event (framework-dependent: server-audit
+#      on Fastify is opt-in per route; np-api-js on Express is opt-out; the
+#      service-api and workflow-api derive names with hand-rolled rules),
+#   B. the enhancer knows the entity name (entityConfig in its app.js:
+#      STANDARD / SELF_CONTAINED / NRN, plus clients map for non-default hosts),
+#   C. the enhancer's service account can read the entity (platform grant).
+#
+# Deterministic signals gathered before any LLM call:
+#   - enhancer entityConfig keys (read from the enhancer repo),
+#   - lake: entities first seen in the last 7 days + per-entity empty-row rate
+#     (the real-world proxy of `degraded`),
+#   - fetch probe: replay the enhancer's own GET (same identity, same
+#     X-Enhanced header) against a real entity_id — the response code predicts
+#     exactly what production will do (200 ok / 404 host-or-id / 401-403 grant
+#     / 5xx DLQ).
+# The LLM covers what data cannot: write routes in the repo that produce NO
+# audit at all (the evidence is an absence), and predicting the entity name a
+# new route will emit under each framework's derivation rule.
+#
+# Incremental strategy (same as arch-rule-check): past checklist runs are the
+# checkpoint store. Carry over the previous verdict only when the code diff
+# has no audit-relevant changes AND the deterministic signals raised no flags.
+# Fail open towards FULL analysis, never towards skipping.
+id: audit-entity-check
+key: audit-entity-check
+name: "Audit Coverage — Entity Config Check"
+description: >
+  Validates that the entities written by this application are correctly
+  configured for the HTTP audit pipeline: producer emits the event, the
+  audit-enhancer has config for the entity name, and the enhancer's service
+  account can fetch it. Combines deterministic signals (lake queries, enhancer
+  config, fetch probe) with an LLM pass over the repository for write routes
+  that do not audit. One execution per checklist item
+  (kind: audit-entity-check).
+semantic_version: 1.0.0
+path: "/checklist/audit"
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-checklist-trigger
+    name: "On checklist dispatch (audit-entity-check)"
+    config:
+      pathPrefix: /np/checklist/audit-entity-check
+      mode: start
+      kind: audit-entity-check
+      # Literal NRN: the hosted engine does NOT resolve ${{ vars.* }} in
+      # trigger config at activation time — an expression here reaches the
+      # notifications API verbatim and fails channel creation with an
+      # unexplained 403. Change this value when publishing to another org.
+      nrn: "organization=1255165411"
+      npApiKey: "${{ secrets.NP_API_KEY }}"
+
+  - id: progress
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: collecting audit signals"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Collecting audit pipeline signals (lake, enhancer config, fetch probe)…"
+
+  - id: signals
+    type: module
+    plugin_type: code-exec
+    name: "Deterministic signals: enhancer config + lake + probe"
+    inputs:
+      github_token:     "${{ secrets.GITHUB_TOKEN }}"
+      enhancer_api_key: "${{ secrets.ENHANCER_API_KEY }}"
+      org_id:           "${{ vars.NP_ORGANIZATION_ID }}"
+      enhancer_repo:    "nullplatform/data-audit-stream-enhancer"
+      ch_host:          "${{ vars.CLICKHOUSE_HOST }}"
+      ch_port:          "${{ vars.CLICKHOUSE_PORT }}"
+      ch_database:      "${{ vars.CLICKHOUSE_DATABASE }}"
+      ch_username:      "${{ vars.CLICKHOUSE_USERNAME }}"
+      ch_password:      "${{ secrets.CLICKHOUSE_PASSWORD }}"
+    config:
+      network:
+        allowedHosts:
+          - "api.github.com"
+          - "authz.nullplatform.io"
+          - "api.nullplatform.io"
+          - "users.nullplatform.io"
+          - "params.nullplatform.io"
+          - "providers.nullplatform.io"
+          - "approvals.nullplatform.io"
+          - "notifications.nullplatform.io"
+          - "governance-action-items-api-production-ufjmx.prod.nullapps.io"
+          - "${{ vars.CLICKHOUSE_HOST }}"
+      code: |
+        const { github_token, enhancer_api_key, org_id, enhancer_repo,
+                ch_host, ch_port, ch_database, ch_username, ch_password } = $item;
+
+        // Every signal source degrades to a flag instead of failing the run:
+        // a missing signal forces analysis, it never blocks the checklist.
+        const flags = [];
+
+        // --- Source 1: enhancer entityConfig (side B) ---
+        let entityConfigKeys = [];
+        let appJsExcerpt = "";
+        try {
+          const r = await fetch(`https://api.github.com/repos/${enhancer_repo}/contents/app.js`, {
+            headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github.raw+json" },
+          });
+          if (!r.ok) throw new Error(`GET app.js → ${r.status}`);
+          const src = await r.text();
+          const at = src.indexOf("entityConfig");
+          if (at < 0) throw new Error("entityConfig not found in app.js");
+          const open = src.indexOf("{", at);
+          // Walk braces and collect the object's top-level keys.
+          let depth = 0, end = open;
+          for (let i = open; i < src.length; i++) {
+            if (src[i] === "{") depth++;
+            else if (src[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+          }
+          const block = src.slice(open, end + 1);
+          let d = 0;
+          const keyRe = /(?:"([^"\n]+)"|'([^'\n]+)'|([A-Za-z_$][\w$]*))\s*:/y;
+          for (let i = 0; i < block.length; i++) {
+            const c = block[i];
+            if (c === "{") d++;
+            else if (c === "}") d--;
+            else if (d === 1) {
+              keyRe.lastIndex = i;
+              const m = keyRe.exec(block);
+              if (m) {
+                entityConfigKeys.push(m[1] || m[2] || m[3]);
+                i = keyRe.lastIndex - 1;
+                // Skip the key's value so nested object keys are not collected.
+                while (i < block.length && block[i] !== "{" && block[i] !== "," && block[i] !== "}") i++;
+                i--;
+              }
+            }
+          }
+          appJsExcerpt = src.slice(Math.max(0, at - 200), Math.min(src.length, end + 1200)).slice(0, 12000);
+        } catch (e) {
+          flags.push(`enhancer entityConfig unavailable: ${e.message}`);
+        }
+
+        // --- Source 2: the lake (sides A+B observed in the wild) ---
+        // reader user: custom_session_nrns MUST precede readonly in the query
+        // string, otherwise readonly=1 locks the setting and every table 403s.
+        const chUrl = `http://${ch_host}:${ch_port}/?database=${ch_database}`
+          + `&custom_session_nrns=${encodeURIComponent(`organization=${org_id}`)}&readonly=1`;
+        const chAuth = "Basic " + btoa(`${ch_username}:${ch_password}`);
+        const ch = async (sql) => {
+          const r = await fetch(chUrl, {
+            method: "POST",
+            headers: { authorization: chAuth },
+            body: `${sql} FORMAT JSON`,
+          });
+          if (!r.ok) throw new Error(`clickhouse → ${r.status}: ${(await r.text()).slice(0, 200)}`);
+          return (await r.json()).data || [];
+        };
+
+        let newEntities = [], degradedEntities = [];
+        try {
+          newEntities = await ch(`
+            SELECT entity, toString(min(date)) AS first_seen, count() AS writes,
+                   groupUniqArray(10)(method) AS methods
+            FROM audit_events
+            WHERE method != 'GET'
+            GROUP BY entity
+            HAVING min(date) > now() - INTERVAL 7 DAY
+            ORDER BY writes DESC
+            LIMIT 20`);
+          // Empty-row detector: buildResp always injects `version`, so an
+          // enriched row has at least one other key in entity_data.
+          degradedEntities = await ch(`
+            SELECT entity, count() AS total,
+                   countIf(JSONAllPaths(entity_data) = ['version']
+                           AND toString(entity_context) = '{}') AS empty_rows,
+                   round(100 * empty_rows / total, 1) AS pct_empty
+            FROM audit_events
+            WHERE date > now() - INTERVAL 7 DAY AND method != 'GET'
+            GROUP BY entity
+            HAVING total > 20 AND pct_empty > 5
+            ORDER BY pct_empty DESC
+            LIMIT 20`);
+          for (const e of newEntities) {
+            if (entityConfigKeys.length && !entityConfigKeys.includes(e.entity)) {
+              flags.push(`new entity "${e.entity}" (first seen ${e.first_seen}) is missing from the enhancer entityConfig`);
+            }
+          }
+          for (const e of degradedEntities) {
+            flags.push(`entity "${e.entity}" has ${e.pct_empty}% empty rows in the lake (${e.empty_rows}/${e.total}, last 7d)`);
+          }
+        } catch (e) {
+          flags.push(`lake unavailable: ${e.message}`);
+        }
+
+        // --- Source 3: fetch probe (side C) ---
+        // Replays the enhancer's own enrichment GET with ITS identity, so
+        // every response code is conclusive about what production will do.
+        const HOSTS = [
+          "https://api.nullplatform.io",
+          "https://users.nullplatform.io",
+          "https://params.nullplatform.io",
+          "https://providers.nullplatform.io",
+          "https://approvals.nullplatform.io",
+          "https://notifications.nullplatform.io",
+          "https://governance-action-items-api-production-ufjmx.prod.nullapps.io",
+        ];
+        const PROBE_VERDICT = (code, altHit) => {
+          if (code === 200) return "ok";
+          if (altHit) return "wrong_host";
+          if (code === 404) return "id_or_endpoint_missing";
+          if (code === 401 || code === 403) return "missing_grant";
+          return "upstream_error_dlq_risk";
+        };
+        const probes = [];
+        try {
+          // Entity names derive from request URL segments, so they are
+          // attacker-influenced: only allowlisted names may reach the SQL
+          // literal or the probe URL.
+          const SAFE_ENTITY = /^[A-Za-z0-9_][A-Za-z0-9_./-]{0,63}$/;
+          const allSuspects = [...new Set([
+            ...newEntities.map(e => e.entity),
+            ...degradedEntities.map(e => e.entity),
+          ])];
+          for (const entity of allSuspects) {
+            if (!SAFE_ENTITY.test(entity)) {
+              probes.push({ entity, verdict: "skipped_unsafe_name" });
+              flags.push(`probe: entity name ${JSON.stringify(entity)} skipped (characters outside the audit naming convention — itself a finding)`);
+            }
+          }
+          const suspects = allSuspects.filter(e => SAFE_ENTITY.test(e)).slice(0, 8);
+          if (suspects.length) {
+            const tokRes = await fetch("https://authz.nullplatform.io/token", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ apikey: enhancer_api_key }),
+            });
+            if (!tokRes.ok) throw new Error(`enhancer token exchange → ${tokRes.status}`);
+            const token = (await tokRes.json()).access_token;
+            for (const entity of suspects) {
+              const sample = await ch(`
+                SELECT entity_id FROM audit_events
+                WHERE entity = '${entity}'
+                  AND method != 'GET' AND entity_id != ''
+                  AND date > now() - INTERVAL 14 DAY
+                ORDER BY date DESC LIMIT 1`).catch(() => []);
+              const id = sample[0] && sample[0].entity_id;
+              if (!id) { probes.push({ entity, verdict: "no_sample_id" }); continue; }
+              if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(id)) {
+                probes.push({ entity, entity_id: id, verdict: "skipped_unsafe_id" });
+                flags.push(`probe: entity "${entity}" has a sample entity_id with unexpected characters (${JSON.stringify(String(id).slice(0, 40))}) — itself a finding`);
+                continue;
+              }
+              const get = async (host) => {
+                const r = await fetch(`${host}/${entity}/${id}`, {
+                  headers: { authorization: `Bearer ${token}`, "X-Enhanced": "true" },
+                }).catch(() => null);
+                return r ? r.status : 0;
+              };
+              const code = await get(HOSTS[0]);
+              let altHit = null;
+              if (code === 404) {
+                for (const host of HOSTS.slice(1)) {
+                  if (await get(host) === 200) { altHit = host; break; }
+                }
+              }
+              const verdict = PROBE_VERDICT(code, altHit);
+              probes.push({ entity, entity_id: id, status: code, alt_host: altHit, verdict });
+              if (verdict !== "ok") {
+                flags.push(`probe: entity "${entity}" → HTTP ${code}${altHit ? ` on default host but 200 on ${altHit}` : ""} (${verdict})`);
+              }
+            }
+          }
+        } catch (e) {
+          flags.push(`fetch probe unavailable: ${e.message}`);
+        }
+
+        const signals_view = [
+          `### Enhancer entityConfig keys (${entityConfigKeys.length})`,
+          entityConfigKeys.length ? "```\n" + entityConfigKeys.join(", ") + "\n```" : "(unavailable)",
+          ``,
+          `### Enhancer app.js excerpt (entityConfig + clients)`,
+          appJsExcerpt ? "```js\n" + appJsExcerpt + "\n```" : "(unavailable)",
+          ``,
+          `### Entities first seen in the lake in the last 7 days`,
+          newEntities.length
+            ? newEntities.map(e => `- ${e.entity} — first seen ${e.first_seen}, ${e.writes} writes, methods: ${(e.methods || []).join("/")}`).join("\n")
+            : "(none)",
+          ``,
+          `### Entities with empty enrichment rows (degraded proxy, last 7 days)`,
+          degradedEntities.length
+            ? degradedEntities.map(e => `- ${e.entity} — ${e.pct_empty}% empty (${e.empty_rows}/${e.total})`).join("\n")
+            : "(none)",
+          ``,
+          `### Fetch probe (enhancer identity)`,
+          probes.length
+            ? probes.map(p => `- ${p.entity} (id ${p.entity_id || "?"}) → HTTP ${p.status ?? "-"}${p.alt_host ? `, 200 on ${p.alt_host}` : ""} → ${p.verdict}`).join("\n")
+            : "(no suspect entities probed)",
+          ``,
+          `### Flags (${flags.length})`,
+          flags.length ? flags.map(f => `- ${f}`).join("\n") : "(none)",
+        ].join("\n");
+
+        return {
+          flags,
+          entity_config_keys: entityConfigKeys,
+          new_entities: newEntities,
+          degraded_entities: degradedEntities,
+          probes,
+          signals_view,
+        };
+    error_handling:
+      fallback_step: resolve_failure_signals
+
+  - id: gather
+    type: module
+    plugin_type: code-exec
+    name: "Checkpoint + diff + repo content"
+    inputs:
+      application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
+      release_id:     "${{ steps.trigger.outputs.inputs.release_id }}"
+      check_id:       "${{ steps.trigger.outputs.inputs.check_id }}"
+      force_full:     "${{ steps.trigger.outputs.inputs.force_full }}"
+      callbackUrl:    "${{ steps.trigger.outputs.callbackUrl }}"
+      signal_flags:   "${{ steps.signals.outputs.flags }}"
+      np_api_key:     "${{ secrets.NP_API_KEY }}"
+      github_token:   "${{ secrets.GITHUB_TOKEN }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com", "api.github.com"]
+      code: |
+        const { application_id, release_id, check_id, force_full, callbackUrl,
+                signal_flags, np_api_key, github_token } = $item;
+        const itemId = check_id || "audit_entity_check";
+
+        // --- NP client (api-key → token) ---
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: np_api_key }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+        const np = async (path) => {
+          const r = await fetch(`https://api.nullplatform.com${path}`, {
+            headers: { authorization: `Bearer ${npToken}` },
+          });
+          if (!r.ok) throw new Error(`NP GET ${path} → ${r.status}`);
+          return r.json();
+        };
+        const npTry = async (path) => { try { return await np(path); } catch (e) { return null; } };
+        const ghJson = async (path) => {
+          const r = await fetch(`https://api.github.com${path}`, {
+            headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github+json" },
+          });
+          if (!r.ok) throw new Error(`GitHub ${path} → ${r.status}`);
+          return r.json();
+        };
+        const ghRaw = async (path) => {
+          const r = await fetch(`https://api.github.com${path}`, {
+            headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github.raw+json" },
+          });
+          if (!r.ok) return null;
+          return r.text();
+        };
+
+        // --- App, repo, current commit ---
+        const app = await np(`/application/${application_id}`);
+        const repo = (app.repository_url || "").replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
+        if (!repo) throw new Error(`application ${application_id} has no repository_url`);
+        let currentSha = null, branch = null;
+        if (release_id) {
+          const rel = await npTry(`/release/${release_id}`);
+          const build = rel && rel.build_id ? await npTry(`/build/${rel.build_id}`) : null;
+          currentSha = build && build.commit && build.commit.id || null;
+          branch = build && build.branch || null;
+        }
+        const repoInfo = await ghJson(`/repos/${repo}`);
+        branch = branch || repoInfo.default_branch || "main";
+        if (!currentSha) {
+          const head = await ghJson(`/repos/${repo}/commits/${branch}`);
+          currentSha = head.sha;
+        }
+
+        // --- Checkpoint: previous checklist run with our item stamped ---
+        const myApproval = (callbackUrl.match(/\/approval\/(\d+)\//) || [])[1];
+        const flatten = (items) => (items || []).reduce((acc, it) => {
+          acc.push(it);
+          if (it.children) acc.push(...flatten(it.children));
+          return acc;
+        }, []);
+        let checkpoint = null;
+        const appNrn = encodeURIComponent(app.nrn);
+        const prior = await npTry(`/approval?nrn=${appNrn}&limit=10`);
+        // Cancelled approvals are VALID checkpoints — the natural loop is
+        // cancel → fix → redeploy. What matters is the stamped analyzed_sha.
+        for (const row of (prior && prior.results || [])) {
+          if (String(row.id) === String(myApproval)) continue;
+          if (row.mode !== "checklist") continue;
+          const run = await npTry(`/approval/${row.id}/checklist`);
+          if (!run) continue;
+          const item = flatten(run.items).find(i => i.id === itemId);
+          const det = item && (item.details || (item.state && item.state.details));
+          if (item && det && det.analyzed_sha && (item.status === "passed" || item.status === "failed")) {
+            checkpoint = {
+              approval_id: row.id,
+              sha: det.analyzed_sha,
+              status: item.status,
+              findings: det.findings || [],
+              markdown: det.markdown || "",
+            };
+            break;
+          }
+        }
+
+        // --- Decision: carry_over vs analyze (full | diff | verify_fix) ---
+        // Audit wiring lives in source code (routes, audit config), so any
+        // changed source file is relevant; docs/tests/lockfiles are not.
+        const forceFull = String(force_full || "") === "true";
+        const dataFlags = Array.isArray(signal_flags) ? signal_flags : [];
+        const RELEVANT = /\.(m?[jt]sx?|py|go|rb|java)$|(^|\/)(null(app)?\.ya?ml|\.nullplatform\/[^/]+)$/i;
+        const IRRELEVANT = /(^|\/)(__tests__|__mocks__|tests?|docs?)\/|\.(md|txt|snap)$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
+        let mode = "analyze", scope = "full", changed = null;
+
+        if (!forceFull && checkpoint && checkpoint.sha) {
+          if (checkpoint.sha === currentSha) {
+            changed = [];
+            if (checkpoint.status === "failed") { mode = "analyze"; scope = "verify_fix"; }
+            else if (dataFlags.length === 0) { mode = "carry_over"; }
+            else { mode = "analyze"; scope = "diff"; }
+          } else {
+            try {
+              const cmp = await ghJson(`/repos/${repo}/compare/${checkpoint.sha}...${currentSha}`);
+              changed = (cmp.files || []).map(f => f.filename);
+              const tooBig = changed.length > 80 || (cmp.files || []).length === 0 && (cmp.commits || []).length > 0;
+              const relevant = changed.filter(p => RELEVANT.test(p) && !IRRELEVANT.test(p));
+              if (tooBig) { mode = "analyze"; scope = "full"; }
+              else if (checkpoint.status === "failed") { mode = "analyze"; scope = "verify_fix"; }
+              else if (relevant.length === 0 && dataFlags.length === 0) { mode = "carry_over"; }
+              else { mode = "analyze"; scope = "diff"; }
+            } catch (e) {
+              // compare failed (force-push, divergent history) → full, never skip
+              mode = "analyze"; scope = "full"; changed = null;
+            }
+          }
+        }
+
+        if (mode === "carry_over") {
+          return {
+            mode, repo, branch, analyzed_sha: currentSha,
+            prev: checkpoint,
+            changed_count: changed ? changed.length : 0,
+          };
+        }
+
+        // --- Build llm_view for the analysis path ---
+        const tree = await ghJson(`/repos/${repo}/git/trees/${branch}?recursive=1`);
+        const blobs = (tree.tree || []).filter(t => t.type === "blob");
+        const paths = blobs.map(t => t.path);
+        // Audit wiring concentrates in routes/controllers/middleware and the
+        // app entry point, so those rank first in the snapshot.
+        const AUDIT_HOT = /(route|controller|handler|endpoint|middleware|audit|server|api|entit)/i;
+        const ALWAYS = /(^|\/)(package\.json|requirements\.txt|go\.mod|Dockerfile|null(app)?\.ya?ml|\.nullplatform\/[^/]+)$/i;
+        const ENTRY = /(^|\/)(src\/)?(index|main|app|server)\.[cm]?[jt]sx?$|(^|\/)(app|main)\.py$|(^|\/)main\.go$/i;
+        const SKIP = /(^|\/)(node_modules|dist|build|\.git|vendor|coverage|\.next|out)\/|(\.(png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|lock|min\.js|min\.css))$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
+
+        const changedSet = new Set(changed || []);
+        const findingFiles = new Set((checkpoint && checkpoint.findings || []).map(f => f.file).filter(Boolean));
+        const score = (p) => {
+          if (SKIP.test(p)) return -1;
+          if (scope !== "full" && (changedSet.has(p) || findingFiles.has(p))) return 5;
+          if (AUDIT_HOT.test(p)) return 3;
+          if (ALWAYS.test(p)) return 3;
+          if (ENTRY.test(p)) return 4;
+          return 0;
+        };
+        const ranked = blobs
+          .map(b => ({ path: b.path, size: b.size || 0, s: score(b.path) }))
+          .filter(b => b.s > 0 && b.size < 200000)
+          .sort((a, b) => b.s - a.s || a.size - b.size)
+          .slice(0, 30);
+
+        const PER_FILE = 12000, TOTAL = 90000;
+        let used = 0;
+        const files = [];
+        for (const f of ranked) {
+          if (used >= TOTAL) break;
+          const content = await ghRaw(`/repos/${repo}/contents/${encodeURIComponent(f.path).replace(/%2F/g, "/")}?ref=${branch}`);
+          if (content === null) continue;
+          const clipped = content.slice(0, Math.min(PER_FILE, TOTAL - used));
+          used += clipped.length;
+          files.push({ path: f.path, truncated: content.length > clipped.length, content: clipped });
+        }
+
+        const treeView = paths.filter(p => !SKIP.test(p)).slice(0, 400).join("\n");
+        const scopeNote = scope === "full"
+          ? "FULL AUDIT: no previous checkpoint (or forced)."
+          : scope === "verify_fix"
+            ? `FIX VERIFICATION: this check FAILED at commit ${checkpoint.sha.slice(0,7)}. Changed files since then: ${(changed||[]).join(", ") || "(none)"}.`
+            : `DIFF-SCOPED AUDIT: check passed at ${checkpoint.sha.slice(0,7)}; re-checking because of ${(changed||[]).length} changed file(s) and/or ${dataFlags.length} data flag(s).`;
+        const llm_view = [
+          `## Repository: ${repo} (branch: ${branch}, commit: ${currentSha.slice(0,7)}) — application "${app.name}"`,
+          ``, `### Analysis scope`, scopeNote, ``,
+          `### Full file tree (${paths.length} files)`,
+          "```", treeView, "```",
+          ``,
+          `### Selected file contents (${files.length} files)`,
+          ...files.map(f => `\n--- ${f.path}${f.truncated ? " (truncated)" : ""} ---\n${f.content}`),
+        ].join("\n");
+
+        return {
+          mode: "analyze", scope, repo, branch, analyzed_sha: currentSha,
+          prev: checkpoint, changed_count: changed ? changed.length : null,
+          total_files: paths.length,
+          prev_findings_view: (checkpoint && checkpoint.findings || []).map(f => `- ${f.file || f.entity}: ${f.issue}`).join("\n") || "(none)",
+          llm_view,
+        };
+    error_handling:
+      fallback_step: resolve_failure_gather
+
+  - id: route
+    type: decider
+    plugin_type: conditional
+    name: "Carry-over or analyze?"
+    config:
+      expression: "steps.gather.outputs.mode == 'analyze'"
+
+  - id: progress_analyzing
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: auditing entity configuration"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Auditing entity audit configuration (${{ steps.gather.outputs.scope }}) with AI…"
+
+  - id: audit_agent
+    type: module
+    plugin_type: claude-code-agent
+    name: "Audit entity configuration coverage"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 5
+      systemPrompt: |
+        You are the audit-coverage auditor for nullplatform's engineering
+        platform. Every HTTP write (POST/PUT/PATCH/DELETE) served by an
+        internal API must produce an audit event that flows producer →
+        audit-enhancer → customers_lake. Your job: given ONE application's
+        repository snapshot plus deterministic pipeline signals, decide
+        whether the entities this application writes are correctly configured
+        for auditing. Do not use tools; respond directly with your final
+        answer.
+
+        How entity names are derived (framework-specific — identify which one
+        this repo uses before judging):
+        - Fastify + @nullplatform/server-audit: OPT-IN per route via
+          `config.audit` ({ enabled: true, entity, id resolver }). A write
+          route without config.audit produces NO audit event. Field
+          validation is blocking and silent: a missing mandatory field means
+          the event is never published.
+        - Express + np-api-js inspector: OPT-OUT. Every write is audited and
+          the entity name is inferred from the FIRST path segment of the URL.
+          GETs are not audited. A route can disable with `audit.enabled:
+          false`.
+        - Hand-rolled (main-service-api): entity derived with an
+          even/odd URL-segment rule.
+        - Hand-rolled (workflow-api): explicit regex map (ENTITY_MAP) with a
+          `workflow_<segment>` fallback for unmatched paths.
+
+        An entity is correctly configured when three sides agree:
+        A. producer emits the event with mandatory fields,
+        B. the enhancer's entityConfig has an entry for that exact name
+           (STANDARD needs a readable GET /<entity>/<id>; SELF_CONTAINED
+           enriches from the body/snapshot; NRN from the nrn), plus a
+           `clients` entry when the entity lives on a non-default host,
+        C. the enhancer's service account holds a read grant (the probe
+           results are the ground truth for this side — trust them over any
+           inference).
+
+        The snapshot header states the ANALYSIS SCOPE:
+        - FULL AUDIT: judge the whole repo.
+        - DIFF-SCOPED AUDIT: the check passed at a previous commit; focus on
+          whether the CHANGED files (new/modified routes) break audit
+          coverage, and on the data flags. Do not re-litigate unchanged code.
+        - FIX VERIFICATION: the check previously FAILED with the findings
+          listed; your PRIMARY job is deciding whether each was resolved,
+          filling `resolved_findings`, then checking for new issues.
+
+        Judgment guidelines:
+        - The single most important thing data cannot see: write routes that
+          produce NO audit event. Enumerate the repo's write routes, apply the
+          framework's derivation rule, and predict the entity name each will
+          emit. Cross-check predicted names against the enhancer
+          entityConfig keys.
+        - Use the probe table verbatim: 200=ok; 404 with a 200 on another
+          host=missing clients entry; 404 everywhere=wrong entity_id or no
+          read endpoint (needs idRemapper or SELF_CONTAINED); 401/403=missing
+          grant; 5xx=DLQ risk (most urgent).
+        - Tolerated-401 configs (ignoreStatusCodes) avoid the DLQ but leave
+          the entity degraded forever — flag them as findings, not as ok.
+        - If this application serves no HTTP writes at all (worker, frontend),
+          answer not_applicable and say why in one sentence.
+        - Every finding names a concrete file or entity, one-sentence issue,
+          one-sentence concrete fix.
+        - fix_instructions_md must be a short markdown recipe actionable by a
+          coding agent WITHOUT further context. Empty string when passed.
+        - The snapshot is partial: never invent file contents you were not
+          shown. If the selected files are insufficient to prove a problem,
+          lean towards passed and say what you could not verify.
+      userPrompt: |
+        Application audit-coverage check.
+
+        Previous findings (relevant in FIX VERIFICATION scope):
+        ${{ steps.gather.outputs.prev_findings_view }}
+
+        Deterministic pipeline signals (enhancer config, lake, probe):
+
+        ${{ steps.signals.outputs.signals_view }}
+
+        Repository snapshot:
+
+        ${{ steps.gather.outputs.llm_view }}
+      outputSchema:
+        type: object
+        required: [status, summary]
+        properties:
+          status: { type: string, enum: [passed, failed, not_applicable] }
+          summary: { type: string, description: "≤60 words: the verdict and its single most important reason" }
+          findings:
+            type: array
+            items:
+              type: object
+              required: [issue, fix]
+              properties:
+                area: { type: string, enum: [unaudited_route, name_mismatch, missing_entity_config, missing_grant, wrong_host, needs_id_remapper, needs_self_contained, degraded_entity, dlq_risk, missing_mandatory_field, other] }
+                entity: { type: string }
+                file: { type: string }
+                issue: { type: string }
+                fix: { type: string }
+          resolved_findings:
+            type: array
+            items:
+              type: object
+              required: [issue, resolution]
+              properties:
+                entity: { type: string }
+                file: { type: string }
+                issue: { type: string }
+                resolution: { type: string }
+          entities:
+            type: array
+            description: "Write entities this application emits (observed or predicted from routes)"
+            items:
+              type: object
+              required: [entity, verdict]
+              properties:
+                entity: { type: string }
+                source: { type: string, description: "route or mechanism that produces it" }
+                verdict: { type: string, enum: [ok, unaudited, misconfigured, unverified] }
+          fix_instructions_md: { type: string }
+    error_handling:
+      fallback_step: resolve_failure_agent
+
+  - id: resolve
+    type: module
+    plugin_type: code-exec
+    name: "Log findings + resolve item"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      check_id:      "${{ steps.trigger.outputs.inputs.check_id }}"
+      verdict:       "${{ steps.audit_agent.outputs }}"
+      gathered:      "${{ steps.gather.outputs }}"
+      signal_flags:  "${{ steps.signals.outputs.flags }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const { callbackUrl, callbackToken, check_id, verdict, gathered, signal_flags } = $item;
+        const itemId = check_id || "audit_entity_check";
+        const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
+        const post = (url, body) => fetch(url, { method: "POST", headers: H, body: JSON.stringify(body) });
+        const patch = (url, body) => fetch(url, { method: "PATCH", headers: H, body: JSON.stringify(body) });
+
+        const v = verdict || {};
+        const na = v.status === "not_applicable";
+        const status = v.status === "failed" ? "failed" : "passed";
+        const findings = v.findings || [];
+        const resolved = v.resolved_findings || [];
+        const entities = v.entities || [];
+        const flags = Array.isArray(signal_flags) ? signal_flags : [];
+        const scope = gathered.scope || "full";
+        const sha7 = (gathered.analyzed_sha || "").slice(0, 7);
+
+        for (const f of resolved) {
+          await post(`${callbackUrl}/log`, { level: "info", message: `Resolved: ${f.entity || f.file || ""} — ${f.issue} → ${f.resolution}` }).catch(() => null);
+        }
+        for (const f of findings) {
+          await post(`${callbackUrl}/log`, {
+            level: status === "failed" ? "warning" : "info",
+            message: `[${f.area || "other"}] ${f.entity || f.file || ""}: ${f.issue} — Fix: ${f.fix}`,
+          }).catch(() => null);
+        }
+        await post(`${callbackUrl}/log`, {
+          level: "info",
+          message: na ? `Check not applicable — treated as passed.` : `Verdict (${scope} @ ${sha7}): ${v.status}. ${v.summary || ""}`,
+        }).catch(() => null);
+
+        const ICON = { ok: "✅", unaudited: "🔇", misconfigured: "⚠️", unverified: "❔" };
+        const mdEntities = entities.length
+          ? "\n**Entidades de escritura de esta aplicación:**\n" + entities.map(e =>
+              `- ${ICON[e.verdict] || "•"} \`${e.entity}\` (${e.verdict})${e.source ? ` — ${e.source}` : ""}`).join("\n")
+          : "";
+        const mdResolved = resolved.length
+          ? "\n**Findings resueltos desde el último deploy:**\n" + resolved.map(f => `- ✅ \`${f.entity || f.file || ""}\` — ${f.issue}\n  - ${f.resolution}`).join("\n")
+          : "";
+        const mdFindings = findings.length
+          ? "\n**Findings:**\n" + findings.map(f => `- \`${f.entity || f.file || ""}\` [${f.area || "other"}] — ${f.issue}\n  - **Fix:** ${f.fix}`).join("\n")
+          : "";
+        const mdFlags = flags.length
+          ? "\n**Señales determinísticas:**\n" + flags.map(f => `- ${f}`).join("\n")
+          : "";
+        const mdFix = (status === "failed" && v.fix_instructions_md)
+          ? `\n\n#### How to fix\n${v.fix_instructions_md}`
+          : "";
+        const scopeLabel = scope === "full" ? "análisis completo"
+          : scope === "verify_fix" ? "verificación de fixes"
+          : `incremental (${gathered.changed_count ?? "?"} archivos cambiados)`;
+        const markdown = [
+          `### Audit coverage — ${na ? "N/A" : status.toUpperCase()}`,
+          ``,
+          `Repo: \`${gathered.repo}\` · 🔎 ${scopeLabel} @ \`${sha7}\``,
+          ``,
+          v.summary || "",
+          mdEntities, mdFlags, mdResolved, mdFindings, mdFix,
+        ].join("\n");
+
+        const message = na
+          ? `N/A: ${v.summary || "application serves no audited writes"}`
+          : `${status === "passed" ? "OK" : `${findings.length} issue(s)`} [${scopeLabel}]: ${(v.summary || "").slice(0, 160)}`;
+
+        const details = {
+          markdown, check_id: itemId, findings,
+          analyzed_sha: gathered.analyzed_sha, scope,
+          entities: entities.map(e => ({ ...e })),
+        };
+
+        const r = await patch(callbackUrl, { status, message, details });
+        if (!r.ok) throw new Error(`resolve ${itemId} -> ${r.status}: ${await r.text()}`);
+        return { resolved: true, status, findings: findings.length, scope };
+
+  - id: resolve_carryover
+    type: module
+    plugin_type: code-exec
+    name: "Carry over previous verdict (no relevant changes, no flags)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      check_id:      "${{ steps.trigger.outputs.inputs.check_id }}"
+      gathered:      "${{ steps.gather.outputs }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const { callbackUrl, callbackToken, check_id, gathered } = $item;
+        const itemId = check_id || "audit_entity_check";
+        const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
+        const prev = gathered.prev || {};
+        const sha7 = (gathered.analyzed_sha || "").slice(0, 7);
+        const prev7 = (prev.sha || "").slice(0, 7);
+        const n = gathered.changed_count || 0;
+
+        const message = `≡ Sin cambios relevantes ni señales nuevas desde ${prev7} (${n} archivo(s) tocados) — se mantiene ${prev.status.toUpperCase()}`;
+        const markdown = [
+          `### Audit coverage — ${prev.status.toUpperCase()} (carry-over)`,
+          ``,
+          `Repo: \`${gathered.repo}\` · ≡ sin re-análisis: los ${n} archivo(s) cambiados desde \`${prev7}\` no tocan el wiring de audit y no hay señales nuevas del pipeline.`,
+          ``,
+          `_Último análisis real (@ \`${prev7}\`):_`,
+          ``,
+          prev.markdown || "(sin detalle previo)",
+        ].join("\n");
+
+        await fetch(`${callbackUrl}/log`, { method: "POST", headers: H, body: JSON.stringify({
+          level: "info", message: `Carry-over from approval ${prev.approval_id} @ ${prev7}: ${n} changed file(s), none audit-relevant, no data flags.`,
+        }) }).catch(() => null);
+
+        const r = await fetch(callbackUrl, { method: "PATCH", headers: H, body: JSON.stringify({
+          status: prev.status, message,
+          details: { markdown, check_id: itemId, findings: prev.findings || [], analyzed_sha: gathered.analyzed_sha, scope: "carry_over", carried_from: prev.sha },
+        }) });
+        if (!r.ok) throw new Error(`carry-over resolve ${itemId} -> ${r.status}: ${await r.text()}`);
+        return { resolved: true, status: prev.status, scope: "carry_over" };
+
+  # Fallbacks — the item resolves failed with the raw error so the run never hangs.
+  - id: resolve_failure_signals
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve failed (signal collection crashed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Audit-coverage check could not collect pipeline signals: ${{ steps.signals.error.message }}"
+      details:
+        markdown: "Signal collection (enhancer config / lake / probe) crashed before the audit ran. Error: ${{ steps.signals.error.message }}"
+
+  - id: resolve_failure_gather
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve failed (checkpoint/repo fetch crashed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Audit-coverage check could not prepare the analysis: ${{ steps.gather.error.message }}"
+      details:
+        markdown: "The analysis failed before auditing. Error: ${{ steps.gather.error.message }}"
+
+  - id: resolve_failure_agent
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve failed (audit agent crashed)"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "Audit-coverage agent crashed: ${{ steps.audit_agent.error.message }}"
+      details:
+        markdown: "The AI audit step failed. Error: ${{ steps.audit_agent.error.message }}"
+
+connections:
+  - { id: c1, from: trigger,            to: progress }
+  - { id: c2, from: progress,           to: signals }
+  - { id: c3, from: signals,            to: gather }
+  - { id: c4, from: gather,             to: route }
+  - { id: c5, from: route,              to: progress_analyzing, source_port: "true" }
+  - { id: c6, from: route,              to: resolve_carryover,  source_port: "false" }
+  - { id: c7, from: progress_analyzing, to: audit_agent }
+  - { id: c8, from: audit_agent,        to: resolve }
+  # Dormant edges: keep the fallback tails out of the entry-point set; the
+  # engine routes to them on terminal failure via errorHandling.fallbackStep.
+  - { id: c9,  from: signals,     to: resolve_failure_signals, condition: "false" }
+  - { id: c10, from: gather,      to: resolve_failure_gather,  condition: "false" }
+  - { id: c11, from: audit_agent, to: resolve_failure_agent,   condition: "false" }
