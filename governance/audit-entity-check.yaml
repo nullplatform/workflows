@@ -46,8 +46,8 @@
 # every key position resolved. Each entry is classified by the mechanism it
 # wires up — only a STANDARD entry makes the enhancer fetch the entity — which
 # is what tells the agent whether an entity has to be echoed by the write
-# instead. A source that cannot be read becomes a `degraded_source`: published
-# on the item, never fatal, and never a finding.
+# instead. A source that cannot be read is reported as `unverified`: published on
+# the item, never fatal, and never a finding.
 #
 # The LLM covers what static config cannot: write routes that produce NO audit
 # event (the evidence is an absence), the entity name each route will emit under
@@ -55,9 +55,12 @@
 # echoed back by the write that produces it.
 #
 # Incremental strategy (same as arch-rule-check): past checklist runs are the
-# checkpoint store. Carry over the previous verdict when the code diff has no
-# audit-relevant changes. Fail open towards FULL analysis, never towards
-# skipping.
+# checkpoint store. The verdict has TWO inputs, so a checkpoint is only reusable
+# while both are unchanged: the code diff must carry no audit-relevant changes,
+# AND the enhancer configuration must fingerprint the same as when that verdict
+# was produced — otherwise a change in the enhancer's repo would never re-evaluate
+# any application until it happened to touch its own code. Fail open towards FULL
+# analysis, never towards skipping.
 id: audit-entity-check
 key: audit-entity-check
 name: "Audit Coverage — Entity Config Check"
@@ -115,9 +118,9 @@ steps:
       code: |
         const { github_token, enhancer_repo } = $item;
 
-        // Sources that could not be read. Published on the item so the report
+        // Sources this step could not read. Published on the item so the report
         // says what it could not check, never fatal and never a finding.
-        const degraded_sources = [];
+        const unverified = [];
         // A config entry that does not exist is absent from $item altogether,
         // so an unset secret would otherwise reach fetch() as "undefined".
         const isSet = (v) => typeof v === "string" && v.trim().length > 0;
@@ -312,23 +315,34 @@ steps:
         //   self_contained → it does not fetch; the event body must carry the
         //                    entity (an echo, or an entity_snapshot),
         //   nrn            → it resolves the nrn's own parts, no entity read,
-        //   ignored        → the entry opts out of enrichment entirely.
+        //   ignored        → the entry opts out of enrichment entirely,
+        //   unknown        → the entry does not say (typically it delegates to a
+        //                    variable declared elsewhere).
+        //
+        // Every mode is matched explicitly and anything left over is `unknown`,
+        // never assumed: the only statically checkable obligation belongs to
+        // SELF_CONTAINED (the write has to echo the entity), so quietly calling
+        // an unreadable entry STANDARD would skip the one check this gate is
+        // best at. `unknown` sends the agent to look at both.
         //
         // The patterns match the mechanism, never the prose: entries carry
         // `expandNRN: true` and comments that discuss self-containedness at
-        // length, so a loose match would mislabel a STANDARD entity — the
-        // failure direction that hides real misconfiguration.
+        // length, so a loose match would mislabel an entity — the failure
+        // direction that hides real misconfiguration. `ignore: true` is anchored
+        // to the whole entry because that is the only way the real map uses it;
+        // nested in a `fields[]` element it means something else entirely.
         const ENTRY_MODES = [
-          ["ignored", /\bignore\s*:\s*true\b/i],
+          ["ignored", /^\{\s*ignore\s*:\s*true\s*,?\s*\}$/i],
           ["self_contained", new RegExp(
             "\\.\\.\\.[A-Za-z_$]*self[_-]?contained"
             + "|self[_-]?contained[A-Za-z_$]*enhancer"
             + "|entityType\\s*:\\s*ENTITY_TYPE\\.SELF_CONTAINED", "i")],
           ["nrn", /entityType\s*:\s*ENTITY_TYPE\.NRN/i],
+          ["standard", /entityType\s*:\s*ENTITY_TYPE\.STANDARD/i],
         ];
         const entityModes = {};
         if (!isSet(github_token)) {
-          degraded_sources.push("config entry GITHUB_TOKEN missing — enhancer entityConfig not read");
+          unverified.push("config entry GITHUB_TOKEN missing — enhancer entityConfig not read");
         } else {
           try {
             const ghFile = async (path) => {
@@ -382,7 +396,7 @@ steps:
             }
             clientsKeys = clientsDoubts.length === 0 ? clients.keys : null;
             if (clientsDoubts.length) {
-              degraded_sources.push(
+              unverified.push(
                 `enhancer clients map not parsed with confidence (${clientsDoubts.join("; ")})`
                 + ` — non-default hosts cannot be cross-checked`);
             }
@@ -398,18 +412,16 @@ steps:
             }
             entityConfigTrusted = doubts.length === 0;
             if (!entityConfigTrusted) {
-              degraded_sources.push(
+              unverified.push(
                 `enhancer entityConfig not parsed with confidence (${doubts.join("; ")})`
                 + ` — per-entity comparison skipped`);
             } else {
               // Classified on the entry's code, with comments and strings
-              // blanked. An entry whose code says none of the three is STANDARD
-              // by elimination, which is also the mode that demands the most of
-              // the pipeline — erring towards checking, not towards excusing.
+              // blanked.
               for (const k of entityConfigKeys) {
                 const code = cfg.codeEntries[k] || "";
                 const hit = ENTRY_MODES.find(([, re]) => re.test(code));
-                entityModes[k] = hit ? hit[0] : "standard";
+                entityModes[k] = hit ? hit[0] : "unknown";
               }
             }
             appJsExcerpt = [
@@ -420,7 +432,7 @@ steps:
                 : `\n// --- clients: no clients object literal found in ${ENHANCER_DIR}/app.js ---`,
             ].join("\n");
           } catch (e) {
-            degraded_sources.push(`enhancer entityConfig unavailable: ${e.message}`);
+            unverified.push(`enhancer entityConfig unavailable: ${e.message}`);
           }
         }
 
@@ -430,8 +442,31 @@ steps:
         // not misconfigured by itself: it gets the default STANDARD treatment.
         const hasDefaultConfig = entityConfigKeys.includes("default");
 
+        // A fingerprint of everything about the enhancer that can change a
+        // verdict: which entities it knows, how it will enrich each one, and
+        // which ones it routes off the default host. `gather` compares it against
+        // the fingerprint the previous verdict stamped, so a change in the
+        // ENHANCER's repository re-opens the analysis of applications whose own
+        // code did not move. Canonical by construction (sorted, one token per
+        // entity) so the same configuration always hashes the same.
+        //
+        // Only emitted when the map was parsed with confidence: a fingerprint of
+        // a doubtful parse would flap and force a full analysis forever.
+        const hash32 = (text) => {
+          let h = 5381;
+          for (let i = 0; i < text.length; i++) {
+            h = (((h << 5) + h) ^ text.charCodeAt(i)) >>> 0;
+          }
+          return h.toString(16).padStart(8, "0");
+        };
+        const canonicalConfig = [
+          ...entityConfigKeys.slice().sort().map(k => `${k}=${entityModes[k] || "?"}`),
+          `clients:${(clientsKeys || []).slice().sort().join(",")}`,
+        ].join("|");
+        const configFingerprint = entityConfigTrusted ? hash32(canonicalConfig) : "";
+
         const config_view = [
-          `### Enhancer entityConfig keys (${entityConfigKeys.length}${entityConfigTrusted ? "" : ", NOT trusted — see unverified sources"})`,
+          `### Enhancer entityConfig keys (${entityConfigKeys.length}${entityConfigTrusted ? "" : ", NOT trusted — see the unverified section"})`,
           entityConfigKeys.length ? "```\n" + entityConfigKeys.join(", ") + "\n```" : "(unavailable)",
           ``,
           hasDefaultConfig
@@ -445,6 +480,7 @@ steps:
                 `- SELF_CONTAINED (no fetch — the WRITE must carry the entity): ${byMode("self_contained").join(", ") || "(none)"}`,
                 `- NRN (only the nrn is resolved): ${byMode("nrn").join(", ") || "(none)"}`,
                 `- IGNORED (opted out of enrichment): ${byMode("ignored").join(", ") || "(none)"}`,
+                `- UNKNOWN (the entry delegates elsewhere — judge both sides): ${byMode("unknown").join(", ") || "(none)"}`,
               ].join("\n")
             : "(not classified — the key set could not be trusted)",
           ``,
@@ -454,18 +490,19 @@ steps:
           `### Enhancer app.js excerpt (entityConfig + clients)`,
           appJsExcerpt ? "```js\n" + appJsExcerpt + "\n```" : "(unavailable)",
           ``,
-          `### Sources that could not be read (${degraded_sources.length}) — not findings`,
-          degraded_sources.length ? degraded_sources.map(f => `- ${f}`).join("\n") : "(none)",
+          `### Not verified — what this check could not read (${unverified.length})`,
+          unverified.length ? unverified.map(f => `- ${f}`).join("\n") : "(none)",
         ].join("\n");
 
         return {
-          degraded_sources,
+          unverified,
           entity_config_keys: entityConfigKeys,
           entity_config_trusted: entityConfigTrusted,
           entity_modes: entityModes,
           self_contained_entities: byMode("self_contained"),
           clients_keys: clientsKeys,
           has_default_config: hasDefaultConfig,
+          config_fingerprint: configFingerprint,
           config_view,
         };
 
@@ -484,6 +521,7 @@ steps:
       item_id:        "${{ steps.trigger.outputs.itemId }}"
       force_full:     "${{ steps.trigger.outputs.inputs.force_full }}"
       callbackUrl:    "${{ steps.trigger.outputs.callbackUrl }}"
+      config_fingerprint: "${{ steps.enhancer_config.outputs.config_fingerprint }}"
       np_api_key:     "${{ secrets.NP_API_KEY }}"
       github_token:   "${{ secrets.GITHUB_TOKEN }}"
     config:
@@ -491,7 +529,8 @@ steps:
         allowedHosts: ["api.nullplatform.com", "api.github.com"]
       code: |
         const { application_id, release_id, trigger_build, check_id, item_id,
-                force_full, callbackUrl, np_api_key, github_token } = $item;
+                force_full, callbackUrl, config_fingerprint, np_api_key, github_token } = $item;
+        const isSet = (v) => typeof v === "string" && v.trim().length > 0;
         // The dispatch carries the item id first-class; `check_id` in the item
         // inputs stays supported as an override.
         const itemId = check_id || item_id || "audit_entity_check";
@@ -574,6 +613,7 @@ steps:
               status: item.status,
               findings: det.findings || [],
               entities: det.entities || [],
+              config_fingerprint: det.config_fingerprint || "",
               markdown: det.markdown || "",
             };
             break;
@@ -583,10 +623,20 @@ steps:
         // --- Decision: carry_over vs analyze (full | diff | verify_fix) ---
         // Audit wiring lives in source code (routes, audit config), so any
         // changed source file is relevant; docs/tests/lockfiles are not.
-        // The check is static, so the code diff is the whole input to this
-        // decision: nothing outside the repository can change the verdict
-        // between two deploys of the same commit.
+        // The verdict has TWO inputs: this repository and the enhancer's entity
+        // configuration, which lives in another repo and moves on its own. A
+        // checkpoint is only reusable while neither of them moved, so the
+        // fingerprint of the configuration is compared alongside the code diff —
+        // otherwise a change in the enhancer would never re-evaluate any
+        // application until that application happened to touch its own code.
+        //
+        // Compared only when both fingerprints are known: the current one is
+        // empty when the map could not be parsed with confidence (nothing to
+        // conclude), and a checkpoint stamped before this comparison existed has
+        // none, which re-opens the analysis exactly once.
         const forceFull = String(force_full || "") === "true";
+        const configChanged = !!checkpoint && isSet(config_fingerprint)
+          && checkpoint.config_fingerprint !== config_fingerprint;
         const RELEVANT = /\.([cm]?[jt]sx?|py|go|rb|java|kt|rs|php|cs)$|(^|\/)(null(app)?\.ya?ml|\.nullplatform\/[^/]+)$/i;
         const IRRELEVANT = /(^|\/)(__tests__|__mocks__|tests?|docs?)\/|\.(md|txt|snap)$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
         let mode = "analyze", scope = "full", changed = null;
@@ -595,6 +645,7 @@ steps:
           if (checkpoint.sha === currentSha) {
             changed = [];
             if (checkpoint.status === "failed") { mode = "analyze"; scope = "verify_fix"; }
+            else if (configChanged) { mode = "analyze"; scope = "diff"; }
             else { mode = "carry_over"; }
           } else {
             try {
@@ -604,7 +655,7 @@ steps:
               const relevant = changed.filter(p => RELEVANT.test(p) && !IRRELEVANT.test(p));
               if (tooBig) { mode = "analyze"; scope = "full"; }
               else if (checkpoint.status === "failed") { mode = "analyze"; scope = "verify_fix"; }
-              else if (relevant.length === 0) { mode = "carry_over"; }
+              else if (relevant.length === 0 && !configChanged) { mode = "carry_over"; }
               else { mode = "analyze"; scope = "diff"; }
             } catch (e) {
               // compare failed (force-push, divergent history) → full, never skip
@@ -665,7 +716,7 @@ steps:
           ? "FULL AUDIT: no previous checkpoint (or forced)."
           : scope === "verify_fix"
             ? `FIX VERIFICATION: this check FAILED at commit ${checkpoint.sha.slice(0,7)}. Changed files since then: ${(changed||[]).join(", ") || "(none)"}.`
-            : `DIFF-SCOPED AUDIT: check passed at ${checkpoint.sha.slice(0,7)}; re-checking because of ${(changed||[]).length} changed file(s).`;
+            : `DIFF-SCOPED AUDIT: check passed at ${checkpoint.sha.slice(0,7)}; re-checking because of ${(changed||[]).length} changed file(s)${configChanged ? ", and because the enhancer configuration changed since that verdict" : ""}.`;
         const llm_view = [
           `## Repository: ${repo} (branch: ${branch}, commit: ${currentSha.slice(0,7)}) — application "${app.name}"`,
           ``, `### Analysis scope`, scopeNote, ``,
@@ -771,6 +822,12 @@ steps:
           you can catch here.
         - NRN: only the nrn is resolved; the entity itself is never read.
         - IGNORED: the entry opts out of enrichment on purpose. Not a finding.
+        - UNKNOWN: the entry does not state its mode (it usually delegates to
+          something declared elsewhere), so this check could not classify it. Do
+          the work of both branches for these: cross-check the name as usual AND
+          look at the write route for an echo or an entity_snapshot. Report what
+          you find, and if the code does not settle it, say the mode could not be
+          determined instead of assuming one.
         - An entity with NO entry of its own is not automatically
           misconfigured: when the map has a `default` entry it gets the default
           STANDARD treatment, so judge it as STANDARD. Report a finding only
@@ -802,8 +859,9 @@ steps:
           summary. It is not a finding and it must not turn the item red.
         - A source that could not be read is not a finding either. Treat the
           side it covers as unverified and say which one.
-        - Tolerated-401 configs (`ignoreStatusCodes`) avoid the DLQ but leave
-          the entity degraded forever — flag them as findings, not as ok.
+        - Nothing about the ENHANCER's own configuration is a finding against this
+          application: its team cannot change that file. Use it to judge what the
+          application has to provide, and no more.
         - If this application serves no HTTP writes at all (worker, frontend),
           answer not_applicable and say why in one sentence.
         - Every finding names a concrete file or entity, one-sentence issue,
@@ -885,13 +943,14 @@ steps:
       scope:            "${{ steps.gather.outputs.scope }}"
       analyzed_sha:     "${{ steps.gather.outputs.analyzed_sha }}"
       changed_count:    "${{ steps.gather.outputs.changed_count }}"
-      unverified:       "${{ steps.enhancer_config.outputs.degraded_sources }}"
+      unverified:       "${{ steps.enhancer_config.outputs.unverified }}"
+      config_fingerprint: "${{ steps.enhancer_config.outputs.config_fingerprint }}"
     config:
       network:
         allowedHosts: ["api.nullplatform.com"]
       code: |
         const { callbackUrl, callbackToken, check_id, item_id, verdict, repo,
-                scope, analyzed_sha, changed_count, unverified } = $item;
+                scope, analyzed_sha, changed_count, unverified, config_fingerprint } = $item;
         const itemId = check_id || item_id || "audit_entity_check";
         const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
         const post = (url, body) => fetch(url, { method: "POST", headers: H, body: JSON.stringify(body) });
@@ -964,6 +1023,9 @@ steps:
         const details = {
           markdown, check_id: itemId, findings,
           analyzed_sha, scope: analysisScope,
+          // Stamped next to the sha: together they are the pair of inputs the
+          // next run compares before reusing this verdict.
+          config_fingerprint: config_fingerprint || "",
           entities: entities.map(e => ({ ...e })),
         };
 
@@ -984,13 +1046,15 @@ steps:
       analyzed_sha:     "${{ steps.gather.outputs.analyzed_sha }}"
       changed_count:    "${{ steps.gather.outputs.changed_count }}"
       prev:             "${{ steps.gather.outputs.prev }}"
-      unverified:       "${{ steps.enhancer_config.outputs.degraded_sources }}"
+      unverified:       "${{ steps.enhancer_config.outputs.unverified }}"
+      config_fingerprint: "${{ steps.enhancer_config.outputs.config_fingerprint }}"
     config:
       network:
         allowedHosts: ["api.nullplatform.com"]
       code: |
         const { callbackUrl, callbackToken, check_id, item_id, repo,
-                analyzed_sha, changed_count, prev, unverified } = $item;
+                analyzed_sha, changed_count, prev, unverified, config_fingerprint } = $item;
+        const isSet = (v) => typeof v === "string" && v.trim().length > 0;
         const itemId = check_id || item_id || "audit_entity_check";
         const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
         const p = prev || {};
@@ -1026,6 +1090,9 @@ steps:
           details: {
             markdown, check_id: itemId, findings: p.findings || [],
             entities: p.entities || [],
+            // Keep the previous fingerprint when this run could not compute one,
+            // so an unreadable config does not erase a usable stamp.
+            config_fingerprint: isSet(config_fingerprint) ? config_fingerprint : (p.config_fingerprint || ""),
             analyzed_sha, scope: "carry_over", carried_from: p.sha,
           },
         }) });
