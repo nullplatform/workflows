@@ -432,7 +432,7 @@ async function runEnsure(findResult: Record<string, unknown>) {
   let updateCalls = 0;
   const result = await runWorkflowE2E({
     yamlPath: ENSURE,
-    inputs: { finding: FINDING, category_slug: 'engineering', organization_id: '100000001' },
+    inputs: { finding: FINDING, category_slug: 'engineering', organization_id: '1255165411' },
     pluginStubs: {
       manual: passthroughTrigger,
       'np-action-item-find': { handler: () => ok(findResult), executeMode: 'all' as const },
@@ -518,6 +518,11 @@ interface CloserRunOpts {
   /** actionItemId values for which the close call throws (simulates a
    *  persistent 5xx from the NP API on that page). */
   failCloseIds?: string[];
+  /** actionItemId values the close call reports as a no-op, i.e. what
+   *  `np-action-item-update` returns with `ignoreInvalidTransition: true`
+   *  when the item is ALREADY closed (NP API 400 "Invalid action item
+   *  status transition"). */
+  skipCloseIds?: string[];
 }
 
 async function runCloser(opts: CloserRunOpts) {
@@ -602,6 +607,13 @@ async function runCloser(opts: CloserRunOpts) {
               activePorts: ['default'],
             };
           }
+          if (opts.skipCloseIds?.includes(id)) {
+            // Shape returned by np-action-item-update when
+            // ignoreInvalidTransition swallows the "already closed" 400:
+            // success, but nothing happened and no item comes back.
+            callOrder.push(`skip:${id}`);
+            return ok({ actionItem: null, status: null, skipped: true });
+          }
           closed.push(id);
           callOrder.push(`close:${id}`);
           return ok({ actionItem: {}, status: 'closed' });
@@ -614,7 +626,7 @@ async function runCloser(opts: CloserRunOpts) {
 }
 
 describe('wf2-ami-drift-closer (E2E)', () => {
-  it('closes exactly the items whose drift is gone, commenting first', async () => {
+  it('closes exactly the items whose drift is gone, commenting after', async () => {
     const OPEN_ITEMS = [
       { id: 'ai_still', status: 'open', metadata: { drift_key: 'ami-drift:111' } }, // still drifted
       { id: 'ai_gone', status: 'open', metadata: { drift_key: 'ami-drift:999' } }, // no longer drifted
@@ -635,16 +647,20 @@ describe('wf2-ami-drift-closer (E2E)', () => {
   // ("YAML shape" § "closer close-comment content matches the original
   // wording exactly" below) — plugin stubs ignore `configure()` (see the
   // `runCloser` note above), so `content` isn't observable here. This test
-  // covers what E2E CAN observe: the comment is posted before the close
-  // call, for the right item, every time.
-  it('comment_closing runs before close_items, for the right item', async () => {
+  // covers what E2E CAN observe: the comment is posted AFTER the close
+  // succeeded, for the right item, every time.
+  //
+  // v2.2 inverted this order. Commenting first is what put 54 "Closing
+  // automatically" comments on 8 already-closed items in itti between
+  // 2026-07-18 and 07-22: the comment landed, then the close 400'd.
+  it('close_items runs before comment_closing, for the right item', async () => {
     const OPEN_ITEMS = [
       { id: 'ai_gone', status: 'open', metadata: { drift_key: 'ami-drift:999' } },
     ];
     const { commented, closed, callOrder } = await runCloser({ pages: [OPEN_ITEMS] });
     expect(commented).toEqual(['ai_gone']);
     expect(closed).toEqual(['ai_gone']);
-    expect(callOrder).toEqual(['comment:ai_gone', 'close:ai_gone']);
+    expect(callOrder).toEqual(['close:ai_gone', 'comment:ai_gone']);
   });
 
   it('closes nothing when every open item still drifts', async () => {
@@ -654,6 +670,60 @@ describe('wf2-ami-drift-closer (E2E)', () => {
     expect(result.outputs.closed).toBe(0);
     expect(result.outputs.still_valid).toBe(1);
     expect(closed).toEqual([]);
+  });
+
+  // ── Regression: the itti duplicate-comment incident (v2.2) ───────────
+
+  // Layer 1 — the status guard. Reproduces the actual trigger: the NP
+  // action_item listing leaked `closed` rows out of a `status=open` query
+  // (run fa05435f-… returned 87 open + 8 closed). A leaked closed row must
+  // be left completely alone: no close attempt, no comment.
+  it('ignores already-closed items leaked by the listing (status filter leak)', async () => {
+    const pages = [
+      [
+        { id: 'ai_open', status: 'open', metadata: { drift_key: 'ami-drift:999' } },
+        // Leaked despite filters.status=open — drift_key is NOT in the
+        // current drift set, so pre-v2.1 this was "closeable".
+        { id: 'ai_leaked', status: 'closed', metadata: { drift_key: 'ami-drift:777' } },
+      ],
+    ];
+    const { result, commented, closed } = await runCloser({ pages });
+
+    expect(closed).toEqual(['ai_open']);
+    expect(commented).toEqual(['ai_open']);
+    // The leaked row counts as checked-and-kept, never as closed.
+    expect(result.outputs.closed).toBe(1);
+    expect(result.outputs.still_valid).toBe(1);
+  });
+
+  // Layer 2 + 3 — if a close is nonetheless a no-op (item already closed;
+  // e.g. a race between the page fetch and the close), the item must NOT
+  // be announced as closed. This is the assertion that would have caught
+  // the 54 spurious comments.
+  it('never comments on an item whose close was a no-op', async () => {
+    const pages = [
+      [
+        { id: 'ai_real', status: 'open', metadata: { drift_key: 'ami-drift:999' } },
+        { id: 'ai_noop', status: 'open', metadata: { drift_key: 'ami-drift:888' } },
+      ],
+    ];
+    const { result, commented, closed, callOrder } = await runCloser({
+      pages,
+      skipCloseIds: ['ai_noop'],
+    });
+
+    // Both were attempted; only one genuinely transitioned.
+    expect(callOrder).toContain('skip:ai_noop');
+    expect(closed).toEqual(['ai_real']);
+    // The whole point: no comment for the no-op.
+    expect(commented).toEqual(['ai_real']);
+    expect(result.outputs.closed).toBe(1);
+    expect(result.outputs.close_skipped).toBe(1);
+    // A no-op is not a failure — the sweep runs to the end (workflow-level
+    // outputs only resolve if `summary`/`log_done` were reached) and both
+    // items are accounted for.
+    expect(result.outputs.close_failed).toBe(0);
+    expect(result.outputs.checked).toBe(2);
   });
 
   // ── Pagination fix (v2.1) ────────────────────────────────────────────
@@ -697,10 +767,11 @@ describe('wf2-ami-drift-closer (E2E)', () => {
     expect(itemFetchCalls.length).toBeGreaterThanOrEqual(pages.length);
     // ai_p3 (page 3) still got closed despite page 2's failure.
     expect(closed).toEqual(['ai_p3']);
-    // comment_closing runs BEFORE close_items — ai_p2 was commented even
-    // though its close call failed (documented ordering risk, unchanged
-    // from v2.0; see the YAML header note).
-    expect(commented).toEqual(['ai_p2', 'ai_p3']);
+    // v2.2: close runs FIRST and the comment lane hangs off close_ok:true,
+    // so a page whose close failed is never commented. Pre-v2.2 this
+    // asserted ['ai_p2', 'ai_p3'] — ai_p2 got a "Closing automatically"
+    // comment despite never being closed. That is the itti bug.
+    expect(commented).toEqual(['ai_p3']);
     expect(result.outputs.still_valid).toBe(1); // ai_p1
     expect(result.outputs.closed).toBe(1); // ai_p3
     expect(result.outputs.close_failed).toBe(1); // ai_p2's page
@@ -745,12 +816,30 @@ describe('YAML shape', () => {
     expect(filters['labels.workflow_type']).toBe('ami-drift');
   });
 
-  it('closer close-comment content matches the original wording exactly', async () => {
+  // v2.2: past tense. The comment is now posted only AFTER a confirmed
+  // close, so "Closing" (in-progress, and historically a lie when the
+  // close then failed) became "Closed".
+  it('closer close-comment content matches the expected wording exactly', async () => {
     const def = await loadYaml('wf2-ami-drift-closer.yaml');
     const cfg = def.steps['comment_closing']!.config as Record<string, unknown>;
     expect(cfg.content).toBe(
-      'Closing automatically: AMI drift no longer detected (scope redeployed with a configured AMI, scope no longer active, or the AMI is now configured).',
+      'Closed automatically: AMI drift no longer detected (scope redeployed with a configured AMI, scope no longer active, or the AMI is now configured).',
     );
+  });
+
+  // v2.2 — the two config-level guards against the itti incident.
+  it('closer closes idempotently and comments only what actually closed', async () => {
+    const def = await loadYaml('wf2-ami-drift-closer.yaml');
+
+    // An already-closed item must be a no-op, not a terminal 400 that
+    // discards the whole page.
+    const closeCfg = def.steps['close_items']!.config as Record<string, unknown>;
+    expect(closeCfg.ignoreInvalidTransition).toBe(true);
+
+    // The comment lane iterates the ids that genuinely transitioned, NOT
+    // the ids we merely attempted to close.
+    const commentForEach = def.steps['comment_closing']!.forEach as Record<string, unknown>;
+    expect(commentForEach.expression).toBe('${{ steps.select_closed.outputs.closed_ids }}');
   });
 
   it('create carries priority medium, value 200 and the finding due date', async () => {
