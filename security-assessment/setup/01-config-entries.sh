@@ -1,74 +1,34 @@
 #!/usr/bin/env bash
-# Upserts the config entries the security-assessment workflows read, at
-# engine path /action-items/security-assessment. Re-running rotates values
-# in place (POST /workflows/config is an upsert by name+path).
+# Seeds the config entries for the security-assessment suite on the folder
+# /action-items/security-assessment. Secrets are WRITE-ONLY: re-running
+# upserts by name+path (POST /workflows/config is an upsert).
 #
-# GITHUB_TOKEN needs read access to the repositories the scanner's agent step
-# clones and reviews. A fine-grained PAT must list them explicitly.
-#
-# NP_API_KEY doubles as the workflows' credential (every np-api-call step and
-# the ensure-action-item sub-workflow read secrets.NP_API_KEY). It is written
-# ONCE at root path "/" (shared across every workflow suite in the org) and is
-# NEVER overwritten by a re-run if an entry already exists there — GET is
-# checked first so this can't clobber a live secret.
-#
-# SEC_AGENT_MODEL is intentionally NOT seeded here — the workflow falls back
-# to a default via `${{ vars.SEC_AGENT_MODEL || 'claude-sonnet-5' }}`; set it
-# manually with POST /workflows/config only if you need a non-default model.
-#
-# Usage:
-#   NP_API_KEY=… GITHUB_TOKEN=… NP_ORGANIZATION_ID=<org id> \
-#     SEC_CATEGORY_SLUG=<existing category slug> ./01-config-entries.sh
-#   ./01-config-entries.sh --env-file ../../.env.null
+# Usage: source .env.null && ./01-config-entries.sh   (needs NP_API_KEY + GITHUB_TOKEN)
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=../../cost/setup/lib.sh
-source "$SCRIPT_DIR/../../cost/setup/lib.sh"
-
-parse_common_args "$@"
-
+API="${NP_API_BASE:-https://api.nullplatform.com}"
 FOLDER="/action-items/security-assessment"
 
-: "${GITHUB_TOKEN:?set GITHUB_TOKEN}"
-: "${NP_ORGANIZATION_ID:?set NP_ORGANIZATION_ID}"
-: "${SEC_CATEGORY_SLUG:?set SEC_CATEGORY_SLUG}"
-SEC_MIN_SEVERITY="${SEC_MIN_SEVERITY:-medium}"
-SEC_DUE_DAYS="${SEC_DUE_DAYS:-14}"
+TOKEN=$(curl -sf -X POST "$API/token" -H 'Content-Type: application/json' \
+  -d "{\"api_key\":\"$NP_API_KEY\"}" | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])')
 
-mint_token
-
-put() { # name value secret(true|false) path
-  local body out
-  body=$(jq -n --arg name "$1" --arg value "$2" --argjson secret "$3" --arg path "$4" \
-    '{name: $name, value: $value, secret: $secret, path: $path}')
-  out=$(api POST "/workflows/config" "$body")
-  if [[ "$(last_status)" =~ ^2 ]]; then
-    echo "  $4 $1 → $(jq -r '.mode // "upserted"' <<<"$out")"
-  else
-    echo "  $4 $1 FAILED ($(last_status)): $out"; exit 1
-  fi
+entry() { # $1 name $2 value $3 secret(true|false)
+  curl -sf -X POST "$API/workflows/config" \
+    -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+    -d "$(python3 -c "import json,sys;print(json.dumps({'name':sys.argv[1],'value':sys.argv[2],'secret':sys.argv[3]=='true','path':'$FOLDER'}))" "$1" "$2" "$3")" \
+    > /dev/null && echo "  ✓ $1"
 }
 
-echo "Upserting config entries on $FOLDER:"
-put GITHUB_TOKEN       "$GITHUB_TOKEN"       true  "$FOLDER"
-put NP_ORGANIZATION_ID "$NP_ORGANIZATION_ID" false "$FOLDER"
-put SEC_CATEGORY_SLUG  "$SEC_CATEGORY_SLUG"  false "$FOLDER"
-put SEC_MIN_SEVERITY   "$SEC_MIN_SEVERITY"   false "$FOLDER"
-put SEC_DUE_DAYS       "$SEC_DUE_DAYS"       false "$FOLDER"
-
-echo "Checking root secret NP_API_KEY (path /):"
-existing=$(api GET "/workflows/config?path=/")
-st="$(last_status)"
-if [[ "$st" =~ ^2 ]]; then
-  if jq -e '(.data // .) | map(select(.name == "NP_API_KEY")) | length > 0' <<<"$existing" >/dev/null 2>&1; then
-    echo "  / NP_API_KEY already exists → left untouched (never clobber a live secret)"
-  else
-    put NP_API_KEY "$NP_API_KEY" true "/"
-  fi
-else
-  echo "FAILED: could not verify existing secret (status $st) — refusing to write NP_API_KEY"
-  exit 1
-fi
-
-echo
-echo "Folder: $FOLDER"
+echo "Seeding config entries on $FOLDER"
+entry NP_API_KEY "$NP_API_KEY" true
+entry GITHUB_TOKEN "$GITHUB_TOKEN" true
+entry NP_ORGANIZATION_ID "${NP_ORGANIZATION_ID:?set NP_ORGANIZATION_ID}" false
+entry SEC_CATEGORY_SLUG "${SEC_CATEGORY_SLUG:?set SEC_CATEGORY_SLUG}" false
+entry SEC_MIN_SEVERITY "${SEC_MIN_SEVERITY:-medium}" false
+entry SEC_DUE_DAYS "${SEC_DUE_DAYS:-14}" false
+# SEC_AGENT_MODEL is OPTIONAL — the YAMLs read
+# ${{ vars.SEC_AGENT_MODEL || 'claude-opus-5' }}, so an unset entry just
+# takes the default. Not force-seeded here; set it explicitly only if a run
+# needs a non-default model:
+#   entry SEC_AGENT_MODEL "claude-opus-5" false
+echo "Done."

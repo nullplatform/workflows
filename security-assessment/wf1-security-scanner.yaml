@@ -1,7 +1,11 @@
-# Weekly Security Assessment scanner — enumerates the ACTIVE deployment per
-# scope (all providers) from the lake, fans out one AI assessment per
-# deployment, and summarizes. Action items are created per finding by the
-# assess → ensure chain, idempotent on metadata.finding_key.
+# Weekly Security Assessment scanner (v2) — enumerates the NEWEST active
+# deployment PER APPLICATION (all providers) from the lake, fans out one
+# stateful AI assessment per application (security_assess_application), and
+# summarizes. Action items are created per finding, and closed per resolved
+# finding, by the assess → ensure/close chain, idempotent on
+# metadata.finding_key. The per-app baseline (last assessed commit) lives in
+# application metadata (see wf2's header) — v2 diffs against it by default
+# (`mode: delta`) instead of re-auditing the whole codebase every week.
 #
 # Per-org configuration (config entries on folder /action-items/security-assessment):
 #   NP_API_KEY (secret)         — NP API key
@@ -14,17 +18,19 @@
 id: security_scanner
 name: "Security Assessment Scanner"
 description: >
-  Weekly scan (Mon 03:00, also manual) that runs an in-depth AI security
-  assessment of every active deployment (deployed code + scope configuration)
-  and ensures an idempotent action item per finding.
+  Weekly scan (Mon 03:00, also manual) that runs a stateful AI security
+  assessment of every application's newest active deployment (deployed code +
+  scope configuration) — a delta diff against the last assessed commit by
+  default, or a full sweep on request — and ensures an idempotent action item
+  per finding, closing the ones the re-scan proves resolved.
 path: "/action-items/security-assessment"
-semantic_version: 1.0.0
+semantic_version: 2.0.0
 
 inputs:
   nrn:
     type: string
     required: false
-    description: "Only scan scopes under this NRN (prefix match; empty = whole organization)"
+    description: "Only scan applications under this NRN (prefix match; empty = whole organization)"
   applications:
     type: string
     required: false
@@ -32,7 +38,7 @@ inputs:
   max_deployments:
     type: number
     required: false
-    description: "Hard cap on deployments assessed this run (cost control; dropped rows are logged)"
+    description: "Hard cap on applications assessed this run (cost control; dropped rows are logged)"
   min_severity:
     type: string
     required: false
@@ -41,6 +47,10 @@ inputs:
     type: number
     required: false
     description: "Override for the action item due date offset in days"
+  mode:
+    type: string
+    required: false
+    description: "Assessment mode passed to every child: delta (default — only reassess what changed since the last run) or full (force a full codebase sweep)"
 
 steps:
   - id: start_manual
@@ -53,7 +63,7 @@ steps:
         nrn:
           type: string
           required: false
-          description: "Only scan scopes under this NRN (prefix match)"
+          description: "Only scan applications under this NRN (prefix match)"
           placeholder: "organization=…:account=…"
         applications:
           type: string
@@ -63,7 +73,7 @@ steps:
         max_deployments:
           type: number
           required: false
-          description: "Cap on deployments assessed this run"
+          description: "Cap on applications assessed this run"
           placeholder: "5"
         min_severity:
           type: string
@@ -75,6 +85,11 @@ steps:
           required: false
           description: "Due date offset in days for created action items"
           placeholder: "14"
+        mode:
+          type: string
+          required: false
+          description: "delta (default) | full — force a full codebase sweep for every selected app"
+          placeholder: "delta"
 
   - id: start_cron
     type: trigger
@@ -84,19 +99,25 @@ steps:
       schedule: "0 3 * * 1"
       timezone: "America/Argentina/Buenos_Aires"
 
-  # ── Current state: the active deployment per scope, ALL providers ──────
+  # ── Current state: the newest active deployment PER APPLICATION, ALL
+  # providers. One row per app_id (argMax picks the newest deployment's scope
+  # / nrn / environment) — the assessment unit moved from scope to app in v2
+  # because the baseline (last assessed commit) is application-scoped.
   - id: lake_deployments
     type: module
     plugin_type: np-lake-query
-    name: "Active Deployments (lake)"
+    name: "Newest Active Deployment per App (lake)"
     join_strategy: any
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
-        SELECT d.id AS deployment_id, d.scope_id AS scope_id, s.name AS scope_name, s.nrn AS scope_nrn,
-               a.app_name AS application, toString(s.application_id) AS application_id,
-               toString(d.created_at) AS deployed_at,
-               dims.environment AS environment
+        SELECT a.app_id AS application_id, a.app_name AS application, a.repository_url AS repository_url,
+               toString(argMax(d.id, d.created_at)) AS deployment_id,
+               toString(argMax(d.scope_id, d.created_at)) AS scope_id,
+               argMax(s.name, d.created_at) AS scope_name,
+               argMax(s.nrn, d.created_at) AS scope_nrn,
+               argMax(dims.environment, d.created_at) AS environment,
+               toString(max(d.created_at)) AS deployed_at
         FROM core_entities_deployment AS d FINAL
         JOIN core_entities_scope AS s FINAL ON d.scope_id = s.id AND s._deleted = 0
         JOIN core_entities_application AS a FINAL ON s.application_id = a.app_id AND a._deleted = 0
@@ -109,6 +130,7 @@ steps:
         WHERE d._deleted = 0
           AND d.status_in_scope = 'active'
           AND s.status = 'active'
+        GROUP BY a.app_id, a.app_name, a.repository_url
         LIMIT 5000
 
   - id: filter_rows
@@ -137,27 +159,22 @@ steps:
             if (p) apps.push(p);
           }
         }
-        // One row per scope: keep the NEWEST active deployment (lake can carry
-        // several actives briefly mid-deploy).
-        var byScope = {}; var order = [];
+        // The lake query already dedupes to one row per app (argMax on the
+        // newest deployment) — no scope-level dedup needed here anymore.
+        var out = [];
+        var skipped_no_repo = 0;
         for (var r = 0; r < rows.length; r++) {
           var row = rows[r] || {};
-          var sid = String(row.scope_id);
-          var prior = byScope[sid];
-          if (prior && String(prior.deployed_at || '') >= String(row.deployed_at || '')) continue;
-          if (!prior) order.push(sid);
-          byScope[sid] = row;
-        }
-        var uniq = [];
-        for (var o = 0; o < order.length; o++) uniq.push(byScope[order[o]]);
-        var out = [];
-        for (var k = 0; k < uniq.length; k++) {
-          var row2 = uniq[k];
-          var s = String(row2.scope_nrn || '');
+          var repo = String(row.repository_url || '').trim();
+          // An app with nothing to clone can never be assessed — drop it
+          // before the nrn/applications filters so the counters stay honest
+          // for a pilot run scoped to a handful of apps.
+          if (!repo) { skipped_no_repo++; continue; }
+          var s = String(row.scope_nrn || '');
           if (nrn && !(s === nrn || s.indexOf(nrn + ':') === 0)) continue;
           if (apps.length > 0) {
-            var idMatch = apps.indexOf(String(row2.application_id)) >= 0;
-            var nameMatch = apps.indexOf(String(row2.application || '').toLowerCase()) >= 0;
+            var idMatch = apps.indexOf(String(row.application_id)) >= 0;
+            var nameMatch = apps.indexOf(String(row.application || '').toLowerCase()) >= 0;
             if (!idMatch && !nameMatch) continue;
           }
           // Build a FRESH object rather than mutating the input row — inputs
@@ -165,45 +182,47 @@ steps:
           // silent no-op. Action-item NRN needs the scope segment; the lake
           // row's nrn is the application's.
           out.push({
-            deployment_id: row2.deployment_id,
-            scope_id: row2.scope_id,
-            scope_name: row2.scope_name,
-            scope_nrn: s + ':scope=' + String(row2.scope_id),
-            application: row2.application,
-            application_id: row2.application_id,
-            deployed_at: row2.deployed_at,
-            environment: row2.environment
+            application_id: row.application_id,
+            application: row.application,
+            repository_url: repo,
+            deployment_id: row.deployment_id,
+            scope_id: row.scope_id,
+            scope_name: row.scope_name,
+            scope_nrn: s + ':scope=' + String(row.scope_id),
+            environment: row.environment,
+            deployed_at: row.deployed_at
           });
         }
         var dropped_by_cap = 0;
         if (cap > 0 && out.length > cap) {
           dropped_by_cap = out.length - cap;
-          log.warn('max_deployments cap applied — NOT all deployments assessed', { cap: cap, dropped: dropped_by_cap });
+          log.warn('max_deployments cap applied — NOT all applications assessed', { cap: cap, dropped: dropped_by_cap });
           out = out.slice(0, cap);
         }
-        log.info('Deployments selected', { total_rows: rows.length, unique_scopes: uniq.length, selected: out.length, nrn_filter: nrn || null, app_filter: apps.length || null, dropped_by_cap: dropped_by_cap });
-        return { rows: out, selected: out.length, unique_scopes: uniq.length, dropped_by_cap: dropped_by_cap };
+        log.info('Applications selected', { total_rows: rows.length, selected: out.length, skipped_no_repo: skipped_no_repo, nrn_filter: nrn || null, app_filter: apps.length || null, dropped_by_cap: dropped_by_cap });
+        return { rows: out, selected: out.length, skipped_no_repo: skipped_no_repo, dropped_by_cap: dropped_by_cap };
 
-  # One assessment per deployment. Agent runs are slow and expensive:
-  # maxConcurrency stays LOW. No streaming pagination (deployed engine does
-  # not re-enter streaming loops).
+  # One stateful assessment per application. Agent runs are slow and
+  # expensive: maxConcurrency stays LOW. No streaming pagination (deployed
+  # engine does not re-enter streaming loops).
   - id: assess
     type: module
     plugin_type: sub-workflow
-    name: "Assess Deployments"
+    name: "Assess Applications"
     forEach:
       expression: "${{ steps.filter_rows.outputs.rows }}"
       itemVariable: deployment
       parallel: true
       maxConcurrency: 2
     inputs:
+      mode: "${{ workflow.inputs.mode || 'delta' }}"
       min_severity: "${{ workflow.inputs.min_severity || vars.SEC_MIN_SEVERITY || 'medium' }}"
       category_slug: "${{ vars.SEC_CATEGORY_SLUG }}"
       organization_id: "${{ vars.NP_ORGANIZATION_ID }}"
       due_days: "${{ workflow.inputs.due_days || vars.SEC_DUE_DAYS || 14 }}"
     config:
       # Client key — the uploader rewrites this to the per-org wf_… id.
-      workflowId: security_assess_deployment
+      workflowId: security_assess_application
       waitForCompletion: true
 
   - id: summary
@@ -216,32 +235,60 @@ steps:
     inputs:
       assessed: "${{ steps.assess.outputs.items }}"
       selected: "${{ steps.filter_rows.outputs.selected }}"
+      skipped_no_repo: "${{ steps.filter_rows.outputs.skipped_no_repo }}"
       dropped_by_cap: "${{ steps.filter_rows.outputs.dropped_by_cap }}"
     config:
       code: |
         var rows = inputs.assessed || [];
-        var s = { assessed: 0, skipped: 0, failed: 0, total_findings: 0, created: 0, updated: 0, unchanged: 0 };
+        var s = {
+          assessed: 0, skipped: 0, skipped_no_change: 0, skipped_no_repo_child: 0,
+          failed: 0, state_not_persisted: 0,
+          total_findings: 0, created: 0, updated: 0, unchanged: 0, closed: 0
+        };
         var failures = [];
         for (var i = 0; i < rows.length; i++) {
           var r = rows[i] || {};
-          if (r.status === 'assessed') s.assessed++;
-          else if (r.status === 'skipped') s.skipped++;
-          else { s.failed++; failures.push({ deployment_id: r.deployment_id, application: r.application, reason: r.reason }); }
+          if (r.status === 'assessed') {
+            s.assessed++;
+            // A lost baseline write is NOT a failure — the assessment itself
+            // (creates/closes) already landed. Counted separately as a
+            // warning, never subtracted from `assessed`.
+            if (r.reason === 'state_not_persisted') s.state_not_persisted++;
+          } else if (r.status === 'skipped') {
+            s.skipped++;
+            if (r.reason === 'no_change') s.skipped_no_change++;
+            else if (r.reason === 'no_repo') s.skipped_no_repo_child++;
+          } else {
+            s.failed++;
+            failures.push({ application_id: r.application_id, application: r.application, reason: r.reason });
+          }
           s.total_findings += Number(r.total_findings) || 0;
           s.created += Number(r.created) || 0;
           s.updated += Number(r.updated) || 0;
           s.unchanged += Number(r.unchanged) || 0;
+          s.closed += Number(r.closed) || 0;
         }
         log.info('Security assessment finished', {
-          selected: inputs.selected, assessed: s.assessed, skipped: s.skipped, failed: s.failed,
-          findings: s.total_findings, created: s.created, updated: s.updated, unchanged: s.unchanged,
-          dropped_by_cap: inputs.dropped_by_cap
+          selected: inputs.selected, assessed: s.assessed,
+          skipped: s.skipped, skipped_no_change: s.skipped_no_change, skipped_no_repo_child: s.skipped_no_repo_child,
+          failed: s.failed, state_not_persisted: s.state_not_persisted,
+          findings: s.total_findings, created: s.created, updated: s.updated, unchanged: s.unchanged, closed: s.closed,
+          skipped_no_repo: inputs.skipped_no_repo, dropped_by_cap: inputs.dropped_by_cap
         });
-        if (failures.length > 0) log.warn('Deployments that could not be assessed', { failures: failures });
+        if (failures.length > 0) log.warn('Applications that could not be assessed', { failures: failures });
         return {
-          selected: inputs.selected, dropped_by_cap: inputs.dropped_by_cap,
-          assessed: s.assessed, skipped: s.skipped, failed: s.failed,
-          total_findings: s.total_findings, created: s.created, updated: s.updated, unchanged: s.unchanged,
+          selected: inputs.selected,
+          skipped_no_repo: inputs.skipped_no_repo,
+          dropped_by_cap: inputs.dropped_by_cap,
+          assessed: s.assessed,
+          skipped_no_change: s.skipped_no_change,
+          skipped_no_repo_child: s.skipped_no_repo_child,
+          failed: s.failed,
+          total_findings: s.total_findings,
+          created: s.created,
+          updated: s.updated,
+          unchanged: s.unchanged,
+          closed: s.closed,
           failures: failures
         };
 
@@ -253,12 +300,15 @@ connections:
   - { id: c5, from: assess,           to: summary }
 
 outputs:
-  selected:        "${{ steps.summary.outputs.selected }}"
-  dropped_by_cap:  "${{ steps.summary.outputs.dropped_by_cap }}"
-  assessed:        "${{ steps.summary.outputs.assessed }}"
-  skipped:         "${{ steps.summary.outputs.skipped }}"
-  failed:          "${{ steps.summary.outputs.failed }}"
-  total_findings:  "${{ steps.summary.outputs.total_findings }}"
-  created:         "${{ steps.summary.outputs.created }}"
-  updated:         "${{ steps.summary.outputs.updated }}"
-  unchanged:       "${{ steps.summary.outputs.unchanged }}"
+  selected:              "${{ steps.summary.outputs.selected }}"
+  skipped_no_repo:        "${{ steps.summary.outputs.skipped_no_repo }}"
+  dropped_by_cap:         "${{ steps.summary.outputs.dropped_by_cap }}"
+  assessed:               "${{ steps.summary.outputs.assessed }}"
+  skipped_no_change:      "${{ steps.summary.outputs.skipped_no_change }}"
+  skipped_no_repo_child:  "${{ steps.summary.outputs.skipped_no_repo_child }}"
+  failed:                 "${{ steps.summary.outputs.failed }}"
+  total_findings:         "${{ steps.summary.outputs.total_findings }}"
+  created:                "${{ steps.summary.outputs.created }}"
+  updated:                "${{ steps.summary.outputs.updated }}"
+  unchanged:              "${{ steps.summary.outputs.unchanged }}"
+  closed:                 "${{ steps.summary.outputs.closed }}"

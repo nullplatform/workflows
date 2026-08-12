@@ -1,9 +1,10 @@
 # Sub-workflow: idempotently ensure an action item exists for ONE security finding.
 #
-# Called by security_assess_deployment once per normalized finding.
-# Idempotency: keyed by metadata.finding_key = "sec:<scope_id>:<slug(rule_id:file)>"
-# (string — the NP metadata filter only matches string values). Exactly one live
-# item per finding:
+# Called by security_assess_application once per normalized finding.
+# Idempotency: keyed by metadata.finding_key = "sec:<application_id>:<slug(rule_id:file)>"
+# (string — the NP metadata filter only matches string values; the key is
+# app-scoped, not scope-scoped — built upstream, wf3 treats it opaquely).
+# Exactly one live item per finding:
 #   - no live item with the key → create (priority/value from the finding's severity)
 #   - live item, same commit    → no-op
 #   - live item, other commit (finding survived a redeploy) → patch metadata
@@ -20,7 +21,7 @@ inputs:
   finding:
     type: object
     required: true
-    description: "Normalized finding: {finding_key, scope_id, scope_name, scope_nrn, application, application_id, deployment_id, rule_id, severity, priority, value, title, file, evidence, recommendation, repo, commit, due_date, metadata{}}"
+    description: "Normalized finding: {finding_key (app-scoped: sec:<application_id>:<slug>), scope_id, scope_name, scope_nrn, application, application_id, deployment_id, rule_id, severity, priority, value, title, file, evidence, recommendation, repo, commit, due_date, metadata{}}"
   category_slug:
     type: string
     required: true
@@ -112,8 +113,8 @@ steps:
           '',
           String(f.recommendation || ''),
           '',
-          '_Opened by the weekly security assessment. Re-scans refresh this item;_',
-          '_it is NOT closed automatically when the finding disappears (v1)._'
+          '_Opened by the weekly security assessment. Re-scans refresh this item,_',
+          '_and it is closed automatically once a re-scan verifies the finding is resolved in the deployed code._'
         ];
         return { description: lines.join('\n') };
 

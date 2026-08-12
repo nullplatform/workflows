@@ -1,0 +1,202 @@
+# Sub-workflow: idempotently close the action item for ONE resolved security finding.
+#
+# Called by wf2 (a later task) once per open finding the assessor's re-scan no
+# longer reproduces — the agent's verdict decides "resolved", this workflow
+# executes it. Finds the LIVE item by metadata.finding_key, closes it, and
+# comments the resolution. Everything short-circuits to `not_found` when no
+# live item matches (nothing to close — already closed by a prior run, or the
+# key never had an item).
+#
+# Ordering: CLOSE FIRST, THEN COMMENT — not comment-then-close. This mirrors
+# workflows/ami-drift/wf2-ami-drift-closer.yaml's v2.2 fix (see that YAML's
+# header for the 2026-07-28 itti incident writeup: comment-before-close
+# posted 54 duplicate "closing automatically" comments on items whose close
+# then no-op'd against an already-closed row). `close` runs with
+# `ignoreInvalidTransition: true` (API-CONTRACTS.md §2) so re-running this
+# workflow over an already-closed item is a safe no-op; the comment is
+# skipped in that case (`steps.close.outputs.skipped == true`) so a repeat
+# run never re-announces a close that already happened. Both calls DO
+# happen on the normal found-and-open path — this only changes ordering and
+# adds the skip guard, it doesn't drop either side effect.
+id: security_close_finding
+name: "Security Assessment — Close Resolved Finding"
+description: >
+  Idempotently closes the action item for one security finding the assessor's
+  re-scan verdicted as resolved. Finds by metadata.finding_key (live/open
+  items only); closes (idempotent) then comments the resolution; no-ops to
+  `not_found` when no live item matches.
+path: "/action-items/security-assessment"
+semantic_version: 1.0.0
+
+inputs:
+  finding_key:
+    type: string
+    required: true
+    description: "App-scoped finding key: sec:<application_id>:<slug(rule_id:file)> — same key wf3 used to create the item"
+  organization_id:
+    type: string
+    required: true
+    description: "NP organization id (search scope for the idempotency lookup)"
+  commit:
+    type: string
+    required: true
+    description: "Commit at which the re-scan verified the finding resolved"
+  evidence:
+    type: string
+    required: false
+    description: "Optional agent-provided evidence for why the finding is considered resolved"
+
+variables:
+  found:  { initialValue: { count: 0, items: [], firstMatch: null } }
+  result: { initialValue: { action: "not_found", action_item_id: null } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Closes the action item for one resolved security finding (normally invoked by the assessor)."
+      inputs:
+        finding_key:
+          type: string
+          required: true
+          description: "App-scoped finding key (see workflow description)"
+        organization_id:
+          type: string
+          required: true
+          description: "NP organization id"
+        commit:
+          type: string
+          required: true
+          description: "Commit at which the re-scan verified the finding resolved"
+        evidence:
+          type: string
+          required: false
+          description: "Optional agent-provided evidence"
+
+  - id: find_open
+    type: module
+    plugin_type: np-action-item-find
+    name: "Find Open Item"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      nrn: "organization=${{ workflow.inputs.organization_id }}"
+      metadataKey: finding_key
+      metadataValue: "${{ workflow.inputs.finding_key }}"
+      # metadataKey/metadataValue idempotency search already excludes
+      # resolved/closed/rejected items by default (includeResolved: false —
+      # see np-action-item-find descriptor) and includes pending states
+      # (includePending: true). That's "live/open statuses only" without
+      # needing an explicit status filter — same as wf3's find_existing.
+
+  - id: stash_found
+    type: module
+    plugin_type: set-variable
+    name: "Stash Find Result → variables"
+    inputs:
+      raw: "${{ steps.find_open.outputs }}"
+    config:
+      path: found
+      value: "${{ inputs.raw }}"
+
+  - id: missing
+    type: decider
+    plugin_type: conditional
+    name: "No Live Item?"
+    config:
+      expression: "variables.found.count == 0"
+
+  # ── not-found path ───────────────────────────────────────────────────
+  - id: stash_notfound
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: not_found"
+    config:
+      path: result
+      value:
+        action: "not_found"
+        action_item_id: null
+
+  # ── found path: close first (idempotent), then comment ─────────────────
+  - id: close
+    type: module
+    plugin_type: np-action-item-update
+    name: "Close Item"
+    # Side effect that must not be lost to a transient 5xx/timeout.
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ variables.found.firstMatch.id }}"
+      action: close
+      actor: "workflow:security-assessment"
+      # Re-closing an already-closed item (e.g. a re-run over a stale find
+      # result) is a no-op success (outputs.skipped: true) instead of a
+      # failure. See API-CONTRACTS.md §2 and wf2-ami-drift-closer.yaml.
+      ignoreInvalidTransition: true
+
+  - id: was_skipped
+    type: decider
+    plugin_type: conditional
+    name: "Close Was A No-Op?"
+    config:
+      expression: "steps.close.outputs.skipped == true"
+
+  # Already closed by a prior run — nothing transitioned, so nothing to
+  # announce. Comment is skipped (mirrors ami-drift's v2.2 fix: never
+  # comment on a no-op close).
+  - id: stash_closed_noop
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: closed (no-op)"
+    config:
+      path: result
+      value:
+        action: "closed"
+        action_item_id: "${{ variables.found.firstMatch.id }}"
+
+  - id: comment
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment Resolution"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      actionItemId: "${{ variables.found.firstMatch.id }}"
+      author: "workflow:security-assessment"
+      content: "Resolved by ${{ workflow.inputs.commit }} — verified by the weekly security assessment on re-scan. ${{ workflow.inputs.evidence || '' }}"
+
+  - id: stash_closed
+    type: module
+    plugin_type: set-variable
+    name: "Stash Result: closed"
+    config:
+      path: result
+      value:
+        action: "closed"
+        action_item_id: "${{ variables.found.firstMatch.id }}"
+
+connections:
+  - { id: c1, from: start,            to: find_open }
+  - { id: c2, from: find_open,        to: stash_found }
+  - { id: c3, from: stash_found,      to: missing }
+  - { id: c4, from: missing,          to: stash_notfound,    source_port: "true" }
+  - { id: c5, from: missing,          to: close,              source_port: "false" }
+  - { id: c6, from: close,            to: was_skipped }
+  - { id: c7, from: was_skipped,      to: stash_closed_noop, source_port: "true" }
+  - { id: c8, from: was_skipped,      to: comment,            source_port: "false" }
+  - { id: c9, from: comment,          to: stash_closed }
+
+outputs:
+  action:         "${{ variables.result.action }}"
+  action_item_id: "${{ variables.result.action_item_id }}"

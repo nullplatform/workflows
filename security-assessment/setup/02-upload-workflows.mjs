@@ -34,7 +34,8 @@ const DRY_RUN = process.argv.includes('--dry-run');
 // patchReferences can only rewrite once the child has a wf_… id.
 const FILES = [
   { file: 'wf3-ensure-security-action-item.yaml', key: 'security_ensure_action_item' },
-  { file: 'wf2-assess-deployment.yaml', key: 'security_assess_deployment' },
+  { file: 'wf4-close-resolved-finding.yaml', key: 'security_close_finding' },
+  { file: 'wf2-assess-deployment.yaml', key: 'security_assess_application' },
   { file: 'wf1-security-scanner.yaml', key: 'security_scanner' },
 ];
 
