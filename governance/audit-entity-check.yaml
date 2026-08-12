@@ -256,12 +256,22 @@ steps:
               i--; continue;
             }
             if (c === '"' || c === "'" || c === "`") {
+              // Only a template literal may span lines, so a quote with no
+              // partner on its own line is not opening a string — it is a
+              // character inside something else, typically a regex like
+              // /['"]/. Treating it as a string would blank out the rest of
+              // the file and lose the anchor. A regex is still not modelled:
+              // one holding a quote that DOES have a partner on the same line
+              // masks the span between them, which can only cost the anchor
+              // (an unfound anchor degrades the source, it never invents one).
               let j = i + 1;
               while (j < src.length && src[j] !== c) {
-                isCode[j] = false;
-                if (src[j] === "\\" && j + 1 < src.length) { isCode[j + 1] = false; j++; }
+                if (c !== "`" && src[j] === "\n") { j = -1; break; }
+                if (src[j] === "\\" && j + 1 < src.length) j++;
                 j++;
               }
+              if (j < 0 || j >= src.length) continue;
+              for (let k = i + 1; k < j; k++) isCode[k] = false;
               i = j; continue;
             }
           }
@@ -315,15 +325,17 @@ steps:
               const ahead = src.slice(i, i + 4000);
               if (c === ".") {
                 // `...helper(A, B)` contributes one key per argument; a bare
-                // `...other` contributes an unknown number of them.
-                const call = /^\.\.\.\s*[A-Za-z_$][\w$]*\s*\(([\s\S]*?)\)/.exec(ahead);
+                // `...other` contributes an unknown number of them. The helper
+                // name is the only description those keys have, so it stands in
+                // as their value text.
+                const call = /^\.\.\.\s*([A-Za-z_$][\w$]*)\s*\(([\s\S]*?)\)/.exec(ahead);
                 if (call) {
-                  for (const raw of call[1].split(",")) {
+                  for (const raw of call[2].split(",")) {
                     const arg = raw.replace(/\/\/[^\n]*/g, "").trim();
                     if (!arg) continue;
                     const k = resolve(arg);
                     if (k === undefined) unresolved++;
-                    else keys.push(k);
+                    else { keys.push(k); entries[k] = `...${call[1]}(…)`; }
                   }
                   i += call[0].length - 1;
                   continue;
@@ -383,6 +395,14 @@ steps:
         let entityConfigTrusted = false;
         let clientsKeys = null;
         let appJsExcerpt = "";
+        // Entities the enhancer deliberately never fetches: a SELF_CONTAINED
+        // entry enriches from the event body and an `ignore: true` entry is
+        // skipped outright. The GET the probe replays does not happen in
+        // production for them, so their 404 is the designed behaviour and saying
+        // otherwise both invents a finding and (being a data flag) disables the
+        // carry-over for every application writing those entities.
+        const NOT_FETCHED = /self[_-]?contained|\bignore\s*:\s*true/i;
+        const notFetched = new Set();
         if (!isSet(github_token)) {
           degraded_sources.push("config entry GITHUB_TOKEN missing — enhancer entityConfig not read");
         } else {
@@ -457,6 +477,12 @@ steps:
               degraded_sources.push(
                 `enhancer entityConfig not parsed with confidence (${doubts.join("; ")})`
                 + ` — per-entity comparison skipped`);
+            } else {
+              // An entry whose text does not say either way is left out, so the
+              // entity gets probed: erring towards looking, not towards excusing.
+              for (const k of entityConfigKeys) {
+                if (NOT_FETCHED.test(cfg.entries[k] || "")) notFetched.add(k);
+              }
             }
             appJsExcerpt = [
               "// --- entityConfig ---",
@@ -540,9 +566,9 @@ steps:
         // segments are allowed because real names have them —
         // `notification/channel`, `runtime_configuration/dimension` — and the
         // enhancer fetches them as `GET /notification/channel/<id>`. No dot is
-        // in the charset and no segment may be empty, so `..` and `//` cannot
-        // appear.
-        const SAFE_ENTITY = /^[A-Za-z0-9_-]{1,64}(\/[A-Za-z0-9_-]{1,64})?$/;
+        // in the charset and no segment may be empty or start with a dash, so
+        // `..` and `//` cannot appear.
+        const SAFE_ENTITY = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}(\/[A-Za-z0-9_][A-Za-z0-9_-]{0,63})?$/;
         const SAFE_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
         const MAX_PROBES = 4;
         const samples = new Map();
@@ -551,19 +577,28 @@ steps:
           samples.set(row.entity, row.sample_entity_id || "");
         }
         const probes = [];
-        for (const entity of [...samples.keys()].filter(e => !SAFE_ENTITY.test(e))) {
-          const shown = String(entity).slice(0, 40);
-          probes.push({ entity: shown, verdict: "skipped_unsafe_name" });
-          if (entityConfigTrusted && entityConfigKeys.includes(entity)) {
-            // The enhancer configures this name, so it is legitimate by
-            // definition: not being able to probe it is a gap in this check, not
-            // a finding about the application.
-            degraded_sources.push(`probe: entity ${JSON.stringify(shown)} is configured in the enhancer but its name is outside what this probe builds URLs for — not probed`);
+        const probeable = [];
+        for (const entity of samples.keys()) {
+          if (notFetched.has(entity)) {
+            // Information for the agent, never a finding: production issues no
+            // GET for these, so a probe result would say nothing about them.
+            probes.push({ entity, verdict: "not_fetched_by_design" });
+          } else if (!SAFE_ENTITY.test(entity)) {
+            const shown = String(entity).slice(0, 40);
+            if (entityConfigTrusted && entityConfigKeys.includes(entity)) {
+              // The enhancer configures this name, so it is legitimate by
+              // definition: not being able to probe it is a gap in this check,
+              // not a finding about the application.
+              probes.push({ entity: shown, verdict: "skipped_not_probeable" });
+              degraded_sources.push(`probe: entity ${JSON.stringify(shown)} is configured in the enhancer but its name is outside what this probe builds URLs for — not probed`);
+            } else {
+              probes.push({ entity: shown, verdict: "skipped_unsafe_name" });
+              flag(entity, `probe: entity name ${JSON.stringify(shown)} skipped (characters outside the audit naming convention — itself a finding)`);
+            }
           } else {
-            flag(entity, `probe: entity name ${JSON.stringify(shown)} skipped (characters outside the audit naming convention — itself a finding)`);
+            probeable.push(entity);
           }
         }
-        const probeable = [...samples.keys()].filter(e => SAFE_ENTITY.test(e));
         const suspects = probeable.slice(0, MAX_PROBES);
         // The probe table must never read as exhaustive when it is not, and the
         // honest total is every suspect, not only the probeable ones.
@@ -975,16 +1010,32 @@ steps:
           entityConfig keys — but only when the signals do NOT report the
           entityConfig as untrusted or unavailable; when they do, the key list
           proves nothing and absence is not evidence.
-        - How to read the probe table: 200=ok; `answers_on_alt_host`=the
-          entity answered 200 on a non-default host, which is legitimate when
-          the enhancer has a `clients` entry routing it there — confirm on the
-          app.js excerpt, and report a finding only when the excerpt IS present
-          and shows no such entry (if the excerpt is unavailable this stays
-          unverified and is not a finding); `wrong_host`=the clients map was
-          read and has no entry for this entity, so the enhancer will only ever
-          call the default host that 404s; 404 everywhere=wrong entity_id or no
-          read endpoint (needs idRemapper or SELF_CONTAINED); 401/403=missing
-          grant; 5xx=DLQ risk (most urgent).
+        - How to read the probe table. Every verdict it can carry:
+          - `ok`: 200 on the default host, side C proven.
+          - `answers_on_alt_host`: 404 on the default host, 200 on another one.
+            Legitimate when the enhancer has a `clients` entry routing the
+            entity there — confirm on the app.js excerpt, and report a finding
+            only when the excerpt IS present and shows no such entry. If the
+            excerpt is unavailable this stays unverified and is not a finding.
+          - `wrong_host`: the clients map was read and has no entry for this
+            entity, so the enhancer will only ever call the default host, which
+            404s. This one is a finding.
+          - `id_or_endpoint_missing`: 404 everywhere — wrong entity_id or no
+            read endpoint (needs an idRemapper, or a SELF_CONTAINED entry).
+          - `missing_grant`: 401/403, the service account cannot read it.
+          - `upstream_error_dlq_risk`: 5xx, the most urgent finding.
+          - `not_fetched_by_design`: the entityConfig entry is SELF_CONTAINED or
+            `ignore: true`, so the enhancer never issues this GET. NOT probed
+            and NOT a finding — enrichment comes from the event body. Do not
+            claim a missing read endpoint for these; a 404 would be expected.
+          - `probe_unreachable`, `no_sample_id`, `skipped_unsafe_id`,
+            `skipped_not_probeable`: the probe could not run (no HTTP response,
+            no sample id in the lake window, an id or a name this check cannot
+            put in a URL). Side C is UNVERIFIED for that entity — say so, do
+            not read it as either healthy or broken.
+          - `skipped_unsafe_name`: the entity name carries characters outside
+            the audit naming convention AND the enhancer does not configure it.
+            That name itself is the finding.
         - Degraded sources are NOT findings. They say a source could not be
           read; treat those sides as unverified and say so. The probe table is
           only exhaustive if no degraded source says otherwise.
