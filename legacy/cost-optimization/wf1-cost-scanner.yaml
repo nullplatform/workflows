@@ -1,0 +1,158 @@
+# Cost Action Items — main orchestrator
+id: cost_action_items
+name: "Cost Action Items"
+description: >
+  Scans all scopes in an application for over-provisioned CPU and memory.
+  Processes scopes one at a time using split-in-batches to handle large
+  scope counts. Each scope is analyzed by the analyze-scope sub-workflow
+  which creates action items for findings.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+inputs:
+  application_id:
+    type: number
+    required: true
+    description: "NP application ID to scan"
+  np_api_base:
+    type: string
+    required: false
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+# Per-page scope results accumulate here across re-entries via the
+# `acc_scopes` step. `summary` reads this variable directly because the
+# `fetch_scopes:done` envelope it normally fans into is empty.
+variables:
+  scope_results:
+    initialValue: []
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Cost Scan"
+    config:
+      description: "Starts a cost optimization scan across all active scopes of an application"
+      inputs:
+        application_id:
+          type: number
+          required: true
+          description: "NP application ID"
+          placeholder: "e.g. 1182532716"
+          example: 1182532716
+        np_api_base:
+          type: string
+          required: false
+          description: "NP API base URL"
+          default: "https://api.nullplatform.com"
+          placeholder: "https://api.nullplatform.com"
+
+  # Streaming pagination: fetches ONE page per invocation and emits its
+  # items via the `loop` port. Downstream `analyze` fans out per scope
+  # within that page; once finished, `track` connects back to
+  # fetch_scopes:callback (re-entry port) to pull the next page.
+  # When fetch_scopes detects the last page, it routes via `done` to
+  # `summary` instead of `loop`. Memory stays bounded to one page.
+  - id: fetch_scopes
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "List Active Scopes"
+    config:
+      apiBaseUrl: "${{ workflow.inputs.np_api_base || 'https://api.nullplatform.com' }}"
+      apiToken: "${{ secrets.np_api_token }}"
+      entity: scope
+      filters:
+        application: "${{ workflow.inputs.application_id }}"
+        status: active
+      limit: 100
+      mode: stream
+
+  - id: analyze
+    type: module
+    plugin_type: sub-workflow
+    name: "Analyze Scope"
+    config:
+      workflowId: analyze_scope
+      waitForCompletion: true
+    inputs:
+      scope_id: "${{ $item.id }}"
+      application_id: "${{ $item.application_id }}"
+      scope_name: "${{ $item.name }}"
+      scope_nrn: "${{ $item.nrn }}"
+
+  # Append this page's per-scope analyze_scope outputs to the workflow
+  # accumulator. set-variable runs once per loop iteration with the full
+  # batch in `$items`. flipPorts keeps the visual back-edge tidy.
+  - id: acc_scopes
+    type: module
+    plugin_type: set-variable
+    name: "Accumulate Scope Results"
+    metadata:
+      flipPorts: true
+    config:
+      path: scope_results
+      value: "${{ concat(variables.scope_results, $items) }}"
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Build Summary"
+    inputs:
+      results: "${{ variables.scope_results }}"
+    config:
+      code: |
+        var items = inputs.results || [];
+        var findings = [];
+        for (var i = 0; i < items.length; i++) {
+          var r = items[i] || {};
+          if (!r.action_item_id) continue;
+          var f = r.finding || {};
+          findings.push({
+            namespace_id:   r.namespace_id != null ? r.namespace_id : null,
+            application_id: r.application_id != null ? r.application_id : null,
+            scope_id:       r.scope_id != null ? r.scope_id : null,
+            scope_name:     r.scope_name || null,
+            scope_nrn:      r.scope_nrn || f.nrn || null,
+            action_item_id: r.action_item_id,
+            title:          f.title || null,
+            value:          f.value != null ? f.value : null,
+            priority:       f.priority || null,
+            resources:      f.resources || null,
+          });
+        }
+        return {
+          total_scopes_scanned: items.length,
+          action_items_created: findings.length,
+          action_item_ids: findings.map(function(f){ return f.action_item_id; }),
+          findings: findings
+        };
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Scan Complete"
+    config:
+      level: info
+      message: "Cost scan complete. Scanned ${{ steps.summary.outputs.total_scopes_scanned }} scopes, created ${{ steps.summary.outputs.action_items_created }} action items."
+
+connections:
+  - { id: c1, from: start, to: fetch_scopes }
+  # fetch_scopes streams: `loop` port → analyze (per-page items fan out).
+  - { id: c2, from: fetch_scopes, to: analyze, source_port: loop }
+  - { id: c3, from: analyze, to: acc_scopes }
+  # `acc_scopes` loops back into fetch_scopes:callback (reentry port) to
+  # pull the next page. The engine resets fetch_scopes' join state on
+  # each reentry-edge settle so it can re-fire.
+  - { id: c4, from: acc_scopes, to: fetch_scopes, target_port: callback }
+  # When fetch_scopes detects the last page, it activates `done`.
+  - { id: c5, from: fetch_scopes, to: summary, source_port: done }
+  - { id: c6, from: summary, to: log_done }
+
+outputs:
+  total_scopes:         "${{ steps.summary.outputs.total_scopes_scanned }}"
+  action_items_created: "${{ steps.summary.outputs.action_items_created }}"
+  action_item_ids:      "${{ steps.summary.outputs.action_item_ids }}"
+  findings:             "${{ steps.summary.outputs.findings }}"

@@ -1,0 +1,567 @@
+# Sub-workflow: Analyze a single scope for cost optimization
+id: analyze_scope
+name: "Analyze Scope"
+description: >
+  Analyzes a single scope for over-provisioned CPU and memory.
+  Creates an action item if waste exceeds the minimum threshold.
+  Only scope_id is required — application_id, nrn, and name are derived
+  from the scope details fetched at the start.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+inputs:
+  scope_id:
+    type: number
+    required: true
+    description: "NP scope ID — the only required input."
+  np_api_base:
+    type: string
+    required: false
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+# Workflow shared context. Downstream steps read these via ${{ variables.X }}
+# instead of reaching into other steps' outputs (which would couple steps to
+# each other's names + output shape — fragile across renames/refactors).
+variables:
+  scope:           { initialValue: null }   # populated after fetch_scope
+  dup_check:       { initialValue: { count: 0, items: [] } }  # populated after check_duplicates
+  finding:         { initialValue: null }   # populated after analyze (when has_finding)
+  action_item_id:  { initialValue: null }   # populated after create_ai
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Analyzes a single scope for over-provisioned resources. Only needs scope_id."
+      inputs:
+        scope_id:
+          type: number
+          required: true
+          description: "NP scope ID (application_id, nrn, name are derived from the scope)"
+          placeholder: "e.g. 1823123121"
+
+  # Fetch scope details — the only serial call. Everything else runs in parallel.
+  - id: fetch_scope
+    type: module
+    plugin_type: http-request
+    name: "Fetch Scope"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/scope/${{ workflow.inputs.scope_id }}"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  # Stash the entire scope into shared context. Anything downstream that
+  # needs nrn/application_id/name reads from variables.scope.* — never from
+  # steps.fetch_scope.outputs.*. This is the single point where the scope
+  # leaves its producing step.
+  - id: stash_scope
+    type: module
+    plugin_type: set-variable
+    name: "Stash Scope → variables"
+    # Bridge fetch_scope's response body into shared context.
+    # See `stash_dup_check` below for the inputs/value pattern rationale.
+    inputs:
+      body: "${{ steps.fetch_scope.outputs.body }}"
+    config:
+      path: scope
+      value: "${{ inputs.body }}"
+
+  # ── Active-scope guard ───────────────────────────────────────────────
+  # Skip anything that isn't an active scope (deleted, archived, etc.) —
+  # there's nothing to right-size on a non-active workload, and any
+  # "savings" computed from stale data would be misleading.
+  - id: is_active
+    type: decider
+    plugin_type: conditional
+    name: "Scope Active?"
+    config:
+      expression: "variables.scope.status == 'active'"
+
+  - id: log_inactive
+    type: module
+    plugin_type: log
+    name: "Skip: Scope Not Active"
+    config:
+      level: info
+      message: "Scope ${{ workflow.inputs.scope_id }}: skipped — status='${{ variables.scope.status }}' (not active)"
+
+  # ── Deduplication check ──────────────────────────────────────────────
+  - id: check_duplicates
+    type: module
+    plugin_type: np-action-item-find
+    name: "Check for Open Duplicates"
+    config:
+      nrn: "${{ variables.scope.nrn }}"
+      status:
+        - open
+        - pending_verification
+        - pending_deferral
+        - deferred
+      labels:
+        workflow_type: cost-optimization
+      metadata:
+        scope_id: "${{ workflow.inputs.scope_id }}"
+      limit: 1
+
+  # Stash the full check_duplicates result into shared context. set-variable
+  # uses an `inputs:` declaration to bridge the producing step's outputs
+  # into the variable — that keeps the rule "no steps.X.outputs in config"
+  # intact (the only reference is in `inputs:`, which IS the documented
+  # contract for cross-step data).
+  - id: stash_dup_check
+    type: module
+    plugin_type: set-variable
+    name: "Stash Dedup Result → variables"
+    inputs:
+      raw: "${{ steps.check_duplicates.outputs }}"
+    config:
+      path: dup_check
+      value: "${{ inputs.raw }}"
+
+  - id: has_duplicate
+    type: decider
+    plugin_type: conditional
+    name: "Already Has Open AI?"
+    config:
+      # Raw expression — conditional reads from variables (set-variable
+      # has populated dup_check by now).
+      expression: "variables.dup_check.count > 0"
+
+  - id: log_duplicate
+    type: module
+    plugin_type: log
+    name: "Skip: Duplicate Found"
+    config:
+      level: info
+      message: "Scope ${{ workflow.inputs.scope_id }}: skipped — open action item already exists (${{ variables.dup_check.items[0].id }})"
+
+  # ── Parallel fetches — read application_id from shared context ─────
+  - id: fetch_instances
+    type: module
+    plugin_type: http-request
+    name: "Fetch Instances"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/telemetry/instance?application_id=${{ variables.scope.application_id }}&scope_id=${{ workflow.inputs.scope_id }}"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  - id: fetch_cpu
+    type: module
+    plugin_type: http-request
+    name: "Fetch CPU Metrics (12h)"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/telemetry/application/${{ variables.scope.application_id }}/metric/system.cpu_usage_percentage?scope_id=${{ workflow.inputs.scope_id }}&minutes=720&period=300"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  - id: fetch_mem
+    type: module
+    plugin_type: http-request
+    name: "Fetch Memory Metrics (12h)"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/telemetry/application/${{ variables.scope.application_id }}/metric/system.memory_usage_percentage?scope_id=${{ workflow.inputs.scope_id }}&minutes=720&period=300"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  # `analyze` has 3 incoming connections (from fetch_cpu, fetch_mem,
+  # fetch_instances). It declares its inputs explicitly — that IS the
+  # contract of this step. Inputs are the documented entry points for a
+  # plugin and can legitimately reference upstream step outputs (this is
+  # not the same as reaching into other steps' outputs from inside `config`).
+  - id: analyze
+    type: module
+    plugin_type: code-exec
+    name: "Analyze Resources"
+    config:
+      code: |
+        var scope = $item.scope_data || {};
+        var instances = $item.instances || [];
+        var cpuMetrics = $item.cpu_body || {};
+        var memMetrics = $item.mem_body || {};
+
+        var THRESHOLD = 20, MIN_SAVINGS = 5, SAFETY = 2, BURST = 6;
+        var CPU_PRICE = 33.28, MEM_PRICE = 4.49;
+
+        // ── Stage 1: what scope are we analyzing ───────────────────────
+        log.info('Analyzing scope', {
+          scope_id: scope.id,
+          scope_name: scope.name,
+          scope_status: scope.status,
+          application_id: scope.application_id,
+          tier: scope.tier,
+        });
+
+        // ── Stage 2: instances summary ─────────────────────────────────
+        if (instances && instances.results) {
+          // NP returns { results: [...], filters: {...} } — unwrap
+          instances = instances.results;
+        }
+        var instanceCount = Array.isArray(instances) ? instances.length : 0;
+        log.info('Instances fetched', {
+          count: instanceCount,
+          first_instance_id: instanceCount > 0 ? instances[0].id : null,
+        });
+
+        // ── Stage 3: per-pod allocation FROM SCOPE CONFIG ──────────────
+        // We read the configured per-pod resources from scope.capabilities
+        // (this is what we'd actually adjust to right-size the workload).
+        // Then multiply by replica count to reason about fleet-level waste.
+        // Reading instances[0].details is wrong because: (a) some instances
+        // may not have populated details, (b) replica count drives total
+        // allocation, (c) the recommendation is what we'll write back to
+        // the scope config, not to a single pod.
+        var caps = scope.capabilities || {};
+        var spec = scope.specification || {};
+        var cpuReqM = caps.cpu_millicores || 0;
+        var memReqMi = caps.ram_memory || 0;
+        // No explicit limit field on scope config — common k8s pattern is
+        // limit = request * BURST. Track it for reporting only.
+        var cpuLimM = cpuReqM > 0 ? Math.ceil(cpuReqM * BURST) : 0;
+        var memLimMi = memReqMi > 0 ? Math.ceil(memReqMi * BURST) : 0;
+
+        // Replica count: prefer current actual (instance count) — falls
+        // back to autoscaling.min_replicas (configured floor).
+        var replicas = instanceCount > 0
+          ? instanceCount
+          : ((caps.autoscaling && caps.autoscaling.min_replicas) || spec.replicas || 1);
+
+        log.info('Per-pod allocation (from scope.capabilities)', {
+          cpu_request_m: cpuReqM,
+          memory_request_mi: memReqMi,
+          replicas: replicas,
+          source: 'scope.capabilities (right-sizing target)',
+        });
+        log.info('Total fleet allocation', {
+          total_cpu_m: cpuReqM * replicas,
+          total_memory_mi: memReqMi * replicas,
+        });
+
+        // Compute robust stats from a metric body. Returns:
+        //   avg          — arithmetic mean across all samples
+        //   max          — true max (kept for transparency)
+        //   p95          — 95th percentile, the value used by the algorithm
+        //                  to decide over-provisioning. Discards isolated
+        //                  spikes (e.g. NP returning a single 1507% sample
+        //                  amid 143 zeros) which would otherwise mislead
+        //                  right-sizing.
+        //   sample_count, nonzero_count — for log diagnostics.
+        function getStats(body) {
+          var data = [];
+          if (body && body.results && body.results.length > 0) data = body.results[0].data || [];
+          if (data.length === 0) return { avg: 0, max: 0, p95: 0, sample_count: 0, nonzero_count: 0 };
+          var values = [];
+          var sum = 0, max = 0, nonzero = 0;
+          for (var i = 0; i < data.length; i++) {
+            var v = data[i].value || 0;
+            values.push(v);
+            sum += v;
+            if (v > max) max = v;
+            if (v > 0) nonzero++;
+          }
+          values.sort(function (a, b) { return a - b; });
+          // Linear-interpolated p95 — for 144 samples, idx ≈ 135.85 →
+          // mostly captures the 136th value, smoothing past the top tail.
+          var rank = 0.95 * (values.length - 1);
+          var lo = Math.floor(rank);
+          var hi = Math.ceil(rank);
+          var p95 = lo === hi ? values[lo] : values[lo] + (values[hi] - values[lo]) * (rank - lo);
+          return {
+            avg: sum / data.length,
+            max: max,
+            p95: p95,
+            sample_count: data.length,
+            nonzero_count: nonzero,
+          };
+        }
+
+        // ── Stage 3: metrics summaries (% utilization over 12h window) ─
+        // Use p95 as the "peak" signal so isolated spikes don't dominate
+        // the recommendation. True max is kept in the log for visibility.
+        var cpuStats = getStats(cpuMetrics);
+        var memStats = getStats(memMetrics);
+        log.info('CPU metrics stats (% utilization, 12h)', {
+          samples: cpuStats.sample_count,
+          nonzero_samples: cpuStats.nonzero_count,
+          avg_pct: Math.round(cpuStats.avg * 100) / 100,
+          p95_pct: Math.round(cpuStats.p95 * 100) / 100,
+          max_pct: Math.round(cpuStats.max * 100) / 100,
+        });
+        log.info('Memory metrics stats (% utilization, 12h)', {
+          samples: memStats.sample_count,
+          nonzero_samples: memStats.nonzero_count,
+          avg_pct: Math.round(memStats.avg * 100) / 100,
+          p95_pct: Math.round(memStats.p95 * 100) / 100,
+          max_pct: Math.round(memStats.max * 100) / 100,
+        });
+
+        // Use p95 (not max) for over-provisioning decision — robust to
+        // single-sample spikes from NP metric pipeline glitches.
+        var cpuMaxM = (cpuStats.p95 / 100) * cpuReqM;
+        var cpuAvgM = (cpuStats.avg / 100) * cpuReqM;
+        var memMaxMi = (memStats.p95 / 100) * memReqMi;
+        var memAvgMi = (memStats.avg / 100) * memReqMi;
+
+        // `alloc` is per-pod. `peak`/`avg` are per-pod usage in the same
+        // unit. Waste and savings get scaled by `replicas` so the dollar
+        // figure reflects fleet-wide impact (the recommendation itself is
+        // per-pod since that's what we'll write back to the scope config).
+        function check(res, alloc, allocLim, peak, avg, repl) {
+          if (alloc <= 0) {
+            log.info('Skipping ' + res + ' — no allocation declared (alloc=0)', { resource: res });
+            return null;
+          }
+          var util = (peak / alloc) * 100;
+          if (util >= THRESHOLD) {
+            log.info('Skipping ' + res + ' — utilization >= ' + THRESHOLD + '% (no waste)', {
+              resource: res, peak_per_pod: peak, allocated_per_pod: alloc,
+              utilization_pct: Math.round(util * 100) / 100,
+            });
+            return null;
+          }
+          var rec = Math.max(1, Math.ceil(peak * SAFETY));
+          var recLim = Math.max(rec, Math.ceil(peak * BURST));
+          if (rec >= alloc) {
+            log.info('Skipping ' + res + ' — recommended >= allocated (no savings)', {
+              resource: res, recommended_per_pod: rec, allocated_per_pod: alloc,
+            });
+            return null;
+          }
+          var wastePerPod = alloc - rec;
+          var fleetWaste = wastePerPod * repl;
+          var sav = res === 'cpu' ? (fleetWaste / 1000) * CPU_PRICE : (fleetWaste / 1024) * MEM_PRICE;
+          sav = Math.round(sav * 100) / 100;
+          if (sav < MIN_SAVINGS) {
+            log.info('Skipping ' + res + ' — fleet savings $' + sav + '/mo below MIN_SAVINGS=$' + MIN_SAVINGS, {
+              resource: res, fleet_savings_usd_month: sav, min_required: MIN_SAVINGS,
+              waste_per_pod: wastePerPod, replicas: repl,
+            });
+            return null;
+          }
+          log.info(res.toUpperCase() + ' is over-provisioned across the fleet', {
+            resource: res,
+            allocated_per_pod: alloc,
+            peak_per_pod: Math.round(peak * 100) / 100,
+            utilization_pct: Math.round(util * 100) / 100,
+            recommended_per_pod: rec,
+            replicas: repl,
+            fleet_waste: fleetWaste,
+            fleet_savings_usd_month: sav,
+          });
+          return {
+            resource: res,
+            allocated: alloc, allocated_limit: allocLim,
+            peak: Math.round(peak * 100) / 100, avg: Math.round(avg * 100) / 100,
+            utilization_pct: Math.round(util * 100) / 100,
+            recommended_request: rec, recommended_limit: Math.min(recLim, allocLim),
+            waste_units: wastePerPod,
+            fleet_waste_units: fleetWaste,
+            replicas: repl,
+            savings_usd_month: sav,
+          };
+        }
+
+        var analyses = [];
+        var cpu = check('cpu', cpuReqM, cpuLimM, cpuMaxM, cpuAvgM, replicas);
+        if (cpu) analyses.push(cpu);
+        var mem = check('memory', memReqMi, memLimMi, memMaxMi, memAvgMi, replicas);
+        if (mem) analyses.push(mem);
+
+        if (analyses.length === 0) {
+          log.warn('No actionable finding for this scope', {
+            reason: 'no resource crossed the waste threshold (see per-resource skip logs above)',
+          });
+          return { has_finding: false, finding: null };
+        }
+
+        var totalSav = 0, resList = [];
+        for (var a = 0; a < analyses.length; a++) {
+          totalSav += analyses[a].savings_usd_month;
+          resList.push(analyses[a].resource);
+        }
+        totalSav = Math.round(totalSav * 100) / 100;
+        var resStr = resList.join(' & ');
+        var scopeName = scope.name || scope.slug || ('scope-' + scope.id);
+        var appName = scope.application_name || ('app-' + scope.application_id);
+        var nrn = scope.nrn || '';
+        var pri = totalSav >= 50 ? 'critical' : totalSav >= 20 ? 'high' : totalSav >= 5 ? 'medium' : 'low';
+
+        log.info('Finding produced', {
+          resources: resStr,
+          total_savings_usd_month: totalSav,
+          priority: pri,
+          analyses_count: analyses.length,
+        });
+
+        return {
+          has_finding: true,
+          finding: {
+            nrn: nrn,
+            title: resStr.toUpperCase() + ' over-provisioned: ' + appName + ' / ' + scopeName + ' - $' + totalSav.toFixed(2) + '/mo waste',
+            priority: pri, value: totalSav, resources: resStr,
+            app_name: appName, scope_name: scopeName, analyses: analyses,
+            metadata: {
+              scope_id: scope.id, application_id: scope.application_id,
+              replicas: (scope.specification && scope.specification.replicas) || 1,
+              analyses: analyses,
+              total_savings_usd_month: totalSav, analysis_period_hours: 12, confidence: 0.85
+            }
+          }
+        };
+    inputs:
+      # code-exec exposes `inputs` inside the sandbox — these declared
+      # inputs ARE this step's contract (its "function signature").
+      # Inputs may reference upstream steps explicitly because that IS
+      # the documented input wiring; the rule only forbids reaching into
+      # other steps' outputs from inside `config:` blocks.
+      # scope_data still comes from shared context (set once after fetch_scope).
+      scope_data: "${{ variables.scope }}"
+      instances:  "${{ steps.fetch_instances.outputs.body }}"
+      cpu_body:   "${{ steps.fetch_cpu.outputs.body }}"
+      mem_body:   "${{ steps.fetch_mem.outputs.body }}"
+
+  # Stash the finding into shared context so create_ai (and anyone else)
+  # can read it without naming `analyze`.
+  - id: stash_finding
+    type: module
+    plugin_type: set-variable
+    name: "Stash Finding → variables"
+    inputs:
+      finding: "${{ steps.analyze.outputs.finding }}"
+    config:
+      path: finding
+      value: "${{ inputs.finding }}"
+
+  - id: has_finding
+    type: decider
+    plugin_type: conditional
+    name: "Has Finding?"
+    config:
+      expression: "variables.finding != null"
+
+  - id: no_finding
+    type: module
+    plugin_type: log
+    name: "No Finding"
+    config:
+      level: info
+      message: "Scope ${{ workflow.inputs.scope_id }}: resources well-utilized"
+
+  - id: build_description
+    type: module
+    plugin_type: code-exec
+    name: "Build AI Description"
+    config:
+      code: |
+        var f = $item.finding;
+        if (!f) return { description: '', skip: true };
+        var lines = ['## Over-provisioned Resources', '',
+          '- **App**: ' + f.app_name, '- **Scope**: ' + f.scope_name, ''];
+        for (var i = 0; i < f.analyses.length; i++) {
+          var a = f.analyses[i];
+          var u = a.resource === 'cpu' ? 'm' : 'Mi';
+          lines.push('### ' + a.resource.toUpperCase(),
+            '- Allocated: **' + a.allocated + u + '**, Peak: **' + a.peak + u + '** (' + a.utilization_pct + '%)',
+            '- Recommend: **' + a.recommended_request + u + '** request, **' + a.recommended_limit + u + '** limit',
+            '- Savings: **$' + a.savings_usd_month.toFixed(2) + '/mo**', '');
+        }
+        lines.push('**Total: $' + f.value.toFixed(2) + '/mo**');
+        return { description: lines.join('\n') };
+    inputs:
+      # Declared input — reads finding from shared context.
+      finding: "${{ variables.finding }}"
+
+  - id: create_ai
+    type: module
+    plugin_type: np-action-item-create
+    name: "Create Action Item"
+    config:
+      categorySlug: cost-optimization
+      createdBy: "agent:cost-scanner"
+      # All finding fields come from shared context, not from steps.analyze.*
+      nrn: "${{ variables.finding.nrn }}"
+      title: "${{ variables.finding.title }}"
+      # description is the build_description output — single-hop passthrough.
+      description: "${{ $item.description }}"
+      priority: "${{ variables.finding.priority }}"
+      value: "${{ variables.finding.value }}"
+      labels:
+        workflow_type: cost-optimization
+        resources: "${{ variables.finding.resources }}"
+        scanner_version: "1.0"
+        auto_detected: "true"
+      metadata: "${{ variables.finding.metadata }}"
+
+  # Stash the created action_item_id so `comment` and `done` (and the
+  # workflow outputs) read from variables instead of reaching into create_ai.
+  - id: stash_action_item_id
+    type: module
+    plugin_type: set-variable
+    name: "Stash Action Item ID → variables"
+    inputs:
+      id: "${{ steps.create_ai.outputs.actionItemId }}"
+    config:
+      path: action_item_id
+      value: "${{ inputs.id }}"
+
+  - id: comment
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Add Scan Comment"
+    config:
+      author: "agent:cost-scanner"
+      content: "Automated scan detected this over-provisioning. A remediation plan will be generated."
+      actionItemId: "${{ variables.action_item_id }}"
+
+  - id: done
+    type: module
+    plugin_type: log
+    name: "Done"
+    config:
+      level: info
+      message: "Scope ${{ workflow.inputs.scope_id }}: created AI ${{ variables.action_item_id }}"
+
+connections:
+  - { id: c1,  from: start,            to: fetch_scope }
+  - { id: c2,  from: fetch_scope,      to: stash_scope }
+  - { id: c3,  from: stash_scope,      to: is_active }
+  - { id: c3a, from: is_active,        to: log_inactive,     source_port: "false" }
+  - { id: c3b, from: is_active,        to: check_duplicates, source_port: "true" }
+  - { id: c4,  from: check_duplicates, to: stash_dup_check }
+  - { id: c5,  from: stash_dup_check,  to: has_duplicate }
+  - { id: c6,  from: has_duplicate,    to: log_duplicate,   source_port: "true" }
+  - { id: c7,  from: has_duplicate,    to: fetch_instances, source_port: "false" }
+  - { id: c8,  from: has_duplicate,    to: fetch_cpu,       source_port: "false" }
+  - { id: c9,  from: has_duplicate,    to: fetch_mem,       source_port: "false" }
+  - { id: c10, from: fetch_instances,  to: analyze }
+  - { id: c11, from: fetch_cpu,        to: analyze }
+  - { id: c12, from: fetch_mem,        to: analyze }
+  - { id: c13, from: analyze,          to: stash_finding }
+  - { id: c14, from: stash_finding,    to: has_finding }
+  - { id: c15, from: has_finding,      to: build_description, source_port: "true" }
+  - { id: c16, from: has_finding,      to: no_finding,        source_port: "false" }
+  - { id: c17, from: build_description, to: create_ai }
+  - { id: c18, from: create_ai,        to: stash_action_item_id }
+  - { id: c19, from: stash_action_item_id, to: comment }
+  - { id: c20, from: comment,          to: done }
+
+# Workflow-level outputs read from shared context — same pattern.
+outputs:
+  action_item_id: "${{ variables.action_item_id }}"
+  has_finding:    "${{ variables.finding != null }}"
+  finding:        "${{ variables.finding }}"
+  # Echo the input identifiers so the parent's accumulator gets a full
+  # breadcrumb without having to reach into the sub-execution.
+  scope_id:       "${{ workflow.inputs.scope_id }}"
+  application_id: "${{ variables.scope.application_id }}"
+  namespace_id:   "${{ variables.scope.namespace_id }}"
+  scope_name:     "${{ variables.scope.name }}"
+  scope_nrn:      "${{ variables.scope.nrn }}"
