@@ -18,7 +18,11 @@
 #   - lake (two `np-lake-query` steps): entities first seen in the last 7 days
 #     and the per-entity empty-row rate (the real-world proxy of `degraded`),
 #     each carrying a sample entity_id for the probe,
-#   - enhancer entityConfig + clients keys (read from the enhancer repo),
+#   - enhancer entityConfig + clients keys, read out of `audit-ennhancer/app.js`
+#     in the enhancer repo. Both maps are properties of a constructor call and
+#     most entityConfig keys are computed (`[ENTITIES.USER]:`) or arrive through
+#     `...selfContained(…)`, so the ENTITIES map in `audit_enhancer.js` is read
+#     too and the key set is only used when every key position resolved,
 #   - fetch probe: replay the enhancer's own GET (same identity, same
 #     X-Enhanced header) against a real entity_id — the response code predicts
 #     exactly what production will do (200 ok / 404 host-or-id / 401-403 grant
@@ -91,10 +95,14 @@ steps:
       callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
       message:       "Collecting audit pipeline signals (lake, enhancer config, fetch probe)…"
 
-  # Neither lake query may fail the run: a missing signal forces analysis, it
-  # never blocks the checklist. Each one falls back to its own re-entry node
-  # (see lake_new_degraded) which hands control back to `signals`; `signals`
-  # then sees the absent `rows` input and records a degraded source.
+  # Neither lake query may fail the run, and neither may take the other down
+  # with it: a missing signal forces analysis, it never blocks the checklist.
+  # Each query falls back to its own re-entry node, which continues to the SAME
+  # successor the query has on the happy path — so a failed query 1 still lets
+  # query 2 run, and `signals` sees the absent `rows` input either way and
+  # records a degraded source. Every join point downstream therefore has exactly
+  # two predecessors of which exactly one ever completes, which is what makes
+  # `join_strategy: any` unambiguous there (see governance/README.md).
   - id: lake_new_entities
     type: module
     plugin_type: np-lake-query
@@ -125,6 +133,9 @@ steps:
     type: module
     plugin_type: np-lake-query
     name: "Lake: entities with empty enrichment rows (degraded proxy)"
+    # Runs whether query 1 succeeded or degraded — exactly one of those two
+    # predecessors ever completes.
+    join_strategy: any
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
@@ -146,12 +157,12 @@ steps:
     error_handling:
       fallback_step: lake_empty_degraded
 
-  # Re-entry nodes for a failed lake query. A failing step can only hand
-  # control to a node whose predecessors are ALL settled, and `signals` keeps
-  # an unsettled happy-path edge whenever the query before it never ran — hence
-  # one single-predecessor node per query, exactly like the failure-resolve
-  # tails. They only exist to get back onto the graph; `signals` reads the
-  # error message straight off the failed step.
+  # Re-entry nodes for a failed lake query, one per query: a failing step can
+  # only hand control to a node whose predecessors are ALL settled, so a shared
+  # node would hang on the query that never ran (same reason the failure-resolve
+  # tails are separate). Each one records the error in the execution state and
+  # continues where its query would have; `signals` reads the error message
+  # straight off the failed step.
   - id: lake_new_degraded
     type: module
     plugin_type: set-variable
@@ -172,9 +183,8 @@ steps:
     type: module
     plugin_type: code-exec
     name: "Deterministic signals: enhancer config + probe over the lake rows"
-    # Reachable from lake_empty_rows on the happy path and from either re-entry
-    # node otherwise: `any` starts the step on the first completed edge and
-    # ignores the ones that will never settle.
+    # Runs whether query 2 succeeded or degraded — exactly one of those two
+    # predecessors ever completes.
     join_strategy: any
     inputs:
       github_token:       "${{ secrets.GITHUB_TOKEN }}"
@@ -213,19 +223,37 @@ steps:
         // so an unset secret would otherwise reach fetch() as "undefined".
         const isSet = (v) => typeof v === "string" && v.trim().length > 0;
 
-        // Extracts the top-level keys of the object literal assigned in
-        // `const <name> = { … }`, plus the literal's source text. Anchored on
-        // the declaration (not the first mention of the name, which is often a
-        // read) and aware of comments and strings: a `word:` inside a comment
-        // is not a key, and a brace inside a comment or a string neither opens
-        // nor closes the object. `spread` reports `...other` at the top level,
-        // which means the key list is incomplete.
-        const extractObjectLiteral = (src, name) => {
-          const decl = new RegExp("(?:const|let|var)\\s+" + name + "\\s*=\\s*\\{").exec(src);
+        // Extracts the top-level keys of an object literal, plus the raw source
+        // text of each value and of the literal itself. The name is matched
+        // either as an assignment (`const X = { … }`) or as a property
+        // (`new Thing({ X: { … } })`) — the enhancer builds its maps the second
+        // way. Comments and strings are skipped, so a `word:` inside a comment
+        // is not a key and a brace inside a comment or a string neither opens
+        // nor closes the object.
+        //
+        // Two shapes need `resolveRef` to be named at all: computed keys
+        // (`[ENTITIES.USER]:`) and spreads of a helper call
+        // (`...selfContained(ENTITIES.LINK, …)`). `unresolved` counts the key
+        // positions that could not be named — a non-zero count means the key
+        // list is INCOMPLETE, which is the difference between "this entity is
+        // not configured" and "we did not read the whole map".
+        const extractObjectLiteral = (src, name, resolveRef) => {
+          const resolve = resolveRef || (() => undefined);
+          const anchor = new RegExp(
+            "(?:(?:const|let|var)\\s+" + name + "\\s*=|\\b" + name + "\\s*:)\\s*\\{");
+          const decl = anchor.exec(src);
           if (!decl) return null;
           const open = decl.index + decl[0].length - 1;
           const keys = [];
-          let depth = 0, end = -1, expectKey = false, spread = false;
+          const entries = {};
+          let depth = 0, end = -1, expectKey = false, unresolved = 0;
+          let pendingKey = null, valueStart = -1;
+          const closeEntry = (at) => {
+            if (pendingKey !== null && valueStart >= 0) {
+              entries[pendingKey] = src.slice(valueStart, at).trim();
+            }
+            pendingKey = null; valueStart = -1;
+          };
           for (let i = open; i < src.length; i++) {
             const c = src[i], next = src[i + 1];
             if (c === "/" && next === "/") {
@@ -243,10 +271,41 @@ steps:
             // quoted key would be consumed as a plain string literal.
             if (expectKey && depth === 1) {
               expectKey = false;
-              if (src.startsWith("...", i)) { spread = true; i += 2; continue; }
-              const m = /^(?:(["'])((?:\\.|[^\\\n])*?)\1|([A-Za-z_$][\w$]*))\s*:/.exec(src.slice(i, i + 300));
+              const ahead = src.slice(i, i + 4000);
+              if (c === ".") {
+                // `...helper(A, B)` contributes one key per argument; a bare
+                // `...other` contributes an unknown number of them.
+                const call = /^\.\.\.\s*[A-Za-z_$][\w$]*\s*\(([\s\S]*?)\)/.exec(ahead);
+                if (call) {
+                  for (const raw of call[1].split(",")) {
+                    const arg = raw.replace(/\/\/[^\n]*/g, "").trim();
+                    if (!arg) continue;
+                    const k = resolve(arg);
+                    if (k === undefined) unresolved++;
+                    else keys.push(k);
+                  }
+                  i += call[0].length - 1;
+                  continue;
+                }
+                if (ahead.startsWith("...")) { unresolved++; i += 2; continue; }
+              }
+              if (c === "[") {
+                const computed = /^\[\s*([^\]]+?)\s*\]\s*:/.exec(ahead);
+                if (computed) {
+                  const k = resolve(computed[1]);
+                  if (k === undefined) unresolved++;
+                  else { keys.push(k); pendingKey = k; valueStart = i + computed[0].length; }
+                  i += computed[0].length - 1;
+                  continue;
+                }
+                unresolved++;
+              }
+              const m = /^(?:(["'])((?:\\.|[^\\\n])*?)\1|([A-Za-z_$][\w$]*))\s*:/.exec(ahead);
               if (m) {
-                keys.push(m[2] !== undefined ? m[2] : m[3]);
+                const k = m[2] !== undefined ? m[2] : m[3];
+                keys.push(k);
+                pendingKey = k;
+                valueStart = i + m[0].length;
                 i += m[0].length - 1;
                 continue;
               }
@@ -266,50 +325,87 @@ steps:
             }
             if (c === "}" || c === "]" || c === ")") {
               depth--;
-              if (depth === 0) { end = i; break; }
+              if (depth === 0) { closeEntry(i); end = i; break; }
               continue;
             }
-            if (c === "," && depth === 1) { expectKey = true; continue; }
+            if (c === "," && depth === 1) { closeEntry(i); expectKey = true; continue; }
           }
           if (end < 0) return null;
-          return { keys, spread, block: src.slice(open, end + 1) };
+          return { keys, entries, unresolved, block: src.slice(open, end + 1) };
         };
 
         // --- Source 1: enhancer entityConfig + clients map (side B) ---
+        // Both maps live in `audit-ennhancer/app.js` — that directory name is
+        // spelled with a double n in the enhancer repo.
+        const ENHANCER_DIR = "audit-ennhancer";
         let entityConfigKeys = [];
         let entityConfigTrusted = false;
-        let clientsInfo = null;
+        let clientsKeys = null;
         let appJsExcerpt = "";
         if (!isSet(github_token)) {
           degraded_sources.push("config entry GITHUB_TOKEN missing — enhancer entityConfig not read");
         } else {
           try {
-            const r = await fetch(`https://api.github.com/repos/${enhancer_repo}/contents/app.js`, {
-              headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github.raw+json" },
-            });
-            if (!r.ok) throw new Error(`GET app.js → ${r.status}`);
-            const src = await r.text();
-            const cfg = extractObjectLiteral(src, "entityConfig");
-            if (!cfg) throw new Error("no `const entityConfig = {…}` declaration in app.js");
+            const ghFile = async (path) => {
+              const r = await fetch(`https://api.github.com/repos/${enhancer_repo}/contents/${path}`, {
+                headers: { authorization: `Bearer ${github_token}`, accept: "application/vnd.github.raw+json" },
+              });
+              if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
+              return r.text();
+            };
+            // audit_enhancer.js only carries the ENTITIES map; without it the
+            // computed keys stay unresolved and the key set is untrusted, but
+            // the clients map and the excerpt are still worth having.
+            const [appJs, enhancerJs] = await Promise.all([
+              ghFile(`${ENHANCER_DIR}/app.js`),
+              ghFile(`${ENHANCER_DIR}/audit_enhancer.js`).catch(() => ""),
+            ]);
+            // ENTITIES maps the constant names used as computed keys of
+            // entityConfig to the entity names the audit events carry.
+            const entityNames = {};
+            const entities = enhancerJs ? extractObjectLiteral(enhancerJs, "ENTITIES") : null;
+            if (entities) {
+              for (const k of entities.keys) {
+                const literal = /^["'](.*)["']$/.exec(entities.entries[k] || "");
+                if (literal) entityNames[k] = literal[1];
+              }
+            }
+            const resolveRef = (expr) => {
+              const e = String(expr).trim();
+              const literal = /^["'](.*)["']$/.exec(e);
+              if (literal) return literal[1];
+              const ref = /^ENTITIES\.([A-Za-z_$][\w$]*)$/.exec(e);
+              if (ref) return entityNames[ref[1]];
+              return undefined;
+            };
+
+            const cfg = extractObjectLiteral(appJs, "entityConfig", resolveRef);
+            if (!cfg) throw new Error(`no entityConfig object literal in ${ENHANCER_DIR}/app.js`);
             entityConfigKeys = cfg.keys;
-            clientsInfo = extractObjectLiteral(src, "clients");
-            // Sanity gate before any comparison: the real map always carries
-            // the core platform entities, so a key list without `application`
-            // cannot be told apart from a mis-parse — and a mis-parsed list
-            // would report perfectly configured entities as missing.
-            entityConfigTrusted = !cfg.spread && entityConfigKeys.includes("application");
+            const clients = extractObjectLiteral(appJs, "clients", resolveRef);
+            clientsKeys = clients ? clients.keys : null;
+            // Sanity gate before any comparison. An incomplete key set is the
+            // dangerous one: comparing against it reports entities that ARE
+            // configured as missing, so the gate demands every key position
+            // resolved plus two entities the enhancer has always configured.
+            const doubts = [];
+            if (cfg.unresolved > 0) doubts.push(`${cfg.unresolved} key position(s) unresolved`);
+            if (entityConfigKeys.length < 5) doubts.push(`only ${entityConfigKeys.length} key(s) parsed`);
+            for (const known of ["user", "parameter"]) {
+              if (!entityConfigKeys.includes(known)) doubts.push(`no "${known}" key`);
+            }
+            entityConfigTrusted = doubts.length === 0;
             if (!entityConfigTrusted) {
               degraded_sources.push(
-                `enhancer entityConfig not parsed with confidence (${entityConfigKeys.length} key(s), `
-                + `${cfg.spread ? "the literal spreads another object" : 'no "application" key'}) `
-                + `— per-entity comparison skipped`);
+                `enhancer entityConfig not parsed with confidence (${doubts.join("; ")})`
+                + ` — per-entity comparison skipped`);
             }
             appJsExcerpt = [
               "// --- entityConfig ---",
               cfg.block.slice(0, 8000),
-              clientsInfo
-                ? "\n// --- clients ---\n" + clientsInfo.block.slice(0, 4000)
-                : "\n// --- clients: no `const clients = {…}` declaration found in app.js ---",
+              clients
+                ? "\n// --- clients ---\n" + clients.block.slice(0, 4000)
+                : `\n// --- clients: no clients object literal found in ${ENHANCER_DIR}/app.js ---`,
             ].join("\n");
           } catch (e) {
             degraded_sources.push(`enhancer entityConfig unavailable: ${e.message}`);
@@ -322,18 +418,27 @@ steps:
         // flags down to this application before deciding anything.
         const newEntities = Array.isArray(new_entity_rows) ? new_entity_rows : [];
         const degradedEntities = Array.isArray(empty_row_rows) ? empty_row_rows : [];
-        if (!Array.isArray(new_entity_rows)) {
-          degraded_sources.push(`lake unavailable (new entities): ${new_entities_error || "no rows returned"}`);
-        }
-        if (!Array.isArray(empty_row_rows)) {
-          degraded_sources.push(`lake unavailable (empty rows): ${empty_rows_error || "no rows returned"}`);
-        }
+        // No rows input means the query step did not deliver: it either failed
+        // (its error travels here) or never ran at all. Those read very
+        // differently on the item, so keep them apart.
+        const lakeDegraded = (label, error) => degraded_sources.push(
+          isSet(error)
+            ? `lake unavailable (${label}): the query failed — ${error}`
+            : `lake unavailable (${label}): the query did not run`);
+        if (!Array.isArray(new_entity_rows)) lakeDegraded("new entities", new_entities_error);
+        if (!Array.isArray(empty_row_rows)) lakeDegraded("empty rows", empty_rows_error);
 
+        // entityConfig has a `default` entry, so an absent entity is not
+        // misconfigured by itself: it gets the default STANDARD treatment, which
+        // only works if the enhancer can GET it. Say that instead of claiming a
+        // missing configuration the absence does not prove.
+        const hasDefaultConfig = entityConfigKeys.includes("default");
         if (entityConfigTrusted) {
           for (const e of newEntities) {
-            if (!entityConfigKeys.includes(e.entity)) {
-              flag(e.entity, `new entity "${e.entity}" (first seen ${e.first_seen}) is missing from the enhancer entityConfig`);
-            }
+            if (entityConfigKeys.includes(e.entity)) continue;
+            flag(e.entity, hasDefaultConfig
+              ? `new entity "${e.entity}" (first seen ${e.first_seen}) has no dedicated enhancer entityConfig entry, so it falls back to "default" (STANDARD): GET /${e.entity}/<id> has to answer for the enhancer's own identity`
+              : `new entity "${e.entity}" (first seen ${e.first_seen}) is missing from the enhancer entityConfig`);
           }
         }
         for (const e of degradedEntities) {
@@ -353,17 +458,14 @@ steps:
           "https://governance-action-items-api-production-ufjmx.prod.nullapps.io",
         ];
         // A 404 on the default host with a 200 elsewhere is only a
-        // misconfiguration when the enhancer has no trace of that host for the
-        // entity: plenty of entities legitimately live off the default host,
-        // which is why HOSTS has six alternates. The `clients` map is keyed by
-        // entity in some revisions and holds the host in others, so either
-        // trace counts as declared and the agent confirms it on the excerpt.
-        const clientsEntryFor = (entity, altHost) => {
-          if (!altHost || !clientsInfo) return null;
-          if (clientsInfo.keys.includes(entity)) return "entity";
-          if (clientsInfo.block.includes(String(altHost).replace(/^https?:\/\//, ""))) return "host";
-          return false;
-        };
+        // misconfiguration when the entity has NO `clients` entry: that map is
+        // what routes an entity off the default host, and plenty of entities
+        // legitimately live elsewhere — which is why HOSTS has six alternates.
+        // It is keyed by entity name.
+        //   true  → declared, so answering elsewhere is expected
+        //   false → no entry, so the enhancer only ever calls the default host
+        //   null  → map unavailable; nothing can be concluded from the probe
+        const clientsDeclares = (entity) => (clientsKeys ? clientsKeys.includes(entity) : null);
         const PROBE_VERDICT = (code, altHit, clientsEntry) => {
           // No HTTP response at all: sandbox egress or a network blip, not a
           // statement about the entity.
@@ -392,7 +494,12 @@ steps:
           probes.push({ entity: shown, verdict: "skipped_unsafe_name" });
           flag(entity, `probe: entity name ${JSON.stringify(shown)} skipped (characters outside the audit naming convention — itself a finding)`);
         }
-        const suspects = [...samples.keys()].filter(e => SAFE_ENTITY.test(e)).slice(0, MAX_PROBES);
+        const probeable = [...samples.keys()].filter(e => SAFE_ENTITY.test(e));
+        const suspects = probeable.slice(0, MAX_PROBES);
+        // The probe table must never read as exhaustive when it is not.
+        if (probeable.length > MAX_PROBES) {
+          degraded_sources.push(`probe: ${probeable.length} suspect entities but only the first ${MAX_PROBES} were probed (sandbox time budget) — the rest are unverified`);
+        }
 
         if (suspects.length && !isSet(enhancer_api_key)) {
           degraded_sources.push("config entry ENHANCER_API_KEY missing — fetch probe skipped");
@@ -429,7 +536,7 @@ steps:
               }
               return {
                 entity, entity_id: id, status: code, alt_host: altHit,
-                verdict: PROBE_VERDICT(code, altHit, clientsEntryFor(entity, altHit)),
+                verdict: PROBE_VERDICT(code, altHit, clientsDeclares(entity)),
               };
             }));
             probes.push(...results);
@@ -467,7 +574,7 @@ steps:
             ? degradedEntities.map(e => `- ${e.entity} — ${e.pct_empty}% empty (${e.empty_rows}/${e.total})`).join("\n")
             : "(none)",
           ``,
-          `### Fetch probe (enhancer identity)`,
+          `### Fetch probe (enhancer identity, ${suspects.length} of ${probeable.length} suspect entities)`,
           probes.length
             ? probes.map(p => `- ${p.entity} (id ${p.entity_id || "?"}) → HTTP ${p.status ?? "-"}${p.alt_host ? `, 200 on ${p.alt_host}` : ""} → ${p.verdict}`).join("\n")
             : "(no suspect entities probed)",
@@ -766,10 +873,14 @@ steps:
 
         An entity is correctly configured when three sides agree:
         A. producer emits the event with mandatory fields,
-        B. the enhancer's entityConfig has an entry for that exact name
-           (STANDARD needs a readable GET /<entity>/<id>; SELF_CONTAINED
-           enriches from the body/snapshot; NRN from the nrn), plus a
-           `clients` entry when the entity lives on a non-default host,
+        B. the enhancer's entityConfig handles the name (STANDARD needs a
+           readable GET /<entity>/<id>; SELF_CONTAINED enriches from the
+           body/snapshot; NRN from the nrn), plus a `clients` entry when the
+           entity lives on a non-default host. Note the map has a `default`
+           entry: an entity with no entry of its own is NOT automatically
+           misconfigured, it gets the default STANDARD treatment — the finding
+           is only real when that GET cannot work (no read endpoint, no grant,
+           wrong host),
         C. the enhancer's service account holds a read grant (the probe
            results are the ground truth for this side — trust them over any
            inference).
@@ -794,13 +905,16 @@ steps:
         - How to read the probe table: 200=ok; `answers_on_alt_host`=the
           entity answered 200 on a non-default host, which is legitimate when
           the enhancer has a `clients` entry routing it there — confirm on the
-          app.js excerpt and only report a finding when the excerpt shows no
-          such entry; `wrong_host`=answers elsewhere and the excerpt has no
-          trace of that host; 404 everywhere=wrong entity_id or no read
-          endpoint (needs idRemapper or SELF_CONTAINED); 401/403=missing
+          app.js excerpt, and report a finding only when the excerpt IS present
+          and shows no such entry (if the excerpt is unavailable this stays
+          unverified and is not a finding); `wrong_host`=the clients map was
+          read and has no entry for this entity, so the enhancer will only ever
+          call the default host that 404s; 404 everywhere=wrong entity_id or no
+          read endpoint (needs idRemapper or SELF_CONTAINED); 401/403=missing
           grant; 5xx=DLQ risk (most urgent).
         - Degraded sources are NOT findings. They say a source could not be
-          read; treat those sides as unverified and say so.
+          read; treat those sides as unverified and say so. The probe table is
+          only exhaustive if no degraded source says otherwise.
         - The lake signals are organization-wide: an entity in them that this
           application does not write is context, not a finding against it.
         - Tolerated-401 configs (ignoreStatusCodes) avoid the DLQ but leave
@@ -1075,7 +1189,9 @@ connections:
   - { id: c2, from: progress,           to: lake_new_entities }
   - { id: c3, from: lake_new_entities,  to: lake_empty_rows }
   - { id: c4, from: lake_empty_rows,    to: signals }
-  - { id: c5, from: lake_new_degraded,  to: signals }
+  # Each degraded re-entry continues to its query's own successor, so one dead
+  # lake query never takes the other one (or the run) with it.
+  - { id: c5, from: lake_new_degraded,  to: lake_empty_rows }
   - { id: c6, from: lake_empty_degraded, to: signals }
   - { id: c7, from: signals,            to: gather }
   - { id: c8, from: gather,             to: route }
