@@ -14,7 +14,7 @@ channel on alias activation, receives the dispatch (with a `callbackUrl` /
 | `check-release-staged.yaml` | `check-release-staged` | The release was previously deployed to a `dimensions.environment=stage` scope of the same application — scans the last 30 finalized deployments and passes on a match. |
 | `create-jira-ticket.yaml` | `create-jira-ticket` | Creates a Jira ticket, writes a per-execution callback URL into a custom field, then **parks on `signal-wait`** until a Jira Automation rule pokes it back. On the poke it re-reads the ticket from Jira (source of truth — the webhook body is untrusted) and resolves passed / failed. |
 | `arch-rule-check.yaml` | `arch-rule-check` | Evaluates ONE company architecture rule (carried in the item inputs) against the application repository with an LLM pass, and resolves the item with findings and fix instructions. Incremental: a rule whose files did not change carries over its previous verdict. |
-| `audit-entity-check.yaml` | `audit-entity-check` | **Static, preventive** check that the entities this application writes are configured for the HTTP audit pipeline. Reads the enhancer's `entityConfig` / `clients` maps out of its repository and classifies every entity by how it will be enriched (STANDARD = fetched, SELF_CONTAINED = the write must echo it, NRN, ignored), then an LLM pass over this repository looks for write routes that produce no audit event, names that no entry handles, and self-contained entities the write never echoes back. No lake queries and no live probes — runtime health (`degraded`, `dropped`, DLQ) is the pipeline monitors' job, and a pre-deploy probe of a new entity proves nothing. Incremental, same checkpoint scheme as `arch-rule-check`. |
+| `audit-entity-check.yaml` | `audit-entity-check` | **Static, preventive** check that the entities this application writes are configured for the HTTP audit pipeline. Reads the enhancer's `entityConfig` / `clients` maps out of its repository and classifies every entity by how it will be enriched (STANDARD = fetched, SELF_CONTAINED = the write must echo it, NRN, ignored), then an LLM pass over this repository looks for write routes that produce no audit event, names that no entry handles, and self-contained entities the write never echoes back. No lake queries and no live probes — runtime health (`degraded`, `dropped`, DLQ) is the pipeline monitors' job, and a pre-deploy probe of a new entity proves nothing. Incremental like `arch-rule-check`, but the checkpoint also stamps a fingerprint of the enhancer configuration: a verdict is reused only while the code diff AND that configuration are unchanged. |
 
 ## Patterns worth knowing
 
@@ -39,6 +39,14 @@ channel on alias activation, receives the dispatch (with a `callbackUrl` /
   join point has two predecessors of which exactly one can complete: that is the
   only shape `join_strategy: any` resolves without a race (`any` fires on the
   *first* completed edge).
+- **A checkpoint is only valid for the inputs it was taken against**
+  (`audit-entity-check`): the verdict depends on this repository *and* on the
+  enhancer's entity configuration, which lives in another repo and moves on its
+  own. The incremental decision therefore compares a canonical fingerprint of
+  that configuration alongside the code diff — otherwise a change in the enhancer
+  would never re-evaluate any application until it happened to touch its own
+  code. A checkpoint stamped before the fingerprint existed re-opens the analysis
+  exactly once.
 - **Gate on what the deploy can change** (`audit-entity-check`): the check reads
   source only. Runtime signals were removed on purpose — they cannot be
   attributed to the deploy that gates on them (the lake's `application` column is

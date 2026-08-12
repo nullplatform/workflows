@@ -95,13 +95,14 @@ const CONFIG_CODE = stepCode('enhancer_config');
 type EntityMode = 'standard' | 'self_contained' | 'nrn' | 'ignored';
 
 interface ConfigOutput {
-  degraded_sources: string[];
+  unverified: string[];
   entity_config_keys: string[];
   entity_config_trusted: boolean;
   entity_modes: Record<string, EntityMode>;
   self_contained_entities: string[];
   clients_keys: string[] | null;
   has_default_config: boolean;
+  config_fingerprint: string;
   config_view: string;
 }
 
@@ -148,12 +149,12 @@ const clients = {
 
 const entityConfig = {
   // STANDARD: enriched via GET
-  user: { type: STANDARD },
-  parameter: { type: STANDARD },
+  user: { entityType: ENTITY_TYPE.STANDARD },
+  parameter: { entityType: ENTITY_TYPE.STANDARD },
   // SELF_CONTAINED: enriched from the body
   service: { entityClient: selfContainedEnhancer },
   nrn: { entityType: ENTITY_TYPE.NRN },
-  default: { type: STANDARD },
+  default: { entityType: ENTITY_TYPE.STANDARD },
 };
 `;
 
@@ -169,22 +170,22 @@ const entityConfig = { user: { t: 1 }, parameter: { t: 2 }, service: {}, nrn: {}
 /** Quoted keys, a brace inside a block comment and one inside a string. */
 const APP_JS_QUOTED_KEYS = `
 const entityConfig = {
-  "user": { type: STANDARD },
-  'parameter': { type: STANDARD },
+  "user": { entityType: ENTITY_TYPE.STANDARD },
+  'parameter': { entityType: ENTITY_TYPE.STANDARD },
   /* } */
   service: { entityClient: selfContainedEnhancer, path: "/service/{id}" },
   "notification/channel": { entityClient: selfContainedEnhancer },
-  default: { type: STANDARD },
+  default: { entityType: ENTITY_TYPE.STANDARD },
 };
 `;
 
 /** A spread of an unknown object: the key list cannot be complete. */
 const APP_JS_BARE_SPREAD = `
 const entityConfig = {
-  user: { type: STANDARD },
-  parameter: { type: STANDARD },
+  user: { entityType: ENTITY_TYPE.STANDARD },
+  parameter: { entityType: ENTITY_TYPE.STANDARD },
   ...legacyEntityConfig,
-  default: { type: STANDARD },
+  default: { entityType: ENTITY_TYPE.STANDARD },
 };
 `;
 
@@ -222,16 +223,17 @@ const REAL_KEYS = [
   'default',
 ];
 
-/** The only entries of the real map the enhancer actually fetches. */
+/** Entries of the real map that state STANDARD (the enhancer fetches them). */
 const REAL_STANDARD = [
   'user',
   'parameter',
   'runtime_configuration',
-  'runtime_configuration/dimension',
-  'dimension',
   'action_item_category',
   'default',
 ];
+
+/** Entries that delegate to a variable, so their mode is not readable here. */
+const REAL_UNKNOWN = ['runtime_configuration/dimension', 'dimension'];
 
 describe('audit-entity-check enhancer_config — extraction (real enhancer)', () => {
   it('reads both maps out of the real app.js, resolving computed keys and spreads', async () => {
@@ -249,7 +251,7 @@ describe('audit-entity-check enhancer_config — extraction (real enhancer)', ()
     // Computed key resolved through ENTITIES, and one of the 16 spread ones.
     expect(out.entity_config_keys).toContain('notification/channel');
     expect(out.entity_config_keys).toContain('workflow_webhook');
-    expect(out.degraded_sources).toEqual([]);
+    expect(out.unverified).toEqual([]);
   });
 
   it('reads the clients map and publishes it for the cross-check', async () => {
@@ -270,7 +272,7 @@ describe('audit-entity-check enhancer_config — extraction (real enhancer)', ()
   it('distrusts the key set when the ENTITIES map cannot be read', async () => {
     const out = await runConfig({}, { enhancerJs: null });
     expect(out.entity_config_trusted).toBe(false);
-    expect(out.degraded_sources.join(' ')).toContain('key position(s) unresolved');
+    expect(out.unverified.join(' ')).toContain('key position(s) unresolved');
     // An incomplete key set is not classified at all, and the view says so.
     expect(out.entity_modes).toEqual({});
     expect(out.config_view).toContain('not classified');
@@ -305,30 +307,30 @@ describe('audit-entity-check enhancer_config — extraction (other shapes)', () 
   it('distrusts a literal that spreads an unknown object', async () => {
     const out = await runConfig({}, { appJs: APP_JS_BARE_SPREAD });
     expect(out.entity_config_trusted).toBe(false);
-    expect(out.degraded_sources.join(' ')).toContain('1 key position(s) unresolved');
+    expect(out.unverified.join(' ')).toContain('1 key position(s) unresolved');
     expect(out.entity_modes).toEqual({});
   });
 
   it('distrusts a key set that lacks the entities the enhancer always configures', async () => {
     const out = await runConfig(
       {},
-      { appJs: 'const entityConfig = { widget: { type: STANDARD } };' },
+      { appJs: 'const entityConfig = { widget: { entityType: ENTITY_TYPE.STANDARD } };' },
     );
     expect(out.entity_config_trusted).toBe(false);
-    expect(out.degraded_sources.join(' ')).toContain('no "user" key');
-    expect(out.degraded_sources.join(' ')).toContain('no "parameter" key');
+    expect(out.unverified.join(' ')).toContain('no "user" key');
+    expect(out.unverified.join(' ')).toContain('no "parameter" key');
   });
 
   it('degrades when app.js has no entityConfig at all', async () => {
     const out = await runConfig({}, { appJs: 'module.exports = {};' });
     expect(out.entity_config_trusted).toBe(false);
-    expect(out.degraded_sources.join(' ')).toContain('entityConfig unavailable');
+    expect(out.unverified.join(' ')).toContain('entityConfig unavailable');
   });
 
   it('says so in the view when there is no clients map', async () => {
     const out = await runConfig({}, { appJs: APP_JS_QUOTED_KEYS });
     expect(out.clients_keys).toBeNull();
-    expect(out.degraded_sources.join(' ')).toContain('no clients object literal found');
+    expect(out.unverified.join(' ')).toContain('no clients object literal found');
     expect(out.config_view).toContain('no clients object literal found');
   });
 });
@@ -343,8 +345,12 @@ describe('audit-entity-check enhancer_config — per-entity mode', () => {
     expect(byMode('standard')).toEqual(REAL_STANDARD);
     expect(byMode('nrn')).toEqual(['nrn']);
     expect(byMode('ignored')).toEqual(['agent']);
+    // `dimension` and its twin point at a `dimensionConfig` variable, so the
+    // entry itself says nothing: unknown, never assumed.
+    expect(byMode('unknown')).toEqual(REAL_UNKNOWN);
+    const named = [...REAL_STANDARD, ...REAL_UNKNOWN, 'nrn', 'agent'];
     expect(new Set(byMode('self_contained'))).toEqual(
-      new Set(REAL_KEYS.filter((k) => !REAL_STANDARD.includes(k) && k !== 'nrn' && k !== 'agent')),
+      new Set(REAL_KEYS.filter((k) => !named.includes(k))),
     );
     // The list the agent needs for the echo check.
     expect(out.self_contained_entities).toEqual(byMode('self_contained'));
@@ -358,6 +364,7 @@ describe('audit-entity-check enhancer_config — per-entity mode', () => {
     expect(out.config_view).toContain('SELF_CONTAINED (no fetch — the WRITE must carry the entity)');
     expect(out.config_view).toContain('NRN (only the nrn is resolved)');
     expect(out.config_view).toContain('IGNORED (opted out of enrichment)');
+    expect(out.config_view).toContain('UNKNOWN (the entry delegates elsewhere — judge both sides)');
   });
 
   it('classifies the synthetic shapes too', async () => {
@@ -369,6 +376,18 @@ describe('audit-entity-check enhancer_config — per-entity mode', () => {
       nrn: 'nrn',
       default: 'standard',
     });
+  });
+
+  it('does not read an `ignore: true` nested inside the entry as opting out', async () => {
+    // The real map only ever opts out with a whole `{ ignore: true }` entry; the
+    // same words inside a `fields[]` element mean something else.
+    const appJs = REAL_APP_JS.replace(
+      '                fields:[',
+      '                fields:[\n                    {name:"x", ignore: true},',
+    );
+    const out = await runConfig({}, { appJs });
+    expect(out.entity_modes['user']).toBe('standard');
+    expect(out.entity_modes['agent']).toBe('ignored');
   });
 
   it('keeps a STANDARD entity standard when its entry merely talks about the others', async () => {
@@ -435,7 +454,7 @@ describe('audit-entity-check enhancer_config — anchor decoys', () => {
     const out = await runConfig({}, { appJs });
     expect(out.entity_config_keys).toEqual(REAL_KEYS);
     expect(out.entity_config_trusted).toBe(true);
-    expect(out.degraded_sources).toEqual([]);
+    expect(out.unverified).toEqual([]);
   });
 
   it('degrades visibly on source it cannot scan at all', async () => {
@@ -444,7 +463,7 @@ describe('audit-entity-check enhancer_config — anchor decoys', () => {
     const appJs = `/* oops\n${REAL_APP_JS}`;
     const out = await runConfig({}, { appJs });
     expect(out.entity_config_trusted).toBe(false);
-    expect(out.degraded_sources.join(' ')).toContain('entityConfig unavailable');
+    expect(out.unverified.join(' ')).toContain('entityConfig unavailable');
   });
 
   it('publishes no clients key list it cannot trust', async () => {
@@ -454,8 +473,8 @@ describe('audit-entity-check enhancer_config — anchor decoys', () => {
     );
     const out = await runConfig({}, { appJs });
     expect(out.clients_keys).toBeNull();
-    expect(out.degraded_sources.join(' ')).toContain('clients map not parsed with confidence');
-    expect(out.degraded_sources.join(' ')).toContain('no "default" client');
+    expect(out.unverified.join(' ')).toContain('clients map not parsed with confidence');
+    expect(out.unverified.join(' ')).toContain('no "default" client');
   });
 });
 
@@ -463,11 +482,76 @@ describe('audit-entity-check enhancer_config — sources it could not read', () 
   it('reports a missing config entry instead of calling out with "undefined"', async () => {
     const urls: string[] = [];
     const out = await runConfig({ github_token: undefined }, { urls });
-    expect(out.degraded_sources).toContain(
+    expect(out.unverified).toContain(
       'config entry GITHUB_TOKEN missing — enhancer entityConfig not read',
     );
     expect(urls).toEqual([]);
     expect(out.entity_config_trusted).toBe(false);
+  });
+});
+
+describe('audit-entity-check enhancer_config — configuration fingerprint', () => {
+  it('is stable for the same configuration', async () => {
+    const a = await runConfig();
+    const b = await runConfig();
+    expect(a.config_fingerprint).toMatch(/^[0-9a-f]{8}$/);
+    expect(b.config_fingerprint).toBe(a.config_fingerprint);
+  });
+
+  it('moves when an entity changes how it will be enriched', async () => {
+    const base = await runConfig();
+    // `service` leaves the selfContained(…) spread for a STANDARD entry.
+    const appJs = REAL_APP_JS.replace(
+      '        ...selfContained(\n            ENTITIES.SERVICE,',
+      '        [ENTITIES.SERVICE]: { entityClient: new EntityEnhancer({ entityUtils,'
+        + ' entityType: ENTITY_TYPE.STANDARD, cache }) },\n        ...selfContained(',
+    );
+    const changed = await runConfig({}, { appJs });
+    expect(base.entity_modes['service']).toBe('self_contained');
+    expect(changed.entity_modes['service']).toBe('standard');
+    expect(changed.config_fingerprint).not.toBe(base.config_fingerprint);
+  });
+
+  it('moves when an entry or a client is added', async () => {
+    const base = await runConfig();
+    const withEntity = await runConfig(
+      {},
+      {
+        appJs: REAL_APP_JS.replace(
+          '        "default": {',
+          '        "runbook": { entityClient: selfContainedEnhancer },\n        "default": {',
+        ),
+      },
+    );
+    expect(withEntity.config_fingerprint).not.toBe(base.config_fingerprint);
+
+    const withClient = await runConfig(
+      {},
+      {
+        appJs: REAL_APP_JS.replace(
+          '        approval: approvalsApiClient,',
+          '        approval: approvalsApiClient,\n        runbook: approvalsApiClient,',
+        ),
+      },
+    );
+    expect(withClient.config_fingerprint).not.toBe(base.config_fingerprint);
+  });
+
+  it('does not move for a comment-only edit', async () => {
+    const base = await runConfig();
+    const appJs = REAL_APP_JS.replace(
+      'const auditEnhancer = new AuditEnhancer({',
+      '// a comment nobody should have to re-analyse for\nconst auditEnhancer = new AuditEnhancer({',
+    );
+    const cosmetic = await runConfig({}, { appJs });
+    expect(cosmetic.config_fingerprint).toBe(base.config_fingerprint);
+  });
+
+  it('emits none when the configuration could not be trusted', async () => {
+    // A fingerprint of a doubtful parse would flap and force analysis forever.
+    const out = await runConfig({}, { enhancerJs: null });
+    expect(out.entity_config_trusted).toBe(false);
+    expect(out.config_fingerprint).toBe('');
   });
 });
 
@@ -504,6 +588,16 @@ describe('audit-entity-check audit_agent', () => {
     expect(prompt).not.toContain('probe table');
     expect(prompt).not.toContain('answers_on_alt_host');
     expect(prompt).not.toContain('data flags');
+    // The enhancer's own tolerated-4xx config is not this application's to fix,
+    // and the finding area it used to map to no longer exists.
+    expect(prompt).not.toContain('ignoreStatusCodes');
+    expect(prompt).toContain("Nothing about the ENHANCER's own configuration is a finding");
+  });
+
+  it('sends an unclassifiable entry to both checks instead of assuming a mode', () => {
+    const prompt = systemPrompt();
+    expect(prompt).toContain('UNKNOWN: the entry does not state its mode');
+    expect(prompt).toContain('Do the work of both branches for these');
   });
 
   it('only allows finding areas a static reading can establish', () => {
@@ -541,6 +635,7 @@ interface GatherFetchOptions {
   itemId?: string;
   prevStatus?: string;
   prevSha?: string;
+  prevFingerprint?: string;
   prevEntities?: Array<{ entity: string }>;
   changedFiles?: string[];
   /** Omit to have the prior approval list come back empty (no checkpoint). */
@@ -549,6 +644,11 @@ interface GatherFetchOptions {
 
 function gatherFetch(opts: GatherFetchOptions): FakeFetch {
   const itemId = opts.itemId ?? 'audit_entity_check';
+  // Unless a case says otherwise, the checkpoint was taken against the same
+  // enhancer configuration this run reads.
+  if (opts.prevFingerprint === undefined && !('prevFingerprint' in opts)) {
+    opts.prevFingerprint = 'aaaaaaaa';
+  }
   return async (url) => {
     if (url === 'https://api.nullplatform.com/token') return res(200, { access_token: 'np_tok' });
     if (url.includes('/application/')) {
@@ -573,6 +673,9 @@ function gatherFetch(opts: GatherFetchOptions): FakeFetch {
               analyzed_sha: opts.prevSha ?? SHA_PREV,
               findings: [],
               entities: opts.prevEntities ?? [],
+              ...(opts.prevFingerprint === undefined
+                ? {}
+                : { config_fingerprint: opts.prevFingerprint }),
               markdown: '### Audit coverage — PASSED',
             },
           },
@@ -600,6 +703,7 @@ const GATHER_ITEM = {
   trigger_build: { branch: 'main', commit: { id: SHA_CURRENT } },
   item_id: 'audit_entity_check',
   callbackUrl: 'https://approval-api.test/approval/9001/checklist/items/audit_entity_check',
+  config_fingerprint: 'aaaaaaaa',
   np_api_key: 'np_key',
   github_token: 'gh_token',
 };
@@ -626,6 +730,51 @@ describe('audit-entity-check gather — carry-over decision', () => {
       { prevSha: SHA_CURRENT },
     );
     expect(out.mode).toBe('carry_over');
+  });
+
+  it('re-analyses when the enhancer configuration changed, with no code change at all', async () => {
+    // The verdict depends on the enhancer's map too, so a checkpoint taken
+    // against a different configuration cannot be reused.
+    const out = await runGather(
+      { config_fingerprint: 'ffffffff' },
+      { prevSha: SHA_CURRENT, prevFingerprint: 'aaaaaaaa' },
+    );
+    expect(out.mode).toBe('analyze');
+    expect(out.scope).toBe('diff');
+  });
+
+  it('carries over when the configuration fingerprint matches', async () => {
+    const out = await runGather(
+      { config_fingerprint: 'aaaaaaaa' },
+      { prevSha: SHA_CURRENT, prevFingerprint: 'aaaaaaaa' },
+    );
+    expect(out.mode).toBe('carry_over');
+  });
+
+  it('re-analyses once against a checkpoint stamped before fingerprints existed', async () => {
+    const out = await runGather(
+      { config_fingerprint: 'aaaaaaaa' },
+      { prevSha: SHA_CURRENT, prevFingerprint: undefined },
+    );
+    expect(out.mode).toBe('analyze');
+  });
+
+  it('does not force analysis when this run could not fingerprint the configuration', async () => {
+    // Nothing to compare against is not evidence of a change.
+    const out = await runGather(
+      { config_fingerprint: '' },
+      { prevSha: SHA_CURRENT, prevFingerprint: 'aaaaaaaa' },
+    );
+    expect(out.mode).toBe('carry_over');
+  });
+
+  it('re-analyses on an irrelevant diff when the configuration also moved', async () => {
+    const out = await runGather(
+      { config_fingerprint: 'ffffffff' },
+      { changedFiles: ['README.md'], prevFingerprint: 'aaaaaaaa' },
+    );
+    expect(out.mode).toBe('analyze');
+    expect(out.scope).toBe('diff');
   });
 
   it('re-analyses in verify_fix mode when the previous verdict failed', async () => {
@@ -688,6 +837,7 @@ interface Patched {
   details: {
     markdown: string;
     check_id: string;
+    config_fingerprint?: string;
     findings: unknown[];
     entities: Array<{ entity: string }>;
     analyzed_sha: string;
@@ -747,6 +897,7 @@ const RESOLVE_ITEM = {
   analyzed_sha: SHA_CURRENT,
   changed_count: 3,
   unverified: ['enhancer clients map not parsed with confidence (no "default" client)'],
+  config_fingerprint: 'aaaaaaaa',
 };
 
 describe('audit-entity-check resolve', () => {
@@ -760,6 +911,8 @@ describe('audit-entity-check resolve', () => {
     expect(capture.patched?.details.check_id).toBe('audit_entity_check');
     expect(capture.patched?.details.analyzed_sha).toBe(SHA_CURRENT);
     expect(capture.patched?.details.scope).toBe('diff');
+    // Stamped next to the sha: the pair of inputs the next run compares.
+    expect(capture.patched?.details.config_fingerprint).toBe('aaaaaaaa');
     expect(capture.patched?.details.findings).toHaveLength(1);
     expect(capture.patched?.details.entities).toHaveLength(2);
 
@@ -822,9 +975,11 @@ describe('audit-entity-check resolve_carryover', () => {
       status: 'passed',
       findings: [{ entity: 'runbook', issue: 'x' }],
       entities: [{ entity: 'runbook', verdict: 'ok' }],
+      config_fingerprint: 'aaaaaaaa',
       markdown: '### Audit coverage — PASSED',
     },
     unverified: ['config entry GITHUB_TOKEN missing — enhancer entityConfig not read'],
+    config_fingerprint: 'bbbbbbbb',
   };
 
   it('re-applies the previous verdict and carries the checkpoint forward', async () => {
@@ -838,11 +993,25 @@ describe('audit-entity-check resolve_carryover', () => {
     // Findings and entities survive a chain of carry-overs.
     expect(capture.patched?.details.findings).toHaveLength(1);
     expect(capture.patched?.details.entities).toEqual([{ entity: 'runbook', verdict: 'ok' }]);
+    // The stamp is refreshed, so the next run compares against what was read now.
+    expect(capture.patched?.details.config_fingerprint).toBe('bbbbbbbb');
     const markdown = capture.patched?.details.markdown ?? '';
     expect(markdown).toContain('(carry-over)');
     expect(markdown).toContain('El chequeo es estático');
     expect(markdown).toContain('GITHUB_TOKEN');
     expect(markdown).toContain('### Audit coverage — PASSED');
+  });
+
+  it('keeps the previous fingerprint when this run could not compute one', async () => {
+    // An unreadable configuration must not erase a usable stamp, or the next run
+    // would re-analyse for no reason.
+    const capture: ResolveCapture = { logs: [] };
+    await runStepCode(
+      CARRYOVER_CODE,
+      { ...CARRYOVER_ITEM, config_fingerprint: '' },
+      resolveFetch(capture),
+    );
+    expect(capture.patched?.details.config_fingerprint).toBe('aaaaaaaa');
   });
 
   it('keeps a failed verdict failed', async () => {

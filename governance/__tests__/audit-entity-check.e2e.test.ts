@@ -48,13 +48,14 @@ const TRIGGER_OUTPUTS = {
 };
 
 const CONFIG_CLEAN = {
-  degraded_sources: [],
+  unverified: [],
   entity_config_keys: ['user', 'parameter', 'notification', 'nrn', 'default'],
   entity_config_trusted: true,
   entity_modes: { user: 'standard', notification: 'self_contained', nrn: 'nrn' },
   self_contained_entities: ['notification'],
   clients_keys: ['default', 'user', 'notification'],
   has_default_config: true,
+  config_fingerprint: 'abcd1234',
   config_view: '### Enhancer entityConfig keys (5)',
 };
 
@@ -232,6 +233,7 @@ describe('audit-entity-check — resolve payloads', () => {
       scope?: string;
       analyzed_sha?: string;
       unverified?: unknown[];
+      config_fingerprint?: string;
       item_id?: string;
     };
     expect(inputs.verdict?.status).toBe('failed');
@@ -241,6 +243,9 @@ describe('audit-entity-check — resolve payloads', () => {
     expect(inputs.item_id).toBe('audit_entity_check');
     // Whatever could not be read reaches the item, so the report can say so.
     expect(inputs.unverified).toEqual([]);
+    // The fingerprint of the configuration this verdict was produced against
+    // travels to the stamp the next run compares.
+    expect(inputs.config_fingerprint).toBe('abcd1234');
   });
 
   it('hands the previous verdict to resolve_carryover', async () => {
@@ -249,11 +254,13 @@ describe('audit-entity-check — resolve payloads', () => {
       prev?: { status?: string; sha?: string };
       changed_count?: number;
       unverified?: unknown[];
+      config_fingerprint?: string;
     };
     expect(inputs.prev?.status).toBe('passed');
     expect(inputs.prev?.sha).toBe(GATHER_CARRY_OVER.prev.sha);
     expect(inputs.changed_count).toBe(2);
     expect(inputs.unverified).toEqual([]);
+    expect(inputs.config_fingerprint).toBe('abcd1234');
   });
 });
 
