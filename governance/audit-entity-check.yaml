@@ -654,8 +654,16 @@ steps:
         const forceFull = String(force_full || "") === "true";
         const configChanged = !!checkpoint && isSet(config_fingerprint)
           && checkpoint.config_fingerprint !== config_fingerprint;
+        // Tests, mocks, specs and documentation are not audit wiring. Declared
+        // once and consulted twice — by the diff rule right below, and by the
+        // snapshot ranking further down — because the two have to exclude exactly
+        // the same files. While they did not, a Ruby `spec/…_spec.rb` change
+        // matched the diff rule and opened a run whose snapshot then dropped the
+        // very file that caused it, and reported its coverage complete.
+        // Matched on whole path segments, so `routes/test_utils.js` stays a route.
+        const TEST_OR_DOCS = /(^|\/)(__tests__|__mocks__|tests?|specs?|docs?)\//i;
         const RELEVANT = /\.([cm]?[jt]sx?|py|go|rb|java|kt|rs|php|cs)$|(^|\/)(null(app)?\.ya?ml|\.nullplatform\/[^/]+)$/i;
-        const IRRELEVANT = /(^|\/)(__tests__|__mocks__|tests?|docs?)\/|\.(md|txt|snap)$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
+        const IRRELEVANT = new RegExp(TEST_OR_DOCS.source + "|\\.(md|txt|snap)$|package-lock\\.json|pnpm-lock\\.yaml|yarn\\.lock", "i");
         let mode = "analyze", scope = "full", changed = null;
 
         if (!forceFull && checkpoint && checkpoint.sha) {
@@ -704,21 +712,21 @@ steps:
         // budget, the slots that remain have to go to routes, not to whatever
         // else happens to have "api" or "server" in its name.
         const ROUTE_DIR = /(^|\/)(routes?|controllers?|handlers?|endpoints?)\//i;
-        // Tests and documentation are not audit wiring, and a suite that mirrors
-        // the routes it exercises (`test/routes/*.spec.js` beside `routes/*.js`)
-        // would otherwise claim the whole snapshot at the route-dir rank and push
-        // the production code out. Same vocabulary as IRRELEVANT above: a file
-        // that cannot make this check re-run must not fill its snapshot either.
-        // Matched on whole path segments, so `routes/test_utils.js` stays a route.
-        const TEST_OR_DOCS = /(^|\/)(__tests__|__mocks__|tests?|specs?|docs?)\//i;
-        const SKIP = /(^|\/)(node_modules|dist|build|\.git|vendor|coverage|\.next|out)\/|(\.(png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|lock|min\.js|min\.css))$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
+        const SKIP =/(^|\/)(node_modules|dist|build|\.git|vendor|coverage|\.next|out)\/|(\.(png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|lock|min\.js|min\.css))$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
 
         const changedSet = new Set(changed || []);
         const findingFiles = new Set((checkpoint && checkpoint.findings || []).map(f => f.file).filter(Boolean));
         const score = (p) => {
           if (SKIP.test(p)) return -1;
-          if (TEST_OR_DOCS.test(p)) return 0;
+          // Whatever opened this run is read, wherever it lives. Ranking it after
+          // the test/docs exclusion would let a file trigger the analysis and
+          // then be missing from it — invisible to the agent AND to the coverage
+          // that is supposed to report what the snapshot missed.
           if (scope !== "full" && (changedSet.has(p) || findingFiles.has(p))) return 5;
+          // A suite that mirrors the routes it exercises (`test/routes/*.spec.js`
+          // beside `routes/*.js`) would otherwise claim the whole snapshot at the
+          // route-dir rank and push the production code out.
+          if (TEST_OR_DOCS.test(p)) return 0;
           if (ENTRY.test(p)) return 4;
           if (ROUTE_DIR.test(p)) return 4;
           if (AUDIT_HOT.test(p)) return 3;

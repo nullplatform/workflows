@@ -701,6 +701,8 @@ interface GatherFetchOptions {
   /** Several prior approvals, in the order the API returns them. */
   priorApprovals?: PriorApproval[];
   prevEntities?: Array<{ entity: string }>;
+  /** Findings stamped on the checkpoint, whose files re-enter the snapshot. */
+  prevFindings?: Array<{ file?: string; entity?: string; issue?: string }>;
   changedFiles?: string[];
   /** Omit to have the prior approval list come back empty (no checkpoint). */
   withCheckpoint?: boolean;
@@ -754,7 +756,7 @@ function gatherFetch(opts: GatherFetchOptions): FakeFetch {
             status: approval.status ?? 'passed',
             details: {
               analyzed_sha: approval.sha ?? SHA_PREV,
-              findings: [],
+              findings: opts.prevFindings ?? [],
               entities: opts.prevEntities ?? [],
               ...(approval.fingerprint === undefined
                 ? {}
@@ -1188,6 +1190,101 @@ describe('audit-entity-check gather — snapshot budget', () => {
       },
     );
     expect(snapshotPaths(out.llm_view)).toEqual(['src/routes/here.js']);
+  });
+});
+
+/**
+ * Paths the workflow treats as tests or documentation, one per shape of the
+ * vocabulary. Every one carries an extension RELEVANT accepts, so a change
+ * confined to it would re-open the analysis were it not excluded.
+ */
+const TEST_OR_DOCS_SAMPLES = [
+  'test/routes/user.js',
+  'tests/controllers/scope.rb',
+  '__tests__/handlers/audit.ts',
+  '__mocks__/routes/api.js',
+  'spec/webhook-handler_spec.rb',
+  'specs/endpoints/notification.py',
+  'docs/routes/application.js',
+  'doc/controllers/api.js',
+];
+
+describe('audit-entity-check gather — tests and docs, one vocabulary', () => {
+  it('is defined once and used by both rules', () => {
+    // Two lists drift. The scope decision and the snapshot have to exclude
+    // exactly the same files, or one of them can admit what the other hides.
+    expect(GATHER_CODE).toContain('const TEST_OR_DOCS =');
+    expect(GATHER_CODE).toContain('TEST_OR_DOCS.source');
+    expect(GATHER_CODE).not.toMatch(/const IRRELEVANT = \/.*__tests__/);
+  });
+
+  it.each(TEST_OR_DOCS_SAMPLES)('does not re-open the analysis for %s alone', async (path) => {
+    const out = await runGather({}, { changedFiles: [path] });
+    expect(out.mode).toBe('carry_over');
+  });
+
+  it.each(TEST_OR_DOCS_SAMPLES)('gives %s no slot in the snapshot', async (path) => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path, size: 400 },
+          { path: 'src/routes/real.js', size: 400 },
+        ],
+      },
+    );
+    expect(snapshotPaths(out.llm_view)).toEqual(['src/routes/real.js']);
+    expect(out.coverage).toMatchObject({ complete: true, hot_total: 1 });
+  });
+});
+
+describe('audit-entity-check gather — a file that caused the run is never hidden', () => {
+  it('carries over a spec-only change instead of analysing without it', async () => {
+    // A Ruby suite lives in `spec/`, and `.rb` is a source extension the diff
+    // rule accepts. While the snapshot excluded `spec/` and the diff rule did
+    // not, this change opened a diff-scoped run whose snapshot then dropped the
+    // one file the run was about — and coverage reported itself complete.
+    const out = await runGather({}, { changedFiles: ['spec/webhook-handler_spec.rb'] });
+    expect(out.mode).toBe('carry_over');
+  });
+
+  it('puts a changed file in the snapshot even when its path reads as a test', async () => {
+    // Defence in depth for the next time the two lists drift: whatever opened
+    // this run is ranked before the test/docs exclusion is consulted.
+    const out = await runGather(
+      { config_fingerprint: 'ffffffff' },
+      {
+        changedFiles: ['spec/webhook-handler_spec.rb'],
+        prevFingerprint: 'aaaaaaaa',
+        tree: [
+          { path: 'spec/webhook-handler_spec.rb', size: 900 },
+          { path: 'src/routes/real.js', size: 900 },
+        ],
+      },
+    );
+    // The enhancer configuration moved, so the run happens regardless of the diff.
+    expect(out.scope).toBe('diff');
+    expect(snapshotPaths(out.llm_view)).toContain('spec/webhook-handler_spec.rb');
+    expect(out.coverage).toMatchObject({ complete: true, hot_total: 2, included: 2 });
+  });
+
+  it('re-reads a previously flagged file in verify_fix, wherever it lives', async () => {
+    const out = await runGather(
+      {},
+      {
+        prevSha: SHA_CURRENT,
+        prevStatus: 'failed',
+        prevFindings: [{ file: 'spec/webhook-handler_spec.rb', issue: 'no audit event' }],
+        tree: [
+          { path: 'spec/webhook-handler_spec.rb', size: 900 },
+          { path: 'src/routes/real.js', size: 900 },
+        ],
+      },
+    );
+    expect(out.scope).toBe('verify_fix');
+    expect(snapshotPaths(out.llm_view)).toContain('spec/webhook-handler_spec.rb');
+    expect(out.coverage?.complete).toBe(true);
   });
 });
 
