@@ -84,6 +84,15 @@ const GATHER_ANALYZE = {
   prev: null,
   changed_count: 3,
   total_files: 12,
+  coverage: {
+    complete: false,
+    hot_total: 14,
+    included: 12,
+    omitted_count: 2,
+    omitted: ['src/routes/application.js', 'src/routes/deployment.js'],
+    truncated_count: 0,
+    truncated: [],
+  },
   prev_findings_view: '(none)',
   llm_view: '## Repository: nullplatform/some-api …',
 };
@@ -235,6 +244,7 @@ describe('audit-entity-check — resolve payloads', () => {
       unverified?: unknown[];
       config_fingerprint?: string;
       item_id?: string;
+      coverage?: { complete?: boolean; omitted?: string[] };
     };
     expect(inputs.verdict?.status).toBe('failed');
     expect(inputs.verdict?.findings).toHaveLength(1);
@@ -246,6 +256,13 @@ describe('audit-entity-check — resolve payloads', () => {
     // The fingerprint of the configuration this verdict was produced against
     // travels to the stamp the next run compares.
     expect(inputs.config_fingerprint).toBe('abcd1234');
+    // What the snapshot could not reach travels with it, so the item can say
+    // how much of the repository the verdict is actually based on.
+    expect(inputs.coverage?.complete).toBe(false);
+    expect(inputs.coverage?.omitted).toEqual([
+      'src/routes/application.js',
+      'src/routes/deployment.js',
+    ]);
   });
 
   it('hands the previous verdict to resolve_carryover', async () => {

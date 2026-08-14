@@ -600,6 +600,32 @@ describe('audit-entity-check audit_agent', () => {
     expect(prompt).toContain('Do the work of both branches for these');
   });
 
+  it('rules on a partial snapshot instead of leaving it to the agent to notice', () => {
+    const prompt = systemPrompt();
+    expect(prompt).toContain('The snapshot header states its SNAPSHOT COVERAGE');
+    expect(prompt).toContain('those files are unread');
+    expect(prompt).toContain('gets verdict `unverified` with the coverage gap named in its `reason`');
+    expect(prompt).toContain('Absence of an audit event is not evidence in a file you were not shown');
+  });
+
+  it('gives an unverified entity somewhere to say why', () => {
+    const entity = (
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      workflow().steps.find((s) => s.id === 'audit_agent') as any
+    ).config.outputSchema.properties.entities.items.properties;
+    expect(entity.reason?.type).toBe('string');
+    expect(String(entity.reason?.description)).toContain('coverage gap');
+  });
+
+  it('does not ask the agent for the coverage figures themselves', () => {
+    // Coverage is measured by `gather` while it packs the snapshot. Asking the
+    // agent to restate it would make a deterministic fact a matter of opinion.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const schema = (workflow().steps.find((s) => s.id === 'audit_agent') as any).config
+      .outputSchema;
+    expect(Object.keys(schema.properties)).not.toContain('coverage');
+  });
+
   it('only allows finding areas a static reading can establish', () => {
     const areas = String(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -622,6 +648,17 @@ const GATHER_CODE = stepCode('gather');
 const SHA_PREV = 'bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222';
 const SHA_CURRENT = 'cccc3333cccc3333cccc3333cccc3333cccc3333';
 
+/** How much of the audit-relevant code the snapshot actually carries. */
+interface Coverage {
+  complete: boolean;
+  hot_total: number;
+  included: number;
+  omitted_count: number;
+  omitted: string[];
+  truncated_count: number;
+  truncated: string[];
+}
+
 interface GatherOutput {
   mode: string;
   scope?: string;
@@ -630,6 +667,7 @@ interface GatherOutput {
   changed_count: number | null;
   /** Absent on the carry-over path, which never builds a snapshot. */
   llm_view: string;
+  coverage?: Coverage;
   prev: {
     approval_id?: number;
     status: string;
@@ -782,6 +820,13 @@ const snapshotPaths = (llmView: string): string[] => snapshotFiles(llmView).map(
 const hotTree = (n: number, size = 400): TreeBlob[] =>
   Array.from({ length: n }, (_, i) => ({
     path: `src/services/api-service-${String(i).padStart(3, '0')}.js`,
+    size,
+  }));
+
+/** `n` files under a routes directory, which outrank the generic hot set. */
+const routeTree = (n: number, size = 400): TreeBlob[] =>
+  Array.from({ length: n }, (_, i) => ({
+    path: `src/routes/entity-${String(i).padStart(3, '0')}.js`,
     size,
   }));
 
@@ -1087,6 +1132,109 @@ describe('audit-entity-check gather — snapshot budget', () => {
   });
 });
 
+describe('audit-entity-check gather — snapshot coverage', () => {
+  it('reports a complete snapshot when every audit-relevant file fits', async () => {
+    const out = await runGather({}, { ...FULL_SCOPE, tree: routeTree(3) });
+    expect(out.coverage).toEqual({
+      complete: true,
+      hot_total: 3,
+      included: 3,
+      omitted_count: 0,
+      omitted: [],
+      truncated_count: 0,
+      truncated: [],
+    });
+    expect(out.llm_view).toContain('### Snapshot coverage');
+    expect(out.llm_view).toContain('COMPLETE: every audit-relevant file');
+  });
+
+  it('names the audit-relevant files the budget did not reach', async () => {
+    const out = await runGather({}, { ...FULL_SCOPE, tree: hotTree(70) });
+    expect(out.coverage?.complete).toBe(false);
+    expect(out.coverage?.hot_total).toBe(70);
+    expect(out.coverage?.included).toBe(60);
+    expect(out.coverage?.omitted_count).toBe(10);
+    expect(out.coverage?.omitted).toEqual(
+      hotTree(70)
+        .slice(60)
+        .map((b) => b.path),
+    );
+  });
+
+  it('lists the omitted files in ranking order, so the cap keeps the worst misses', async () => {
+    // 140 files miss the snapshot; only 50 paths travel, and they have to be the
+    // ones that mattered most — routes before the rest of the hot set.
+    const out = await runGather(
+      {},
+      { ...FULL_SCOPE, tree: [...hotTree(100), ...routeTree(70)] },
+    );
+    expect(out.coverage?.omitted_count).toBe(110);
+    expect(out.coverage?.omitted).toHaveLength(50);
+    expect(out.coverage?.omitted?.[0]).toBe('src/routes/entity-060.js');
+    // The routes that missed come before any generic hot file.
+    expect(out.coverage?.omitted?.slice(0, 10).every((p) => p.startsWith('src/routes/'))).toBe(true);
+  });
+
+  it('counts a file it had to clip as incomplete coverage, not as read', async () => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'src/routes/huge.js', size: 60000 },
+          { path: 'src/routes/small.js', size: 100 },
+        ],
+        contents: (p) => (p.endsWith('huge.js') ? 'x'.repeat(60000) : 'ok'),
+      },
+    );
+    expect(out.coverage?.complete).toBe(false);
+    expect(out.coverage?.included).toBe(2);
+    expect(out.coverage?.omitted).toEqual([]);
+    expect(out.coverage?.truncated).toEqual(['src/routes/huge.js']);
+    expect(out.coverage?.truncated_count).toBe(1);
+  });
+
+  it('counts a blob rejected for its size, and one that could not be fetched', async () => {
+    // Both are audit-relevant files the agent will not see, whatever the reason.
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'src/routes/generated.js', size: 400000 },
+          { path: 'src/routes/gone.js', size: 900 },
+          { path: 'src/routes/here.js', size: 900 },
+        ],
+        contents: (p) => (p.endsWith('gone.js') ? null : 'ok'),
+      },
+    );
+    expect(out.coverage?.complete).toBe(false);
+    expect(out.coverage?.omitted).toEqual(['src/routes/generated.js', 'src/routes/gone.js']);
+  });
+
+  it('tells the agent to mark the affected entities unverified', async () => {
+    const out = await runGather({}, { ...FULL_SCOPE, tree: hotTree(70) });
+    const view = out.llm_view.replace(/\s+/g, ' ');
+    expect(view).toContain('INCOMPLETE: 60 of 70 audit-relevant file(s)');
+    expect(view).toContain('NOT shown to you at all (10)');
+    expect(view).toContain('Treat every file listed above as unread');
+    expect(view).toContain('must be reported with verdict `unverified`');
+    expect(view).toContain('may claim the review covered the whole repository');
+  });
+
+  it('caps the list it shows the agent as well', async () => {
+    const out = await runGather({}, { ...FULL_SCOPE, tree: hotTree(200) });
+    expect(out.llm_view).toContain('NOT shown to you at all (140)');
+    expect(out.llm_view).toContain('…and 90 more');
+  });
+
+  it('reports no coverage on the carry-over path, which builds no snapshot', async () => {
+    const out = await runGather({}, { prevSha: SHA_CURRENT });
+    expect(out.mode).toBe('carry_over');
+    expect(out.coverage).toBeUndefined();
+  });
+});
+
 // --------------------------------------------------------------------------
 // resolve / resolve_carryover
 // --------------------------------------------------------------------------
@@ -1105,11 +1253,23 @@ interface Patched {
     config_fingerprint?: string;
     findings: unknown[];
     entities: Array<{ entity: string }>;
+    coverage?: Coverage | null;
     analyzed_sha: string;
     scope: string;
     carried_from?: string;
   };
 }
+
+/** A snapshot that missed 12 files and clipped one more. */
+const PARTIAL_COVERAGE: Coverage = {
+  complete: false,
+  hot_total: 73,
+  included: 60,
+  omitted_count: 12,
+  omitted: Array.from({ length: 12 }, (_, i) => `src/routes/entity-${String(i).padStart(2, '0')}.js`),
+  truncated_count: 1,
+  truncated: ['src/routes/application.js'],
+};
 
 interface ResolveCapture {
   patched?: Patched;
@@ -1222,6 +1382,95 @@ describe('audit-entity-check resolve', () => {
     await expect(
       runStepCode(RESOLVE_CODE, RESOLVE_ITEM, resolveFetch(capture, 401)),
     ).rejects.toThrow(/resolve audit_entity_check -> 401/);
+  });
+});
+
+describe('audit-entity-check resolve — snapshot coverage', () => {
+  const withCoverage = (coverage: Coverage | undefined) => ({ ...RESOLVE_ITEM, coverage });
+
+  it('publishes the coverage block next to the verdict it qualifies', async () => {
+    const capture: ResolveCapture = { logs: [] };
+    await runStepCode(RESOLVE_CODE, withCoverage(PARTIAL_COVERAGE), resolveFetch(capture));
+    expect(capture.patched?.details.coverage).toEqual(PARTIAL_COVERAGE);
+  });
+
+  it('names the omitted files in the markdown, capped at ten plus a count', async () => {
+    const capture: ResolveCapture = { logs: [] };
+    await runStepCode(RESOLVE_CODE, withCoverage(PARTIAL_COVERAGE), resolveFetch(capture));
+    const markdown = capture.patched?.details.markdown ?? '';
+    expect(markdown).toContain('**Cobertura del snapshot: INCOMPLETA**');
+    expect(markdown).toContain('leyó 60 de 73 archivo(s)');
+    expect(markdown).toContain('12 archivo(s) que no entraron');
+    expect(markdown).toContain('`src/routes/entity-00.js`');
+    expect(markdown).toContain('`src/routes/entity-09.js`');
+    expect(markdown).not.toContain('`src/routes/entity-10.js`');
+    expect(markdown).toContain('…y 2 más');
+    expect(markdown).toContain('1 archivo(s) truncado(s)');
+    expect(markdown).toContain('`src/routes/application.js`');
+  });
+
+  it('logs the shortfall as a warning without changing the verdict', async () => {
+    const capture: ResolveCapture = { logs: [] };
+    await runStepCode(
+      RESOLVE_CODE,
+      { ...withCoverage(PARTIAL_COVERAGE), verdict: { status: 'passed', summary: 'All good.' } },
+      resolveFetch(capture),
+    );
+    // Best-effort by design: a partial reading is declared, never escalated.
+    expect(capture.patched?.status).toBe('passed');
+    expect(
+      capture.logs.some((l) => l.includes('Snapshot coverage incomplete: 12 audit-relevant file(s)')),
+    ).toBe(true);
+  });
+
+  it('says nothing when the snapshot was complete', async () => {
+    const capture: ResolveCapture = { logs: [] };
+    const complete: Coverage = {
+      complete: true,
+      hot_total: 8,
+      included: 8,
+      omitted_count: 0,
+      omitted: [],
+      truncated_count: 0,
+      truncated: [],
+    };
+    await runStepCode(RESOLVE_CODE, withCoverage(complete), resolveFetch(capture));
+    expect(capture.patched?.details.markdown).not.toContain('Cobertura del snapshot');
+    expect(capture.patched?.details.coverage).toEqual(complete);
+    expect(capture.logs.some((l) => l.includes('coverage incomplete'))).toBe(false);
+  });
+
+  it('resolves the item when no coverage reached it at all', async () => {
+    const capture: ResolveCapture = { logs: [] };
+    await runStepCode(RESOLVE_CODE, withCoverage(undefined), resolveFetch(capture));
+    expect(capture.patched?.status).toBe('failed');
+    expect(capture.patched?.details.coverage).toBeNull();
+    expect(capture.patched?.details.markdown).not.toContain('Cobertura del snapshot');
+  });
+
+  it('renders the reason the agent gives for an unverified entity', async () => {
+    const capture: ResolveCapture = { logs: [] };
+    await runStepCode(
+      RESOLVE_CODE,
+      {
+        ...withCoverage(PARTIAL_COVERAGE),
+        verdict: {
+          ...RESOLVE_ITEM.verdict,
+          entities: [
+            {
+              entity: 'scope',
+              source: 'POST /scope',
+              verdict: 'unverified',
+              reason: 'its routes are in src/routes/entity-00.js, omitted from the snapshot',
+            },
+          ],
+        },
+      },
+      resolveFetch(capture),
+    );
+    const markdown = capture.patched?.details.markdown ?? '';
+    expect(markdown).toContain('❔ `scope` (unverified) — POST /scope');
+    expect(markdown).toContain('omitted from the snapshot');
   });
 });
 

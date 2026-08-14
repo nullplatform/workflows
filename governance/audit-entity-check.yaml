@@ -54,6 +54,16 @@
 # its framework's derivation rule, and whether a SELF_CONTAINED entity is really
 # echoed back by the write that produces it.
 #
+# The snapshot it reads is budgeted, so on a large repository it can be partial —
+# and one of its two checks reasons from an ABSENCE, which a partial snapshot
+# manufactures for free. `gather` therefore measures its own coverage while it
+# packs: every audit-relevant file the budget did not reach, and every one it had
+# to clip. That list is handed to the agent (whose instruction is to mark the
+# affected entities `unverified`) and published on the item as `coverage`, so a
+# pass over 60% of the routes never reads like a pass over all of them. It is
+# declared, not enforced: the gate stays best-effort and coverage never flips the
+# verdict.
+#
 # Incremental strategy (same as arch-rule-check): past checklist runs are the
 # checkpoint store. The verdict has TWO inputs, so a checkpoint is only reusable
 # while both are unchanged: the code diff must carry no audit-relevant changes,
@@ -715,7 +725,7 @@ steps:
         // fits more files in the same budget, but it drops the largest file of
         // every tier — in a routes directory that is the CRUD module this check
         // most needs to read. Path order carries no such bias and is stable
-        // across runs.
+        // across runs, and what does not fit is reported below instead.
         const byRank = blobs
           .map(b => ({ path: b.path, size: b.size || 0, s: score(b.path) }))
           .filter(b => b.s > 0)
@@ -733,6 +743,44 @@ steps:
           files.push({ path: f.path, truncated: content.length > clipped.length, content: clipped });
         }
 
+        // How much of the audit-relevant code the agent actually got to read.
+        // This is a property of the snapshot, so it is computed here and handed
+        // to the agent and to the item as a fact — never asked of the agent,
+        // which can only report what it was shown. `omitted` follows the ranking
+        // order, so the capped list names the most relevant misses first.
+        const OMITTED_CAP = 50;
+        const includedPaths = new Set(files.map(f => f.path));
+        const omitted = byRank.map(b => b.path).filter(p => !includedPaths.has(p));
+        const truncatedPaths = files.filter(f => f.truncated).map(f => f.path);
+        const coverage = {
+          complete: omitted.length === 0 && truncatedPaths.length === 0,
+          hot_total: byRank.length,
+          included: files.length,
+          omitted_count: omitted.length,
+          omitted: omitted.slice(0, OMITTED_CAP),
+          truncated_count: truncatedPaths.length,
+          truncated: truncatedPaths.slice(0, OMITTED_CAP),
+        };
+        const listFor = (paths, total) => {
+          const rest = total - paths.length;
+          return paths.map(p => `- ${p}`).join("\n") + (rest > 0 ? `\n- …and ${rest} more` : "");
+        };
+        const coverageNote = coverage.complete
+          ? "COMPLETE: every audit-relevant file of the tree is included below, in full."
+          : [
+              `INCOMPLETE: ${coverage.included} of ${coverage.hot_total} audit-relevant file(s) fit the snapshot budget.`,
+              coverage.omitted_count
+                ? `NOT shown to you at all (${coverage.omitted_count}):\n${listFor(coverage.omitted, coverage.omitted_count)}`
+                : "",
+              coverage.truncated_count
+                ? `Included but CUT OFF mid-file (${coverage.truncated_count}):\n${listFor(coverage.truncated, coverage.truncated_count)}`
+                : "",
+              "Treat every file listed above as unread. An entity whose write routes"
+                + " live in one of them must be reported with verdict `unverified` and a"
+                + " reason naming this coverage gap, and neither your summary nor any"
+                + " finding may claim the review covered the whole repository.",
+            ].filter(Boolean).join("\n\n");
+
         const treeView = paths.filter(p => !SKIP.test(p)).slice(0, 400).join("\n");
         const scopeNote = scope === "full"
           ? "FULL AUDIT: no previous checkpoint (or forced)."
@@ -742,6 +790,7 @@ steps:
         const llm_view = [
           `## Repository: ${repo} (branch: ${branch}, commit: ${currentSha.slice(0,7)}) — application "${app.name}"`,
           ``, `### Analysis scope`, scopeNote, ``,
+          `### Snapshot coverage`, coverageNote, ``,
           `### Full file tree (${paths.length} files)`,
           "```", treeView, "```",
           ``,
@@ -753,6 +802,7 @@ steps:
           mode: "analyze", scope, repo, branch, analyzed_sha: currentSha,
           prev: checkpoint, changed_count: changed ? changed.length : null,
           total_files: paths.length,
+          coverage,
           prev_findings_view: (checkpoint && checkpoint.findings || []).map(f => `- ${f.file || f.entity}: ${f.issue}`).join("\n") || "(none)",
           llm_view,
         };
@@ -893,6 +943,13 @@ steps:
         - The snapshot is partial: never invent file contents you were not
           shown. If the selected files are insufficient to prove a problem,
           lean towards passed and say what you could not verify.
+        - The snapshot header states its SNAPSHOT COVERAGE, and it is measured,
+          not estimated. When it reports omitted or truncated files, those files
+          are unread: an entity whose write routes live in one of them gets
+          verdict `unverified` with the coverage gap named in its `reason`, and
+          neither the summary nor any finding may claim the review covered the
+          whole repository. Absence of an audit event is not evidence in a file
+          you were not shown.
       userPrompt: |
         Application audit-coverage check.
 
@@ -947,6 +1004,7 @@ steps:
                 entity: { type: string }
                 source: { type: string, description: "route or mechanism that produces it" }
                 verdict: { type: string, description: "`unverified` is the honest answer whenever the entity's enrichment depends on something only the deploy can settle", enum: [ok, unaudited, misconfigured, unverified] }
+                reason: { type: string, description: "Why the verdict is what it is. Mandatory for `unverified`: name what could not be settled — the read grant, or the snapshot coverage gap that hid the entity's write routes." }
           fix_instructions_md: { type: string }
     error_handling:
       fallback_step: resolve_failure_agent
@@ -965,6 +1023,7 @@ steps:
       scope:            "${{ steps.gather.outputs.scope }}"
       analyzed_sha:     "${{ steps.gather.outputs.analyzed_sha }}"
       changed_count:    "${{ steps.gather.outputs.changed_count }}"
+      coverage:         "${{ steps.gather.outputs.coverage }}"
       unverified:       "${{ steps.enhancer_config.outputs.unverified }}"
       config_fingerprint: "${{ steps.enhancer_config.outputs.config_fingerprint }}"
     config:
@@ -972,7 +1031,7 @@ steps:
         allowedHosts: ["api.nullplatform.com"]
       code: |
         const { callbackUrl, callbackToken, check_id, item_id, verdict, repo,
-                scope, analyzed_sha, changed_count, unverified, config_fingerprint } = $item;
+                scope, analyzed_sha, changed_count, coverage, unverified, config_fingerprint } = $item;
         const itemId = check_id || item_id || "audit_entity_check";
         const H = { authorization: `Bearer ${callbackToken}`, "content-type": "application/json" };
         const post = (url, body) => fetch(url, { method: "POST", headers: H, body: JSON.stringify(body) });
@@ -987,6 +1046,11 @@ steps:
         const unread = Array.isArray(unverified) ? unverified : [];
         const analysisScope = scope || "full";
         const sha7 = (analyzed_sha || "").slice(0, 7);
+        // Measured by the gather step while it packed the snapshot, not taken
+        // from the verdict: how much of the code the agent read is not something
+        // the agent itself can attest to.
+        const cov = coverage && typeof coverage === "object" ? coverage : null;
+        const covIncomplete = !!cov && cov.complete === false;
 
         for (const f of resolved) {
           await post(`${callbackUrl}/log`, { level: "info", message: `Resolved: ${f.entity || f.file || ""} — ${f.issue} → ${f.resolution}` }).catch(() => null);
@@ -1000,6 +1064,12 @@ steps:
         for (const d of unread) {
           await post(`${callbackUrl}/log`, { level: "warning", message: `Could not be read: ${d}` }).catch(() => null);
         }
+        if (covIncomplete) {
+          await post(`${callbackUrl}/log`, {
+            level: "warning",
+            message: `Snapshot coverage incomplete: ${cov.omitted_count || 0} audit-relevant file(s) omitted, ${cov.truncated_count || 0} truncated (${cov.included || 0}/${cov.hot_total || 0} read).`,
+          }).catch(() => null);
+        }
         await post(`${callbackUrl}/log`, {
           level: "info",
           message: na ? `Check not applicable — treated as passed.` : `Verdict (${analysisScope} @ ${sha7}): ${v.status}. ${v.summary || ""}`,
@@ -1008,7 +1078,7 @@ steps:
         const ICON = { ok: "✅", unaudited: "🔇", misconfigured: "⚠️", unverified: "❔" };
         const mdEntities = entities.length
           ? "\n**Entidades de escritura de esta aplicación:**\n" + entities.map(e =>
-              `- ${ICON[e.verdict] || "•"} \`${e.entity}\` (${e.verdict})${e.source ? ` — ${e.source}` : ""}`).join("\n")
+              `- ${ICON[e.verdict] || "•"} \`${e.entity}\` (${e.verdict})${e.source ? ` — ${e.source}` : ""}${e.reason ? `\n  - ${e.reason}` : ""}`).join("\n")
           : "";
         const mdResolved = resolved.length
           ? "\n**Findings resueltos desde el último deploy:**\n" + resolved.map(f => `- ✅ \`${f.entity || f.file || ""}\` — ${f.issue}\n  - ${f.resolution}`).join("\n")
@@ -1023,6 +1093,28 @@ steps:
           "- El grant de lectura del enhancer y el comportamiento del primer write real se verifican recién en el próximo deploy; el runtime lo cubren los monitores del pipeline.",
           ...unread.map(f => `- ${f}`),
         ].join("\n");
+        // A partial reading that reports itself is best-effort; a partial reading
+        // that stays quiet is a false negative, so the shortfall is named on the
+        // item even though it never changes the verdict.
+        const MD_COVERAGE_LIST = 10;
+        const covList = (paths, total) => {
+          const shown = (paths || []).slice(0, MD_COVERAGE_LIST);
+          const rest = (total || 0) - shown.length;
+          return shown.map(p => `  - \`${p}\``)
+            .concat(rest > 0 ? [`  - …y ${rest} más`] : []).join("\n");
+        };
+        const mdCoverage = covIncomplete
+          ? [
+              `\n**Cobertura del snapshot: INCOMPLETA** — el agente leyó ${cov.included || 0} de ${cov.hot_total || 0} archivo(s) relevantes para audit.`,
+              cov.omitted_count
+                ? `- ${cov.omitted_count} archivo(s) que no entraron:\n${covList(cov.omitted, cov.omitted_count)}`
+                : "",
+              cov.truncated_count
+                ? `- ${cov.truncated_count} archivo(s) truncado(s):\n${covList(cov.truncated, cov.truncated_count)}`
+                : "",
+              "- Las entidades cuyas rutas de escritura viven en esos archivos quedan sin verificar; el veredicto no cambia por esto.",
+            ].filter(Boolean).join("\n")
+          : "";
         const mdFix = (status === "failed" && v.fix_instructions_md)
           ? `\n\n#### How to fix\n${v.fix_instructions_md}`
           : "";
@@ -1035,7 +1127,7 @@ steps:
           `Repo: \`${repo}\` · 🔎 ${scopeLabel} @ \`${sha7}\``,
           ``,
           v.summary || "",
-          mdEntities, mdResolved, mdFindings, mdFix, mdUnverified,
+          mdEntities, mdResolved, mdFindings, mdCoverage, mdFix, mdUnverified,
         ].join("\n");
 
         const message = na
@@ -1049,6 +1141,10 @@ steps:
           // next run compares before reusing this verdict.
           config_fingerprint: config_fingerprint || "",
           entities: entities.map(e => ({ ...e })),
+          // How much of the code this verdict is based on, next to the verdict
+          // itself: a reader of the item can tell a clean pass from a pass over
+          // a partial snapshot without re-running anything.
+          coverage: cov,
         };
 
         const r = await patch(callbackUrl, { status, message, details });
