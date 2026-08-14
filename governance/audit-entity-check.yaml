@@ -688,6 +688,12 @@ steps:
         const AUDIT_HOT = /(route|controller|handler|endpoint|middleware|audit|server|api|entit)/i;
         const ALWAYS = /(^|\/)(package\.json|requirements\.txt|go\.mod|Dockerfile|null(app)?\.ya?ml|\.nullplatform\/[^/]+)$/i;
         const ENTRY = /(^|\/)(src\/)?(index|main|app|server)\.[cm]?[jt]sx?$|(^|\/)(app|main)\.py$|(^|\/)main\.go$/i;
+        // The write routes are the evidence this whole check rests on, and by
+        // convention they live under one of these directories. They therefore
+        // outrank the rest of the hot set: when a repository does not fit the
+        // budget, the slots that remain have to go to routes, not to whatever
+        // else happens to have "api" or "server" in its name.
+        const ROUTE_DIR = /(^|\/)(routes?|controllers?|handlers?|endpoints?)\//i;
         const SKIP = /(^|\/)(node_modules|dist|build|\.git|vendor|coverage|\.next|out)\/|(\.(png|jpe?g|gif|svg|ico|woff2?|ttf|eot|map|lock|min\.js|min\.css))$|package-lock\.json|pnpm-lock\.yaml|yarn\.lock/i;
 
         const changedSet = new Set(changed || []);
@@ -696,17 +702,26 @@ steps:
           if (SKIP.test(p)) return -1;
           if (scope !== "full" && (changedSet.has(p) || findingFiles.has(p))) return 5;
           if (ENTRY.test(p)) return 4;
+          if (ROUTE_DIR.test(p)) return 4;
           if (AUDIT_HOT.test(p)) return 3;
           if (ALWAYS.test(p)) return 3;
           return 0;
         };
-        const ranked = blobs
+        // Sized against the agent's context window, not against the repository.
+        // A blob past MAX_BLOB is not worth a slot: what would survive the
+        // per-file clip is a fraction of it, and it costs a whole file's budget.
+        const MAX_FILES = 60, PER_FILE = 24000, TOTAL = 240000, MAX_BLOB = 200000;
+        // Ties inside one score are broken by path. Ordering by ascending size
+        // fits more files in the same budget, but it drops the largest file of
+        // every tier — in a routes directory that is the CRUD module this check
+        // most needs to read. Path order carries no such bias and is stable
+        // across runs.
+        const byRank = blobs
           .map(b => ({ path: b.path, size: b.size || 0, s: score(b.path) }))
-          .filter(b => b.s > 0 && b.size < 200000)
-          .sort((a, b) => b.s - a.s || a.size - b.size)
-          .slice(0, 30);
+          .filter(b => b.s > 0)
+          .sort((a, b) => b.s - a.s || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+        const ranked = byRank.filter(b => b.size < MAX_BLOB).slice(0, MAX_FILES);
 
-        const PER_FILE = 12000, TOTAL = 90000;
         let used = 0;
         const files = [];
         for (const f of ranked) {

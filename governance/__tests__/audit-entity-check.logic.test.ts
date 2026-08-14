@@ -628,6 +628,8 @@ interface GatherOutput {
   repo: string;
   analyzed_sha: string;
   changed_count: number | null;
+  /** Absent on the carry-over path, which never builds a snapshot. */
+  llm_view: string;
   prev: {
     approval_id?: number;
     status: string;
@@ -647,6 +649,12 @@ interface PriorApproval {
   status?: string;
 }
 
+/** One `type: blob` entry of `GET /git/trees/<branch>?recursive=1`. */
+interface TreeBlob {
+  path: string;
+  size: number;
+}
+
 interface GatherFetchOptions {
   itemId?: string;
   prevStatus?: string;
@@ -658,6 +666,10 @@ interface GatherFetchOptions {
   changedFiles?: string[];
   /** Omit to have the prior approval list come back empty (no checkpoint). */
   withCheckpoint?: boolean;
+  /** Repository tree the snapshot is packed from. */
+  tree?: TreeBlob[];
+  /** Body served per path by the raw contents endpoint. */
+  contents?: (path: string) => string | null;
 }
 
 function gatherFetch(opts: GatherFetchOptions): FakeFetch {
@@ -722,9 +734,15 @@ function gatherFetch(opts: GatherFetchOptions): FakeFetch {
       });
     }
     if (url.includes('/git/trees/')) {
-      return res(200, { tree: [{ path: 'src/index.js', type: 'blob', size: 500 }] });
+      const tree = opts.tree ?? [{ path: 'src/index.js', size: 500 }];
+      return res(200, { tree: tree.map((b) => ({ ...b, type: 'blob' })) });
     }
-    if (url.includes('/contents/')) return res(200, 'export const app = 1;');
+    const contents = /\/contents\/(.+)\?ref=/.exec(url);
+    if (contents) {
+      const path = decodeURIComponent(contents[1]);
+      const body = opts.contents ? opts.contents(path) : 'export const app = 1;';
+      return body === null ? res(404, 'Not Found') : res(200, body);
+    }
     if (url.includes('api.github.com/repos/')) return res(200, { default_branch: 'main' });
     return res(404, {});
   };
@@ -746,6 +764,29 @@ const runGather = (
   opts: GatherFetchOptions = {},
 ): Promise<GatherOutput> =>
   runStepCode<GatherOutput>(GATHER_CODE, { ...GATHER_ITEM, ...item }, gatherFetch(opts));
+
+/**
+ * The files the snapshot actually carries, in the order it lists them — read
+ * back from the `--- path (truncated) ---` headers of its contents section.
+ */
+function snapshotFiles(llmView: string): Array<{ path: string; truncated: boolean }> {
+  return [...llmView.matchAll(/^--- (.+?)( \(truncated\))? ---$/gm)].map((m) => ({
+    path: m[1],
+    truncated: m[2] !== undefined,
+  }));
+}
+
+const snapshotPaths = (llmView: string): string[] => snapshotFiles(llmView).map((f) => f.path);
+
+/** `n` files matching AUDIT_HOT and nothing stronger, all small. */
+const hotTree = (n: number, size = 400): TreeBlob[] =>
+  Array.from({ length: n }, (_, i) => ({
+    path: `src/services/api-service-${String(i).padStart(3, '0')}.js`,
+    size,
+  }));
+
+/** No checkpoint at all, so the run takes the full-analysis path. */
+const FULL_SCOPE: GatherFetchOptions = { withCheckpoint: false };
 
 describe('audit-entity-check gather — carry-over decision', () => {
   it('carries over when the sha is unchanged', async () => {
@@ -887,6 +928,162 @@ describe('audit-entity-check gather — carry-over decision', () => {
       { itemId: 'override_id', prevSha: SHA_CURRENT },
     );
     expect(out.mode).toBe('carry_over');
+  });
+});
+
+describe('audit-entity-check gather — snapshot ranking', () => {
+  it('gives route directories a slot before the rest of the hot set', async () => {
+    // The check reasons about write routes, and on a repository with more
+    // audit-relevant files than the budget holds, those are the files that must
+    // survive the cut — not everything that happens to have "api" in its name.
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          ...hotTree(70),
+          { path: 'src/routes/application.js', size: 40000 },
+          { path: 'src/routes/deployment.js', size: 30000 },
+        ],
+      },
+    );
+    const paths = snapshotPaths(out.llm_view);
+    expect(paths).toContain('src/routes/application.js');
+    expect(paths).toContain('src/routes/deployment.js');
+    // Ranked above the hot set, so they lead the snapshot.
+    expect(paths.slice(0, 2)).toEqual(['src/routes/application.js', 'src/routes/deployment.js']);
+  });
+
+  it('keeps the big route modules that the ascending-size tie-break used to drop', async () => {
+    // Ranking hot files by ascending size filled the snapshot with the smallest
+    // of them, so the largest route file of a big repository — the CRUD module
+    // this check exists to read — was the first thing cut, silently.
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [...hotTree(70, 300), { path: 'src/controllers/scope.js', size: 90000 }],
+      },
+    );
+    expect(snapshotPaths(out.llm_view)).toContain('src/controllers/scope.js');
+  });
+
+  it('ranks handler and endpoint directories with the routes', async () => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          ...hotTree(70),
+          { path: 'internal/handlers/user.go', size: 8000 },
+          { path: 'app/endpoints/notification.py', size: 8000 },
+        ],
+      },
+    );
+    const paths = snapshotPaths(out.llm_view);
+    expect(paths.slice(0, 2)).toEqual([
+      'app/endpoints/notification.py',
+      'internal/handlers/user.go',
+    ]);
+  });
+
+  it('breaks a tie by path, not by size', async () => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'src/routes/aaa.js', size: 9000 },
+          { path: 'src/routes/bbb.js', size: 100 },
+          { path: 'src/routes/ccc.js', size: 5000 },
+        ],
+      },
+    );
+    expect(snapshotPaths(out.llm_view)).toEqual([
+      'src/routes/aaa.js',
+      'src/routes/bbb.js',
+      'src/routes/ccc.js',
+    ]);
+  });
+
+  it('still puts the changed files of an incremental run first of all', async () => {
+    const out = await runGather(
+      {},
+      {
+        changedFiles: ['src/services/api-service-042.js'],
+        tree: [...hotTree(70), { path: 'src/routes/application.js', size: 40000 }],
+      },
+    );
+    expect(out.scope).toBe('diff');
+    expect(snapshotPaths(out.llm_view)[0]).toBe('src/services/api-service-042.js');
+  });
+});
+
+describe('audit-entity-check gather — snapshot budget', () => {
+  it('takes at most sixty files', async () => {
+    const out = await runGather({}, { ...FULL_SCOPE, tree: hotTree(200) });
+    expect(snapshotFiles(out.llm_view)).toHaveLength(60);
+  });
+
+  it('clips a file at the per-file budget and marks it truncated', async () => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'src/routes/huge.js', size: 60000 },
+          { path: 'src/routes/small.js', size: 100 },
+        ],
+        contents: (p) => (p.endsWith('huge.js') ? 'x'.repeat(60000) : 'ok'),
+      },
+    );
+    expect(snapshotFiles(out.llm_view)).toEqual([
+      { path: 'src/routes/huge.js', truncated: true },
+      { path: 'src/routes/small.js', truncated: false },
+    ]);
+    expect(out.llm_view).toContain('x'.repeat(24000));
+    expect(out.llm_view).not.toContain('x'.repeat(24001));
+  });
+
+  it('stops at the total character budget', async () => {
+    // 24000 chars per file against a 240000 total: ten files fill it, and the
+    // rest of the ranking never gets fetched.
+    const out = await runGather(
+      {},
+      { ...FULL_SCOPE, tree: hotTree(60, 30000), contents: () => 'x'.repeat(30000) },
+    );
+    const files = snapshotFiles(out.llm_view);
+    expect(files).toHaveLength(10);
+    expect(files.every((f) => f.truncated)).toBe(true);
+  });
+
+  it('gives no slot to a blob too big to be worth one', async () => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'src/routes/generated.js', size: 400000 },
+          { path: 'src/routes/real.js', size: 900 },
+        ],
+      },
+    );
+    expect(snapshotPaths(out.llm_view)).toEqual(['src/routes/real.js']);
+  });
+
+  it('skips a file whose contents could not be fetched', async () => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'src/routes/gone.js', size: 900 },
+          { path: 'src/routes/here.js', size: 900 },
+        ],
+        contents: (p) => (p.endsWith('gone.js') ? null : 'ok'),
+      },
+    );
+    expect(snapshotPaths(out.llm_view)).toEqual(['src/routes/here.js']);
   });
 });
 
