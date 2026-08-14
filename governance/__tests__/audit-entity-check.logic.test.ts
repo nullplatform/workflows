@@ -1051,6 +1051,65 @@ describe('audit-entity-check gather — snapshot ranking', () => {
     ]);
   });
 
+  it('does not let a mirrored test suite crowd the production code out', async () => {
+    // A Node repository whose suite mirrors its routes — `test/routes/*.spec.js`
+    // next to `routes/*.js` — used to hand every one of those fixtures the
+    // route-dir rank, so the fixtures took the budget and real code that only
+    // matched AUDIT_HOT was pushed out. That is this change's own bug, inverted.
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          ...Array.from({ length: 60 }, (_, i) => ({
+            path: `test/routes/fixture-${String(i).padStart(2, '0')}.spec.js`,
+            size: 400,
+          })),
+          { path: 'src/lib/audit-publisher.js', size: 900 },
+          { path: 'src/routes/application.js', size: 40000 },
+        ],
+      },
+    );
+    expect(snapshotPaths(out.llm_view)).toEqual([
+      'src/routes/application.js',
+      'src/lib/audit-publisher.js',
+    ]);
+    // And the fixtures are not audit-relevant, so they are not a coverage gap.
+    expect(out.coverage).toMatchObject({ complete: true, hot_total: 2, included: 2 });
+  });
+
+  it('gives no rank at all to tests, mocks, specs or documentation', async () => {
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'test/routes/user.spec.js', size: 400 },
+          { path: 'tests/controllers/scope.js', size: 400 },
+          { path: '__tests__/handlers/audit.js', size: 400 },
+          { path: '__mocks__/routes/api.js', size: 400 },
+          { path: 'spec/endpoints/notification.js', size: 400 },
+          { path: 'docs/routes/application.md', size: 400 },
+          { path: 'doc/controllers/api.md', size: 400 },
+          { path: 'src/api/legacy/tests/helper.js', size: 400 },
+          { path: 'src/routes/real.js', size: 400 },
+        ],
+      },
+    );
+    expect(snapshotPaths(out.llm_view)).toEqual(['src/routes/real.js']);
+    expect(out.coverage).toMatchObject({ complete: true, hot_total: 1 });
+  });
+
+  it('keeps a route file whose name merely begins with "test"', async () => {
+    // The exclusion matches whole path segments, so a legitimately named module
+    // inside a routes directory is not caught by it.
+    const out = await runGather(
+      {},
+      { ...FULL_SCOPE, tree: [{ path: 'src/routes/test_utils.js', size: 400 }, ...hotTree(70)] },
+    );
+    expect(snapshotPaths(out.llm_view)[0]).toBe('src/routes/test_utils.js');
+  });
+
   it('still puts the changed files of an incremental run first of all', async () => {
     const out = await runGather(
       {},
