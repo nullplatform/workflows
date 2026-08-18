@@ -733,10 +733,13 @@ steps:
           if (ALWAYS.test(p)) return 3;
           return 0;
         };
-        // Sized against the agent's context window, not against the repository.
-        // A blob past MAX_BLOB is not worth a slot: what would survive the
-        // per-file clip is a fraction of it, and it costs a whole file's budget.
-        const MAX_FILES = 60, PER_FILE = 24000, TOTAL = 240000, MAX_BLOB = 200000;
+        // Selection budget: how much file content is worth fetching at all. It
+        // sits below MAX_PROMPT further down so the assembled view normally fits
+        // without trimming, and leaves room for the file tree and the notes that
+        // travel with it. A blob past MAX_BLOB is not worth a slot either — what
+        // would survive the per-file clip is a fraction of it, at the cost of a
+        // whole file's budget.
+        const MAX_FILES = 60, PER_FILE = 24000, TOTAL = 90000, MAX_BLOB = 200000;
         // Ties inside one score are broken by path. Ordering by ascending size
         // fits more files in the same budget, but it drops the largest file of
         // every tier — in a routes directory that is the CRUD module this check
@@ -759,60 +762,101 @@ steps:
           files.push({ path: f.path, truncated: content.length > clipped.length, content: clipped });
         }
 
+        // The tree is the agent's map of what exists — a list of names, not
+        // evidence — so it takes a bounded share of the prompt: whichever comes
+        // first, 400 entries or TREE_CHARS. Bounding it is what makes the trimming
+        // below terminate: with every part of the view except the file contents
+        // capped, dropping files always brings the total under MAX_PROMPT.
+        const TREE_CHARS = 30000;
+        const treeCandidates = paths.filter(p => !SKIP.test(p));
+        const treePaths = [];
+        let treeUsed = 0;
+        for (const p of treeCandidates) {
+          if (treePaths.length >= 400 || treeUsed + p.length + 1 > TREE_CHARS) break;
+          treePaths.push(p);
+          treeUsed += p.length + 1;
+        }
+        const treeView = treePaths.join("\n");
+        const treeNote = treePaths.length < treeCandidates.length
+          ? ` — first ${treePaths.length} of ${treeCandidates.length} listed`
+          : "";
+        const scopeNote = scope === "full"
+          ? "FULL AUDIT: no previous checkpoint (or forced)."
+          : scope === "verify_fix"
+            ? `FIX VERIFICATION: this check FAILED at commit ${checkpoint.sha.slice(0,7)}. Changed files since then: ${(changed||[]).join(", ") || "(none)"}.`
+            : `DIFF-SCOPED AUDIT: check passed at ${checkpoint.sha.slice(0,7)}; re-checking because of ${(changed||[]).length} changed file(s)${configChanged ? ", and because the enhancer configuration changed since that verdict" : ""}.`;
+
         // How much of the audit-relevant code the agent actually got to read.
         // This is a property of the snapshot, so it is computed here and handed
         // to the agent and to the item as a fact — never asked of the agent,
         // which can only report what it was shown. `omitted` follows the ranking
         // order, so the capped list names the most relevant misses first.
         const OMITTED_CAP = 50;
-        const includedPaths = new Set(files.map(f => f.path));
-        const omitted = byRank.map(b => b.path).filter(p => !includedPaths.has(p));
-        const truncatedPaths = files.filter(f => f.truncated).map(f => f.path);
-        const coverage = {
-          complete: omitted.length === 0 && truncatedPaths.length === 0,
-          hot_total: byRank.length,
-          included: files.length,
-          omitted_count: omitted.length,
-          omitted: omitted.slice(0, OMITTED_CAP),
-          truncated_count: truncatedPaths.length,
-          truncated: truncatedPaths.slice(0, OMITTED_CAP),
+        const listFor = (list, total) => {
+          const rest = total - list.length;
+          return list.map(p => `- ${p}`).join("\n") + (rest > 0 ? `\n- …and ${rest} more` : "");
         };
-        const listFor = (paths, total) => {
-          const rest = total - paths.length;
-          return paths.map(p => `- ${p}`).join("\n") + (rest > 0 ? `\n- …and ${rest} more` : "");
+        const coverageOf = (shown) => {
+          const includedPaths = new Set(shown.map(f => f.path));
+          const omitted = byRank.map(b => b.path).filter(p => !includedPaths.has(p));
+          const truncatedPaths = shown.filter(f => f.truncated).map(f => f.path);
+          return {
+            complete: omitted.length === 0 && truncatedPaths.length === 0,
+            hot_total: byRank.length,
+            included: shown.length,
+            omitted_count: omitted.length,
+            omitted: omitted.slice(0, OMITTED_CAP),
+            truncated_count: truncatedPaths.length,
+            truncated: truncatedPaths.slice(0, OMITTED_CAP),
+          };
         };
-        const coverageNote = coverage.complete
+        const noteOf = (cov) => cov.complete
           ? "COMPLETE: every audit-relevant file of the tree is included below, in full."
           : [
-              `INCOMPLETE: ${coverage.included} of ${coverage.hot_total} audit-relevant file(s) fit the snapshot budget.`,
-              coverage.omitted_count
-                ? `NOT shown to you at all (${coverage.omitted_count}):\n${listFor(coverage.omitted, coverage.omitted_count)}`
+              `INCOMPLETE: ${cov.included} of ${cov.hot_total} audit-relevant file(s) fit the snapshot budget.`,
+              cov.omitted_count
+                ? `NOT shown to you at all (${cov.omitted_count}):\n${listFor(cov.omitted, cov.omitted_count)}`
                 : "",
-              coverage.truncated_count
-                ? `Included but CUT OFF mid-file (${coverage.truncated_count}):\n${listFor(coverage.truncated, coverage.truncated_count)}`
+              cov.truncated_count
+                ? `Included but CUT OFF mid-file (${cov.truncated_count}):\n${listFor(cov.truncated, cov.truncated_count)}`
                 : "",
               "Treat every file listed above as unread. An entity whose write routes"
                 + " live in one of them must be reported with verdict `unverified` and a"
                 + " reason naming this coverage gap, and neither your summary nor any"
                 + " finding may claim the review covered the whole repository.",
             ].filter(Boolean).join("\n\n");
-
-        const treeView = paths.filter(p => !SKIP.test(p)).slice(0, 400).join("\n");
-        const scopeNote = scope === "full"
-          ? "FULL AUDIT: no previous checkpoint (or forced)."
-          : scope === "verify_fix"
-            ? `FIX VERIFICATION: this check FAILED at commit ${checkpoint.sha.slice(0,7)}. Changed files since then: ${(changed||[]).join(", ") || "(none)"}.`
-            : `DIFF-SCOPED AUDIT: check passed at ${checkpoint.sha.slice(0,7)}; re-checking because of ${(changed||[]).length} changed file(s)${configChanged ? ", and because the enhancer configuration changed since that verdict" : ""}.`;
-        const llm_view = [
+        const viewOf = (shown, cov) => [
           `## Repository: ${repo} (branch: ${branch}, commit: ${currentSha.slice(0,7)}) — application "${app.name}"`,
           ``, `### Analysis scope`, scopeNote, ``,
-          `### Snapshot coverage`, coverageNote, ``,
-          `### Full file tree (${paths.length} files)`,
+          `### Snapshot coverage`, noteOf(cov), ``,
+          `### Full file tree (${paths.length} files${treeNote})`,
           "```", treeView, "```",
           ``,
-          `### Selected file contents (${files.length} files)`,
-          ...files.map(f => `\n--- ${f.path}${f.truncated ? " (truncated)" : ""} ---\n${f.content}`),
+          `### Selected file contents (${shown.length} files)`,
+          ...shown.map(f => `\n--- ${f.path}${f.truncated ? " (truncated)" : ""} ---\n${f.content}`),
         ].join("\n");
+
+        // The agent runner re-expands this view as a single shell argument, and
+        // the kernel caps one argument at 128KiB (MAX_ARG_STRLEN). Crossing that
+        // line does not degrade the analysis — execve fails, and the step dies
+        // with exit 126 and no diagnostic worth reading. So the file budget above
+        // is only the selection heuristic; THIS is the invariant that has to
+        // hold. The margin absorbs what the runner wraps around the view, shell
+        // escaping, and multi-byte characters that cost more bytes than chars.
+        const MAX_PROMPT = 110000;
+        // Trimming drops whole files from the tail of the ranking — lowest score,
+        // last one in, first one out — and never cuts through the assembled
+        // string. A file sliced mid-body is worse evidence than an absent one,
+        // and every file that goes has to stay reportable, so coverage is
+        // recomputed on each pass instead of describing a snapshot that changed.
+        let shown = files;
+        let coverage = coverageOf(shown);
+        let llm_view = viewOf(shown, coverage);
+        while (llm_view.length > MAX_PROMPT && shown.length > 0) {
+          shown = shown.slice(0, shown.length - 1);
+          coverage = coverageOf(shown);
+          llm_view = viewOf(shown, coverage);
+        }
 
         return {
           mode: "analyze", scope, repo, branch, analyzed_sha: currentSha,

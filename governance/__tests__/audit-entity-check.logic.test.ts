@@ -1152,14 +1152,14 @@ describe('audit-entity-check gather — snapshot budget', () => {
   });
 
   it('stops at the total character budget', async () => {
-    // 24000 chars per file against a 240000 total: ten files fill it, and the
-    // rest of the ranking never gets fetched.
+    // 24000 chars per file against a 90000 total: three full files and a fourth
+    // clipped to the 18000 that were left, and the rest is never fetched.
     const out = await runGather(
       {},
       { ...FULL_SCOPE, tree: hotTree(60, 30000), contents: () => 'x'.repeat(30000) },
     );
     const files = snapshotFiles(out.llm_view);
-    expect(files).toHaveLength(10);
+    expect(files).toHaveLength(4);
     expect(files.every((f) => f.truncated)).toBe(true);
   });
 
@@ -1285,6 +1285,125 @@ describe('audit-entity-check gather — a file that caused the run is never hidd
     expect(out.scope).toBe('verify_fix');
     expect(snapshotPaths(out.llm_view)).toContain('spec/webhook-handler_spec.rb');
     expect(out.coverage?.complete).toBe(true);
+  });
+});
+
+describe('audit-entity-check gather — the prompt fits one shell argument', () => {
+  /** The hard cap the assembled view has to respect, whatever the budget picks. */
+  const MAX_PROMPT = 110000;
+
+  /** A tree path no ranking rule matches, long enough to pad the file tree. */
+  const padPath = (i: number) =>
+    `src/models/nested/${'d'.repeat(160)}/model-${String(i).padStart(3, '0')}.js`;
+
+  /**
+   * Three route files and three generic hot files, all larger than the per-file
+   * budget, plus a file tree long enough that the assembled view cannot hold the
+   * whole selection.
+   */
+  const CROWDED: GatherFetchOptions = {
+    ...FULL_SCOPE,
+    tree: [
+      ...Array.from({ length: 3 }, (_, i) => ({ path: `src/routes/r${i}.js`, size: 30000 })),
+      ...Array.from({ length: 3 }, (_, i) => ({ path: `src/lib/api-client-${i}.js`, size: 30000 })),
+      ...Array.from({ length: 400 }, (_, i) => ({ path: padPath(i), size: 200 })),
+    ],
+    contents: () => 'x'.repeat(30000),
+  };
+
+  it('never hands the runner a view past the single-argument limit', async () => {
+    const out = await runGather({}, CROWDED);
+    expect(out.llm_view.length).toBeLessThanOrEqual(MAX_PROMPT);
+  });
+
+  it('drops whole files from the tail of the ranking', async () => {
+    const out = await runGather({}, CROWDED);
+    const paths = snapshotPaths(out.llm_view);
+    // What survives is a prefix of the ranking: routes outrank the hot set, so a
+    // route file is the last thing to go.
+    expect(paths.length).toBeGreaterThan(0);
+    expect(paths[0]).toBe('src/routes/r0.js');
+    expect(paths.every((p) => p.startsWith('src/routes/'))).toBe(true);
+    expect(paths.some((p) => p.startsWith('src/lib/'))).toBe(false);
+  });
+
+  it('reports every file the cap dropped, in ranking order', async () => {
+    const out = await runGather({}, CROWDED);
+    const kept = snapshotPaths(out.llm_view);
+    expect(out.coverage?.complete).toBe(false);
+    expect(out.coverage?.included).toBe(kept.length);
+    // Declared, not silently missing — whether the file was fetched and then
+    // trimmed by the cap (api-client-0) or never fetched because the selection
+    // budget ran out first (api-client-1 and -2). Both are files the agent did
+    // not see, and the order is the ranking's.
+    expect(out.coverage?.omitted).toEqual([
+      'src/lib/api-client-0.js',
+      'src/lib/api-client-1.js',
+      'src/lib/api-client-2.js',
+    ]);
+    expect(out.coverage?.hot_total).toBe(6);
+  });
+
+  it('drops a route file too when the routes are the tail of the ranking', async () => {
+    // Nothing is privileged past the cap: the ranking decides the order files go
+    // in, and the same order decides which ones leave.
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          ...Array.from({ length: 6 }, (_, i) => ({ path: `src/routes/r${i}.js`, size: 30000 })),
+          ...Array.from({ length: 400 }, (_, i) => ({ path: padPath(i), size: 200 })),
+        ],
+        contents: () => 'x'.repeat(30000),
+      },
+    );
+    expect(out.llm_view.length).toBeLessThanOrEqual(MAX_PROMPT);
+    expect(snapshotPaths(out.llm_view)).toEqual([
+      'src/routes/r0.js',
+      'src/routes/r1.js',
+      'src/routes/r2.js',
+    ]);
+    expect(out.coverage?.omitted).toEqual([
+      'src/routes/r3.js',
+      'src/routes/r4.js',
+      'src/routes/r5.js',
+    ]);
+  });
+
+  it('bounds the file tree so the trimming always converges', async () => {
+    // With every part of the view except the file contents capped, dropping files
+    // is guaranteed to bring the total under the limit. An unbounded tree of long
+    // paths could exceed it on its own, and no amount of trimming would help.
+    const out = await runGather(
+      {},
+      {
+        ...FULL_SCOPE,
+        tree: [
+          { path: 'src/routes/real.js', size: 400 },
+          ...Array.from({ length: 400 }, (_, i) => ({ path: padPath(i), size: 200 })),
+        ],
+      },
+    );
+    expect(out.llm_view.length).toBeLessThanOrEqual(MAX_PROMPT);
+    expect(out.llm_view).toContain('listed');
+    // The header still states the true total, so the agent knows it saw a prefix.
+    expect(out.llm_view).toContain('### Full file tree (401 files');
+    expect(snapshotPaths(out.llm_view)).toEqual(['src/routes/real.js']);
+  });
+
+  it('trims by dropping files, not by shaving the assembled string', async () => {
+    const out = await runGather({}, CROWDED);
+    // A cut through the middle would land exactly on the cap and leave a partial
+    // block; dropping whole files lands wherever the last kept file ends.
+    expect(out.llm_view.length).toBeLessThan(MAX_PROMPT);
+    expect(out.llm_view.endsWith('x'.repeat(200))).toBe(true);
+  });
+
+  it('leaves a view that already fits completely alone', async () => {
+    const out = await runGather({}, { ...FULL_SCOPE, tree: routeTree(3) });
+    expect(out.llm_view.length).toBeLessThan(MAX_PROMPT);
+    expect(out.coverage).toMatchObject({ complete: true, included: 3 });
   });
 });
 
