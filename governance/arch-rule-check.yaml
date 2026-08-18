@@ -137,12 +137,15 @@ steps:
         }, []);
         let checkpoint = null;
         const appNrn = encodeURIComponent(app.nrn);
-        const prior = await npTry(`/approval?nrn=${appNrn}&limit=10`);
+        const prior = await npTry(`/approval?nrn=${appNrn}&limit=10&sort=created_at:desc`);
         // NOTE: cancelled approvals are VALID checkpoints — the natural agent
         // loop is cancel → fix → redeploy, so the previous run is almost
         // always cancelled. What matters is that the item resolved and
         // stamped its analyzed_sha, not how the request ended.
-        // GET /approval lists ascending by created_at; scan newest first.
+        // Ask for newest first: the API's default order is not guaranteed
+        // (observed unordered), and the window matters — limit=10 of the wrong
+        // order can miss the newest verdict entirely. The local sort stays as
+        // a guard on the returned window.
         const priorRows = (prior && prior.results || []).slice().sort((a, b) =>
           String(b.created_at || "").localeCompare(String(a.created_at || "")));
         for (const row of priorRows) {

@@ -78,7 +78,7 @@ interface GatherOutput {
  * verdict, diffs OLD...CURRENT and re-analyses; the correct scan finds the
  * newest verdict, sees the sha unchanged, and carries the result over.
  */
-function fetchWithAscendingApprovals(): FakeFetch {
+function fetchWithAscendingApprovals(requested: string[] = []): FakeFetch {
   const OLD_SHA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const CURRENT_SHA = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
   const stamped = (sha: string) => ({
@@ -91,6 +91,7 @@ function fetchWithAscendingApprovals(): FakeFetch {
     ],
   });
   return async (url: string) => {
+    requested.push(url);
     if (url.endsWith('/token')) return res(200, { access_token: 'tok' });
     if (url.includes('/application/'))
       return res(200, {
@@ -122,6 +123,7 @@ function fetchWithAscendingApprovals(): FakeFetch {
 
 describe('arch-rule-check — checkpoint picks the newest stamped verdict', () => {
   it('carries over when the newest verdict already covers the current sha', async () => {
+    const requested: string[] = [];
     const out = await runStepCode<GatherOutput>(
       GATHER_CODE,
       {
@@ -134,8 +136,12 @@ describe('arch-rule-check — checkpoint picks the newest stamped verdict', () =
         np_api_key: 'k',
         github_token: 'g',
       },
-      fetchWithAscendingApprovals(),
+      fetchWithAscendingApprovals(requested),
     );
+    // The window matters, not just the order: limit=10 of an ascending list
+    // is the ten oldest, so the query itself must ask for newest first.
+    const listUrl = requested.find((u) => u.includes('/approval?'));
+    expect(listUrl).toContain('sort=created_at:desc');
     expect(out.mode).toBe('carry_over');
     expect(out.prev?.approval_id).toBe(200);
     expect(out.prev?.sha).toBe('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
