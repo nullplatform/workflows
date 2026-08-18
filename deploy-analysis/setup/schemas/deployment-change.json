@@ -1,453 +1,465 @@
 {
- "name": "Deployment change analysis",
- "description": "Computed by the deploy-change-analysis workflow (and the categories backfill): diff between deployed and candidate release, participants, signals, AI usage, risk and matrix decision. Machine-written — humans never edit it. visibleOn: [read] → deployment detail only, never in list columns nor create/update forms. Raw payloads (commits, files) are intentionally NOT declared as properties: they stay stored (additionalProperties) but the schema-driven UI does not render them; summary_md narrates them. See design doc 13-deploy-governance.",
- "schema": {
-  "type": "object",
-  "additionalProperties": true,
-  "visibleOn": [
-   "read"
-  ],
-  "properties": {
-   "risk": {
-    "type": "string",
-    "title": "Risk",
-    "enum": [
-     "low",
-     "medium",
-     "high"
-    ],
-    "description": "Scored by LLM + deterministic floors (db migrations, auth changes, first deploy can never be low)",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "short_summary": {
-    "type": "string",
-    "title": "Summary",
-    "description": "One-line functional summary of the change",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "summary_md": {
-    "type": "string",
-    "title": "Change analysis",
-    "contentMediaType": "text/markdown",
-    "description": "Narrative of the change: PRs with authors/collaborators/AI usage, size, participants, risk rationale",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "risk_rationale": {
-    "type": "string",
-    "title": "Risk rationale",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "risk_floors_applied": {
-    "type": "array",
-    "title": "Risk floors applied",
-    "description": "Hard rules that bounded the LLM score (db_migration, auth_change, first_deploy)",
-    "items": {
-     "type": "string"
-    },
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "change_categories": {
-    "type": "array",
-    "title": "Change categories",
-    "description": "LLM classification of what the deploy ships, relative to the app's product domain",
-    "visibleOn": [
-     "read"
-    ],
-    "items": {
-     "type": "object",
-     "additionalProperties": true,
-     "properties": {
-      "category": {
-       "type": "string",
-       "title": "Category",
-       "description": "feature | improvement | bugfix | security | performance | refactor | dependencies | infra | config | docs | tests | schema_change | revert"
-      },
-      "count": {
-       "type": "integer",
-       "title": "Count"
-      },
-      "notes": {
-       "type": "string",
-       "title": "Notes"
-      }
-     }
-    }
-   },
-   "breaking": {
-    "type": "boolean",
-    "title": "Breaking change",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "hotfix": {
-    "type": "boolean",
-    "title": "Hotfix",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "approval": {
+  "name": "Deployment change analysis",
+  "description": "Computed by the deploy-change-analysis workflow (and the categories backfill): diff between deployed and candidate release, participants, signals, AI usage, risk and matrix decision. Machine-written — humans never edit it. visibleOn: [read] → deployment detail only, never in list columns nor create/update forms. Raw payloads (commits, files) are intentionally NOT declared as properties: they stay stored (additionalProperties) but the schema-driven UI does not render them; summary_md narrates them. See design doc 13-deploy-governance.",
+  "schema": {
     "type": "object",
-    "title": "Matrix decision",
     "additionalProperties": true,
-    "visibleOn": [
-     "read"
-    ],
+    "visibleOn": [],
     "properties": {
-     "mode": {
-      "type": "string",
-      "title": "Approval mode",
-      "description": "auto | fastpath | par | grupo — decided by risk × app criticality"
-     },
-     "criticality": {
-      "type": "string",
-      "title": "App criticality"
-     }
-    }
-   },
-   "criticality": {
-    "type": "string",
-    "title": "App criticality (at analysis time)",
-    "visibleOn": []
-   },
-   "from_release": {
-    "type": [
-     "object",
-     "null"
-    ],
-    "title": "From release",
-    "description": "Release deployed in the target scope before this deploy; null on first deploy",
-    "additionalProperties": true,
-    "visibleOn": [
-     "read"
-    ],
-    "properties": {
-     "id": {
-      "type": [
-       "integer",
-       "string"
-      ],
-      "visibleOn": []
-     },
-     "semver": {
-      "type": "string",
-      "title": "Version"
-     },
-     "commit_sha": {
-      "type": "string",
-      "title": "Commit"
-     }
-    }
-   },
-   "to_release": {
-    "type": "object",
-    "title": "To release",
-    "additionalProperties": true,
-    "visibleOn": [
-     "read"
-    ],
-    "properties": {
-     "id": {
-      "type": [
-       "integer",
-       "string"
-      ],
-      "visibleOn": []
-     },
-     "semver": {
-      "type": "string",
-      "title": "Version"
-     },
-     "commit_sha": {
-      "type": "string",
-      "title": "Commit"
-     }
-    }
-   },
-   "releases_between": {
-    "type": "integer",
-    "title": "Intermediate releases",
-    "description": "Releases accumulated between from and to",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "previously_deployed": {
-    "type": "boolean",
-    "title": "Already deployed recently",
-    "description": "Candidate release is among the last 10 finalized deploys of the scope (rollback fastpath)",
-    "visibleOn": [
-     "read"
-    ]
-   },
-   "signals": {
-    "type": "object",
-    "title": "Signals",
-    "description": "Deterministic size/shape signals feeding the risk score",
-    "additionalProperties": true,
-    "visibleOn": [
-     "read"
-    ],
-    "properties": {
-     "lines_added": {
-      "type": "integer",
-      "title": "Lines added"
-     },
-     "lines_deleted": {
-      "type": "integer",
-      "title": "Lines deleted"
-     },
-     "files_changed": {
-      "type": "integer",
-      "title": "Files changed"
-     },
-     "commits": {
-      "type": "integer",
-      "title": "Commits"
-     },
-     "branches": {
-      "type": "integer",
-      "title": "Branches"
-     },
-     "intermediate_releases": {
-      "type": "integer",
-      "title": "Intermediate releases",
-      "visibleOn": []
-     },
-     "prs": {
-      "type": "array",
-      "items": {
-       "type": "integer"
+      "risk": {
+        "type": "string",
+        "title": "Risk",
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "description": "Scored by LLM + deterministic floors (db migrations, auth changes, first deploy can never be low)",
+        "visibleOn": []
       },
-      "title": "PR numbers",
-      "visibleOn": []
-     },
-     "sensitive_paths": {
-      "type": "object",
-      "title": "Sensitive paths touched",
-      "additionalProperties": true,
-      "properties": {
-       "db_migrations": {
-        "type": "boolean",
-        "title": "DB migrations"
-       },
-       "auth": {
-        "type": "boolean",
-        "title": "Auth"
-       },
-       "infra": {
-        "type": "boolean",
-        "title": "Infra"
-       },
-       "dependencies": {
-        "type": "boolean",
-        "title": "Dependencies"
-       }
-      }
-     }
-    }
-   },
-   "prs": {
-    "type": "array",
-    "title": "Pull requests",
-    "visibleOn": [
-     "read"
-    ],
-    "items": {
-     "type": "object",
-     "additionalProperties": true,
-     "properties": {
-      "number": {
-       "type": "integer",
-       "title": "PR #"
+      "short_summary": {
+        "type": "string",
+        "title": "Summary",
+        "description": "One-line functional summary of the change",
+        "visibleOn": []
       },
-      "title": {
-       "type": "string",
-       "title": "Title"
+      "summary_md": {
+        "type": "string",
+        "title": "Change analysis",
+        "contentMediaType": "text/markdown",
+        "description": "Narrative of the change: PRs with authors/collaborators/AI usage, size, participants, risk rationale",
+        "visibleOn": []
       },
-      "author": {
-       "type": "string",
-       "title": "Author"
+      "risk_rationale": {
+        "type": "string",
+        "title": "Risk rationale",
+        "visibleOn": []
       },
-      "summary": {
-       "type": [
-        "string",
-        "null"
-       ],
-       "title": "Summary"
-      },
-      "branch": {
-       "type": "string",
-       "title": "Branch",
-       "visibleOn": []
-      },
-      "description": {
-       "type": "string",
-       "visibleOn": []
-      },
-      "opened_at": {
-       "type": [
-        "string",
-        "null"
-       ],
-       "visibleOn": []
-      },
-      "first_commit_at": {
-       "type": [
-        "string",
-        "null"
-       ],
-       "visibleOn": []
-      },
-      "merged_at": {
-       "type": [
-        "string",
-        "null"
-       ],
-       "title": "Merged at"
-      },
-      "size": {
-       "type": [
-        "object",
-        "null"
-       ],
-       "title": "Size",
-       "additionalProperties": true,
-       "properties": {
-        "additions": {
-         "type": "integer",
-         "title": "Additions"
+      "risk_floors_applied": {
+        "type": "array",
+        "title": "Risk floors applied",
+        "description": "Hard rules that bounded the LLM score (db_migration, auth_change, first_deploy)",
+        "items": {
+          "type": "string",
+          "visibleOn": []
         },
-        "deletions": {
-         "type": "integer",
-         "title": "Deletions"
-        },
-        "files": {
-         "type": "integer",
-         "title": "Files"
+        "visibleOn": []
+      },
+      "change_categories": {
+        "type": "array",
+        "title": "Change categories",
+        "description": "LLM classification of what the deploy ships, relative to the app's product domain",
+        "visibleOn": [],
+        "items": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "category": {
+              "type": "string",
+              "title": "Category",
+              "description": "feature | improvement | bugfix | security | performance | refactor | dependencies | infra | config | docs | tests | schema_change | revert",
+              "visibleOn": []
+            },
+            "count": {
+              "type": "integer",
+              "title": "Count",
+              "visibleOn": []
+            },
+            "notes": {
+              "type": "string",
+              "title": "Notes",
+              "visibleOn": []
+            }
+          },
+          "visibleOn": []
         }
-       }
       },
-      "collaborators": {
-       "type": "array",
-       "title": "Collaborators",
-       "visibleOn": [],
-       "items": {
+      "breaking": {
+        "type": "boolean",
+        "title": "Breaking change",
+        "visibleOn": []
+      },
+      "hotfix": {
+        "type": "boolean",
+        "title": "Hotfix",
+        "visibleOn": []
+      },
+      "approval": {
         "type": "object",
+        "title": "Matrix decision",
         "additionalProperties": true,
+        "visibleOn": [],
         "properties": {
-         "github": {
-          "type": "string"
-         },
-         "roles": {
-          "type": "array",
-          "items": {
-           "type": "string"
+          "mode": {
+            "type": "string",
+            "title": "Approval mode",
+            "description": "auto | fastpath | par | grupo — decided by risk × app criticality",
+            "visibleOn": []
+          },
+          "criticality": {
+            "type": "string",
+            "title": "App criticality",
+            "visibleOn": []
           }
-         }
         }
-       }
       },
-      "ai": {
-       "type": "object",
-       "title": "AI usage",
-       "additionalProperties": true,
-       "properties": {
-        "used": {
-         "type": "boolean",
-         "title": "AI used"
-        },
-        "level": {
-         "type": "string",
-         "title": "Level",
-         "description": "none | assisted | mostly | full"
-        },
-        "commits_ai": {
-         "type": "integer",
-         "visibleOn": []
-        },
-        "commits_total": {
-         "type": "integer",
-         "visibleOn": []
-        },
-        "body_marker": {
-         "type": "boolean",
-         "visibleOn": []
+      "criticality": {
+        "type": "string",
+        "title": "App criticality (at analysis time)",
+        "visibleOn": []
+      },
+      "from_release": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "title": "From release",
+        "description": "Release deployed in the target scope before this deploy; null on first deploy",
+        "additionalProperties": true,
+        "visibleOn": [],
+        "properties": {
+          "id": {
+            "type": [
+              "integer",
+              "string"
+            ],
+            "visibleOn": []
+          },
+          "semver": {
+            "type": "string",
+            "title": "Version",
+            "visibleOn": []
+          },
+          "commit_sha": {
+            "type": "string",
+            "title": "Commit",
+            "visibleOn": []
+          }
         }
-       }
-      }
-     }
-    }
-   },
-   "participants": {
-    "type": "array",
-    "title": "Participants",
-    "visibleOn": [
-     "read"
-    ],
-    "items": {
-     "type": "object",
-     "additionalProperties": true,
-     "properties": {
-      "github": {
-       "type": "string",
-       "title": "GitHub"
       },
-      "np_user_id": {
-       "type": [
-        "integer",
-        "null"
-       ],
-       "title": "NP user",
-       "description": "null when the GitHub handle has no mapped nullplatform user"
+      "to_release": {
+        "type": "object",
+        "title": "To release",
+        "additionalProperties": true,
+        "visibleOn": [],
+        "properties": {
+          "id": {
+            "type": [
+              "integer",
+              "string"
+            ],
+            "visibleOn": []
+          },
+          "semver": {
+            "type": "string",
+            "title": "Version",
+            "visibleOn": []
+          },
+          "commit_sha": {
+            "type": "string",
+            "title": "Commit",
+            "visibleOn": []
+          }
+        }
       },
-      "roles": {
-       "type": "array",
-       "title": "Roles",
-       "items": {
-        "type": "string"
-       }
+      "releases_between": {
+        "type": "integer",
+        "title": "Intermediate releases",
+        "description": "Releases accumulated between from and to",
+        "visibleOn": []
+      },
+      "previously_deployed": {
+        "type": "boolean",
+        "title": "Already deployed recently",
+        "description": "Candidate release is among the last 10 finalized deploys of the scope (rollback fastpath)",
+        "visibleOn": []
+      },
+      "signals": {
+        "type": "object",
+        "title": "Signals",
+        "description": "Deterministic size/shape signals feeding the risk score",
+        "additionalProperties": true,
+        "visibleOn": [],
+        "properties": {
+          "lines_added": {
+            "type": "integer",
+            "title": "Lines added",
+            "visibleOn": []
+          },
+          "lines_deleted": {
+            "type": "integer",
+            "title": "Lines deleted",
+            "visibleOn": []
+          },
+          "files_changed": {
+            "type": "integer",
+            "title": "Files changed",
+            "visibleOn": []
+          },
+          "commits": {
+            "type": "integer",
+            "title": "Commits",
+            "visibleOn": []
+          },
+          "branches": {
+            "type": "integer",
+            "title": "Branches",
+            "visibleOn": []
+          },
+          "intermediate_releases": {
+            "type": "integer",
+            "title": "Intermediate releases",
+            "visibleOn": []
+          },
+          "prs": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "visibleOn": []
+            },
+            "title": "PR numbers",
+            "visibleOn": []
+          },
+          "sensitive_paths": {
+            "type": "object",
+            "title": "Sensitive paths touched",
+            "additionalProperties": true,
+            "properties": {
+              "db_migrations": {
+                "type": "boolean",
+                "title": "DB migrations",
+                "visibleOn": []
+              },
+              "auth": {
+                "type": "boolean",
+                "title": "Auth",
+                "visibleOn": []
+              },
+              "infra": {
+                "type": "boolean",
+                "title": "Infra",
+                "visibleOn": []
+              },
+              "dependencies": {
+                "type": "boolean",
+                "title": "Dependencies",
+                "visibleOn": []
+              }
+            },
+            "visibleOn": []
+          }
+        }
+      },
+      "prs": {
+        "type": "array",
+        "title": "Pull requests",
+        "visibleOn": [],
+        "items": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "number": {
+              "type": "integer",
+              "title": "PR #",
+              "visibleOn": []
+            },
+            "title": {
+              "type": "string",
+              "title": "Title",
+              "visibleOn": []
+            },
+            "author": {
+              "type": "string",
+              "title": "Author",
+              "visibleOn": []
+            },
+            "summary": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "title": "Summary",
+              "visibleOn": []
+            },
+            "branch": {
+              "type": "string",
+              "title": "Branch",
+              "visibleOn": []
+            },
+            "description": {
+              "type": "string",
+              "visibleOn": []
+            },
+            "opened_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "visibleOn": []
+            },
+            "first_commit_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "visibleOn": []
+            },
+            "merged_at": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "title": "Merged at",
+              "visibleOn": []
+            },
+            "size": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "title": "Size",
+              "additionalProperties": true,
+              "properties": {
+                "additions": {
+                  "type": "integer",
+                  "title": "Additions",
+                  "visibleOn": []
+                },
+                "deletions": {
+                  "type": "integer",
+                  "title": "Deletions",
+                  "visibleOn": []
+                },
+                "files": {
+                  "type": "integer",
+                  "title": "Files",
+                  "visibleOn": []
+                }
+              },
+              "visibleOn": []
+            },
+            "collaborators": {
+              "type": "array",
+              "title": "Collaborators",
+              "visibleOn": [],
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "github": {
+                    "type": "string",
+                    "visibleOn": []
+                  },
+                  "roles": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "visibleOn": []
+                    },
+                    "visibleOn": []
+                  }
+                },
+                "visibleOn": []
+              }
+            },
+            "ai": {
+              "type": "object",
+              "title": "AI usage",
+              "additionalProperties": true,
+              "properties": {
+                "used": {
+                  "type": "boolean",
+                  "title": "AI used",
+                  "visibleOn": []
+                },
+                "level": {
+                  "type": "string",
+                  "title": "Level",
+                  "description": "none | assisted | mostly | full",
+                  "visibleOn": []
+                },
+                "commits_ai": {
+                  "type": "integer",
+                  "visibleOn": []
+                },
+                "commits_total": {
+                  "type": "integer",
+                  "visibleOn": []
+                },
+                "body_marker": {
+                  "type": "boolean",
+                  "visibleOn": []
+                }
+              },
+              "visibleOn": []
+            }
+          },
+          "visibleOn": []
+        }
+      },
+      "participants": {
+        "type": "array",
+        "title": "Participants",
+        "visibleOn": [],
+        "items": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "github": {
+              "type": "string",
+              "title": "GitHub",
+              "visibleOn": []
+            },
+            "np_user_id": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "title": "NP user",
+              "description": "null when the GitHub handle has no mapped nullplatform user",
+              "visibleOn": []
+            },
+            "roles": {
+              "type": "array",
+              "title": "Roles",
+              "items": {
+                "type": "string",
+                "visibleOn": []
+              },
+              "visibleOn": []
+            }
+          },
+          "visibleOn": []
+        }
+      },
+      "ai_usage": {
+        "type": "object",
+        "title": "AI usage (aggregate)",
+        "additionalProperties": true,
+        "visibleOn": [],
+        "properties": {
+          "prs_ai": {
+            "type": "integer",
+            "title": "PRs with AI",
+            "visibleOn": []
+          },
+          "prs_total": {
+            "type": "integer",
+            "title": "PRs total",
+            "visibleOn": []
+          },
+          "commits_ai": {
+            "type": "integer",
+            "title": "Commits with AI",
+            "visibleOn": []
+          },
+          "commits_total": {
+            "type": "integer",
+            "title": "Commits total",
+            "visibleOn": []
+          }
+        }
       }
-     }
     }
-   },
-   "ai_usage": {
-    "type": "object",
-    "title": "AI usage (aggregate)",
-    "additionalProperties": true,
-    "visibleOn": [
-     "read"
-    ],
-    "properties": {
-     "prs_ai": {
-      "type": "integer",
-      "title": "PRs with AI"
-     },
-     "prs_total": {
-      "type": "integer",
-      "title": "PRs total"
-     },
-     "commits_ai": {
-      "type": "integer",
-      "title": "Commits with AI"
-     },
-     "commits_total": {
-      "type": "integer",
-      "title": "Commits total"
-     }
-    }
-   }
   }
- }
 }
