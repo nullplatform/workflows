@@ -1,0 +1,179 @@
+# Hourly batch: find finalized deployments missing metadata.change in the
+# configured namespaces/environments and analyze each one via the
+# deploy-change-analysis sub-workflow (forEach fan-out, bounded concurrency).
+#
+# Idempotent and convergent: deployments that already have metadata.change
+# are skipped, so re-running only processes what is missing. The 1-day
+# default window (each hourly tick) self-heals short gaps; manual runs pass days=N.
+#
+# Scoping comes from config-entry VARS (never hardcoded):
+#   DEPLOY_ANALYSIS_NAMESPACES   e.g. "123,456"  (namespace ids)
+#   DEPLOY_ANALYSIS_ENVIRONMENTS e.g. "prod,stage" (scope dimension values)
+id: deploy_backfill
+key: deploy_backfill
+name: Deploy Backfill (change analysis)
+path: /deploy-analysis
+description: 'Nightly batch: finds finalized deployments in the configured namespaces/environments
+  missing metadata.change and analyzes each via the Deploy Change Analysis sub-workflow. Idempotent:
+  re-runs only process what is missing.'
+steps:
+- id: start
+  type: trigger
+  plugin_type: manual
+  name: Run Now
+  config:
+    description: Backfill deploy analyses for the last N days (idempotent).
+    inputs:
+      days:
+        type: number
+        required: false
+        default: 3
+        description: 'Lookback window in days (initial backfills: 15).'
+- id: trigger_hourly
+  type: trigger
+  plugin_type: cron
+  name: Hourly
+  config:
+    schedule: 0 * * * *
+    timezone: America/Argentina/Buenos_Aires
+- id: run
+  type: module
+  plugin_type: code-exec
+  name: Lake pairs + fan-out webhooks
+  inputs:
+    days: ${{ workflow.inputs.days }}
+    np_api_key: ${{ secrets.NP_API_KEY }}
+    namespaces: ${{ vars.DEPLOY_ANALYSIS_NAMESPACES }}
+    environments: ${{ vars.DEPLOY_ANALYSIS_ENVIRONMENTS }}
+  config:
+    code: |
+      // Default 3: the nightly cron fires with no body — a 3-day window
+      // self-heals weekend gaps. Manual webhook calls pass days explicitly.
+      const days = Number($item.days) || 1;
+      const appId = Number($item.application_id) || 0;
+      const npApiKey = $item.np_api_key;
+      const nsFilter = String($item.namespaces || "").split(",").map((s) => s.trim()).filter(Boolean);
+      const envFilter = String($item.environments || "prod").split(",").map((s) => s.trim()).filter(Boolean);
+      const envSql = envFilter.map((e) => `'${e}'`).join(",");
+      const nsSql = nsFilter.join(",");
+      if (!nsFilter.length) return { stage: "config", error: "DEPLOY_ANALYSIS_NAMESPACES var is not set" };
+
+
+      let stage = "token";
+      const tokRes = await fetch("https://api.nullplatform.com/token", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ api_key: npApiKey }),
+      });
+      const tokText = await tokRes.text();
+      let npToken;
+      try { npToken = JSON.parse(tokText).access_token; }
+      catch (e) { return { stage, error: String(e), sample: tokText.slice(0, 200) }; }
+      if (!npToken) return { stage, error: "no access_token", sample: tokText.slice(0, 200) };
+
+      const sql = `
+        WITH prod_scopes AS (
+          SELECT DISTINCT scope_id FROM core_entities_scope_dimension
+          WHERE dimension_slug = 'environment' AND value_slug IN (${envSql})
+        ),
+        ordered AS (
+          SELECT d.id AS deployment_id, d.scope_id AS scope_id, d.release_id AS release_id, d.created_at AS created_at,
+                 s.application_id AS application_id,
+                 groupArray(d.release_id) OVER (PARTITION BY d.scope_id ORDER BY d.created_at ROWS BETWEEN 10 PRECEDING AND 1 PRECEDING) AS prev10,
+                 lagInFrame(d.release_id) OVER (PARTITION BY d.scope_id ORDER BY d.created_at) AS from_release_id
+          FROM core_entities_deployment d FINAL
+          JOIN core_entities_scope s FINAL ON s.id = d.scope_id
+          JOIN core_entities_application a FINAL ON a.app_id = s.application_id
+          WHERE d.status = 'finalized' AND d.scope_id IN (SELECT scope_id FROM prod_scopes)
+            AND a.namespace_id IN (${nsSql})
+        )
+        SELECT deployment_id, application_id, scope_id, release_id, from_release_id,
+               has(prev10, release_id) AS previously_deployed
+        FROM ordered
+        WHERE created_at > now() - INTERVAL ${days} DAY
+          AND (${appId} = 0 OR application_id = ${appId})
+        ORDER BY created_at`;
+
+      const lakeRes = await fetch("https://api.nullplatform.com/data/lake/query", {
+        method: "POST",
+        headers: { authorization: `Bearer ${npToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ query: sql }),
+      });
+      stage = "lake";
+      const lakeText = await lakeRes.text();
+      if (!lakeRes.ok) return { stage, error: "http " + lakeRes.status, sample: lakeText.slice(0, 200) };
+      // Lake responds TSV without headers, columns in SELECT order.
+      const COLS = ["deployment_id", "application_id", "scope_id", "release_id", "from_release_id", "previously_deployed"];
+      const rows = lakeText.trim().split("\n").filter(Boolean).map((line) => {
+        const parts = line.split("\t");
+        const r = {};
+        for (let i = 0; i < COLS.length; i++) r[COLS[i]] = parts[i];
+        return r;
+      });
+
+      // Idempotent + convergent: skip deploys whose metadata.change already
+      // exists, so re-running the backfill only analyzes what's missing.
+      // The analyses themselves are dispatched by the next step (sub-workflow
+      // fan-out, one child execution per pending deployment).
+      let firstDeploys = 0, skippedDone = 0;
+      const pending = [];
+      for (const r of rows) {
+        const metaRes = await fetch(`https://api.nullplatform.com/metadata/deployment/${r.deployment_id}/change`, {
+          headers: { authorization: `Bearer ${npToken}` },
+        });
+        if (metaRes.ok) { skippedDone++; continue; }
+        const from = String(r.from_release_id || "");
+        // "\\N" = ClickHouse NULL in TSV (scope's first deploy ever).
+        const isFirst = !from || from === "0" || from === "\\N";
+        if (isFirst) firstDeploys++;
+        pending.push({
+          application_id: r.application_id,
+          release_id: r.release_id,
+          scope_id: r.scope_id,
+          deployment_id: r.deployment_id,
+          from_release_id: isFirst ? "none" : from,
+          previously_deployed: String(r.previously_deployed) === "1",
+        });
+      }
+      return { total_rows: rows.length, to_analyze: pending.length, already_done: skippedDone, first_deploys: firstDeploys, pending };
+    network:
+      allowedHosts:
+      - api.nullplatform.com
+  join_strategy: any
+- id: dispatch
+  type: module
+  plugin_type: sub-workflow
+  name: Analyze per deployment
+  forEach:
+    expression: ${{ steps.run.outputs.pending }}
+    itemVariable: deploy
+    parallel: true
+    maxConcurrency: 5
+  config:
+    workflowId: deploy_change_analysis
+    alias: live
+    waitForCompletion: true
+- id: summary
+  type: module
+  plugin_type: code-exec
+  name: Summary
+  inputs:
+    plan: ${{ steps.run.outputs }}
+  config:
+    code: 'const p = $item.plan || {}; return { total_rows: p.total_rows, analyzed: p.to_analyze,
+      already_done: p.already_done, first_deploys: p.first_deploys };'
+  metadata:
+    fanOutPerItem: false
+connections:
+- id: c1
+  from: start
+  to: run
+- id: c2
+  from: trigger_hourly
+  to: run
+- id: c3
+  from: run
+  to: dispatch
+- id: c4
+  from: dispatch
+  to: summary

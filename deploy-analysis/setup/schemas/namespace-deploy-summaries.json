@@ -1,0 +1,99 @@
+{
+ "name": "Namespace weekly deploy summaries",
+ "description": "Weekly functional summaries of production deploys (rolling 53 weeks). Written by the deploy-weekly-summary workflow.",
+ "schema": {
+  "type": "object",
+  "additionalProperties": true,
+  "visibleOn": [
+   "list",
+   "read"
+  ],
+  "properties": {
+   "latest_short": {
+    "type": "array",
+    "items": {
+     "type": "string"
+    },
+    "description": "Highlights de la última semana (bullets cortos)",
+    "visibleOn": [
+     "list",
+     "read"
+    ]
+   },
+   "latest_summary": {
+    "type": "string",
+    "contentMediaType": "text/markdown",
+    "description": "Resumen funcional de la última semana de deploys a producción",
+    "visibleOn": [
+     "list",
+     "read"
+    ]
+   },
+   "weeks": {
+    "type": "array",
+    "description": "Histórico semanal (rolling 53 semanas, más nuevo primero)",
+    "visibleOn": [
+     "read"
+    ],
+    "items": {
+     "type": "object",
+     "additionalProperties": true,
+     "properties": {
+      "week_start": {
+       "type": "string",
+       "visibleOn": [
+        "read",
+        "list"
+       ]
+      },
+      "week_end": {
+       "type": "string",
+       "visibleOn": []
+      },
+      "deploys": {
+       "type": "integer",
+       "visibleOn": [
+        "read",
+        "list"
+       ]
+      },
+      "risk": {
+       "type": "object",
+       "additionalProperties": true,
+       "visibleOn": [
+        "read"
+       ]
+      },
+      "summary_md": {
+       "type": "string",
+       "visibleOn": [
+        "read",
+        "list"
+       ]
+      },
+      "prs": {
+       "type": "integer",
+       "visibleOn": [
+        "read"
+       ]
+      },
+      "contributors": {
+       "type": "array",
+       "items": {
+        "type": "object",
+        "additionalProperties": true
+       },
+       "visibleOn": [
+        "read"
+       ]
+      },
+      "generated_at": {
+       "type": "string",
+       "visibleOn": []
+      }
+     }
+    }
+   }
+  }
+ }
+}
