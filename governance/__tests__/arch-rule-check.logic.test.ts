@@ -72,11 +72,10 @@ interface GatherOutput {
 
 /**
  * Two stamped verdicts exist for the app: an ancient one (sha OLD) and the
- * most recent one (sha CURRENT, passed). The approvals API lists them
- * ASCENDING by created_at — oldest first — which is the order production
- * returns. A scan that takes the first stamped row lands on the ancient
- * verdict, diffs OLD...CURRENT and re-analyses; the correct scan finds the
- * newest verdict, sees the sha unchanged, and carries the result over.
+ * most recent one (sha CURRENT, passed). The fake API honors the sort param
+ * the way the real one does — descending only when asked. A gather that does
+ * not ask gets the ancient verdict first, diffs OLD...CURRENT and re-analyses;
+ * asking for newest-first finds the sha unchanged and carries the result over.
  */
 function fetchWithAscendingApprovals(requested: string[] = []): FakeFetch {
   const OLD_SHA = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -103,13 +102,15 @@ function fetchWithAscendingApprovals(requested: string[] = []): FakeFetch {
     if (url.includes('/release/')) return res(200, { id: 9, build_id: 8 });
     if (url.includes('/build/'))
       return res(200, { commit: { id: CURRENT_SHA }, branch: 'main' });
-    if (url.includes('/approval?'))
-      return res(200, {
-        results: [
-          { id: 100, mode: 'checklist', created_at: '2026-01-01T00:00:00Z' },
-          { id: 200, mode: 'checklist', created_at: '2026-02-01T00:00:00Z' },
-        ],
-      });
+    if (url.includes('/approval?')) {
+      // Order-aware, like the real API: descending only when asked for.
+      const rows = [
+        { id: 100, mode: 'checklist', created_at: '2026-01-01T00:00:00Z' },
+        { id: 200, mode: 'checklist', created_at: '2026-02-01T00:00:00Z' },
+      ];
+      if (url.includes('sort=created_at:desc')) rows.reverse();
+      return res(200, { results: rows });
+    }
     if (url.includes('/approval/100/checklist')) return res(200, stamped(OLD_SHA));
     if (url.includes('/approval/200/checklist')) return res(200, stamped(CURRENT_SHA));
     if (url.includes('/compare/'))
