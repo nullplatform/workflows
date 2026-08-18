@@ -137,7 +137,10 @@ steps:
         }, []);
         let checkpoint = null;
         const appNrn = encodeURIComponent(app.nrn);
-        const prior = await npTry(`/approval?nrn=${appNrn}&limit=10`);
+        // Newest first matters twice over: the API's default order is not
+        // guaranteed (observed unordered), and limit=10 of the wrong order can
+        // miss the newest stamped verdict entirely.
+        const prior = await npTry(`/approval?nrn=${appNrn}&limit=10&sort=created_at:desc`);
         // NOTE: cancelled approvals are VALID checkpoints — the natural agent
         // loop is cancel → fix → redeploy, so the previous run is almost
         // always cancelled. What matters is that the item resolved and
@@ -297,7 +300,7 @@ steps:
       model: claude-opus-4-8
       maxIterations: 5
       systemPrompt: |
-        You are the architecture compliance auditor for Kwik-E-Mart's
+        You are the architecture compliance auditor for this organization's
         engineering platform. You evaluate exactly ONE company architecture
         rule against an application repository snapshot. Do not use tools;
         respond directly with your final answer.
