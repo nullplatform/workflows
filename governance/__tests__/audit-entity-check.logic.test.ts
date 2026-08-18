@@ -42,8 +42,14 @@ const REAL_ENHANCER_JS = readFileSync(
 );
 
 interface WorkflowDoc {
-  steps: Array<{ id: string; config?: { code?: string; systemPrompt?: string } }>;
+  steps: Array<{
+    id: string;
+    config?: { code?: string; systemPrompt?: string; userPrompt?: string };
+  }>;
 }
+
+/** UTF-8 byte length, the oracle the step's own counter is measured against. */
+const bytes = (s: string): number => Buffer.byteLength(s, 'utf8');
 
 function workflow(): WorkflowDoc {
   return parse(readFileSync(WF_PATH, 'utf8')) as WorkflowDoc;
@@ -667,6 +673,7 @@ interface GatherOutput {
   changed_count: number | null;
   /** Absent on the carry-over path, which never builds a snapshot. */
   llm_view: string;
+  prev_findings_view: string;
   coverage?: Coverage;
   prev: {
     approval_id?: number;
@@ -1152,14 +1159,14 @@ describe('audit-entity-check gather — snapshot budget', () => {
   });
 
   it('stops at the total character budget', async () => {
-    // 24000 chars per file against a 90000 total: three full files and a fourth
-    // clipped to the 18000 that were left, and the rest is never fetched.
+    // 24000 chars per file against a 60000 total: two full files and a third
+    // clipped to the 12000 that were left, and the rest is never fetched.
     const out = await runGather(
       {},
       { ...FULL_SCOPE, tree: hotTree(60, 30000), contents: () => 'x'.repeat(30000) },
     );
     const files = snapshotFiles(out.llm_view);
-    expect(files).toHaveLength(4);
+    expect(files).toHaveLength(3);
     expect(files.every((f) => f.truncated)).toBe(true);
   });
 
@@ -1288,36 +1295,122 @@ describe('audit-entity-check gather — a file that caused the run is never hidd
   });
 });
 
-describe('audit-entity-check gather — the prompt fits one shell argument', () => {
-  /** The hard cap the assembled view has to respect, whatever the budget picks. */
-  const MAX_PROMPT = 110000;
+/**
+ * The step's own `utf8ByteLength`, lifted out of the YAML and made callable, so
+ * the counter the budget depends on is tested rather than a copy of it. The
+ * sandbox has no Buffer, which is why the step counts bytes by hand.
+ */
+function stepUtf8ByteLength(): (s: string) => number {
+  const start = GATHER_CODE.indexOf('const utf8ByteLength =');
+  if (start < 0) throw new Error('gather has no utf8ByteLength');
+  // The YAML block scalar is dedented on parse, so the arrow function's closing
+  // brace sits at column zero while every brace inside it is indented.
+  const END = '\n};';
+  const end = GATHER_CODE.indexOf(END, start);
+  if (end < 0) throw new Error('utf8ByteLength is not terminated as expected');
+  const src = GATHER_CODE.slice(start, end + END.length);
+  return new Function(`${src}\nreturn utf8ByteLength;`)() as (s: string) => number;
+}
 
-  /** A tree path no ranking rule matches, long enough to pad the file tree. */
-  const padPath = (i: number) =>
-    `src/models/nested/${'d'.repeat(160)}/model-${String(i).padStart(3, '0')}.js`;
+describe('audit-entity-check gather — utf8ByteLength', () => {
+  const count = stepUtf8ByteLength();
 
-  /**
-   * Three route files and three generic hot files, all larger than the per-file
-   * budget, plus a file tree long enough that the assembled view cannot hold the
-   * whole selection.
-   */
-  const CROWDED: GatherFetchOptions = {
-    ...FULL_SCOPE,
-    tree: [
-      ...Array.from({ length: 3 }, (_, i) => ({ path: `src/routes/r${i}.js`, size: 30000 })),
-      ...Array.from({ length: 3 }, (_, i) => ({ path: `src/lib/api-client-${i}.js`, size: 30000 })),
-      ...Array.from({ length: 400 }, (_, i) => ({ path: padPath(i), size: 200 })),
-    ],
-    contents: () => 'x'.repeat(30000),
-  };
+  it.each([
+    ['empty', ''],
+    ['ascii', 'export const app = 1;'],
+    ['accented Spanish', 'crea la entidad y añade la configuración'],
+    ['Portuguese', 'não há evento de auditoria para esta rota'],
+    ['two-byte boundary', '߿ࠀ'],
+    ['CJK', '観測されたエンティティ、監査イベントなし'],
+    ['emoji surrogate pair', 'ship it 🚀🔥'],
+    ['astral plane', '𝔘𝔫𝔦𝔠𝔬𝔡𝔢'],
+    ['symbols', 'Ω≈ç√∫˜µ≤≥÷'],
+    ['combining marks', 'état combiné'],
+    ['whitespace', 'tab\tnewline\ncarriage\r'],
+    ['lone high surrogate', 'a\ud800b'],
+    ['trailing high surrogate', 'a\ud800'],
+    ['lone low surrogate', '\udc00z'],
+    ['pair then lone', '🚀\ud800'],
+  ])('agrees with Buffer.byteLength on %s', (_name, sample) => {
+    expect(count(sample)).toBe(bytes(sample));
+  });
 
-  it('never hands the runner a view past the single-argument limit', async () => {
-    const out = await runGather({}, CROWDED);
-    expect(out.llm_view.length).toBeLessThanOrEqual(MAX_PROMPT);
+  it('agrees at the sizes the budget is decided at', () => {
+    for (const ch of ['x', 'á', '観', '🚀']) {
+      const sample = ch.repeat(30000);
+      expect(count(sample)).toBe(bytes(sample));
+    }
+  });
+
+  it('is the ratio the budget assumes for each profile', () => {
+    // The reason a character budget could not stand in for a byte budget.
+    expect(count('x'.repeat(1000)) / 1000).toBe(1);
+    expect(count('á'.repeat(1000)) / 1000).toBe(2);
+    expect(count('観'.repeat(1000)) / 1000).toBe(3);
+  });
+});
+
+/** The kernel's MAX_ARG_STRLEN: the ceiling every share is budgeted against. */
+const KERNEL_ARG_LIMIT = 131072;
+/** The same arithmetic the step does, mirrored so the assertions can name it. */
+const ASSEMBLED_TARGET = 120000;
+const TEMPLATE_BYTES = 400;
+const CONFIG_VIEW_BYTES = 20000;
+const FINDINGS_BYTES = 8000;
+const MAX_PROMPT = ASSEMBLED_TARGET - TEMPLATE_BYTES - CONFIG_VIEW_BYTES - FINDINGS_BYTES;
+
+/** A tree path no ranking rule matches, long enough to pad the file tree. */
+const padPath = (i: number) =>
+  `src/models/nested/${'d'.repeat(160)}/model-${String(i).padStart(3, '0')}.js`;
+
+/**
+ * Three route files and three generic hot files, each larger than the per-file
+ * budget, plus a file tree long enough to claim its whole share. `ch` is the
+ * character the sources are made of — what decides how many bytes a given
+ * number of characters actually costs.
+ */
+const crowded = (ch: string): GatherFetchOptions => ({
+  ...FULL_SCOPE,
+  tree: [
+    ...Array.from({ length: 3 }, (_, i) => ({ path: `src/routes/r${i}.js`, size: 30000 })),
+    ...Array.from({ length: 3 }, (_, i) => ({ path: `src/lib/api-client-${i}.js`, size: 30000 })),
+    ...Array.from({ length: 400 }, (_, i) => ({ path: padPath(i), size: 200 })),
+  ],
+  contents: () => ch.repeat(30000),
+});
+
+/** Six route files small enough that ASCII source fits with nothing trimmed. */
+const sixSmall = (ch: string): GatherFetchOptions => ({
+  ...FULL_SCOPE,
+  tree: Array.from({ length: 6 }, (_, i) => ({ path: `src/routes/r${i}.js`, size: 8000 })),
+  contents: () => ch.repeat(8000),
+});
+
+describe('audit-entity-check gather — the snapshot fits its byte share', () => {
+  it.each([
+    ['ASCII', 'x'],
+    ['accented', 'á'],
+    ['CJK', '観'],
+  ])('never exceeds its share on %s source', async (_profile, ch) => {
+    const out = await runGather({}, crowded(ch));
+    expect(bytes(out.llm_view)).toBeLessThanOrEqual(MAX_PROMPT);
+  });
+
+  it('counts bytes, not characters', async () => {
+    const ascii = await runGather({}, sixSmall('x'));
+    const cjk = await runGather({}, sixSmall('観'));
+    // The same number of characters of source on both sides, three times the
+    // bytes on one — so one has to give files up and the other does not.
+    expect(snapshotFiles(ascii.llm_view)).toHaveLength(6);
+    expect(snapshotFiles(cjk.llm_view).length).toBeLessThan(6);
+    // Measured in characters the CJK view looks comfortably small; in bytes it is
+    // past half the budget. That gap is the whole reason the cap counts bytes.
+    expect(cjk.llm_view.length).toBeLessThan(MAX_PROMPT / 2);
+    expect(bytes(cjk.llm_view)).toBeGreaterThan(MAX_PROMPT / 2);
   });
 
   it('drops whole files from the tail of the ranking', async () => {
-    const out = await runGather({}, CROWDED);
+    const out = await runGather({}, crowded('á'));
     const paths = snapshotPaths(out.llm_view);
     // What survives is a prefix of the ranking: routes outrank the hot set, so a
     // route file is the last thing to go.
@@ -1328,15 +1421,17 @@ describe('audit-entity-check gather — the prompt fits one shell argument', () 
   });
 
   it('reports every file the cap dropped, in ranking order', async () => {
-    const out = await runGather({}, CROWDED);
+    const out = await runGather({}, crowded('á'));
     const kept = snapshotPaths(out.llm_view);
     expect(out.coverage?.complete).toBe(false);
     expect(out.coverage?.included).toBe(kept.length);
     // Declared, not silently missing — whether the file was fetched and then
-    // trimmed by the cap (api-client-0) or never fetched because the selection
-    // budget ran out first (api-client-1 and -2). Both are files the agent did
-    // not see, and the order is the ranking's.
+    // trimmed by the cap (r1, r2) or never fetched because the selection budget
+    // ran out first (the api-client files). Both are files the agent did not
+    // see, and the order is the ranking's.
     expect(out.coverage?.omitted).toEqual([
+      'src/routes/r1.js',
+      'src/routes/r2.js',
       'src/lib/api-client-0.js',
       'src/lib/api-client-1.js',
       'src/lib/api-client-2.js',
@@ -1355,16 +1450,14 @@ describe('audit-entity-check gather — the prompt fits one shell argument', () 
           ...Array.from({ length: 6 }, (_, i) => ({ path: `src/routes/r${i}.js`, size: 30000 })),
           ...Array.from({ length: 400 }, (_, i) => ({ path: padPath(i), size: 200 })),
         ],
-        contents: () => 'x'.repeat(30000),
+        contents: () => 'á'.repeat(30000),
       },
     );
-    expect(out.llm_view.length).toBeLessThanOrEqual(MAX_PROMPT);
-    expect(snapshotPaths(out.llm_view)).toEqual([
-      'src/routes/r0.js',
+    expect(bytes(out.llm_view)).toBeLessThanOrEqual(MAX_PROMPT);
+    expect(snapshotPaths(out.llm_view)).toEqual(['src/routes/r0.js']);
+    expect(out.coverage?.omitted).toEqual([
       'src/routes/r1.js',
       'src/routes/r2.js',
-    ]);
-    expect(out.coverage?.omitted).toEqual([
       'src/routes/r3.js',
       'src/routes/r4.js',
       'src/routes/r5.js',
@@ -1385,7 +1478,7 @@ describe('audit-entity-check gather — the prompt fits one shell argument', () 
         ],
       },
     );
-    expect(out.llm_view.length).toBeLessThanOrEqual(MAX_PROMPT);
+    expect(bytes(out.llm_view)).toBeLessThanOrEqual(MAX_PROMPT);
     expect(out.llm_view).toContain('listed');
     // The header still states the true total, so the agent knows it saw a prefix.
     expect(out.llm_view).toContain('### Full file tree (401 files');
@@ -1393,17 +1486,119 @@ describe('audit-entity-check gather — the prompt fits one shell argument', () 
   });
 
   it('trims by dropping files, not by shaving the assembled string', async () => {
-    const out = await runGather({}, CROWDED);
+    const out = await runGather({}, crowded('á'));
     // A cut through the middle would land exactly on the cap and leave a partial
-    // block; dropping whole files lands wherever the last kept file ends.
-    expect(out.llm_view.length).toBeLessThan(MAX_PROMPT);
-    expect(out.llm_view.endsWith('x'.repeat(200))).toBe(true);
+    // block; dropping whole files lands wherever the last kept file ends. It
+    // would also risk splitting a multi-byte character in half.
+    expect(bytes(out.llm_view)).toBeLessThan(MAX_PROMPT);
+    expect(out.llm_view.endsWith('á'.repeat(200))).toBe(true);
   });
 
   it('leaves a view that already fits completely alone', async () => {
     const out = await runGather({}, { ...FULL_SCOPE, tree: routeTree(3) });
-    expect(out.llm_view.length).toBeLessThan(MAX_PROMPT);
+    expect(bytes(out.llm_view)).toBeLessThan(MAX_PROMPT);
     expect(out.coverage).toMatchObject({ complete: true, included: 3 });
+  });
+});
+
+describe('audit-entity-check gather — previous findings share the argument', () => {
+  const manyFindings = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      file: `src/routes/file-${String(i).padStart(3, '0')}.js`,
+      issue: `finding ${i} ${'d'.repeat(60)}`,
+    }));
+
+  const runWithFindings = (findings: Array<{ file?: string; issue?: string }>) =>
+    runGather({}, { prevSha: SHA_CURRENT, prevStatus: 'failed', prevFindings: findings });
+
+  it('leaves a list that fits exactly as it is', async () => {
+    const out = await runWithFindings([{ file: 'src/routes/a.js', issue: 'no audit event' }]);
+    expect(out.prev_findings_view).toBe('- src/routes/a.js: no audit event');
+  });
+
+  it('says so when there are none', async () => {
+    const out = await runWithFindings([]);
+    expect(out.prev_findings_view).toBe('(none)');
+  });
+
+  it('caps the list within its byte share', async () => {
+    const out = await runWithFindings(manyFindings(400));
+    expect(bytes(out.prev_findings_view)).toBeLessThanOrEqual(FINDINGS_BYTES);
+  });
+
+  it('drops whole findings and states how many are missing', async () => {
+    const out = await runWithFindings(manyFindings(400));
+    const lines = out.prev_findings_view.split('\n');
+    // Every line but the last is an intact finding — never half of one.
+    for (const line of lines.slice(0, -1)) {
+      expect(line).toMatch(/^- src\/routes\/file-\d{3}\.js: finding \d+ d{60}$/);
+    }
+    // And the count is the real remainder, so a trimmed list cannot be read as
+    // the whole history.
+    expect(lines[lines.length - 1]).toBe(
+      `- …and ${400 - (lines.length - 1)} older finding(s) not shown`,
+    );
+  });
+
+  it('counts the findings in bytes too', async () => {
+    // Accented issue text costs more than its character count suggests, so fewer
+    // findings fit — the same mistake the snapshot cap used to make.
+    const ascii = await runWithFindings(
+      Array.from({ length: 400 }, (_, i) => ({ file: `f${i}.js`, issue: 'x'.repeat(80) })),
+    );
+    const accented = await runWithFindings(
+      Array.from({ length: 400 }, (_, i) => ({ file: `f${i}.js`, issue: 'á'.repeat(80) })),
+    );
+    expect(bytes(accented.prev_findings_view)).toBeLessThanOrEqual(FINDINGS_BYTES);
+    expect(accented.prev_findings_view.split('\n').length).toBeLessThan(
+      ascii.prev_findings_view.split('\n').length,
+    );
+  });
+});
+
+describe('audit-entity-check — the assembled agent prompt fits one argument', () => {
+  /** The `userPrompt` template, with each interpolation replaced by a view. */
+  const assemble = (findings: string, config: string, snapshot: string): string => {
+    const template = workflow().steps.find((s) => s.id === 'audit_agent')?.config?.userPrompt;
+    if (typeof template !== 'string') throw new Error('audit_agent has no userPrompt');
+    return template
+      .replace('${{ steps.gather.outputs.prev_findings_view }}', findings)
+      .replace('${{ steps.enhancer_config.outputs.config_view }}', config)
+      .replace('${{ steps.gather.outputs.llm_view }}', snapshot);
+  };
+
+  it('keeps the fixed template inside the bytes reserved for it', () => {
+    expect(bytes(assemble('', '', ''))).toBeLessThanOrEqual(TEMPLATE_BYTES);
+  });
+
+  it('reserves enough for the real enhancer configuration view', async () => {
+    // The snapshot's share is whatever is left after this one, and this step
+    // cannot measure it at runtime — so the reservation has to hold in practice.
+    const out = await runConfig();
+    expect(bytes(out.config_view)).toBeLessThanOrEqual(CONFIG_VIEW_BYTES);
+  });
+
+  it('fits with every interpolation at its budgeted worst case', () => {
+    // The test that was missing all along: the limit applies to the assembled
+    // argument, and no single piece of it can prove the whole thing fits.
+    // 'á' is two bytes, so repeat(n / 2) spends exactly n bytes.
+    const assembled = assemble(
+      'á'.repeat(FINDINGS_BYTES / 2),
+      'á'.repeat(CONFIG_VIEW_BYTES / 2),
+      'á'.repeat(MAX_PROMPT / 2),
+    );
+    expect(bytes(assembled)).toBeLessThanOrEqual(ASSEMBLED_TARGET);
+    expect(bytes(assembled)).toBeLessThan(KERNEL_ARG_LIMIT);
+  });
+
+  it('fits with a real worst-case snapshot in place of the padding', async () => {
+    const out = await runGather({}, crowded('観'));
+    const assembled = assemble(
+      'á'.repeat(FINDINGS_BYTES / 2),
+      'á'.repeat(CONFIG_VIEW_BYTES / 2),
+      out.llm_view,
+    );
+    expect(bytes(assembled)).toBeLessThan(KERNEL_ARG_LIMIT);
   });
 });
 

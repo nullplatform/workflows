@@ -734,12 +734,15 @@ steps:
           return 0;
         };
         // Selection budget: how much file content is worth fetching at all. It
-        // sits below MAX_PROMPT further down so the assembled view normally fits
-        // without trimming, and leaves room for the file tree and the notes that
-        // travel with it. A blob past MAX_BLOB is not worth a slot either — what
+        // sits below MAX_PROMPT further down, with room left for the file tree and
+        // the notes that travel with it, so the assembled view normally fits
+        // without trimming — ASCII source at TOTAL plus a full tree lands near
+        // 80000 of the 91600 bytes available. Accented source spends more than one
+        // byte per character and does get trimmed; that is the cap's job, and it
+        // is reported. A blob past MAX_BLOB is not worth a slot either — what
         // would survive the per-file clip is a fraction of it, at the cost of a
         // whole file's budget.
-        const MAX_FILES = 60, PER_FILE = 24000, TOTAL = 90000, MAX_BLOB = 200000;
+        const MAX_FILES = 60, PER_FILE = 24000, TOTAL = 60000, MAX_BLOB = 200000;
         // Ties inside one score are broken by path. Ordering by ascending size
         // fits more files in the same budget, but it drops the largest file of
         // every tier — in a routes directory that is the CRUD module this check
@@ -762,19 +765,66 @@ steps:
           files.push({ path: f.path, truncated: content.length > clipped.length, content: clipped });
         }
 
+        // Bytes of UTF-8, counted from code points. The limit this budget answers
+        // to is a byte limit, and `String.length` counts UTF-16 code units, which
+        // undercounts everything outside ASCII — accented prose runs about 1.16
+        // bytes per character and CJK three, so a view measured in characters can
+        // be three times its assumed size. There is no Buffer in this sandbox, so
+        // the count is done by hand: one byte below U+0080, two below U+0800, four
+        // for a surrogate pair (a single astral code point), three otherwise —
+        // including an unpaired surrogate, which encodes as U+FFFD.
+        const utf8ByteLength = (s) => {
+          let n = 0;
+          for (let i = 0; i < s.length; i++) {
+            const c = s.charCodeAt(i);
+            if (c < 0x80) { n += 1; continue; }
+            if (c < 0x800) { n += 2; continue; }
+            if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+              const d = s.charCodeAt(i + 1);
+              if (d >= 0xdc00 && d <= 0xdfff) { n += 4; i++; continue; }
+            }
+            n += 3;
+          }
+          return n;
+        };
+
+        // The agent runner re-expands the user prompt as a single shell argument,
+        // and the kernel caps one argument at 131072 bytes (MAX_ARG_STRLEN).
+        // Crossing that line does not degrade the analysis — execve fails, and the
+        // step dies with exit status 126 and no diagnostic worth reading.
+        //
+        // The argument is not this view alone: the agent's prompt template
+        // interpolates three of them. So the budget is shared, and the share left
+        // for the snapshot is what remains after the others are reserved:
+        //
+        //   131072  kernel limit per argument
+        //   120000  ASSEMBLED_TARGET — what the three views plus template may total
+        //     -400  TEMPLATE_BYTES — the fixed prose around the interpolations
+        //   -20000  CONFIG_VIEW_BYTES — the enhancer view, bounded in its own step
+        //           (an 8000 + 4000 character source excerpt, plus key and mode
+        //           lines); reserved here because this step cannot measure it
+        //    -8000  FINDINGS_BYTES — the previous findings, capped below
+        //   ------
+        //    91600  MAX_PROMPT — the snapshot's share
+        const ASSEMBLED_TARGET = 120000, TEMPLATE_BYTES = 400;
+        const CONFIG_VIEW_BYTES = 20000, FINDINGS_BYTES = 8000;
+        const MAX_PROMPT = ASSEMBLED_TARGET - TEMPLATE_BYTES - CONFIG_VIEW_BYTES - FINDINGS_BYTES;
+
         // The tree is the agent's map of what exists — a list of names, not
-        // evidence — so it takes a bounded share of the prompt: whichever comes
-        // first, 400 entries or TREE_CHARS. Bounding it is what makes the trimming
-        // below terminate: with every part of the view except the file contents
-        // capped, dropping files always brings the total under MAX_PROMPT.
-        const TREE_CHARS = 30000;
+        // evidence — so it takes a bounded share: whichever comes first, 400
+        // entries or TREE_BYTES. Bounding it is what makes the trimming below
+        // terminate: with every part of the view except the file contents bounded,
+        // dropping files always brings the total under MAX_PROMPT.
+        const TREE_BYTES = 20000;
         const treeCandidates = paths.filter(p => !SKIP.test(p));
         const treePaths = [];
         let treeUsed = 0;
         for (const p of treeCandidates) {
-          if (treePaths.length >= 400 || treeUsed + p.length + 1 > TREE_CHARS) break;
+          if (treePaths.length >= 400) break;
+          const cost = utf8ByteLength(p) + 1;
+          if (treeUsed + cost > TREE_BYTES) break;
           treePaths.push(p);
-          treeUsed += p.length + 1;
+          treeUsed += cost;
         }
         const treeView = treePaths.join("\n");
         const treeNote = treePaths.length < treeCandidates.length
@@ -836,34 +886,50 @@ steps:
           ...shown.map(f => `\n--- ${f.path}${f.truncated ? " (truncated)" : ""} ---\n${f.content}`),
         ].join("\n");
 
-        // The agent runner re-expands this view as a single shell argument, and
-        // the kernel caps one argument at 128KiB (MAX_ARG_STRLEN). Crossing that
-        // line does not degrade the analysis — execve fails, and the step dies
-        // with exit 126 and no diagnostic worth reading. So the file budget above
-        // is only the selection heuristic; THIS is the invariant that has to
-        // hold. The margin absorbs what the runner wraps around the view, shell
-        // escaping, and multi-byte characters that cost more bytes than chars.
-        const MAX_PROMPT = 110000;
-        // Trimming drops whole files from the tail of the ranking — lowest score,
-        // last one in, first one out — and never cuts through the assembled
-        // string. A file sliced mid-body is worse evidence than an absent one,
-        // and every file that goes has to stay reportable, so coverage is
-        // recomputed on each pass instead of describing a snapshot that changed.
+        // The file budget above is only the selection heuristic — it cannot know
+        // how many bytes the view it produces will occupy. MAX_PROMPT is the
+        // invariant that has to hold. Trimming drops whole files from the tail of
+        // the ranking — lowest score, last one in, first one out — and never cuts
+        // through the assembled string. A file sliced mid-body is worse evidence
+        // than an absent one, and every file that goes has to stay reportable, so
+        // coverage is recomputed on each pass instead of describing a snapshot
+        // that changed underneath it.
         let shown = files;
         let coverage = coverageOf(shown);
         let llm_view = viewOf(shown, coverage);
-        while (llm_view.length > MAX_PROMPT && shown.length > 0) {
+        while (utf8ByteLength(llm_view) > MAX_PROMPT && shown.length > 0) {
           shown = shown.slice(0, shown.length - 1);
           coverage = coverageOf(shown);
           llm_view = viewOf(shown, coverage);
         }
+
+        // The previous findings ride in the same argument, so they get a bounded
+        // share of it too. Whole findings are dropped from the end of the list,
+        // never half a line, and the view says how many are missing so the agent
+        // does not read a trimmed list as the complete one.
+        const findingLines = (checkpoint && checkpoint.findings || [])
+          .map(f => `- ${f.file || f.entity}: ${f.issue}`);
+        const keptFindings = [];
+        let findingsUsed = 0;
+        for (const line of findingLines) {
+          const cost = utf8ByteLength(line) + 1;
+          // Leaves room for the "not shown" line the trimming itself adds.
+          if (findingsUsed + cost > FINDINGS_BYTES - 80) break;
+          keptFindings.push(line);
+          findingsUsed += cost;
+        }
+        const droppedFindings = findingLines.length - keptFindings.length;
+        if (droppedFindings > 0) {
+          keptFindings.push(`- …and ${droppedFindings} older finding(s) not shown`);
+        }
+        const prev_findings_view = keptFindings.join("\n") || "(none)";
 
         return {
           mode: "analyze", scope, repo, branch, analyzed_sha: currentSha,
           prev: checkpoint, changed_count: changed ? changed.length : null,
           total_files: paths.length,
           coverage,
-          prev_findings_view: (checkpoint && checkpoint.findings || []).map(f => `- ${f.file || f.entity}: ${f.issue}`).join("\n") || "(none)",
+          prev_findings_view,
           llm_view,
         };
     error_handling:
