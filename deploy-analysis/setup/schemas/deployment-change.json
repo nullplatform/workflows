@@ -447,6 +447,43 @@
       "title": "Commits total"
      }
     }
+   },
+   "entity_audit": {
+    "type": "object",
+    "title": "Entity audit",
+    "additionalProperties": false,
+    "visibleOn": [
+     "read"
+    ],
+    "properties": {
+     "touched": {
+      "type": "boolean",
+      "title": "Touches audited entities",
+      "description": "LLM flag: the change creates or modifies audited entities, their write paths, or the producer configuration. Ambiguity flags true; the deep audit runs only on flagged deploys."
+     },
+     "note": {
+      "type": "string",
+      "title": "What changed",
+      "description": "One sentence from the analyzer naming the entity-related change"
+     },
+     "audited": {
+      "type": "boolean",
+      "title": "Deep audit done",
+      "description": "Set by the entity audit scanner after it processes this deploy"
+     },
+     "audited_at": {
+      "type": "string",
+      "title": "Audited at"
+     },
+     "unverified": {
+      "type": "array",
+      "title": "Unverified entities",
+      "description": "Entities the deep audit could not verify (visibility only, never an action item)",
+      "items": {
+       "type": "string"
+      }
+     }
+    }
    }
   }
  }
