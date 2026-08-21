@@ -284,6 +284,10 @@ steps:
         the essential functional change — used where UI space is tight.
       - pr_summaries: for EACH PR in the input, a one-line functional summary
         (≤25 words) of what that PR ships.
+      - entities_touched: true if this change creates or modifies audited
+        entities or their write paths (see system prompt), else false
+      - entities_note: ONE sentence (max 25 words) naming what entity-related
+        thing changed; empty string when entities_touched is false
     outputSchema:
       type: object
       required:
@@ -291,7 +295,12 @@ steps:
       - rationale
       - summary_md
       - short_summary
+      - entities_touched
       properties:
+        entities_touched:
+          type: boolean
+        entities_note:
+          type: string
         risk:
           enum:
           - low
@@ -329,6 +338,17 @@ steps:
       operators will notice), NOT which files were touched — file and line
       detail is already shown as structured data next to your summary.
       Name a code component only when it is essential to understand the risk.
+
+      You also detect whether the change affects AUDITED BUSINESS ENTITIES —
+      the resources this service writes (created/updated/deleted through its
+      API) that the auditing pipeline records. Flag it when the change: adds
+      a write endpoint for a new resource; alters existing write routes
+      (paths, verbs, how the resource id is resolved); changes the shape of
+      what gets written (models, serializers, entity snapshots); or touches
+      the audit/producer configuration. Read-only endpoints, tests, docs and
+      pure refactors do not count. You see file names and commit/PR text,
+      not full diffs: when the evidence is genuinely ambiguous, flag true —
+      a cheap deeper audit runs only on flagged deploys.
     maxIterations: 10
   error_handling:
     fallback_step: assemble_heuristic
@@ -420,6 +440,10 @@ steps:
           prs: prs_enriched,
           risk, risk_rationale: rationale, risk_floors_applied: floors, summary_md, short_summary,
           approval: { mode, criticality: critName },
+          ...(typeof llm.entities_touched === "boolean"
+            ? { entity_audit: { touched: llm.entities_touched,
+                ...(llm.entities_note ? { note: llm.entities_note } : {}) } }
+            : {}),
         }),
         markdown: markdown + "\n**Decision:** " + mode,
         risk, gate_results, decision_mode: mode,
