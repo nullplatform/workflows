@@ -3,13 +3,12 @@ id: cost-finout-upsert-scope
 name: "Cost Finout — wf1b Upsert Scope (child)"
 description: "Child de wf1: resuelve el cluster de UN scope (tabla de providers en inputs) y upsertea su instancia infrastructure_cost. Sin VMs: resolucion inline + np-api-call."
 
-triggers:
+steps:
   - id: manual
     type: trigger
     pluginType: manual
     config: {}
 
-steps:
   # Resolucion pura (inline, sin red): provider mas especifico por
   # (prefijo de NRN × dimensiones) → cluster + cuerpo del upsert.
   - id: resolve
@@ -75,7 +74,36 @@ steps:
       query:
         upsert: "true"
       apiKey: "${{ secrets.COST_NP_API_KEY }}"
-      failOnHttpError: true
+      failOnHttpError: false
+
+  # Un 502 transitorio no puede matar la corrida entera (fail-fast del
+  # fan-out): un reintento y si no, se reporta en outputs.
+  - id: verify
+    type: decider
+    pluginType: conditional
+    config:
+      expression: "steps.patch.outputs.status < 300"
+
+  - id: patch_retry
+    type: module
+    pluginType: np-api-call
+    inputs:
+      path: "${{ steps.resolve.outputs.path }}"
+      body: "${{ steps.resolve.outputs.body }}"
+    config:
+      method: PATCH
+      path: "/catalog/instances/infrastructure_cost/placeholder"
+      query:
+        upsert: "true"
+      apiKey: "${{ secrets.COST_NP_API_KEY }}"
+      failOnHttpError: false
+
+  - id: patched_ok
+    type: module
+    pluginType: log
+    config:
+      level: debug
+      message: "upsert ok ${{ steps.resolve.outputs.scope_id }}"
 
   - id: skipped
     type: module
@@ -85,10 +113,16 @@ steps:
       message: "scope sin cluster resoluble: ${{ steps.resolve.outputs.scope_id }} ${{ steps.resolve.outputs.scope_name }}"
 
 connections:
+  - { id: t1, from: manual, to: resolve }
   - { id: c1, from: resolve, to: route }
   - { id: c2, from: route, to: patch, sourcePort: "true" }
   - { id: c3, from: route, to: skipped, sourcePort: "false" }
+  - { id: c4, from: patch, to: verify }
+  - { id: c5, from: verify, to: patched_ok, sourcePort: "true" }
+  - { id: c6, from: verify, to: patch_retry, sourcePort: "false" }
 
 outputs:
   mapped: "${{ steps.resolve.outputs.mapped }}"
   cluster: "${{ steps.resolve.outputs.cluster }}"
+  s1: "${{ steps.patch.outputs.status }}"
+  s2: "${{ steps.patch_retry.outputs.status }}"

@@ -3,13 +3,12 @@ id: cost-finout-rate-cluster
 name: "Cost Finout — wf2b Rate Cluster (child)"
 description: "Child de wf2: para UN cluster prod NP calcula el blended rate (costo Finout del cluster ÷ reservas Datadog) y upsertea blended_rate con serie diaria mergeada. Cluster sin datos DD o sin costo → skip logueado (no dividimos por ~0)."
 
-triggers:
+steps:
   - id: manual
     type: trigger
     pluginType: manual
     config: {}
 
-steps:
   # 1. Reservas del cluster en Datadog (cores y GB promedios de la ventana).
   - id: usage
     type: module
@@ -161,6 +160,7 @@ steps:
       message: "cluster sin blended rate: ${{ steps.compute.outputs.cluster }} — ${{ steps.compute.outputs.reason }}"
 
 connections:
+  - { id: t1, from: manual, to: usage }
   - { id: c1, from: compute, to: route }
   - { id: c2, from: route, to: patch, sourcePort: "true" }
   - { id: c3, from: route, to: skipped, sourcePort: "false" }

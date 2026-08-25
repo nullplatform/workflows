@@ -3,7 +3,7 @@ id: cost-finout-blended-rates
 name: "Cost Finout — wf2 Blended Rates"
 description: "Diario: costo por cluster NP desde Finout (GKE via cost center Kubernetes; AKS via resource groups mc_* con split de networking) + lista de clusters prod desde providers API → fan-out de un child por cluster (cost-finout-rate-cluster) que calcula $/core-hora y $/GB-hora contra reservas Datadog."
 
-triggers:
+steps:
   - id: manual
     type: trigger
     pluginType: manual
@@ -15,13 +15,13 @@ triggers:
       schedule: "10 4 * * *"
       timezone: UTC
 
-steps:
   # 1. Finout v2 (async generate/poll/results): costo diario por cluster,
   #    ultimos 8 dias cerrados. GKE: cost center Kubernetes. AKS: Azure por
   #    resource group mc_* con desglose por servicio para separar networking.
   - id: finout_costs
     type: module
     pluginType: code-exec
+    joinStrategy: any
     inputs:
       finoutClientId: "${{ secrets.FINOUT_CLIENT_ID }}"
       finoutSecretKey: "${{ secrets.FINOUT_SECRET_KEY }}"
@@ -151,3 +151,7 @@ steps:
     config:
       level: info
       message: "blended-rates: ${{ steps.summary.outputs.with_rate }} clusters con rate, ${{ steps.summary.outputs.without_rate }} sin datos (de ${{ steps.summary.outputs.clusters }})"
+
+connections:
+  - { id: t1, from: manual, to: finout_costs }
+  - { id: t2, from: daily, to: finout_costs }

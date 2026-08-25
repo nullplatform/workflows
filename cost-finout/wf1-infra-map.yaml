@@ -3,7 +3,7 @@ id: cost-finout-infra-map
 name: "Cost Finout — wf1 Infra Map"
 description: "Mapeo diario scope→cluster+dimensiones (prod, clusters NP GKE/AKS). Patron canonico: lake-query emite items → sub-workflow fan-out por scope (child cost-finout-upsert-scope) → summary. Los montos los escribe wf3."
 
-triggers:
+steps:
   - id: manual
     type: trigger
     pluginType: manual
@@ -15,12 +15,12 @@ triggers:
       schedule: "10 3 * * *"
       timezone: UTC
 
-steps:
   # 1. Providers k8s + runtime configs → tabla de resolucion (chica, viaja a
   #    cada child). Tambien upsertea las instancias cluster-* (son ~25).
   - id: plan_providers
     type: module
     pluginType: code-exec
+    joinStrategy: any
     inputs:
       npApiKey: "${{ secrets.COST_NP_API_KEY }}"
     config:
@@ -129,13 +129,16 @@ steps:
     config:
       code: |
         const rows = $items || [];
-        const mapped = rows.filter((r) => r && r.mapped === true).length;
+        const mapped = rows.filter((r) => r && r.mapped === true);
+        const upserted = mapped.filter((r) => (r.s1 && r.s1 < 300) || (r.s2 && r.s2 < 300)).length;
         const clusters = {};
-        for (const r of rows) if (r && r.cluster) clusters[r.cluster] = (clusters[r.cluster] || 0) + 1;
+        for (const r of mapped) if (r.cluster) clusters[r.cluster] = (clusters[r.cluster] || 0) + 1;
         return {
           children: rows.length,
-          mapped,
-          unmapped: rows.length - mapped,
+          mapped: mapped.length,
+          upserted,
+          upsert_failed: mapped.length - upserted,
+          unmapped: rows.length - mapped.length,
           clusters: Object.keys(clusters).length,
           by_cluster: clusters
         };
@@ -146,4 +149,8 @@ steps:
     dependsOn: [summary]
     config:
       level: info
-      message: "infra-map: ${{ steps.summary.outputs.mapped }} scopes prod mapeados en ${{ steps.summary.outputs.clusters }} clusters (${{ steps.summary.outputs.unmapped }} sin mapear de ${{ steps.summary.outputs.children }})"
+      message: "infra-map: ${{ steps.summary.outputs.upserted }} upserts ok / ${{ steps.summary.outputs.mapped }} mapeados en ${{ steps.summary.outputs.clusters }} clusters (${{ steps.summary.outputs.unmapped }} sin mapear, ${{ steps.summary.outputs.upsert_failed }} upserts fallidos, de ${{ steps.summary.outputs.children }})"
+
+connections:
+  - { id: t1, from: manual, to: plan_providers }
+  - { id: t2, from: daily, to: plan_providers }
