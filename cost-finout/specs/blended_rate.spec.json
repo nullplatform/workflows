@@ -64,7 +64,10 @@
     "properties": {
       "id": {
         "type": "string",
-        "description": "Nombre del cluster (nivel cluster) o dim-<cloud>-<country>-<environment> (nivel dimension, agregado ponderado de sus clusters)"
+        "description": "Nombre del cluster (nivel cluster) o dim-<cloud>-<country>-<environment> (nivel dimension, agregado ponderado de sus clusters)",
+        "alias": "id",
+        "primaryKey": true,
+        "autoGenerate": false
       },
       "level": {
         "type": "string",
@@ -72,21 +75,30 @@
           "cluster",
           "dimension"
         ],
-        "description": "Granularidad del rate. El nivel cluster es el primario; el nivel dimension es un agregado ponderado por costo para cortes rapidos."
+        "description": "Granularidad del rate. El nivel cluster es el primario; el nivel dimension es un agregado ponderado por costo para cortes rapidos.",
+        "index": [
+          "filter"
+        ]
       },
       "cluster": {
         "type": [
           "string",
           "null"
         ],
-        "description": "Nombre del cluster k8s (null en level=dimension)"
+        "description": "Nombre del cluster k8s (null en level=dimension)",
+        "index": [
+          "filter"
+        ]
       },
       "provider_spec": {
         "type": [
           "string",
           "null"
         ],
-        "description": "gke-configuration | aks-configuration | oke"
+        "description": "gke-configuration | aks-configuration | oke",
+        "index": [
+          "filter"
+        ]
       },
       "dimensions": {
         "type": "object",

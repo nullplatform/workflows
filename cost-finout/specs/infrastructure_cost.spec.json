@@ -64,7 +64,10 @@
     "properties": {
       "id": {
         "type": "string",
-        "description": "Id estable del sujeto: scope-<id> | service-<uuid> | cluster-<nombre> | shared-<categoria>-<dimension-key>"
+        "description": "Id estable del sujeto: scope-<id> | service-<uuid> | cluster-<nombre> | shared-<categoria>-<dimension-key>",
+        "alias": "id",
+        "primaryKey": true,
+        "autoGenerate": false
       },
       "entity_type": {
         "type": "string",
@@ -79,46 +82,65 @@
           "cluster",
           "shared"
         ],
-        "description": "Tipo de entidad null a la que se asigna el costo. 'cluster' y 'shared' no son entidades null: representan el agregado del cluster y overhead compartido aun no asignable."
+        "description": "Tipo de entidad null a la que se asigna el costo. 'cluster' y 'shared' no son entidades null: representan el agregado del cluster y overhead compartido aun no asignable.",
+        "index": [
+          "filter"
+        ]
       },
       "entity_id": {
         "type": [
           "string",
           "null"
         ],
-        "description": "Id de la entidad en nullplatform (scope id, service uuid...). null para cluster/shared."
+        "description": "Id de la entidad en nullplatform (scope id, service uuid...). null para cluster/shared.",
+        "index": [
+          "filter"
+        ]
       },
       "nrn": {
         "type": [
           "string",
           "null"
         ],
-        "description": "NRN completo de la entidad null (organization=...:account=...:...). null para cluster/shared."
+        "description": "NRN completo de la entidad null (organization=...:account=...:...). null para cluster/shared.",
+        "nrn": true
       },
       "entity_name": {
         "type": "string",
-        "description": "Nombre legible del sujeto (nombre del scope, del service, del cluster...)"
+        "description": "Nombre legible del sujeto (nombre del scope, del service, del cluster...)",
+        "index": [
+          "filter"
+        ]
       },
       "application_id": {
         "type": [
           "string",
           "null"
         ],
-        "description": "Denormalizado para cortes: app duena del scope/service (si aplica)"
+        "description": "Denormalizado para cortes: app duena del scope/service (si aplica)",
+        "index": [
+          "filter"
+        ]
       },
       "account_id": {
         "type": [
           "string",
           "null"
         ],
-        "description": "Denormalizado para cortes: cuenta null (si aplica)"
+        "description": "Denormalizado para cortes: cuenta null (si aplica)",
+        "index": [
+          "filter"
+        ]
       },
       "namespace_id": {
         "type": [
           "string",
           "null"
         ],
-        "description": "Denormalizado para cortes: namespace null (si aplica)"
+        "description": "Denormalizado para cortes: namespace null (si aplica)",
+        "index": [
+          "filter"
+        ]
       },
       "dimensions": {
         "type": "object",
@@ -299,7 +321,10 @@
           "string",
           "null"
         ],
-        "description": "Id de la instancia blended_rate aplicada (= nombre del cluster). null cuando allocation=finout_direct."
+        "description": "Id de la instancia blended_rate aplicada (= nombre del cluster). null cuando allocation=finout_direct.",
+        "index": [
+          "filter"
+        ]
       },
       "daily": {
         "type": "array",
