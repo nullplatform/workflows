@@ -114,7 +114,7 @@ steps:
     config:
       apiKey: "${{ secrets.COST_NP_API_KEY }}"
       maxRows: 500
-      sql: "SELECT JSONExtractString(e.data,'entity_name') cluster, JSONExtractString(e.data,'infra','provider_spec') spec, JSONExtractString(e.data,'dimensions','cloud') cloud, JSONExtractString(e.data,'dimensions','country') country FROM catalog_entities AS e FINAL JOIN catalog_entity_specifications AS sp FINAL ON e.entity_specification_id = sp.id WHERE e._deleted=0 AND e.deleted_at IS NULL AND sp._deleted=0 AND sp.slug='infrastructure_cost' AND JSONExtractString(e.data,'entity_type')='cluster'"
+      sql: "SELECT JSONExtractString(e.data,'entity_name') cluster, JSONExtractString(e.data,'infrastructure_reference','attributes','provider_spec') spec, JSONExtractString(e.data,'dimensions','cloud') cloud, JSONExtractString(e.data,'dimensions','country') country FROM catalog_entities AS e FINAL JOIN catalog_entity_specifications AS sp FINAL ON e.entity_specification_id = sp.id WHERE e._deleted=0 AND e.deleted_at IS NULL AND sp._deleted=0 AND sp.slug='infrastructure_cost' AND JSONExtractString(e.data,'entity_type')='cluster'"
 
   # 3. Un child por cluster: DD reservas + calculo + upsert blended_rate.
   - id: rate_cluster

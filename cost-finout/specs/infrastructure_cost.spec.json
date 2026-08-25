@@ -1,7 +1,7 @@
 {
   "name": "Infrastructure Cost",
   "slug": "infrastructure_cost",
-  "description": "Costo de infraestructura asignado a una entidad null (scope, service, cluster, shared). Una instancia por sujeto con serie diaria, mantenida por la suite cost-finout — no editar a mano. Los precios unitarios viven en blended_rate.",
+  "description": "Costo de infraestructura asignado a una entidad null (scope, service, cluster, shared). Una instancia por sujeto con serie diaria, mantenida por cost-finout — no editar a mano. Precios en blended_rate; infra subyacente en infrastructure_reference.",
   "schema": {
     "type": "object",
     "additionalProperties": false,
@@ -167,29 +167,34 @@
           }
         }
       },
-      "infra": {
+      "infrastructure_reference": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Que infraestructura respalda al sujeto (el mapeo scope→cluster que alimenta los cortes por infra)",
+        "description": "Referencia generica a la infraestructura subyacente del sujeto, sea cual sea su tipo. Detalles especificos del tipo en attributes.",
         "properties": {
-          "cluster": {
+          "kind": {
+            "type": "string",
+            "description": "k8s_cluster | managed_database | cache | object_storage | static_hosting | serverless | vm | external | unknown (abierto)"
+          },
+          "id": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Nombre del cluster k8s (tambien es el id de la instancia blended_rate usada)"
+            "description": "Identificador canonico (nombre cluster k8s, id Atlas, resource id Azure...). Con kind=k8s_cluster coincide con blended_rate.id"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "cloud_provider": {
             "type": [
               "string",
               "null"
             ],
-            "enum": [
-              "gcp",
-              "azure",
-              "oci",
-              null
-            ]
+            "description": "gcp | azure | oci | aws | onprem | other"
           },
           "region": {
             "type": [
@@ -197,18 +202,10 @@
               "null"
             ]
           },
-          "k8s_namespace": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "provider_spec": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Slug del provider spec de null (gke-configuration | aks-configuration | oke)"
+          "attributes": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Atributos del tipo: k8s_namespace, provider_spec, resource_group, project_id, engine, tier, ..."
           }
         }
       },
@@ -321,7 +318,7 @@
           "string",
           "null"
         ],
-        "description": "Id de la instancia blended_rate aplicada (= nombre del cluster). null cuando allocation=finout_direct.",
+        "description": "Id del blended_rate aplicado (= infrastructure_reference.id con kind=k8s_cluster); null si no aplica.",
         "index": [
           "filter"
         ]

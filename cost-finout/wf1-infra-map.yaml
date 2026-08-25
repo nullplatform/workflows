@@ -85,8 +85,9 @@ steps:
           clusters[c.cluster] = clusters[c.cluster] || {
             id: "cluster-" + c.cluster, entity_type: "cluster", entity_name: c.cluster,
             dimensions: { cloud: c.dims.cloud || null, country: c.dims.country || null, environment: "prod" },
-            infra: { cluster: c.cluster, cloud_provider: CLOUD_OF[c.spec], region: REGION[c.dims.cloud] || null,
-                     k8s_namespace: c.ns, provider_spec: c.spec }
+            infrastructure_reference: { kind: "k8s_cluster", id: c.cluster, name: c.cluster,
+                     cloud_provider: CLOUD_OF[c.spec], region: REGION[c.dims.cloud] || null,
+                     attributes: { k8s_namespace: c.ns, provider_spec: c.spec } }
           };
         }
         let clusterUpserts = 0;

@@ -12,7 +12,7 @@ Dos specs de catálogo, **separados a propósito** — hechos vs precios:
 
 | Spec | Qué guarda | Instancia |
 |---|---|---|
-| `infrastructure_cost` | HECHOS de costo asignado a una entidad null: sujeto (`entity_type`/`entity_id`/`nrn`), dimensiones (cloud/country/environment), infra que lo respalda (cluster…), costo del día (`total/usage/waste`), uso vs reserva, serie diaria FIFO 365d | una por sujeto: `scope-<id>`, `service-<uuid>`, `cluster-<nombre>`, `shared-<categoría>-<dim>` |
+| `infrastructure_cost` | HECHOS de costo asignado a una entidad null: sujeto (`entity_type`/`entity_id`/`nrn`), dimensiones (cloud/country/environment), `infrastructure_reference` genérica (kind + id + attributes — cluster k8s hoy; DBs/caches/statics mañana), costo del día (`total/usage/waste`), uso vs reserva, serie diaria FIFO 365d | una por sujeto: `scope-<id>`, `service-<uuid>`, `cluster-<nombre>`, `shared-<categoría>-<dim>` |
 | `blended_rate` | PRECIOS unitarios blended por cluster: `$ / core-hora` y `$ / GB-hora`, con su base auditable (costo Finout del cluster + networking, capacidad reservada Datadog) y serie diaria | una por cluster (`level: cluster`); agregados ponderados opcionales (`level: dimension`, id `dim-<cloud>-<country>-<env>`) |
 
 `infrastructure_cost.rate_ref` apunta al `blended_rate` aplicado (= nombre del

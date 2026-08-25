@@ -52,8 +52,9 @@ steps:
             entity_name: s.acc_name + "/" + s.app_name + "/" + s.name,
             application_id: String(s.app_id), account_id: String(s.acc_id), namespace_id: String(s.ns_id),
             dimensions: dims,
-            infra: { cluster: best.cluster, cloud_provider: CLOUD_OF[best.spec], region: REGION[dims.cloud] || null,
-                     k8s_namespace: best.ns || "nullplatform", provider_spec: best.spec },
+            infrastructure_reference: { kind: "k8s_cluster", id: best.cluster, name: best.cluster,
+                     cloud_provider: CLOUD_OF[best.spec], region: REGION[dims.cloud] || null,
+                     attributes: { k8s_namespace: best.ns || "nullplatform", provider_spec: best.spec } },
             rate_ref: best.cluster
           }
         };
