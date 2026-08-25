@@ -1,0 +1,408 @@
+{
+  "name": "Infrastructure Cost",
+  "slug": "infrastructure_cost",
+  "description": "Costo de infraestructura asignado a una entidad null (scope, service, cluster, shared). Una instancia por sujeto con serie diaria, mantenida por la suite cost-finout — no editar a mano. Los precios unitarios viven en blended_rate.",
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "relations": {},
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 1061226164,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 1061226164,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Id estable del sujeto: scope-<id> | service-<uuid> | cluster-<nombre> | shared-<categoria>-<dimension-key>"
+      },
+      "entity_type": {
+        "type": "string",
+        "enum": [
+          "scope",
+          "application",
+          "namespace",
+          "account",
+          "organization",
+          "service",
+          "link",
+          "cluster",
+          "shared"
+        ],
+        "description": "Tipo de entidad null a la que se asigna el costo. 'cluster' y 'shared' no son entidades null: representan el agregado del cluster y overhead compartido aun no asignable."
+      },
+      "entity_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Id de la entidad en nullplatform (scope id, service uuid...). null para cluster/shared."
+      },
+      "nrn": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "NRN completo de la entidad null (organization=...:account=...:...). null para cluster/shared."
+      },
+      "entity_name": {
+        "type": "string",
+        "description": "Nombre legible del sujeto (nombre del scope, del service, del cluster...)"
+      },
+      "application_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Denormalizado para cortes: app duena del scope/service (si aplica)"
+      },
+      "account_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Denormalizado para cortes: cuenta null (si aplica)"
+      },
+      "namespace_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Denormalizado para cortes: namespace null (si aplica)"
+      },
+      "dimensions": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Dimensiones null del sujeto al momento del calculo (cloud, country, environment, ...)",
+        "properties": {
+          "cloud": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "infra": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Que infraestructura respalda al sujeto (el mapeo scope→cluster que alimenta los cortes por infra)",
+        "properties": {
+          "cluster": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Nombre del cluster k8s (tambien es el id de la instancia blended_rate usada)"
+          },
+          "cloud_provider": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "gcp",
+              "azure",
+              "oci",
+              null
+            ]
+          },
+          "region": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "k8s_namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_spec": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Slug del provider spec de null (gke-configuration | aks-configuration | oke)"
+          }
+        }
+      },
+      "cost": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Costo del ultimo dia computado (USD)",
+        "properties": {
+          "total_usd": {
+            "type": "number",
+            "description": "Chargeback del dia: max(usage, request) por hora × blended rate"
+          },
+          "usage_usd": {
+            "type": "number",
+            "description": "Lo realmente consumido"
+          },
+          "waste_usd": {
+            "type": "number",
+            "description": "total - usage: reservado sin usar"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "allocation": {
+            "type": "string",
+            "enum": [
+              "blended",
+              "finout_direct",
+              "shared_overhead"
+            ],
+            "description": "blended: usage Datadog × blended_rate. finout_direct: allocation por pod label en Finout (hoy solo clusters cmrmx). shared_overhead: costo compartido distribuido."
+          }
+        }
+      },
+      "cost_7d_usd": {
+        "type": "number",
+        "description": "Costo acumulado 7 dias (rolling)"
+      },
+      "cost_30d_usd": {
+        "type": "number",
+        "description": "Costo acumulado 30 dias (rolling)"
+      },
+      "usage": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Uso vs reserva del ultimo dia computado (fuente Datadog, por kube_deployment)",
+        "properties": {
+          "cpu_req_core_h": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Core-horas reservadas en el dia"
+          },
+          "cpu_used_core_h": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Core-horas usadas en el dia"
+          },
+          "mem_req_gb_h": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "GB-horas reservadas en el dia"
+          },
+          "mem_used_gb_h": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "GB-horas usadas en el dia"
+          },
+          "cpu_utilization_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "mem_utilization_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pods_min": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pods_max": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pods_avg": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      },
+      "rate_ref": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Id de la instancia blended_rate aplicada (= nombre del cluster). null cuando allocation=finout_direct."
+      },
+      "daily": {
+        "type": "array",
+        "description": "Serie diaria FIFO (365 dias) — la des-anidan los dashboards del lake",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "d": {
+              "type": "string",
+              "description": "Fecha YYYY-MM-DD"
+            },
+            "cost_usd": {
+              "type": "number"
+            },
+            "usage_usd": {
+              "type": "number"
+            },
+            "waste_usd": {
+              "type": "number"
+            },
+            "cpu_req_core_h": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "cpu_used_core_h": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "mem_req_gb_h": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "mem_used_gb_h": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "pods_min": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "pods_max": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "pods_avg": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "allocation": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "sources": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "finout": {
+            "type": "boolean"
+          },
+          "datadog": {
+            "type": "boolean"
+          },
+          "computed_at": {
+            "type": "string",
+            "description": "ISO timestamp del ultimo calculo"
+          },
+          "workflow_execution_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "created_at": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "updated_at": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    }
+  }
+}

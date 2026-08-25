@@ -1,0 +1,79 @@
+# Cost (Finout + Datadog) — suite catalog-first
+
+Suite de costos para organizaciones cuyos costos viven en **Finout** (multi-cloud)
+y cuyo uso vive en **Datadog** — sin Prometheus ni agente en el cluster (a
+diferencia de [`../cost`](../cost), que es la suite Prometheus/np-agent).
+Primer despliegue: org **falabella** (987889794). Alcance inicial: **solo prod**
+(los clusters preprod de NP no reportan a Datadog).
+
+## Modelo de datos (catalog entities, no metadata)
+
+Dos specs de catálogo, **separados a propósito** — hechos vs precios:
+
+| Spec | Qué guarda | Instancia |
+|---|---|---|
+| `infrastructure_cost` | HECHOS de costo asignado a una entidad null: sujeto (`entity_type`/`entity_id`/`nrn`), dimensiones (cloud/country/environment), infra que lo respalda (cluster…), costo del día (`total/usage/waste`), uso vs reserva, serie diaria FIFO 365d | una por sujeto: `scope-<id>`, `service-<uuid>`, `cluster-<nombre>`, `shared-<categoría>-<dim>` |
+| `blended_rate` | PRECIOS unitarios blended por cluster: `$ / core-hora` y `$ / GB-hora`, con su base auditable (costo Finout del cluster + networking, capacidad reservada Datadog) y serie diaria | una por cluster (`level: cluster`); agregados ponderados opcionales (`level: dimension`, id `dim-<cloud>-<country>-<env>`) |
+
+`infrastructure_cost.rate_ref` apunta al `blended_rate` aplicado (= nombre del
+cluster). El sujeto `cluster` permite reconciliar: Σ scopes del cluster + no
+asignado ≈ costo del cluster en Finout.
+
+Los JSON de los specs viven en [`specs/`](./specs) — incluyen
+`schema.authorization` (sin eso las API keys reciben 403 sobre las instancias).
+
+### Diseño del sujeto (pedido explícito)
+
+`infrastructure_cost` es genérico y expandible: hoy se puebla con scopes y
+clusters; mañana entran **services** (redis 95 / mongo-atlas 74 / postgres 37
+activos en falabella), links, o costos compartidos, sin tocar el spec — solo
+más valores de `entity_type`.
+
+## Fuentes y mecánica
+
+| Dato | Fuente | Cómo |
+|---|---|---|
+| Costo por cluster GKE | Finout API v2 | cost center `Kubernetes`, key `k8s_cluster` |
+| Costo por cluster AKS | Finout API v2 | cost center `Azure`, key `resourcegroup` = `mc_<cluster>` (billing_enrichment) |
+| Networking (LB/NAT/bandwidth) | Finout API v2 | `cloud_service` por cloud, atribución al cluster/dimensión |
+| Allocation directa por scope | Finout API v2 | pod labels `label_scope_id` etc. — hoy SOLO clusters `cmrmx-*` GCP; sirve de reconciliación del blended |
+| Uso/reserva por scope | Datadog API v1 query (org US1) | `kubernetes.cpu.requests`, `kubernetes.cpu.usage.total`, `kubernetes.memory.requests`, `kubernetes.memory.working_set` agrupadas `by {kube_deployment}` |
+| scope_id desde Datadog | tag `kube_deployment` | codifica `<app>-<scope-name>-<scope_id>-d-<deployment_id>` → regex `-(\d+)-d-\d+$` (labels NP NO están mapeados a tags DD) |
+| Mapeo scope→cluster | NP providers API | `GET /provider?nrn=organization=<org>&show_descendants=true` + `GET /runtime_configuration/{data_source.key}` → `values.k8s.clusterId`, resuelto por nivel de NRN × dimensiones |
+
+Finout v2 es asíncrona: `POST /v2/data/cost-usage/generate-query` → poll
+`/status` → `/results` (50 req/min, máx. 60 días por query, `timeInterval`
+obligatorio, un solo `sortDirection` por request).
+
+### Modelo de costo (heredado de ../cost, mismo iron rule)
+
+- `cost.total_usd` (chargeback) = `max(usage, request)` valuado al blended rate — las reservas atan nodos.
+- `cost.usage_usd` = consumo real × rate; `waste = total - usage`.
+- Blended rate del cluster = (costo diario Finout del cluster + networking atribuible) ÷ (core-horas y GB-horas **reservadas** — la capacidad ociosa del cluster la pagan los que reservan, mismo criterio que el loading factor de la suite org-4).
+
+## Workflows (plan)
+
+| WF | Cron | Qué hace |
+|---|---|---|
+| `wf1-infra-map` | diario | lake (scopes activos + dimensiones) × providers API → upsert `infrastructure_cost` (sujeto+dimensiones+infra, sin montos) — el mapeo scope→cluster |
+| `wf2-blended-rates` | diario | Finout (costo por cluster + networking) + Datadog (reservas del cluster) → upsert `blended_rate` por cluster |
+| `wf3-scope-costs` | diario | Datadog por `kube_deployment` × `blended_rate` → montos+serie en `infrastructure_cost`; en clusters cmrmx reconcilia contra allocation directa Finout |
+| `wf4-shared-costs` | semanal | LB/NAT/bandwidth/Datadog-cost no atribuible → sujetos `shared-*` por dimensión |
+
+## Setup
+
+```bash
+# 1. Specs de catálogo — requiere principal admin (la API key de la suite NO
+#    puede crear specs; sí escribe instancias una vez creados):
+NP_TOKEN=<session bearer> ./setup/01-catalog-specs.sh
+
+# 2. Config entries (secrets org-scope): FINOUT_CLIENT_ID, FINOUT_SECRET_KEY,
+#    DD_API_KEY, DD_APPLICATION_KEY   (pendiente: 02-config-entries.sh)
+```
+
+## Hechos verificados del entorno falabella (2026-08-25)
+
+- ~40 clusters NP `<unidad>-np-<az|gcp>-<variante>-<región>-<prod|preprod>`; el cluster lo determina cuenta × cloud × country × environment.
+- Gasto Finout total ~USD 2,1M/30d: Azure 824k / GCP 592k / OCI 470k / Datadog 206k.
+- 353 clusters reportan al Datadog corporativo; **todos los NP prod están, ningún NP preprod**.
+- Cobertura de parsing scope_id en DD: ~97-99% de las series (muestras: bfcl-gcp-beta 191 scopes, banco-cl AKS 277, cmrmx-az-alfa 97).
