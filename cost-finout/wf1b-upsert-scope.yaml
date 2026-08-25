@@ -14,6 +14,8 @@ steps:
   - id: resolve
     type: module
     pluginType: code-exec
+    error_handling:
+      fallback_step: resolve_failed
     inputs:
       scope: "${{ workflow.inputs.scope }}"
       providers: "${{ workflow.inputs.providers }}"
@@ -65,6 +67,8 @@ steps:
   - id: patch
     type: module
     pluginType: np-api-call
+    error_handling:
+      fallback_step: patch_failed
     inputs:
       path: "${{ steps.resolve.outputs.path }}"
       body: "${{ steps.resolve.outputs.body }}"
@@ -87,6 +91,8 @@ steps:
   - id: patch_retry
     type: module
     pluginType: np-api-call
+    error_handling:
+      fallback_step: retry_failed
     inputs:
       path: "${{ steps.resolve.outputs.path }}"
       body: "${{ steps.resolve.outputs.body }}"
@@ -105,6 +111,29 @@ steps:
       level: debug
       message: "upsert ok ${{ steps.resolve.outputs.scope_id }}"
 
+  # Resolves de fallo dedicados (un solo predecesor cada uno) — un child
+  # NUNCA debe fallar: el fan-out del parent es fail-fast.
+  - id: resolve_failed
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "resolve fallo (sandbox/transitorio) — scope queda para la proxima corrida"
+
+  - id: patch_failed
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "patch lanzo error de red — el retry decide"
+
+  - id: retry_failed
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "patch retry tambien fallo — scope ${{ steps.resolve.outputs.scope_id }} queda para la proxima corrida"
+
   - id: skipped
     type: module
     pluginType: log
@@ -120,6 +149,9 @@ connections:
   - { id: c4, from: patch, to: verify }
   - { id: c5, from: verify, to: patched_ok, sourcePort: "true" }
   - { id: c6, from: verify, to: patch_retry, sourcePort: "false" }
+  - { id: f1, from: resolve, to: resolve_failed, condition: "false" }
+  - { id: f2, from: patch, to: patch_failed, condition: "false" }
+  - { id: f3, from: patch_retry, to: retry_failed, condition: "false" }
 
 outputs:
   mapped: "${{ steps.resolve.outputs.mapped }}"

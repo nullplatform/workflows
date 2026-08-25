@@ -26,7 +26,8 @@ steps:
       finoutClientId: "${{ secrets.FINOUT_CLIENT_ID }}"
       finoutSecretKey: "${{ secrets.FINOUT_SECRET_KEY }}"
     config:
-      executionConfig:
+      runtime:
+        kind: microvm
         timeoutMs: 540000
       network:
         allowedHosts: ["app.finout.io"]

@@ -24,7 +24,8 @@ steps:
     inputs:
       npApiKey: "${{ secrets.COST_NP_API_KEY }}"
     config:
-      executionConfig:
+      runtime:
+        kind: microvm
         timeoutMs: 300000
       network:
         allowedHosts: ["api.nullplatform.com"]

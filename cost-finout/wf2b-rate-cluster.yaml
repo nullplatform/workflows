@@ -13,12 +13,15 @@ steps:
   - id: usage
     type: module
     pluginType: code-exec
+    error_handling:
+      fallback_step: usage_failed
     inputs:
       cluster: "${{ workflow.inputs.cluster }}"
       ddApiKey: "${{ secrets.DD_API_KEY }}"
       ddAppKey: "${{ secrets.DD_APPLICATION_KEY }}"
     config:
-      executionConfig:
+      runtime:
+        kind: microvm
         timeoutMs: 120000
       network:
         allowedHosts: ["api.datadoghq.com"]
@@ -54,6 +57,8 @@ steps:
   - id: read_existing
     type: module
     pluginType: np-api-call
+    error_handling:
+      fallback_step: read_failed
     dependsOn: [usage]
     inputs:
       path: "/catalog/instances/blended_rate/${{ workflow.inputs.cluster.cluster }}"
@@ -67,6 +72,8 @@ steps:
   - id: compute
     type: module
     pluginType: code-exec
+    error_handling:
+      fallback_step: compute_failed
     dependsOn: [read_existing]
     inputs:
       cluster: "${{ workflow.inputs.cluster }}"
@@ -141,6 +148,8 @@ steps:
   - id: patch
     type: module
     pluginType: np-api-call
+    error_handling:
+      fallback_step: patch_failed
     inputs:
       path: "${{ steps.compute.outputs.path }}"
       body: "${{ steps.compute.outputs.body }}"
@@ -159,11 +168,43 @@ steps:
       level: warn
       message: "cluster sin blended rate: ${{ steps.compute.outputs.cluster }} — ${{ steps.compute.outputs.reason }}"
 
+  - id: usage_failed
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "datadog fallo para el cluster — sin rate esta corrida"
+
+  - id: read_failed
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "lectura de blended_rate existente fallo — compute sigue sin merge"
+
+  - id: compute_failed
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "compute del rate fallo"
+
+  - id: patch_failed
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "upsert de blended_rate fallo — queda para la proxima corrida"
+
 connections:
   - { id: t1, from: manual, to: usage }
   - { id: c1, from: compute, to: route }
   - { id: c2, from: route, to: patch, sourcePort: "true" }
   - { id: c3, from: route, to: skipped, sourcePort: "false" }
+  - { id: f1, from: usage, to: usage_failed, condition: "false" }
+  - { id: f2, from: read_existing, to: read_failed, condition: "false" }
+  - { id: f3, from: compute, to: compute_failed, condition: "false" }
+  - { id: f4, from: patch, to: patch_failed, condition: "false" }
 
 outputs:
   has_rate: "${{ steps.compute.outputs.has_rate }}"
