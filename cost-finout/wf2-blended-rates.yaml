@@ -15,10 +15,9 @@ steps:
       schedule: "10 4 * * *"
       timezone: UTC
 
-  # 1. Finout v2 (async generate/poll/results): costo diario por cluster,
-  #    ultimos 8 dias cerrados. GKE: cost center Kubernetes. AKS: Azure por
-  #    resource group mc_* con desglose por servicio para separar networking.
-  - id: finout_costs
+  # 1a/1b. Finout v2 (async): DOS pasos paralelos — cada query tarda varios
+  #        minutos y en serie superan el techo de 10 min del microvm.
+  - id: finout_gke
     type: module
     pluginType: code-exec
     joinStrategy: any
@@ -28,7 +27,7 @@ steps:
     config:
       runtime:
         kind: microvm
-        timeoutMs: 540000
+        timeoutMs: 600000
       network:
         allowedHosts: ["app.finout.io"]
       code: |
@@ -44,7 +43,7 @@ steps:
         async function runQuery(q) {
           const gen = await call("POST", "/v2/data/cost-usage/generate-query", q);
           const qid = gen.data.queryId;
-          for (let i = 0; i < 90; i++) {
+          for (let i = 0; i < 110; i++) {
             const st = (await call("GET", "/v2/data/cost-usage/" + qid + "/status")).data;
             if (st.status === "completed") break;
             if (st.status === "failed" || st.status === "expired") throw new Error("finout query " + st.status);
@@ -60,8 +59,7 @@ steps:
           return rows;
         }
         const DAY = 86400000;
-        const now = Date.now();
-        const endOfYesterday = Math.floor(now / DAY) * DAY; // 00:00 UTC de hoy
+        const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
         const start = endOfYesterday - 8 * DAY;
         const base = {
           date: { unixTimeMillisecondsStart: start, unixTimeMillisecondsEnd: endOfYesterday - 1 },
@@ -69,40 +67,102 @@ steps:
           measurements: [{ type: "unblendedCost", operator: "sum", sortDirection: "descending" }],
           rowLimit: 50000
         };
-        const NET_SERVICES = ["load balancer", "bandwidth", "nat gateway", "virtual network", "vpn gateway", "azure dns", "network watcher"];
+        const q = { ...base, dimensions: [{ costCenter: "Kubernetes", key: "k8s_cluster", type: "kubernetes_resource" }] };
         const costs = {};
-        function add(cluster, day, amt, isNet, source) {
-          const c = costs[cluster] = costs[cluster] || { daily: {}, source };
-          const d = c.daily[day] = c.daily[day] || { total: 0, network: 0 };
-          d.total += amt;
-          if (isNet) d.network += amt;
-        }
-        // GKE: cost center Kubernetes por cluster
-        const qGke = { ...base, dimensions: [{ costCenter: "Kubernetes", key: "k8s_cluster", type: "kubernetes_resource" }] };
-        for (const r of await runQuery(qGke)) {
+        for (const r of await runQuery(q)) {
           const cl = r.Kubernetes_kubernetes_resource_k8s_cluster;
           const day = (r.Day || r.day || "").slice(0, 10);
           if (!cl || !day) continue;
-          add(cl, day, r.unblendedCost_sum || 0, false, "finout_k8s_cluster");
+          const c = costs[cl] = costs[cl] || { daily: {}, source: "finout_k8s_cluster" };
+          const d = c.daily[day] = c.daily[day] || { total: 0, network: 0 };
+          d.total += r.unblendedCost_sum || 0;
         }
-        // AKS: Azure por resource group mc_* x servicio (networking separable)
-        const qAks = { ...base,
+        return { costs, clusters: Object.keys(costs).length };
+
+  - id: finout_aks
+    type: module
+    pluginType: code-exec
+    joinStrategy: any
+    inputs:
+      finoutClientId: "${{ secrets.FINOUT_CLIENT_ID }}"
+      finoutSecretKey: "${{ secrets.FINOUT_SECRET_KEY }}"
+    config:
+      runtime:
+        kind: microvm
+        timeoutMs: 600000
+      network:
+        allowedHosts: ["app.finout.io"]
+      code: |
+        const H = { "x-finout-client-id": inputs.finoutClientId,
+                    "x-finout-secret-key": inputs.finoutSecretKey,
+                    "Content-Type": "application/json" };
+        async function call(method, path, body) {
+          const r = await fetch("https://app.finout.io" + path, { method,
+            headers: H, body: body === undefined ? undefined : JSON.stringify(body) });
+          if (!r.ok) throw new Error(method + " " + path + " -> " + r.status + " " + (await r.text()).slice(0, 200));
+          return r.json();
+        }
+        async function runQuery(q) {
+          const gen = await call("POST", "/v2/data/cost-usage/generate-query", q);
+          const qid = gen.data.queryId;
+          for (let i = 0; i < 110; i++) {
+            const st = (await call("GET", "/v2/data/cost-usage/" + qid + "/status")).data;
+            if (st.status === "completed") break;
+            if (st.status === "failed" || st.status === "expired") throw new Error("finout query " + st.status);
+            await new Promise((r) => setTimeout(r, 4000));
+          }
+          let rows = [], cursor = null;
+          while (true) {
+            const res = await call("GET", "/v2/data/cost-usage/" + qid + "/results?pageSize=10000" + (cursor ? "&cursor=" + cursor : ""));
+            rows = rows.concat(res.data || []);
+            if (!res.pagination || !res.pagination.hasMore) break;
+            cursor = res.pagination.nextCursor;
+          }
+          return rows;
+        }
+        const DAY = 86400000;
+        const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
+        const start = endOfYesterday - 8 * DAY;
+        const base = {
+          date: { unixTimeMillisecondsStart: start, unixTimeMillisecondsEnd: endOfYesterday - 1 },
+          timeInterval: { interval: "day" },
+          measurements: [{ type: "unblendedCost", operator: "sum", sortDirection: "descending" }],
+          rowLimit: 50000
+        };
+        const NET = ["load balancer", "bandwidth", "nat gateway", "virtual network", "vpn gateway", "azure dns", "network watcher"];
+        const q = { ...base,
           dimensions: [
             { costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
             { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }
           ],
           filters: { AND: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "mc_" }] }
         };
-        for (const r of await runQuery(qAks)) {
+        const costs = {};
+        for (const r of await runQuery(q)) {
           const rg = r.Azure_billing_enrichment_resourcegroup || "";
           if (!rg.startsWith("mc_")) continue;
           const cl = rg.slice(3);
           const svc = (r.Azure_billing_dimension_cloud_service || "").toLowerCase();
           const day = (r.Day || r.day || "").slice(0, 10);
           if (!day) continue;
-          const isNet = NET_SERVICES.some((s) => svc.includes(s));
-          add(cl, day, r.unblendedCost_sum || 0, isNet, "finout_azure_rg");
+          const c = costs[cl] = costs[cl] || { daily: {}, source: "finout_azure_rg" };
+          const d = c.daily[day] = c.daily[day] || { total: 0, network: 0 };
+          d.total += r.unblendedCost_sum || 0;
+          if (NET.some((s) => svc.includes(s))) d.network += r.unblendedCost_sum || 0;
         }
+        return { costs, clusters: Object.keys(costs).length };
+
+  # 1c. Merge de ambos mapas de costo (inline, espera a los dos).
+  - id: finout_costs
+    type: module
+    pluginType: code-exec
+    dependsOn: [finout_gke, finout_aks]
+    inputs:
+      gke: "${{ steps.finout_gke.outputs.costs }}"
+      aks: "${{ steps.finout_aks.outputs.costs }}"
+    config:
+      code: |
+        const costs = Object.assign({}, inputs.gke || {}, inputs.aks || {});
         return { costs, clusters_with_cost: Object.keys(costs).length };
 
   # 2. Clusters prod NP: las instancias cluster-* que wf1 dejo en el
@@ -154,5 +214,7 @@ steps:
       message: "blended-rates: ${{ steps.summary.outputs.with_rate }} clusters con rate, ${{ steps.summary.outputs.without_rate }} sin datos (de ${{ steps.summary.outputs.clusters }})"
 
 connections:
-  - { id: t1, from: manual, to: finout_costs }
-  - { id: t2, from: daily, to: finout_costs }
+  - { id: t1, from: manual, to: finout_gke }
+  - { id: t2, from: daily, to: finout_gke }
+  - { id: t3, from: manual, to: finout_aks }
+  - { id: t4, from: daily, to: finout_aks }
