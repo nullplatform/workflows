@@ -1,0 +1,259 @@
+key: cost-finout-scope-costs
+id: cost-finout-scope-costs
+name: "Cost Finout — wf3 Scope Costs"
+description: "Por dia (default: ayer): baja metricas por cluster de Datadog (by kube_deployment), deriva el cluster OBSERVADO de cada scope (fuente de verdad del mapping — detecta migraciones), valua max(uso, reserva) por hora con el blended_rate del cluster y upsertea costo + serie diaria en infrastructure_cost. Corre igual para backfill pasando inputs.date."
+
+inputs:
+  date:
+    type: string
+    required: false
+    description: "Dia UTC a computar (YYYY-MM-DD). Default: ayer."
+
+steps:
+  - id: manual
+    type: trigger
+    pluginType: manual
+    config:
+      description: "Computa costos por scope para un dia (default: ayer). Sirve para backfill."
+      inputs:
+        date:
+          type: string
+          required: false
+          description: "Dia UTC a computar (YYYY-MM-DD)"
+          placeholder: "2026-08-24"
+  - id: daily
+    type: trigger
+    pluginType: cron
+    config:
+      schedule: "10 5 * * *"
+      timezone: UTC
+
+  # Todo el dia en un paso: ~20 clusters x 4 queries DD + ~2800 GET+PATCH al
+  # catalogo caben comodos en un VM con presupuesto de 10 min (HTTP crudo con
+  # concurrencia, sin children — la leccion de wf1 v1-v3).
+  - id: process
+    type: module
+    pluginType: code-exec
+    joinStrategy: any
+    inputs:
+      date: "${{ workflow.inputs.date }}"
+      executionId: "${{ execution.id }}"
+      npApiKey: "${{ secrets.COST_NP_API_KEY }}"
+      ddApiKey: "${{ secrets.DD_API_KEY }}"
+      ddAppKey: "${{ secrets.DD_APPLICATION_KEY }}"
+    config:
+      runtime:
+        kind: microvm
+        timeoutMs: 600000
+      network:
+        allowedHosts: ["api.datadoghq.com", "api.nullplatform.com"]
+      code: |
+        const NP = "https://api.nullplatform.com";
+        const DAYMS = 86400000;
+        // --- dia objetivo (UTC, cerrado) ---
+        let day = (inputs.date || "").trim();
+        if (!day) day = new Date(Date.now() - DAYMS).toISOString().slice(0, 10);
+        const from = Math.floor(Date.parse(day + "T00:00:00Z") / 1000);
+        const to = from + 86400;
+        if (!(from > 0)) throw new Error("fecha invalida: " + day);
+
+        // --- helpers ---
+        const tokResp = await fetch(NP + "/token", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ apikey: inputs.npApiKey }) });
+        if (!tokResp.ok) throw new Error("token mint failed: " + tokResp.status);
+        const H = { Authorization: "Bearer " + (await tokResp.json()).access_token, "Content-Type": "application/json" };
+        const DH = { "DD-API-KEY": inputs.ddApiKey, "DD-APPLICATION-KEY": inputs.ddAppKey };
+        async function dd(query) {
+          const r = await fetch("https://api.datadoghq.com/api/v1/query?from=" + from + "&to=" + to + "&query=" + encodeURIComponent(query), { headers: DH });
+          if (!r.ok) throw new Error("datadog " + r.status + " " + (await r.text()).slice(0, 150));
+          return (await r.json()).series || [];
+        }
+        async function npGet(path) {
+          const r = await fetch(NP + path, { headers: H });
+          if (r.status === 404) return null;
+          if (!r.ok) throw new Error("GET " + path + " -> " + r.status);
+          return r.json();
+        }
+        async function npPatch(path, body) {
+          const r = await fetch(NP + path + "?upsert=true", { method: "PATCH", headers: H, body: JSON.stringify(body) });
+          return r.ok ? null : r.status + " " + (await r.text()).slice(0, 100);
+        }
+        async function mapLimit(arr, limit, fn) {
+          const out = new Array(arr.length);
+          let i = 0;
+          await Promise.all(new Array(Math.min(limit, arr.length)).fill(0).map(async () => {
+            while (i < arr.length) { const idx = i++; out[idx] = await fn(arr[idx]); }
+          }));
+          return out;
+        }
+        function tag(s, k) {
+          for (const t of s.tag_set || []) if (t.startsWith(k + ":")) return t.slice(k.length + 1);
+          return null;
+        }
+        const SCOPE_RE = /-(\d+)-d-\d+$/;
+
+        // --- 1) clusters con workloads NP en el dia ---
+        const clSeries = await dd("sum:kubernetes.cpu.requests{kube_namespace:nullplatform} by {kube_cluster_name}.rollup(avg, 3600)");
+        const clusters = clSeries.map((s) => tag(s, "kube_cluster_name")).filter(Boolean);
+
+        // --- 2) blended rates del dia (fallback: rates vigentes) ---
+        const rates = {};
+        await mapLimit(clusters, 6, async (cl) => {
+          const inst = await npGet("/catalog/instances/blended_rate/" + encodeURIComponent(cl));
+          if (!inst) return;
+          let cpu = inst.rates && inst.rates.cpu_usd_core_hour;
+          let mem = inst.rates && inst.rates.mem_usd_gb_hour;
+          for (const p of inst.daily || []) if (p.d === day) { cpu = p.cpu_usd_core_hour; mem = p.mem_usd_gb_hour; }
+          if (cpu > 0 && mem > 0) rates[cl] = { cpu, mem };
+        });
+
+        // --- 3) metricas por cluster: series horarias por kube_deployment ---
+        // por scope: puntos horarios de req/uso cpu y mem
+        const byScope = {};
+        let unknownSeries = 0;
+        const METRICS = [
+          ["kubernetes.cpu.requests", "cpuReq", 1],
+          ["kubernetes.cpu.usage.total", "cpuUse", 1e-9],           // nanocores → cores
+          ["kubernetes.memory.requests", "memReq", 1 / 1073741824], // bytes → GB
+          ["kubernetes.memory.working_set", "memUse", 1 / 1073741824]
+        ];
+        await mapLimit(clusters, 3, async (cl) => {
+          for (const [metric, field, factor] of METRICS) {
+            const series = await dd("sum:" + metric + "{kube_cluster_name:" + cl + ",kube_namespace:nullplatform} by {kube_deployment}.rollup(avg, 3600)");
+            for (const s of series) {
+              const dep = tag(s, "kube_deployment") || "";
+              const m = dep.match(SCOPE_RE);
+              if (!m) { unknownSeries++; continue; }
+              const sid = m[1];
+              const sc = byScope[sid] = byScope[sid] || { cluster: cl, hours: {} };
+              sc.cluster = cl; // el ultimo gana; un scope no deberia reportar en 2 clusters el mismo dia
+              for (const [ts, v] of s.pointlist || []) {
+                if (v == null) continue;
+                const h = sc.hours[ts] = sc.hours[ts] || {};
+                h[field] = (h[field] || 0) + v * factor;
+              }
+            }
+          }
+        });
+
+        // --- 4) valuar + upsert por scope ---
+        const REGION = { gcp: "southamerica-west1", azure: "eastus2" };
+        let costed = 0, moved = 0, noRate = 0, notInCenso = 0, errors = [];
+        let orgCost = 0;
+        const scopeIds = Object.keys(byScope);
+        const clusterAgg = {};
+        await mapLimit(scopeIds, 10, async (sid) => {
+          const sc = byScope[sid];
+          const rate = rates[sc.cluster];
+          if (!rate) { noRate++; return; }
+          let reqCpuH = 0, useCpuH = 0, reqMemH = 0, useMemH = 0, total = 0, usage = 0;
+          for (const ts of Object.keys(sc.hours)) {
+            const h = sc.hours[ts];
+            const cpuReq = h.cpuReq || 0, cpuUse = h.cpuUse || 0, memReq = h.memReq || 0, memUse = h.memUse || 0;
+            reqCpuH += cpuReq; useCpuH += cpuUse; reqMemH += memReq; useMemH += memUse;
+            total += Math.max(cpuReq, cpuUse) * rate.cpu + Math.max(memReq, memUse) * rate.mem;
+            usage += cpuUse * rate.cpu + memUse * rate.mem;
+          }
+          const inst = await npGet("/catalog/instances/infrastructure_cost/scope-" + sid);
+          if (!inst) { notInCenso++; return; }
+          const prevRef = inst.infrastructure_reference || {};
+          if (prevRef.id && prevRef.id !== sc.cluster) moved++;
+          const dims = inst.dimensions || {};
+          const cloud = (dims.cloud || "").startsWith("gcp") ? "gcp" : (dims.cloud || "").startsWith("azure") ? "azure" : (dims.cloud || "").startsWith("oci") ? "oci" : null;
+          // serie diaria: merge por fecha, FIFO 365
+          const byDate = {};
+          for (const p of inst.daily || []) if (p && p.d) byDate[p.d] = p;
+          byDate[day] = {
+            d: day, cost_usd: total, usage_usd: usage, waste_usd: total - usage,
+            cpu_req_core_h: reqCpuH, cpu_used_core_h: useCpuH,
+            mem_req_gb_h: reqMemH, mem_used_gb_h: useMemH,
+            pods_min: null, pods_max: null, pods_avg: null,
+            allocation: "blended"
+          };
+          const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+          const now = new Date();
+          const last7 = daily.slice(-7).reduce((a, p) => a + (p.cost_usd || 0), 0);
+          const last30 = daily.slice(-30).reduce((a, p) => a + (p.cost_usd || 0), 0);
+          const err = await npPatch("/catalog/instances/infrastructure_cost/scope-" + sid, {
+            id: "scope-" + sid,
+            infrastructure_reference: {
+              kind: "k8s_cluster", id: sc.cluster, name: sc.cluster,
+              cloud_provider: cloud, region: cloud ? REGION[cloud] || null : null,
+              attributes: { k8s_namespace: "nullplatform", source: "observed", observed_at: day }
+            },
+            rate_ref: sc.cluster,
+            cost: { total_usd: total, usage_usd: usage, waste_usd: total - usage,
+                    currency: "USD", allocation: "blended" },
+            cost_7d_usd: last7, cost_30d_usd: last30,
+            usage: {
+              cpu_req_core_h: reqCpuH, cpu_used_core_h: useCpuH,
+              mem_req_gb_h: reqMemH, mem_used_gb_h: useMemH,
+              cpu_utilization_pct: reqCpuH > 0 ? Math.round((useCpuH / reqCpuH) * 100) : null,
+              mem_utilization_pct: reqMemH > 0 ? Math.round((useMemH / reqMemH) * 100) : null,
+              pods_min: null, pods_max: null, pods_avg: null
+            },
+            daily,
+            sources: { finout: true, datadog: true, computed_at: now.toISOString(),
+                       workflow_execution_id: inputs.executionId || null }
+          });
+          if (err) { if (errors.length < 5) errors.push("scope-" + sid + " " + err); return; }
+          costed++; orgCost += total;
+          const ca = clusterAgg[sc.cluster] = clusterAgg[sc.cluster] || { total: 0, usage: 0, scopes: 0, dims: {} };
+          ca.total += total; ca.usage += usage; ca.scopes++;
+          const dk = JSON.stringify(dims);
+          ca.dims[dk] = (ca.dims[dk] || 0) + 1;
+        });
+
+        // --- 5) instancias cluster-*: agregado del dia + dims mayoritarias ---
+        await mapLimit(Object.keys(clusterAgg), 6, async (cl) => {
+          const ca = clusterAgg[cl];
+          const topDims = JSON.parse(Object.entries(ca.dims).sort((a, b) => b[1] - a[1])[0][0]);
+          const cloud = (topDims.cloud || "").startsWith("gcp") ? "gcp" : (topDims.cloud || "").startsWith("azure") ? "azure" : null;
+          const inst = await npGet("/catalog/instances/infrastructure_cost/cluster-" + encodeURIComponent(cl));
+          const byDate = {};
+          for (const p of (inst && inst.daily) || []) if (p && p.d) byDate[p.d] = p;
+          byDate[day] = { d: day, cost_usd: ca.total, usage_usd: ca.usage, waste_usd: ca.total - ca.usage,
+                          cpu_req_core_h: null, cpu_used_core_h: null, mem_req_gb_h: null, mem_used_gb_h: null,
+                          pods_min: null, pods_max: null, pods_avg: null, allocation: "blended" };
+          const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+          await npPatch("/catalog/instances/infrastructure_cost/cluster-" + encodeURIComponent(cl), {
+            id: "cluster-" + cl, entity_type: "cluster", entity_name: cl,
+            dimensions: topDims,
+            infrastructure_reference: { kind: "k8s_cluster", id: cl, name: cl,
+              cloud_provider: cloud, region: cloud === "gcp" ? "southamerica-west1" : cloud === "azure" ? "eastus2" : null,
+              attributes: { k8s_namespace: "nullplatform", source: "observed", observed_at: day } },
+            rate_ref: cl,
+            cost: { total_usd: ca.total, usage_usd: ca.usage, waste_usd: ca.total - ca.usage,
+                    currency: "USD", allocation: "blended" },
+            daily,
+            sources: { finout: true, datadog: true, computed_at: new Date().toISOString(),
+                       workflow_execution_id: inputs.executionId || null }
+          });
+        });
+
+        return {
+          date: day,
+          clusters_seen: clusters.length,
+          clusters_with_rate: Object.keys(rates).length,
+          scopes_observed: scopeIds.length,
+          scopes_costed: costed,
+          scopes_moved: moved,
+          scopes_sin_rate: noRate,
+          scopes_fuera_censo: notInCenso,
+          series_no_parseables: unknownSeries,
+          org_cost_usd_day: Math.round(orgCost * 100) / 100,
+          errors
+        };
+
+  - id: report
+    type: module
+    pluginType: log
+    dependsOn: [process]
+    config:
+      level: info
+      message: "scope-costs ${{ steps.process.outputs.date }}: ${{ steps.process.outputs.scopes_costed }} scopes valuados (USD ${{ steps.process.outputs.org_cost_usd_day }}/dia) en ${{ steps.process.outputs.clusters_with_rate }}/${{ steps.process.outputs.clusters_seen }} clusters con rate | migraciones detectadas: ${{ steps.process.outputs.scopes_moved }} | sin rate: ${{ steps.process.outputs.scopes_sin_rate }} | fuera de censo: ${{ steps.process.outputs.scopes_fuera_censo }}"
+
+connections:
+  - { id: t1, from: manual, to: process }
+  - { id: t2, from: daily, to: process }

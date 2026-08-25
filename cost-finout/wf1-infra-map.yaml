@@ -1,7 +1,7 @@
 key: cost-finout-infra-map
 id: cost-finout-infra-map
-name: "Cost Finout — wf1 Infra Map"
-description: "Mapeo diario scope→cluster+dimensiones (prod, clusters NP GKE/AKS). Patron canonico: lake-query emite items → sub-workflow fan-out por scope (child cost-finout-upsert-scope) → summary. Los montos los escribe wf3."
+name: "Cost Finout — wf1 Censo de Sujetos"
+description: "Diario: censo de scopes prod en k8s NP → upsert de la parte de SUJETO de infrastructure_cost (entity/nrn/dims/denormalizados). SIN cluster: el mapping scope→cluster es OBSERVADO y lo escribe wf3 desde Datadog (source: observed). Sin children ni VMs: lake emite items y np-api-call fan-outea el PATCH."
 
 steps:
   - id: manual
@@ -15,144 +15,53 @@ steps:
       schedule: "10 3 * * *"
       timezone: UTC
 
-  # 1. Providers k8s + runtime configs → tabla de resolucion (chica, viaja a
-  #    cada child). Tambien upsertea las instancias cluster-* (son ~25).
-  - id: plan_providers
-    type: module
-    pluginType: code-exec
-    joinStrategy: any
-    inputs:
-      npApiKey: "${{ secrets.COST_NP_API_KEY }}"
-    config:
-      runtime:
-        kind: microvm
-        timeoutMs: 300000
-      network:
-        allowedHosts: ["api.nullplatform.com"]
-      code: |
-        const BASE = "https://api.nullplatform.com";
-        const ORG = "987889794";
-        const tr = await fetch(BASE + "/token", { method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ apikey: inputs.npApiKey }) });
-        if (!tr.ok) throw new Error("token mint failed: " + tr.status);
-        const H = { Authorization: "Bearer " + (await tr.json()).access_token, "Content-Type": "application/json" };
-        async function get(path) {
-          const r = await fetch(BASE + path, { headers: H });
-          if (!r.ok) throw new Error("GET " + path + " -> " + r.status);
-          return r.json();
-        }
-        async function mapLimit(arr, limit, fn) {
-          const out = new Array(arr.length);
-          let i = 0;
-          await Promise.all(new Array(Math.min(limit, arr.length)).fill(0).map(async () => {
-            while (i < arr.length) { const idx = i++; out[idx] = await fn(arr[idx]); }
-          }));
-          return out;
-        }
-        const specsResp = await get("/provider_specification?limit=100");
-        const specSlug = {};
-        for (const s of specsResp.results || []) specSlug[s.id] = s.slug;
-        const CLOUD_OF = { "gke-configuration": "gcp", "aks-configuration": "azure" };
-        let provs = [], off = 0;
-        while (true) {
-          const page = await get("/provider?nrn=organization=" + ORG + "&show_descendants=true&limit=200&offset=" + off);
-          const rs = page.results || [];
-          provs = provs.concat(rs);
-          if (rs.length < 200) break;
-          off += 200;
-        }
-        const k8sProvs = provs.filter((p) => CLOUD_OF[specSlug[p.specification_id]]);
-        let resolved = (await mapLimit(k8sProvs, 10, async (p) => {
-          const key = p.data_source && p.data_source.key;
-          if (!key) return null;
-          try {
-            const rc = await get("/runtime_configuration/" + key);
-            const k8s = ((rc && rc.values) || {}).k8s || {};
-            if (!k8s.clusterId) return null;
-            return { nrn: p.nrn, dims: p.dimensions || {}, spec: specSlug[p.specification_id],
-                     cluster: k8s.clusterId, ns: k8s.namespace || "nullplatform" };
-          } catch (e) { return null; }
-        })).filter(Boolean);
-        // dieta: los children solo mapean scopes prod — los providers uat sobran
-        resolved = resolved.filter((c) => !c.dims.environment || c.dims.environment === "prod");
-
-        // upsert de instancias cluster-* (solo combos prod con dims completos)
-        const REGION = { "gcp-sawest-1": "southamerica-west1", "azure-eastus-2": "eastus2" };
-        const clusters = {};
-        for (const c of resolved) {
-          if (c.dims.environment !== "prod") continue;
-          clusters[c.cluster] = clusters[c.cluster] || {
-            id: "cluster-" + c.cluster, entity_type: "cluster", entity_name: c.cluster,
-            dimensions: { cloud: c.dims.cloud || null, country: c.dims.country || null, environment: "prod" },
-            infrastructure_reference: { kind: "k8s_cluster", id: c.cluster, name: c.cluster,
-                     cloud_provider: CLOUD_OF[c.spec], region: REGION[c.dims.cloud] || null,
-                     attributes: { k8s_namespace: c.ns, provider_spec: c.spec } }
-          };
-        }
-        let clusterUpserts = 0;
-        for (const doc of Object.values(clusters)) {
-          const r = await fetch(BASE + "/catalog/instances/infrastructure_cost/" + encodeURIComponent(doc.id) + "?upsert=true",
-            { method: "PATCH", headers: H, body: JSON.stringify(doc) });
-          if (r.ok) clusterUpserts++;
-        }
-        return { providers: resolved, provider_count: resolved.length,
-                 cluster_upserts: clusterUpserts, cluster_count: Object.keys(clusters).length };
-
-  # 2. Scopes prod activos en GKE/AKS con dimensiones y jerarquia — una fila
-  #    por scope, emitidas como items.
+  # 1. Scopes prod activos en GKE/AKS con dimensiones y jerarquia — una fila
+  #    por scope, emitida como item (ids casteados a string en SQL: el schema
+  #    los declara string y el catalogo no coerciona).
   - id: list_scopes
     type: module
     pluginType: np-lake-query
-    dependsOn: [plan_providers]
+    joinStrategy: any
     config:
       apiKey: "${{ secrets.COST_NP_API_KEY }}"
       maxRows: 10000
-      sql: "SELECT s.id id, s.name name, s.provider provider, s.nrn nrn, s.application_id app_id, app.app_name app_name, app.namespace_id ns_id, n.account_id acc_id, a.account_name acc_name, maxIf(sd.value_slug, sd.dimension_slug='cloud') cloud, maxIf(sd.value_slug, sd.dimension_slug='country') country, maxIf(sd.value_slug, sd.dimension_slug='environment') environment FROM core_entities_scope AS s FINAL JOIN core_entities_application AS app FINAL ON s.application_id = app.app_id JOIN core_entities_namespace AS n FINAL ON app.namespace_id = n.namespace_id JOIN core_entities_account AS a FINAL ON n.account_id = a.account_id JOIN core_entities_scope_dimension AS sd FINAL ON sd.scope_id = s.id WHERE s._deleted=0 AND s.status='active' AND sd._deleted=0 AND s.provider IN ('GOOGLE:WEB_POOL:GKE','AZURE:WEB_POOL:AKS') GROUP BY id, name, provider, nrn, app_id, app_name, ns_id, acc_id, acc_name HAVING environment='prod'"
+      sql: "SELECT toString(s.id) id, s.name name, s.provider provider, s.nrn nrn, toString(s.application_id) app_id, app.app_name app_name, toString(app.namespace_id) ns_id, toString(n.account_id) acc_id, a.account_name acc_name, maxIf(sd.value_slug, sd.dimension_slug='cloud') cloud, maxIf(sd.value_slug, sd.dimension_slug='country') country, maxIf(sd.value_slug, sd.dimension_slug='environment') environment FROM core_entities_scope AS s FINAL JOIN core_entities_application AS app FINAL ON s.application_id = app.app_id JOIN core_entities_namespace AS n FINAL ON app.namespace_id = n.namespace_id JOIN core_entities_account AS a FINAL ON n.account_id = a.account_id JOIN core_entities_scope_dimension AS sd FINAL ON sd.scope_id = s.id WHERE s._deleted=0 AND s.status='active' AND sd._deleted=0 AND s.provider IN ('GOOGLE:WEB_POOL:GKE','AZURE:WEB_POOL:AKS') GROUP BY id, name, provider, nrn, app_id, app_name, ns_id, acc_id, acc_name HAVING environment='prod'"
 
-  # 3. Fan-out: un child por scope (resolucion + upsert, sin VM).
-  - id: upsert_scope
+  # 2. Upsert por scope: fan-out por item, PATCH parcial (solo campos de
+  #    sujeto — merge top-level preserva lo de wf3).
+  #    TERMINAL A PROPOSITO: los ~2800 response bodies no deben viajar como
+  #    items a un paso siguiente (cap de payload de activity — poison pill).
+  #    El resumen vive en metadata.fanOut del step (done/total/failed).
+  - id: upsert
     type: module
-    pluginType: sub-workflow
+    pluginType: np-api-call
     dependsOn: [list_scopes]
+    metadata:
+      fanOutPerItem: true
     inputs:
-      scope: "${{ $item }}"
-      providers: "${{ steps.plan_providers.outputs.providers }}"
+      path: "/catalog/instances/infrastructure_cost/scope-${{ $item.id }}"
+      body:
+        id: "scope-${{ $item.id }}"
+        entity_type: scope
+        entity_id: "${{ $item.id }}"
+        nrn: "${{ $item.nrn }}"
+        entity_name: "${{ $item.acc_name }}/${{ $item.app_name }}/${{ $item.name }}"
+        application_id: "${{ $item.app_id }}"
+        account_id: "${{ $item.acc_id }}"
+        namespace_id: "${{ $item.ns_id }}"
+        dimensions:
+          cloud: "${{ $item.cloud }}"
+          country: "${{ $item.country }}"
+          environment: "${{ $item.environment }}"
     config:
-      workflowId: wf_2gSIis0J3QQz  # cost-finout-upsert-scope
-      alias: live
-      maxParallelism: 5
-
-  # 4. Resumen agregado de los resultados de todos los children.
-  - id: summary
-    type: module
-    pluginType: code-exec
-    dependsOn: [upsert_scope]
-    config:
-      code: |
-        const rows = $items || [];
-        const mapped = rows.filter((r) => r && r.mapped === true);
-        const upserted = mapped.filter((r) => (r.s1 && r.s1 < 300) || (r.s2 && r.s2 < 300)).length;
-        const clusters = {};
-        for (const r of mapped) if (r.cluster) clusters[r.cluster] = (clusters[r.cluster] || 0) + 1;
-        return {
-          children: rows.length,
-          mapped: mapped.length,
-          upserted,
-          upsert_failed: mapped.length - upserted,
-          unmapped: rows.length - mapped.length,
-          clusters: Object.keys(clusters).length,
-          by_cluster: clusters
-        };
-
-  - id: report
-    type: module
-    pluginType: log
-    dependsOn: [summary]
-    config:
-      level: info
-      message: "infra-map: ${{ steps.summary.outputs.upserted }} upserts ok / ${{ steps.summary.outputs.mapped }} mapeados en ${{ steps.summary.outputs.clusters }} clusters (${{ steps.summary.outputs.unmapped }} sin mapear, ${{ steps.summary.outputs.upsert_failed }} upserts fallidos, de ${{ steps.summary.outputs.children }})"
+      method: PATCH
+      path: "/catalog/instances/infrastructure_cost/placeholder"
+      query:
+        upsert: "true"
+      apiKey: "${{ secrets.COST_NP_API_KEY }}"
+      failOnHttpError: false
+      timeoutMs: 20000
 
 connections:
-  - { id: t1, from: manual, to: plan_providers }
-  - { id: t2, from: daily, to: plan_providers }
+  - { id: t1, from: manual, to: list_scopes }
+  - { id: t2, from: daily, to: list_scopes }
