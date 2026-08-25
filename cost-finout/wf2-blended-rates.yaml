@@ -1,0 +1,153 @@
+key: cost-finout-blended-rates
+id: cost-finout-blended-rates
+name: "Cost Finout — wf2 Blended Rates"
+description: "Diario: costo por cluster NP desde Finout (GKE via cost center Kubernetes; AKS via resource groups mc_* con split de networking) + lista de clusters prod desde providers API → fan-out de un child por cluster (cost-finout-rate-cluster) que calcula $/core-hora y $/GB-hora contra reservas Datadog."
+
+triggers:
+  - id: manual
+    type: trigger
+    pluginType: manual
+    config: {}
+  - id: daily
+    type: trigger
+    pluginType: cron
+    config:
+      schedule: "10 4 * * *"
+      timezone: UTC
+
+steps:
+  # 1. Finout v2 (async generate/poll/results): costo diario por cluster,
+  #    ultimos 8 dias cerrados. GKE: cost center Kubernetes. AKS: Azure por
+  #    resource group mc_* con desglose por servicio para separar networking.
+  - id: finout_costs
+    type: module
+    pluginType: code-exec
+    inputs:
+      finoutClientId: "${{ secrets.FINOUT_CLIENT_ID }}"
+      finoutSecretKey: "${{ secrets.FINOUT_SECRET_KEY }}"
+    config:
+      executionConfig:
+        timeoutMs: 540000
+      network:
+        allowedHosts: ["app.finout.io"]
+      code: |
+        const H = { "x-finout-client-id": inputs.finoutClientId,
+                    "x-finout-secret-key": inputs.finoutSecretKey,
+                    "Content-Type": "application/json" };
+        async function call(method, path, body) {
+          const r = await fetch("https://app.finout.io" + path, { method,
+            headers: H, body: body === undefined ? undefined : JSON.stringify(body) });
+          if (!r.ok) throw new Error(method + " " + path + " -> " + r.status + " " + (await r.text()).slice(0, 200));
+          return r.json();
+        }
+        async function runQuery(q) {
+          const gen = await call("POST", "/v2/data/cost-usage/generate-query", q);
+          const qid = gen.data.queryId;
+          for (let i = 0; i < 90; i++) {
+            const st = (await call("GET", "/v2/data/cost-usage/" + qid + "/status")).data;
+            if (st.status === "completed") break;
+            if (st.status === "failed" || st.status === "expired") throw new Error("finout query " + st.status);
+            await new Promise((r) => setTimeout(r, 4000));
+          }
+          let rows = [], cursor = null;
+          while (true) {
+            const res = await call("GET", "/v2/data/cost-usage/" + qid + "/results?pageSize=10000" + (cursor ? "&cursor=" + cursor : ""));
+            rows = rows.concat(res.data || []);
+            if (!res.pagination || !res.pagination.hasMore) break;
+            cursor = res.pagination.nextCursor;
+          }
+          return rows;
+        }
+        const DAY = 86400000;
+        const now = Date.now();
+        const endOfYesterday = Math.floor(now / DAY) * DAY; // 00:00 UTC de hoy
+        const start = endOfYesterday - 8 * DAY;
+        const base = {
+          date: { unixTimeMillisecondsStart: start, unixTimeMillisecondsEnd: endOfYesterday - 1 },
+          timeInterval: { interval: "day" },
+          measurements: [{ type: "unblendedCost", operator: "sum", sortDirection: "descending" }],
+          rowLimit: 50000
+        };
+        const NET_SERVICES = ["load balancer", "bandwidth", "nat gateway", "virtual network", "vpn gateway", "azure dns", "network watcher"];
+        const costs = {};
+        function add(cluster, day, amt, isNet, source) {
+          const c = costs[cluster] = costs[cluster] || { daily: {}, source };
+          const d = c.daily[day] = c.daily[day] || { total: 0, network: 0 };
+          d.total += amt;
+          if (isNet) d.network += amt;
+        }
+        // GKE: cost center Kubernetes por cluster
+        const qGke = { ...base, dimensions: [{ costCenter: "Kubernetes", key: "k8s_cluster", type: "kubernetes_resource" }] };
+        for (const r of await runQuery(qGke)) {
+          const cl = r.Kubernetes_kubernetes_resource_k8s_cluster;
+          const day = (r.Day || r.day || "").slice(0, 10);
+          if (!cl || !day) continue;
+          add(cl, day, r.unblendedCost_sum || 0, false, "finout_k8s_cluster");
+        }
+        // AKS: Azure por resource group mc_* x servicio (networking separable)
+        const qAks = { ...base,
+          dimensions: [
+            { costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
+            { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }
+          ],
+          filters: { AND: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "mc_" }] }
+        };
+        for (const r of await runQuery(qAks)) {
+          const rg = r.Azure_billing_enrichment_resourcegroup || "";
+          if (!rg.startsWith("mc_")) continue;
+          const cl = rg.slice(3);
+          const svc = (r.Azure_billing_dimension_cloud_service || "").toLowerCase();
+          const day = (r.Day || r.day || "").slice(0, 10);
+          if (!day) continue;
+          const isNet = NET_SERVICES.some((s) => svc.includes(s));
+          add(cl, day, r.unblendedCost_sum || 0, isNet, "finout_azure_rg");
+        }
+        return { costs, clusters_with_cost: Object.keys(costs).length };
+
+  # 2. Clusters prod NP: las instancias cluster-* que wf1 dejo en el
+  #    catalogo, espejadas al lake (data spine — si wf1 no corrio, no hay filas).
+  - id: list_clusters
+    type: module
+    pluginType: np-lake-query
+    dependsOn: [finout_costs]
+    config:
+      apiKey: "${{ secrets.COST_NP_API_KEY }}"
+      maxRows: 500
+      sql: "SELECT JSONExtractString(e.data,'entity_name') cluster, JSONExtractString(e.data,'infra','provider_spec') spec, JSONExtractString(e.data,'dimensions','cloud') cloud, JSONExtractString(e.data,'dimensions','country') country FROM catalog_entities AS e FINAL JOIN catalog_entity_specifications AS sp FINAL ON e.entity_specification_id = sp.id WHERE e._deleted=0 AND e.deleted_at IS NULL AND sp._deleted=0 AND sp.slug='infrastructure_cost' AND JSONExtractString(e.data,'entity_type')='cluster'"
+
+  # 3. Un child por cluster: DD reservas + calculo + upsert blended_rate.
+  - id: rate_cluster
+    type: module
+    pluginType: sub-workflow
+    dependsOn: [list_clusters]
+    inputs:
+      cluster: "${{ $item }}"
+      costs: "${{ steps.finout_costs.outputs.costs }}"
+    config:
+      workflowId: wf_UbxSTqKz9XS8  # cost-finout-rate-cluster
+      alias: live
+      maxParallelism: 4
+
+  # 4. Resumen.
+  - id: summary
+    type: module
+    pluginType: code-exec
+    dependsOn: [rate_cluster]
+    config:
+      code: |
+        const rows = $items || [];
+        const ok = rows.filter((r) => r && r.has_rate === true);
+        return {
+          clusters: rows.length,
+          with_rate: ok.length,
+          without_rate: rows.length - ok.length,
+          rated: ok.map((r) => r.cluster)
+        };
+
+  - id: report
+    type: module
+    pluginType: log
+    dependsOn: [summary]
+    config:
+      level: info
+      message: "blended-rates: ${{ steps.summary.outputs.with_rate }} clusters con rate, ${{ steps.summary.outputs.without_rate }} sin datos (de ${{ steps.summary.outputs.clusters }})"

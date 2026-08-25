@@ -1,0 +1,94 @@
+key: cost-finout-upsert-scope
+id: cost-finout-upsert-scope
+name: "Cost Finout — wf1b Upsert Scope (child)"
+description: "Child de wf1: resuelve el cluster de UN scope (tabla de providers en inputs) y upsertea su instancia infrastructure_cost. Sin VMs: resolucion inline + np-api-call."
+
+triggers:
+  - id: manual
+    type: trigger
+    pluginType: manual
+    config: {}
+
+steps:
+  # Resolucion pura (inline, sin red): provider mas especifico por
+  # (prefijo de NRN × dimensiones) → cluster + cuerpo del upsert.
+  - id: resolve
+    type: module
+    pluginType: code-exec
+    inputs:
+      scope: "${{ workflow.inputs.scope }}"
+      providers: "${{ workflow.inputs.providers }}"
+    config:
+      code: |
+        const s = inputs.scope || {};
+        const providers = inputs.providers || [];
+        const PROVIDER_MATCH = { "GOOGLE:WEB_POOL:GKE": "gke-configuration", "AZURE:WEB_POOL:AKS": "aks-configuration" };
+        const CLOUD_OF = { "gke-configuration": "gcp", "aks-configuration": "azure", "oke": "oci" };
+        const REGION = { "gcp-sawest-1": "southamerica-west1", "azure-eastus-2": "eastus2", "oci-sa-santiago-1": "sa-santiago-1" };
+        const dims = { cloud: s.cloud || null, country: s.country || null, environment: s.environment || null };
+        const wantSpec = PROVIDER_MATCH[s.provider];
+        let best = null, bestDepth = -1, bestDims = -1;
+        for (const c of providers) {
+          if (c.spec !== wantSpec) continue;
+          if (!(s.nrn + ":").startsWith(c.nrn + ":") && c.nrn.indexOf(":") >= 0) continue;
+          const entries = Object.entries(c.dims || {});
+          let ok = true;
+          for (const [k, v] of entries) if (dims[k] !== v) { ok = false; break; }
+          if (!ok) continue;
+          const depth = c.nrn.split(":").length;
+          if (depth > bestDepth || (depth === bestDepth && entries.length > bestDims)) {
+            best = c; bestDepth = depth; bestDims = entries.length;
+          }
+        }
+        if (!best) return { mapped: false, scope_id: s.id, scope_name: s.name };
+        return {
+          mapped: true,
+          scope_id: s.id,
+          cluster: best.cluster,
+          path: "/catalog/instances/infrastructure_cost/scope-" + s.id,
+          body: {
+            id: "scope-" + s.id, entity_type: "scope", entity_id: String(s.id), nrn: s.nrn,
+            entity_name: s.acc_name + "/" + s.app_name + "/" + s.name,
+            application_id: String(s.app_id), account_id: String(s.acc_id), namespace_id: String(s.ns_id),
+            dimensions: dims,
+            infra: { cluster: best.cluster, cloud_provider: CLOUD_OF[best.spec], region: REGION[dims.cloud] || null,
+                     k8s_namespace: best.ns || "nullplatform", provider_spec: best.spec },
+            rate_ref: best.cluster
+          }
+        };
+
+  - id: route
+    type: decider
+    pluginType: conditional
+    config:
+      expression: "steps.resolve.outputs.mapped == true"
+
+  - id: patch
+    type: module
+    pluginType: np-api-call
+    inputs:
+      path: "${{ steps.resolve.outputs.path }}"
+      body: "${{ steps.resolve.outputs.body }}"
+    config:
+      method: PATCH
+      path: "/catalog/instances/infrastructure_cost/placeholder"
+      query:
+        upsert: "true"
+      apiKey: "${{ secrets.COST_NP_API_KEY }}"
+      failOnHttpError: true
+
+  - id: skipped
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "scope sin cluster resoluble: ${{ steps.resolve.outputs.scope_id }} ${{ steps.resolve.outputs.scope_name }}"
+
+connections:
+  - { id: c1, from: resolve, to: route }
+  - { id: c2, from: route, to: patch, sourcePort: "true" }
+  - { id: c3, from: route, to: skipped, sourcePort: "false" }
+
+outputs:
+  mapped: "${{ steps.resolve.outputs.mapped }}"
+  cluster: "${{ steps.resolve.outputs.cluster }}"

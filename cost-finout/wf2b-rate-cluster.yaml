@@ -1,0 +1,170 @@
+key: cost-finout-rate-cluster
+id: cost-finout-rate-cluster
+name: "Cost Finout — wf2b Rate Cluster (child)"
+description: "Child de wf2: para UN cluster prod NP calcula el blended rate (costo Finout del cluster ÷ reservas Datadog) y upsertea blended_rate con serie diaria mergeada. Cluster sin datos DD o sin costo → skip logueado (no dividimos por ~0)."
+
+triggers:
+  - id: manual
+    type: trigger
+    pluginType: manual
+    config: {}
+
+steps:
+  # 1. Reservas del cluster en Datadog (cores y GB promedios de la ventana).
+  - id: usage
+    type: module
+    pluginType: code-exec
+    inputs:
+      cluster: "${{ workflow.inputs.cluster }}"
+      ddApiKey: "${{ secrets.DD_API_KEY }}"
+      ddAppKey: "${{ secrets.DD_APPLICATION_KEY }}"
+    config:
+      executionConfig:
+        timeoutMs: 120000
+      network:
+        allowedHosts: ["api.datadoghq.com"]
+      code: |
+        const cl = inputs.cluster.cluster;
+        const WINDOW_DAYS = 7;
+        const now = Math.floor(Date.now() / 1000);
+        const from = now - WINDOW_DAYS * 86400;
+        const H = { "DD-API-KEY": inputs.ddApiKey, "DD-APPLICATION-KEY": inputs.ddAppKey };
+        async function q(metric) {
+          const query = "sum:" + metric + "{kube_cluster_name:" + cl + "}.rollup(avg, 3600)";
+          const r = await fetch("https://api.datadoghq.com/api/v1/query?from=" + from + "&to=" + now + "&query=" + encodeURIComponent(query), { headers: H });
+          if (!r.ok) throw new Error("datadog " + r.status);
+          const j = await r.json();
+          const pts = ((j.series || [])[0] || {}).pointlist || [];
+          const vals = pts.map((p) => p[1]).filter((v) => v != null);
+          if (!vals.length) return null;
+          return vals.reduce((a, b) => a + b, 0) / vals.length;
+        }
+        const cores = await q("kubernetes.cpu.requests");
+        const memBytes = await q("kubernetes.memory.requests");
+        if (cores == null || memBytes == null || cores <= 0) {
+          return { has_usage: false, cluster: cl };
+        }
+        return {
+          has_usage: true, cluster: cl,
+          cpu_alloc_core_h_day: cores * 24,
+          mem_alloc_gb_h_day: (memBytes / 1073741824) * 24,
+          window_days: WINDOW_DAYS
+        };
+
+  # 2. Instancia blended_rate existente (para mergear la serie diaria).
+  - id: read_existing
+    type: module
+    pluginType: np-api-call
+    dependsOn: [usage]
+    inputs:
+      path: "/catalog/instances/blended_rate/${{ workflow.inputs.cluster.cluster }}"
+    config:
+      method: GET
+      path: "/catalog/instances/blended_rate/placeholder"
+      apiKey: "${{ secrets.COST_NP_API_KEY }}"
+      failOnHttpError: false
+
+  # 3. Calculo del rate + merge de la serie (inline, sin red).
+  - id: compute
+    type: module
+    pluginType: code-exec
+    dependsOn: [read_existing]
+    inputs:
+      cluster: "${{ workflow.inputs.cluster }}"
+      costs: "${{ workflow.inputs.costs }}"
+      usage: "${{ steps.usage.outputs }}"
+      existing: "${{ steps.read_existing.outputs }}"
+    config:
+      code: |
+        const c = inputs.cluster;
+        const cl = c.cluster;
+        const dims = { cloud: c.cloud || null, country: c.country || null, environment: "prod" };
+        const u = inputs.usage || {};
+        const cost = (inputs.costs || {})[cl];
+        if (!u.has_usage || !cost || !Object.keys(cost.daily || {}).length) {
+          return { has_rate: false, cluster: cl,
+                   reason: !u.has_usage ? "sin datos de reservas en Datadog" : "sin costo en Finout" };
+        }
+        const days = Object.keys(cost.daily).sort();
+        const totals = days.map((d) => cost.daily[d].total || 0);
+        const nets = days.map((d) => cost.daily[d].network || 0);
+        const costDay = totals.reduce((a, b) => a + b, 0) / days.length;
+        const netDay = nets.reduce((a, b) => a + b, 0) / days.length;
+        // split cpu/mem por ratio de precio vCPU:GB tipico (7:1)
+        const R = 7;
+        const wCpu = (R * u.cpu_alloc_core_h_day) / (R * u.cpu_alloc_core_h_day + u.mem_alloc_gb_h_day);
+        const cpuRate = (costDay * wCpu) / u.cpu_alloc_core_h_day;
+        const memRate = (costDay * (1 - wCpu)) / u.mem_alloc_gb_h_day;
+        // serie: merge por fecha con lo existente, FIFO 365
+        const prev = (inputs.existing && inputs.existing.daily) || [];
+        const byDate = {};
+        for (const p of prev) if (p && p.d) byDate[p.d] = p;
+        for (const d of days) {
+          const dayCost = cost.daily[d].total || 0;
+          byDate[d] = {
+            d,
+            cpu_usd_core_hour: (dayCost * wCpu) / u.cpu_alloc_core_h_day,
+            mem_usd_gb_hour: (dayCost * (1 - wCpu)) / u.mem_alloc_gb_h_day,
+            cluster_cost_usd: dayCost,
+            network_usd: cost.daily[d].network || null,
+            cpu_alloc_core_h: u.cpu_alloc_core_h_day,
+            mem_alloc_gb_h: u.mem_alloc_gb_h_day
+          };
+        }
+        const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+        return {
+          has_rate: true, cluster: cl,
+          path: "/catalog/instances/blended_rate/" + encodeURIComponent(cl),
+          body: {
+            id: cl, level: "cluster", cluster: cl, provider_spec: c.spec,
+            dimensions: dims,
+            rates: { cpu_usd_core_hour: cpuRate, mem_usd_gb_hour: memRate,
+                     currency: "USD", split_method: "vcpu-gb-price-ratio-7" },
+            basis: {
+              window_days: u.window_days, cluster_cost_usd_day: costDay,
+              breakdown: { compute_usd_day: costDay - netDay, network_usd_day: netDay, other_usd_day: 0 },
+              cost_source: cost.source,
+              cpu_alloc_core_h_day: u.cpu_alloc_core_h_day,
+              mem_alloc_gb_h_day: u.mem_alloc_gb_h_day,
+              capacity_source: "datadog_kubernetes_requests"
+            },
+            daily,
+            sources: { computed_at: new Date().toISOString(), workflow_execution_id: null }
+          }
+        };
+
+  - id: route
+    type: decider
+    pluginType: conditional
+    config:
+      expression: "steps.compute.outputs.has_rate == true"
+
+  - id: patch
+    type: module
+    pluginType: np-api-call
+    inputs:
+      path: "${{ steps.compute.outputs.path }}"
+      body: "${{ steps.compute.outputs.body }}"
+    config:
+      method: PATCH
+      path: "/catalog/instances/blended_rate/placeholder"
+      query:
+        upsert: "true"
+      apiKey: "${{ secrets.COST_NP_API_KEY }}"
+      failOnHttpError: true
+
+  - id: skipped
+    type: module
+    pluginType: log
+    config:
+      level: warn
+      message: "cluster sin blended rate: ${{ steps.compute.outputs.cluster }} — ${{ steps.compute.outputs.reason }}"
+
+connections:
+  - { id: c1, from: compute, to: route }
+  - { id: c2, from: route, to: patch, sourcePort: "true" }
+  - { id: c3, from: route, to: skipped, sourcePort: "false" }
+
+outputs:
+  has_rate: "${{ steps.compute.outputs.has_rate }}"
+  cluster: "${{ steps.compute.outputs.cluster }}"

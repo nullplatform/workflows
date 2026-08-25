@@ -1,0 +1,149 @@
+key: cost-finout-infra-map
+id: cost-finout-infra-map
+name: "Cost Finout — wf1 Infra Map"
+description: "Mapeo diario scope→cluster+dimensiones (prod, clusters NP GKE/AKS). Patron canonico: lake-query emite items → sub-workflow fan-out por scope (child cost-finout-upsert-scope) → summary. Los montos los escribe wf3."
+
+triggers:
+  - id: manual
+    type: trigger
+    pluginType: manual
+    config: {}
+  - id: daily
+    type: trigger
+    pluginType: cron
+    config:
+      schedule: "10 3 * * *"
+      timezone: UTC
+
+steps:
+  # 1. Providers k8s + runtime configs → tabla de resolucion (chica, viaja a
+  #    cada child). Tambien upsertea las instancias cluster-* (son ~25).
+  - id: plan_providers
+    type: module
+    pluginType: code-exec
+    inputs:
+      npApiKey: "${{ secrets.COST_NP_API_KEY }}"
+    config:
+      executionConfig:
+        timeoutMs: 300000
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const BASE = "https://api.nullplatform.com";
+        const ORG = "987889794";
+        const tr = await fetch(BASE + "/token", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ apikey: inputs.npApiKey }) });
+        if (!tr.ok) throw new Error("token mint failed: " + tr.status);
+        const H = { Authorization: "Bearer " + (await tr.json()).access_token, "Content-Type": "application/json" };
+        async function get(path) {
+          const r = await fetch(BASE + path, { headers: H });
+          if (!r.ok) throw new Error("GET " + path + " -> " + r.status);
+          return r.json();
+        }
+        async function mapLimit(arr, limit, fn) {
+          const out = new Array(arr.length);
+          let i = 0;
+          await Promise.all(new Array(Math.min(limit, arr.length)).fill(0).map(async () => {
+            while (i < arr.length) { const idx = i++; out[idx] = await fn(arr[idx]); }
+          }));
+          return out;
+        }
+        const specsResp = await get("/provider_specification?limit=100");
+        const specSlug = {};
+        for (const s of specsResp.results || []) specSlug[s.id] = s.slug;
+        const CLOUD_OF = { "gke-configuration": "gcp", "aks-configuration": "azure" };
+        let provs = [], off = 0;
+        while (true) {
+          const page = await get("/provider?nrn=organization=" + ORG + "&show_descendants=true&limit=200&offset=" + off);
+          const rs = page.results || [];
+          provs = provs.concat(rs);
+          if (rs.length < 200) break;
+          off += 200;
+        }
+        const k8sProvs = provs.filter((p) => CLOUD_OF[specSlug[p.specification_id]]);
+        let resolved = (await mapLimit(k8sProvs, 10, async (p) => {
+          const key = p.data_source && p.data_source.key;
+          if (!key) return null;
+          try {
+            const rc = await get("/runtime_configuration/" + key);
+            const k8s = ((rc && rc.values) || {}).k8s || {};
+            if (!k8s.clusterId) return null;
+            return { nrn: p.nrn, dims: p.dimensions || {}, spec: specSlug[p.specification_id],
+                     cluster: k8s.clusterId, ns: k8s.namespace || "nullplatform" };
+          } catch (e) { return null; }
+        })).filter(Boolean);
+        // dieta: los children solo mapean scopes prod — los providers uat sobran
+        resolved = resolved.filter((c) => !c.dims.environment || c.dims.environment === "prod");
+
+        // upsert de instancias cluster-* (solo combos prod con dims completos)
+        const REGION = { "gcp-sawest-1": "southamerica-west1", "azure-eastus-2": "eastus2" };
+        const clusters = {};
+        for (const c of resolved) {
+          if (c.dims.environment !== "prod") continue;
+          clusters[c.cluster] = clusters[c.cluster] || {
+            id: "cluster-" + c.cluster, entity_type: "cluster", entity_name: c.cluster,
+            dimensions: { cloud: c.dims.cloud || null, country: c.dims.country || null, environment: "prod" },
+            infra: { cluster: c.cluster, cloud_provider: CLOUD_OF[c.spec], region: REGION[c.dims.cloud] || null,
+                     k8s_namespace: c.ns, provider_spec: c.spec }
+          };
+        }
+        let clusterUpserts = 0;
+        for (const doc of Object.values(clusters)) {
+          const r = await fetch(BASE + "/catalog/instances/infrastructure_cost/" + encodeURIComponent(doc.id) + "?upsert=true",
+            { method: "PATCH", headers: H, body: JSON.stringify(doc) });
+          if (r.ok) clusterUpserts++;
+        }
+        return { providers: resolved, provider_count: resolved.length,
+                 cluster_upserts: clusterUpserts, cluster_count: Object.keys(clusters).length };
+
+  # 2. Scopes prod activos en GKE/AKS con dimensiones y jerarquia — una fila
+  #    por scope, emitidas como items.
+  - id: list_scopes
+    type: module
+    pluginType: np-lake-query
+    dependsOn: [plan_providers]
+    config:
+      apiKey: "${{ secrets.COST_NP_API_KEY }}"
+      maxRows: 10000
+      sql: "SELECT s.id id, s.name name, s.provider provider, s.nrn nrn, s.application_id app_id, app.app_name app_name, app.namespace_id ns_id, n.account_id acc_id, a.account_name acc_name, maxIf(sd.value_slug, sd.dimension_slug='cloud') cloud, maxIf(sd.value_slug, sd.dimension_slug='country') country, maxIf(sd.value_slug, sd.dimension_slug='environment') environment FROM core_entities_scope AS s FINAL JOIN core_entities_application AS app FINAL ON s.application_id = app.app_id JOIN core_entities_namespace AS n FINAL ON app.namespace_id = n.namespace_id JOIN core_entities_account AS a FINAL ON n.account_id = a.account_id JOIN core_entities_scope_dimension AS sd FINAL ON sd.scope_id = s.id WHERE s._deleted=0 AND s.status='active' AND sd._deleted=0 AND s.provider IN ('GOOGLE:WEB_POOL:GKE','AZURE:WEB_POOL:AKS') GROUP BY id, name, provider, nrn, app_id, app_name, ns_id, acc_id, acc_name HAVING environment='prod'"
+
+  # 3. Fan-out: un child por scope (resolucion + upsert, sin VM).
+  - id: upsert_scope
+    type: module
+    pluginType: sub-workflow
+    dependsOn: [list_scopes]
+    inputs:
+      scope: "${{ $item }}"
+      providers: "${{ steps.plan_providers.outputs.providers }}"
+    config:
+      workflowId: wf_2gSIis0J3QQz  # cost-finout-upsert-scope
+      alias: live
+      maxParallelism: 5
+
+  # 4. Resumen agregado de los resultados de todos los children.
+  - id: summary
+    type: module
+    pluginType: code-exec
+    dependsOn: [upsert_scope]
+    config:
+      code: |
+        const rows = $items || [];
+        const mapped = rows.filter((r) => r && r.mapped === true).length;
+        const clusters = {};
+        for (const r of rows) if (r && r.cluster) clusters[r.cluster] = (clusters[r.cluster] || 0) + 1;
+        return {
+          children: rows.length,
+          mapped,
+          unmapped: rows.length - mapped,
+          clusters: Object.keys(clusters).length,
+          by_cluster: clusters
+        };
+
+  - id: report
+    type: module
+    pluginType: log
+    dependsOn: [summary]
+    config:
+      level: info
+      message: "infra-map: ${{ steps.summary.outputs.mapped }} scopes prod mapeados en ${{ steps.summary.outputs.clusters }} clusters (${{ steps.summary.outputs.unmapped }} sin mapear de ${{ steps.summary.outputs.children }})"
