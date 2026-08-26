@@ -1,7 +1,7 @@
 key: cost-finout-blended-rates
 id: cost-finout-blended-rates
 name: "Cost Finout — wf2 Blended Rates"
-description: "Diario: costo por cluster NP desde Finout (GKE via cost center Kubernetes; AKS via resource groups mc_* con split de networking) + lista de clusters prod desde providers API → fan-out de un child por cluster (cost-finout-rate-cluster) que calcula $/core-hora y $/GB-hora contra reservas Datadog."
+description: "Diario: blended rate por cluster NP en costo AMORTIZADO. GCP: pool por CUENTA dedicada (compute+networking+logging+monitoring+fees) repartido entre sus clusters por reservas DD. AKS: resource group mc_* por cluster con split de networking. Cada rate lleva `composition` (texto) explicando que lo compone."
 
 steps:
   - id: manual
@@ -15,9 +15,10 @@ steps:
       schedule: "10 4 * * *"
       timezone: UTC
 
-  # 1a/1b. Finout v2 (async): DOS pasos paralelos — cada query tarda varios
-  #        minutos y en serie superan el techo de 10 min del microvm.
-  - id: finout_gke
+  # 1a. GCP: costo AMORTIZADO diario por cuenta NP x servicio (cuentas
+  #     dedicadas conocidas — si aparece una nueva, el guardrail de
+  #     compute_rates la delata como "cluster sin costo").
+  - id: finout_gcp
     type: module
     pluginType: code-exec
     joinStrategy: any
@@ -58,27 +59,39 @@ steps:
           }
           return rows;
         }
+        const NP_PROJECTS = ["bfa-cl-null-platforms-prod","bfa-cl-null-platforms-preprod",
+          "bfa-pe-null-platforms-prod","bfa-pe-null-platforms-preprod",
+          "bfa-co-null-platforms-prod","bfa-co-null-platforms-preprod",
+          "cmr-mx-null-platforms-prod","cmr-mx-null-platforms-preprod",
+          "bfa-cl-np-local-prod","bfa-cl-np-local-preprod"];
         const DAY = 86400000;
         const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
-        const start = endOfYesterday - 8 * DAY;
-        const base = {
-          date: { unixTimeMillisecondsStart: start, unixTimeMillisecondsEnd: endOfYesterday - 1 },
+        const q = {
+          date: { unixTimeMillisecondsStart: endOfYesterday - 8 * DAY, unixTimeMillisecondsEnd: endOfYesterday - 1 },
           timeInterval: { interval: "day" },
-          measurements: [{ type: "unblendedCost", operator: "sum", sortDirection: "descending" }],
+          measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
+          dimensions: [{ costCenter: "GCP", key: "project_id", type: "tag" },
+                       { costCenter: "GCP", key: "cloud_service", type: "billing_dimension" }],
+          filters: { AND: [{ costCenter: "GCP", key: "project_id", type: "tag", operator: "oneOf", value: NP_PROJECTS }] },
           rowLimit: 50000
         };
-        const q = { ...base, dimensions: [{ costCenter: "Kubernetes", key: "k8s_cluster", type: "kubernetes_resource" }] };
-        const costs = {};
+        // pools[proyecto] = { daily: {fecha: {total, compute, network, other}} }
+        const pools = {};
         for (const r of await runQuery(q)) {
-          const cl = r.Kubernetes_kubernetes_resource_k8s_cluster;
+          const p = r.GCP_tag_project_id, svc = r.GCP_billing_dimension_cloud_service || "";
           const day = (r.Day || r.day || "").slice(0, 10);
-          if (!cl || !day) continue;
-          const c = costs[cl] = costs[cl] || { daily: {}, source: "finout_k8s_cluster" };
-          const d = c.daily[day] = c.daily[day] || { total: 0, network: 0 };
-          d.total += r.unblendedCost_sum || 0;
+          const amt = r.amortizedCost_sum || 0;
+          if (!p || !day) continue;
+          const pool = pools[p] = pools[p] || { daily: {} };
+          const d = pool.daily[day] = pool.daily[day] || { total: 0, compute: 0, network: 0, other: 0 };
+          d.total += amt;
+          if (svc === "Compute Engine") d.compute += amt;
+          else if (svc === "Networking" || svc === "Cloud DNS") d.network += amt;
+          else d.other += amt;
         }
-        return { costs, clusters: Object.keys(costs).length };
+        return { pools, count: Object.keys(pools).length };
 
+  # 1b. AKS: costo AMORTIZADO diario por rg mc_* x servicio.
   - id: finout_aks
     type: module
     pluginType: code-exec
@@ -122,20 +135,15 @@ steps:
         }
         const DAY = 86400000;
         const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
-        const start = endOfYesterday - 8 * DAY;
-        const base = {
-          date: { unixTimeMillisecondsStart: start, unixTimeMillisecondsEnd: endOfYesterday - 1 },
-          timeInterval: { interval: "day" },
-          measurements: [{ type: "unblendedCost", operator: "sum", sortDirection: "descending" }],
-          rowLimit: 50000
-        };
         const NET = ["load balancer", "bandwidth", "nat gateway", "virtual network", "vpn gateway", "azure dns", "network watcher"];
-        const q = { ...base,
-          dimensions: [
-            { costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
-            { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }
-          ],
-          filters: { AND: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "mc_" }] }
+        const q = {
+          date: { unixTimeMillisecondsStart: endOfYesterday - 8 * DAY, unixTimeMillisecondsEnd: endOfYesterday - 1 },
+          timeInterval: { interval: "day" },
+          measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
+          dimensions: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
+                       { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }],
+          filters: { AND: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "mc_" }] },
+          rowLimit: 50000
         };
         const costs = {};
         for (const r of await runQuery(q)) {
@@ -144,77 +152,177 @@ steps:
           const cl = rg.slice(3);
           const svc = (r.Azure_billing_dimension_cloud_service || "").toLowerCase();
           const day = (r.Day || r.day || "").slice(0, 10);
+          const amt = r.amortizedCost_sum || 0;
           if (!day) continue;
-          const c = costs[cl] = costs[cl] || { daily: {}, source: "finout_azure_rg" };
+          const c = costs[cl] = costs[cl] || { daily: {} };
           const d = c.daily[day] = c.daily[day] || { total: 0, network: 0 };
-          d.total += r.unblendedCost_sum || 0;
-          if (NET.some((s) => svc.includes(s))) d.network += r.unblendedCost_sum || 0;
+          d.total += amt;
+          if (NET.some((s) => svc.includes(s))) d.network += amt;
         }
-        return { costs, clusters: Object.keys(costs).length };
+        return { costs, count: Object.keys(costs).length };
 
-  # 1c. Merge de ambos mapas de costo (inline, espera a los dos).
-  - id: finout_costs
+  # 2. Descubre clusters NP en DD, mide reservas, arma el rate y upsertea
+  #    blended_rate con `composition` (texto explicando que lo compone).
+  - id: compute_rates
     type: module
     pluginType: code-exec
-    dependsOn: [finout_gke, finout_aks]
+    dependsOn: [finout_gcp, finout_aks]
     inputs:
-      gke: "${{ steps.finout_gke.outputs.costs }}"
-      aks: "${{ steps.finout_aks.outputs.costs }}"
+      gcpPools: "${{ steps.finout_gcp.outputs.pools }}"
+      aksCosts: "${{ steps.finout_aks.outputs.costs }}"
+      npApiKey: "${{ secrets.COST_NP_API_KEY }}"
+      ddApiKey: "${{ secrets.DD_API_KEY }}"
+      ddAppKey: "${{ secrets.DD_APPLICATION_KEY }}"
     config:
+      runtime:
+        kind: microvm
+        timeoutMs: 600000
+      network:
+        allowedHosts: ["api.datadoghq.com", "api.nullplatform.com"]
       code: |
-        const costs = Object.assign({}, inputs.gke || {}, inputs.aks || {});
-        return { costs, clusters_with_cost: Object.keys(costs).length };
+        const NP = "https://api.nullplatform.com";
+        const WINDOW_DAYS = 7;
+        const now = Math.floor(Date.now() / 1000);
+        const from = now - WINDOW_DAYS * 86400;
+        const DH = { "DD-API-KEY": inputs.ddApiKey, "DD-APPLICATION-KEY": inputs.ddAppKey };
+        async function dd(query) {
+          const r = await fetch("https://api.datadoghq.com/api/v1/query?from=" + from + "&to=" + now + "&query=" + encodeURIComponent(query), { headers: DH });
+          if (!r.ok) throw new Error("datadog " + r.status);
+          return (await r.json()).series || [];
+        }
+        const tr = await fetch(NP + "/token", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ apikey: inputs.npApiKey }) });
+        if (!tr.ok) throw new Error("token mint failed: " + tr.status);
+        const H = { Authorization: "Bearer " + (await tr.json()).access_token, "Content-Type": "application/json" };
+        async function mapLimit(arr, limit, fn) {
+          const out = new Array(arr.length);
+          let i = 0;
+          await Promise.all(new Array(Math.min(limit, arr.length)).fill(0).map(async () => {
+            while (i < arr.length) { const idx = i++; out[idx] = await fn(arr[idx]); }
+          }));
+          return out;
+        }
+        function tag(s, k) {
+          for (const t of s.tag_set || []) if (t.startsWith(k + ":")) return t.slice(k.length + 1);
+          return null;
+        }
+        function avgOf(series) {
+          const pts = ((series || [])[0] || {}).pointlist || [];
+          const vals = pts.map((p) => p[1]).filter((v) => v != null);
+          return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+        }
+        // cluster GKE → cuenta GCP dedicada
+        function gcpProject(cl) {
+          const m = cl.match(/^(bfcl|bfpe|bfco|cmrmx)-np-gcp-([a-z0-9]+)-sawest1-(prod|preprod)$/);
+          if (!m) return null;
+          const UNIT = { bfcl: "bfa-cl", bfpe: "bfa-pe", bfco: "bfa-co", cmrmx: "cmr-mx" };
+          const pool = (m[2] === "local" || m[2] === "testbackup") ? "np-local" : "null-platforms";
+          return UNIT[m[1]] + "-" + pool + "-" + m[3];
+        }
 
-  # 2. Clusters prod NP: las instancias cluster-* que wf1 dejo en el
-  #    catalogo, espejadas al lake (data spine — si wf1 no corrio, no hay filas).
-  - id: list_clusters
-    type: module
-    pluginType: np-lake-query
-    dependsOn: [finout_costs]
-    config:
-      apiKey: "${{ secrets.COST_NP_API_KEY }}"
-      maxRows: 500
-      sql: "SELECT JSONExtractString(e.data,'entity_name') cluster, JSONExtractString(e.data,'infrastructure_reference','attributes','provider_spec') spec, JSONExtractString(e.data,'dimensions','cloud') cloud, JSONExtractString(e.data,'dimensions','country') country FROM catalog_entities AS e FINAL JOIN catalog_entity_specifications AS sp FINAL ON e.entity_specification_id = sp.id WHERE e._deleted=0 AND e.deleted_at IS NULL AND sp._deleted=0 AND sp.slug='infrastructure_cost' AND JSONExtractString(e.data,'entity_type')='cluster'"
+        // 1) clusters NP activos + reservas
+        const clSeries = await dd("sum:kubernetes.cpu.requests{kube_namespace:nullplatform} by {kube_cluster_name}.rollup(avg, 3600)");
+        const clusters = clSeries.map((s) => tag(s, "kube_cluster_name")).filter(Boolean);
+        const res = {};
+        await mapLimit(clusters, 4, async (cl) => {
+          const cores = avgOf(await dd("sum:kubernetes.cpu.requests{kube_cluster_name:" + cl + "}.rollup(avg, 3600)"));
+          const memB = avgOf(await dd("sum:kubernetes.memory.requests{kube_cluster_name:" + cl + "}.rollup(avg, 3600)"));
+          if (cores > 0 && memB > 0) res[cl] = { cores, gb: memB / 1073741824 };
+        });
 
-  # 3. Un child por cluster: DD reservas + calculo + upsert blended_rate.
-  - id: rate_cluster
-    type: module
-    pluginType: sub-workflow
-    dependsOn: [list_clusters]
-    inputs:
-      cluster: "${{ $item }}"
-      costs: "${{ steps.finout_costs.outputs.costs }}"
-    config:
-      workflowId: wf_UbxSTqKz9XS8  # cost-finout-rate-cluster
-      alias: live
-      maxParallelism: 4
-
-  # 4. Resumen.
-  - id: summary
-    type: module
-    pluginType: code-exec
-    dependsOn: [rate_cluster]
-    config:
-      code: |
-        const rows = $items || [];
-        const ok = rows.filter((r) => r && r.has_rate === true);
-        return {
-          clusters: rows.length,
-          with_rate: ok.length,
-          without_rate: rows.length - ok.length,
-          rated: ok.map((r) => r.cluster)
-        };
+        // 2) costo por cluster: AKS directo por mc_; GKE = share del pool de cuenta
+        const gcpPools = inputs.gcpPools || {};
+        const poolMembers = {};
+        for (const cl of clusters) {
+          const p = gcpProject(cl);
+          if (p && res[cl]) (poolMembers[p] = poolMembers[p] || []).push(cl);
+        }
+        const R = 7;
+        let withRate = 0; const skipped = [], errors = [];
+        await mapLimit(clusters, 5, async (cl) => {
+          const u = res[cl];
+          if (!u) { skipped.push(cl + ": sin reservas DD"); return; }
+          const cpuAlloc = u.cores * 24, memAlloc = u.gb * 24;
+          let daily = null, source = null, compo = null;
+          const aks = (inputs.aksCosts || {})[cl];
+          const proj = gcpProject(cl);
+          if (aks && Object.keys(aks.daily).length) {
+            daily = aks.daily; source = "finout_azure_rg_amortized";
+            const days = Object.keys(daily);
+            const t = days.reduce((a, d) => a + daily[d].total, 0) / days.length;
+            const n = days.reduce((a, d) => a + (daily[d].network || 0), 0) / days.length;
+            compo = "Costo AMORTIZADO 7d del resource group mc_" + cl + " (nodos+discos+LBs+IPs del cluster AKS): $" + t.toFixed(1) + "/dia, de los cuales networking (LB/NAT/bandwidth/vnet) $" + n.toFixed(1) + "/dia. Dividido por reservas Datadog del cluster (" + Math.round(u.cores) + " cores, " + Math.round(u.gb) + " GB). Split CPU/RAM por ratio de precio vCPU:GB 7:1. NO incluye: rg del cluster (AKS fee+Defender+vnet ~$2-4/dia), services (redis/postgres/atlas) ni factura Datadog.";
+          } else if (proj && gcpPools[proj]) {
+            const members = poolMembers[proj] || [cl];
+            const totCores = members.reduce((a, m) => a + (res[m] ? res[m].cores : 0), 0);
+            const share = totCores > 0 ? u.cores / totCores : 1;
+            daily = {};
+            for (const [d, v] of Object.entries(gcpPools[proj].daily)) {
+              daily[d] = { total: v.total * share, network: v.network * share };
+            }
+            const days = Object.keys(daily);
+            const t = days.reduce((a, d) => a + daily[d].total, 0) / days.length;
+            const pd = gcpPools[proj].daily; const pdays = Object.keys(pd);
+            const pt = pdays.reduce((a, d) => a + pd[d].total, 0) / pdays.length;
+            const pc = pdays.reduce((a, d) => a + pd[d].compute, 0) / pdays.length;
+            const pn = pdays.reduce((a, d) => a + pd[d].network, 0) / pdays.length;
+            const po = pdays.reduce((a, d) => a + pd[d].other, 0) / pdays.length;
+            source = "finout_gcp_account_amortized";
+            compo = "Pool = cuenta GCP dedicada " + proj + ", costo AMORTIZADO 7d: $" + pt.toFixed(1) + "/dia (Compute Engine $" + pc.toFixed(1) + ", Networking+DNS $" + pn.toFixed(1) + ", Logging+Monitoring+GKE fee+resto $" + po.toFixed(1) + "). Repartido entre sus clusters [" + members.join(", ") + "] por reservas de CPU en Datadog — este cluster: " + (100 * share).toFixed(0) + "% ($" + t.toFixed(1) + "/dia). Dividido por reservas del cluster (" + Math.round(u.cores) + " cores, " + Math.round(u.gb) + " GB). Split CPU/RAM 7:1. Inmune a labels de cluster faltantes en el billing. NO incluye: services (redis/atlas) ni factura Datadog.";
+          } else {
+            skipped.push(cl + ": sin costo Finout (ni mc_ ni cuenta GCP mapeada)");
+            return;
+          }
+          const days = Object.keys(daily).sort();
+          const costDay = days.reduce((a, d) => a + daily[d].total, 0) / days.length;
+          if (costDay < cpuAlloc * 0.005) { skipped.push(cl + ": costo incompleto (" + costDay.toFixed(1) + "/dia, " + Math.round(u.cores) + " cores)"); return; }
+          const wCpu = (R * cpuAlloc) / (R * cpuAlloc + memAlloc);
+          const exResp = await fetch(NP + "/catalog/instances/blended_rate/" + encodeURIComponent(cl), { headers: H });
+          const existing = exResp.ok ? await exResp.json() : null;
+          const byDate = {};
+          for (const p of (existing && existing.daily) || []) if (p && p.d) byDate[p.d] = p;
+          for (const d of days) {
+            byDate[d] = { d,
+              cpu_usd_core_hour: (daily[d].total * wCpu) / cpuAlloc,
+              mem_usd_gb_hour: (daily[d].total * (1 - wCpu)) / memAlloc,
+              cluster_cost_usd: daily[d].total,
+              network_usd: daily[d].network || null,
+              cpu_alloc_core_h: cpuAlloc, mem_alloc_gb_h: memAlloc };
+          }
+          const series = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+          const netDay = days.reduce((a, d) => a + (daily[d].network || 0), 0) / days.length;
+          const body = {
+            id: cl, level: "cluster", cluster: cl,
+            provider_spec: cl.indexOf("-gcp-") >= 0 ? "gke-configuration" : "aks-configuration",
+            dimensions: { cloud: null, country: null, environment: cl.endsWith("preprod") ? "preprod" : "prod" },
+            rates: { cpu_usd_core_hour: (costDay * wCpu) / cpuAlloc,
+                     mem_usd_gb_hour: (costDay * (1 - wCpu)) / memAlloc,
+                     currency: "USD", split_method: "vcpu-gb-price-ratio-7" },
+            composition: compo,
+            basis: { window_days: WINDOW_DAYS, cluster_cost_usd_day: costDay,
+                     breakdown: { compute_usd_day: costDay - netDay, network_usd_day: netDay, other_usd_day: 0 },
+                     cost_source: source, cpu_alloc_core_h_day: cpuAlloc, mem_alloc_gb_h_day: memAlloc,
+                     capacity_source: "datadog_kubernetes_requests" },
+            daily: series,
+            sources: { computed_at: new Date().toISOString(), workflow_execution_id: null }
+          };
+          const r = await fetch(NP + "/catalog/instances/blended_rate/" + encodeURIComponent(cl) + "?upsert=true",
+            { method: "PATCH", headers: H, body: JSON.stringify(body) });
+          if (r.ok) withRate++; else if (errors.length < 5) errors.push(cl + " -> " + r.status + " " + (await r.text()).slice(0, 80));
+        });
+        return { clusters_np: clusters.length, with_rate: withRate, skipped, errors };
 
   - id: report
     type: module
     pluginType: log
-    dependsOn: [summary]
+    dependsOn: [compute_rates]
     config:
       level: info
-      message: "blended-rates: ${{ steps.summary.outputs.with_rate }} clusters con rate, ${{ steps.summary.outputs.without_rate }} sin datos (de ${{ steps.summary.outputs.clusters }})"
+      message: "blended-rates v3 (amortizado): ${{ steps.compute_rates.outputs.with_rate }}/${{ steps.compute_rates.outputs.clusters_np }} clusters NP con rate"
 
 connections:
-  - { id: t1, from: manual, to: finout_gke }
-  - { id: t2, from: daily, to: finout_gke }
+  - { id: t1, from: manual, to: finout_gcp }
+  - { id: t2, from: daily, to: finout_gcp }
   - { id: t3, from: manual, to: finout_aks }
   - { id: t4, from: daily, to: finout_aks }

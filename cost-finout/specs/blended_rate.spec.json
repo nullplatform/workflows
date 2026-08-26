@@ -152,6 +152,13 @@
           }
         }
       },
+      "composition": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Texto humano que explica QUE compone este rate: fuente de costo (cuenta GCP / rgs Azure), desglose (compute/networking/observabilidad/fees), denominador (reservas DD) y metodo de split. Generado por wf2 en cada corrida."
+      },
       "basis": {
         "type": "object",
         "additionalProperties": false,
