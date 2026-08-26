@@ -235,20 +235,21 @@ Consecuencias:
 ## 9. Logs por app (Datadog): allocation probada
 
 Mecanismo: métrica `datadog.estimated_usage.logs.ingested_bytes by {service}`
-(24h, 3.168 services) × cruce del `service` DD contra los app-slugs de NP del
-lake (normalizando separadores y sufijos -cl/-pe/-prod…).
+sobre día calendario UTC completo (⚠️ los buckets diarios se alinean a
+medianoche UTC — una ventana móvil corta el bucket y subestima ~5×) × cruce
+del `service` DD contra app-slugs NP del lake (normalizando sufijos).
 
-- Total org: **1,70 TB/día** de logs ingeridos.
-- Matcheado a apps NP: **801 services = 172,9 GB/día = 10,2%** del total.
-- Porción NP de la factura de logs DD (~$2.323/día): **≈ $237/día ≈ $7,1k/mes**.
-- Top apps NP: `api-any-customer-information` 9,7 GB/día, `api-any-authify`
-  7,6, `api-any-riskify` 6,0, `kco-bfcl-credit-card-additional-purchase-…` 5,8.
-  Por cuenta: fif ~168 GB/día, seguros 4, BFCL-Local 0,8.
-- 🔎 Los top loggers del org son de RETAIL (falabella-bu-cart 853 GB/día,
-  bu-authn 646, manage-orders 586…) — refuerza la pregunta del contrato DD:
-  financiero no debería absorber esa factura completa.
+- Total org: **11,3 TB/día** ingeridos (4.891 services).
+- Apps NP: **~1.077 GB/día = 9,5%** (fif 1.073, BFCL-Local 4, seguros ~0).
+- Porción NP de la factura de logs DD (~$2.323/día): **≈ $221/día ≈ $6,6k/mes**.
+- Top apps NP: `api-bfcl-marketing-campaigns-v-2` ~120 GB/día (⚠️ 11% de
+  todos los logs NP en una sola app), `api-any-customer-information`,
+  `api-any-authify`, `api-any-riskify`.
+- 🔎 Top loggers org = RETAIL: `falabella-bu-cart-service-cl` 898 GB/día,
+  `bu-authn` 679, `manage-orders` 602 — financiero no debería absorber la
+  factura DD corporativa completa.
 
-Automatizable: mismo patrón que el resto de la suite (una query DD diaria por
-service + cruce con lake) → campo de costo de observabilidad por app en
-`infrastructure_cost` (sujeto `application`), y la misma familia de métricas
-`datadog.estimated_usage.*` cubre APM, infra hosts, custom metrics, etc.
+Automatizable con el mismo patrón de la suite (query DD diaria + cruce lake)
+→ costo de observabilidad por app en `infrastructure_cost` (sujeto
+`application`); la familia `datadog.estimated_usage.*` extiende a APM/hosts/
+custom metrics.
