@@ -185,3 +185,31 @@ clusters NP son ~$200/día de los ~$6.700 de la subscription bfcl prod.
   opacos — la atribución por service NP (74 mongos activos) va a requerir la
   API de Atlas (costo por cluster Atlas) o tags del lado Atlas, no sale de
   Finout solo.
+
+## 7. MongoDB Atlas: quién lo usa (cruce parámetros + services, lake)
+
+Dos vías de consumo, complementarias:
+
+**a) Vía services NP (governed)** — 74 services `mongo-atlas` activos, 130
+links activos resueltos a apps: **67 clusters** (el nombre del service ≈
+nombre del cluster Atlas), **25 compartidos entre 2+ apps**. Por cuenta:
+fif 47, AtencionDigital 12, seguros 8. Top compartidos:
+`fif-bfcl-cross-uat-gcp` (9 apps), `fif-bfpe-cross-uat` (8),
+`fif-bfcl-ffmm-prod` (8), `atendig-bfcl-nova-uat` (4).
+
+**b) Vía parámetros (conexión directa, sin service)** — 1.125 valores de
+parámetros con match mongo; hosts Atlas extraídos (sin credenciales):
+**64 clusters** con su project-id Atlas (p.ej. `checkout.azure` usado por 5
+apps de seguros; `leads-production` por 4), **28 compartidos**. Por cuenta:
+**seguros 45 apps** (casi todo directo, sin services), fif 13, BFCL-Local 2.
+Además 84 apps con params mongo sin host Atlas (self-hosted / Cosmos / hosts
+en params separados).
+
+**Conclusión de asignación**: la TABLA app↔cluster ya existe por ambas vías
+(seguros vive en params; fif/AtencionDigital en services). Para ponerle plata
+a cada cluster falta la otra punta: el costo por cluster/proyecto de Atlas —
+los cargos de marketplace en GCP son opacos (proyectos `pr-…`). Se resuelve
+con la **API de Atlas** (invoices por organización → proyecto → cluster) o
+tags en Atlas. Con eso: costo por cluster × tabla de consumo (repartido entre
+las apps que lo comparten) = allocation completa de los ~$50k/mes de Atlas.
+Pendiente: pedir API key de la org Atlas de falabella (read-only billing).
