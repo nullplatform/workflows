@@ -62,28 +62,35 @@ steps:
         const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
         const LAG_DAYS = 2; // billing Azure llega parcial los ultimos ~2 dias
         const windowEnd = endOfYesterday - LAG_DAYS * DAY;
+        // Granularidad de RECURSO: display_resource_id trae el path Azure completo
+        // (…/flexibleservers/psql-derivador-mx-prd-zu9slv) — el nombre del recurso
+        // es el nombre del service NP + sufijo random, asi que se mapea por nombre.
         const q = {
           date: { unixTimeMillisecondsStart: windowEnd - 8 * DAY, unixTimeMillisecondsEnd: windowEnd - 1 },
           timeInterval: { interval: "day" },
           measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
           dimensions: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
+                       { costCenter: "Azure", key: "display_resource_id", type: "tag_misc" },
                        { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }],
           filters: { AND: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "null-platform-services" }] },
           rowLimit: 50000
         };
-        // pools[rg] = { daily: { fecha: { <svc>: usd } } }
-        const pools = {};
+        // resources: [{ rg, res (ultimo segmento del path), svc, daily {fecha: usd} }]
+        const byKey = {};
         for (const r of await runQuery(q)) {
           const rg = r.Azure_billing_enrichment_resourcegroup || "";
           if (rg.indexOf("null-platform-services") < 0) continue;
+          const rid = r.Azure_tag_misc_display_resource_id || "";
+          const res = rid ? rid.split("/").pop() : "";
           const svc = (r.Azure_billing_dimension_cloud_service || "otros").toLowerCase();
           const day = (r.Day || r.day || "").slice(0, 10);
           if (!day) continue;
-          const p = pools[rg] = pools[rg] || { daily: {} };
-          const d = p.daily[day] = p.daily[day] || {};
-          d[svc] = (d[svc] || 0) + (r.amortizedCost_sum || 0);
+          const k = rg + "|" + res + "|" + svc;
+          const e = byKey[k] = byKey[k] || { rg, res, svc, daily: {} };
+          e.daily[day] = (e.daily[day] || 0) + (r.amortizedCost_sum || 0);
         }
-        return { pools, count: Object.keys(pools).length };
+        const resources = Object.values(byKey);
+        return { resources, count: resources.length };
 
   # 1b. GCP: proyectos *-np-services-* por servicio (amortizado, lag 1d)
   - id: finout_svc_gcp
@@ -131,36 +138,54 @@ steps:
         const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
         const LAG_DAYS = 1;
         const windowEnd = endOfYesterday - LAG_DAYS * DAY;
-        const q = {
-          date: { unixTimeMillisecondsStart: windowEnd - 8 * DAY, unixTimeMillisecondsEnd: windowEnd - 1 },
-          timeInterval: { interval: "day" },
-          measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
-          dimensions: [{ costCenter: "GCP", key: "project_id", type: "tag" },
-                       { costCenter: "GCP", key: "cloud_service", type: "billing_dimension" }],
-          filters: { AND: [{ costCenter: "GCP", key: "project_id", type: "tag", operator: "contains", value: "-np-services-" }] },
-          rowLimit: 50000
-        };
-        const pools = {};
-        for (const r of await runQuery(q)) {
+        // Intento con granularidad de RECURSO (gcp_resource_name); si el tenant
+        // no expone esa dimension, caigo a nivel proyecto (res = "").
+        function baseQuery(dims) {
+          return {
+            date: { unixTimeMillisecondsStart: windowEnd - 8 * DAY, unixTimeMillisecondsEnd: windowEnd - 1 },
+            timeInterval: { interval: "day" },
+            measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
+            dimensions: dims,
+            filters: { AND: [{ costCenter: "GCP", key: "project_id", type: "tag", operator: "contains", value: "-np-services-" }] },
+            rowLimit: 50000
+          };
+        }
+        let rows, resKey = "GCP_tag_gcp_resource_name";
+        try {
+          rows = await runQuery(baseQuery([
+            { costCenter: "GCP", key: "project_id", type: "tag" },
+            { costCenter: "GCP", key: "gcp_resource_name", type: "tag" },
+            { costCenter: "GCP", key: "cloud_service", type: "billing_dimension" }]));
+        } catch (e) {
+          resKey = null;
+          rows = await runQuery(baseQuery([
+            { costCenter: "GCP", key: "project_id", type: "tag" },
+            { costCenter: "GCP", key: "cloud_service", type: "billing_dimension" }]));
+        }
+        const byKey = {};
+        for (const r of rows) {
           const proj = r.GCP_tag_project_id || "";
           if (proj.indexOf("-np-services-") < 0) continue;
+          const rid = resKey ? (r[resKey] || "") : "";
+          const res = rid ? String(rid).split("/").pop() : "";
           const svc = (r.GCP_billing_dimension_cloud_service || "otros").toLowerCase();
           const day = (r.Day || r.day || "").slice(0, 10);
           if (!day) continue;
-          const p = pools[proj] = pools[proj] || { daily: {} };
-          const d = p.daily[day] = p.daily[day] || {};
-          d[svc] = (d[svc] || 0) + (r.amortizedCost_sum || 0);
+          const k = proj + "|" + res + "|" + svc;
+          const e = byKey[k] = byKey[k] || { rg: proj, res, svc, daily: {} };
+          e.daily[day] = (e.daily[day] || 0) + (r.amortizedCost_sum || 0);
         }
-        return { pools, count: Object.keys(pools).length };
+        const resources = Object.values(byKey);
+        return { resources, count: resources.length, resource_level: !!resKey };
 
-  # 2. Inventario de services NP (lake) + reparto del pool + upserts
+  # 2. Inventario de services NP (lake) + match por NOMBRE DE RECURSO + upserts
   - id: process
     type: module
     pluginType: code-exec
     dependsOn: [finout_svc_az, finout_svc_gcp]
     inputs:
-      azPools: "${{ steps.finout_svc_az.outputs.pools }}"
-      gcpPools: "${{ steps.finout_svc_gcp.outputs.pools }}"
+      azResources: "${{ steps.finout_svc_az.outputs.resources }}"
+      gcpResources: "${{ steps.finout_svc_gcp.outputs.resources }}"
       npApiKey: "${{ secrets.COST_NP_API_KEY }}"
     config:
       runtime:
@@ -208,104 +233,78 @@ steps:
         const services = (await lr.text()).trim().split("\n").filter(Boolean).map((l) => {
           const s = JSON.parse(l);
           let dims = {};
-          try { dims = JSON.parse(s.dims || "{}"); } catch (e) { /* dims invalidas: queda {} */ }
-          return { id: s.id, name: s.name, nrn: s.nrn, type: s.type, dims };
+          try { dims = JSON.parse(s.dims || "{}"); } catch (e) { /* dims invalidas */ }
+          return { id: s.id, name: (s.name || "").toLowerCase(), rawName: s.name, nrn: s.nrn, type: s.type, dims };
         }).filter((s) => (s.dims.environment || "") === "prod");
 
-        // --- pools prod: clave de matching (cloudFamily, country) ---
-        // Azure rg:  banco-cl-null-platform-services-eastus2-prod  -> azure, chile
-        // GCP proj:  bfa-cl-np-services-prod                       -> gcp, chile
-        const COUNTRY = { cl: "chile", pe: "peru", co: "colombia", mx: "mexico", ar: "argentina" };
-        function poolKey(name, cloud) {
-          const m = name.match(/(?:^|-)(cl|pe|co|mx|ar)(?:-|$)/);
-          return { cloud, country: m ? COUNTRY[m[1]] : null };
-        }
         function svcCloudFamily(dims) {
           const c = dims.cloud || "";
           return c.indexOf("azure") === 0 ? "azure" : c.indexOf("gcp") === 0 ? "gcp" : null;
         }
-        // tipo de service <-> servicio de la factura
+        const COUNTRY = { cl: "chile", pe: "peru", co: "colombia", mx: "mexico", ar: "argentina" };
+        function poolCountry(name) {
+          const m = name.match(/(?:^|-)(cl|pe|co|mx|ar)(?:-|$)/);
+          return m ? COUNTRY[m[1]] : null;
+        }
         function billedType(svcName) {
           if (svcName.indexOf("redis") >= 0 || svcName.indexOf("memorystore") >= 0) return "redis";
           if (svcName.indexOf("postgre") >= 0 || svcName.indexOf("cloud sql") >= 0) return "postgres";
           return "otros";
         }
-
-        const allPools = [];
-        for (const [name, p] of Object.entries(inputs.azPools || {})) {
-          if (!name.endsWith("prod") || name.indexOf("preprod") >= 0) continue;
-          allPools.push({ name, cloud: "azure", region: "eastus2", daily: p.daily, ...poolKey(name, "azure") });
-        }
-        for (const [name, p] of Object.entries(inputs.gcpPools || {})) {
-          if (!name.endsWith("prod") || name.indexOf("preprod") >= 0) continue;
-          allPools.push({ name, cloud: "gcp", region: "southamerica-west1", daily: p.daily, ...poolKey(name, "gcp") });
-        }
-
-        // acumulador por service: daily {fecha: usd}
-        const perService = {};
-        let unmatchedUsd = 0;
-        const errors = [], poolSummaries = [];
-        for (const pool of allPools) {
-          // costo por (dia, tipo facturado)
-          const byDayType = {};
-          for (const [day, svcs] of Object.entries(pool.daily)) {
-            for (const [svc, usd] of Object.entries(svcs)) {
-              const t = billedType(svc);
-              byDayType[day] = byDayType[day] || {};
-              byDayType[day][t] = (byDayType[day][t] || 0) + usd;
-            }
+        // el recurso Azure/GCP se llama <service_name>-<sufijo random>; probamos
+        // match exacto y por prefijo, restringido a tipo + nube (+ pais si desempata)
+        function matchService(resName, type, cloud, country) {
+          const base = resName.toLowerCase();
+          const cands = services.filter((s) => s.type === type && svcCloudFamily(s.dims) === cloud &&
+            (base === s.name || base.indexOf(s.name + "-") === 0));
+          if (!cands.length) return [];
+          // el nombre mas largo que matchea es el mas especifico
+          const maxLen = Math.max(...cands.map((s) => s.name.length));
+          let best = cands.filter((s) => s.name.length === maxLen);
+          if (best.length > 1 && country) {
+            const byCountry = best.filter((s) => (s.dims.country || "") === country);
+            if (byCountry.length) best = byCountry;
           }
-          // services candidatos del pool
-          const members = {};
-          for (const t of ["redis", "postgres"]) {
-            members[t] = services.filter((s) => s.type === t && svcCloudFamily(s.dims) === pool.cloud &&
-              (!pool.country || (s.dims.country || "") === pool.country));
-          }
-          let allocated = 0, total = 0;
-          for (const [day, types] of Object.entries(byDayType)) {
-            for (const [t, usd] of Object.entries(types)) {
-              total += usd;
-              const ms = members[t] || [];
-              if (!ms.length) { unmatchedUsd += usd; continue; }
-              allocated += usd;
-              const share = usd / ms.length;
-              for (const s of ms) {
-                const ps = perService[s.id] = perService[s.id] || { svc: s, pool: pool.name, daily: {}, nPool: ms.length };
-                ps.daily[day] = (ps.daily[day] || 0) + share;
+          return best;
+        }
+
+        // --- procesar recursos (az + gcp), solo pools prod ---
+        const all = [];
+        for (const r of (inputs.azResources || [])) all.push({ ...r, cloud: "azure", region: "eastus2" });
+        for (const r of (inputs.gcpResources || [])) all.push({ ...r, cloud: "gcp", region: "southamerica-west1" });
+        const perService = {};   // service_id -> { svc, daily {d: usd}, resNames: Set-like {} }
+        const remainder = {};    // pool -> { cloud, region, country, daily {d: {tipo: usd}}, unmatched {} }
+        let matchedUsd = 0, unmatchedUsd = 0, daysSeen = {};
+        for (const r of all) {
+          if (!r.rg || r.rg.indexOf("preprod") >= 0 || !/prod$/.test(r.rg)) continue;
+          const country = poolCountry(r.rg);
+          const type = billedType(r.svc);
+          for (const d of Object.keys(r.daily)) daysSeen[d] = true;
+          const targets = (type !== "otros" && r.res) ? matchService(r.res, type, r.cloud, country) : [];
+          if (targets.length) {
+            const share = 1 / targets.length;
+            for (const t of targets) {
+              const ps = perService[t.id] = perService[t.id] || { svc: t, daily: {}, resNames: {}, pool: r.rg };
+              ps.resNames[r.res] = true;
+              for (const [d, usd] of Object.entries(r.daily)) {
+                ps.daily[d] = (ps.daily[d] || 0) + usd * share;
+                matchedUsd += usd * share;
               }
             }
+          } else {
+            const rem = remainder[r.rg] = remainder[r.rg] || { cloud: r.cloud, region: r.region, country, daily: {}, unmatched: {} };
+            if (r.res) rem.unmatched[r.res + " (" + type + ")"] = true;
+            for (const [d, usd] of Object.entries(r.daily)) {
+              const dd = rem.daily[d] = rem.daily[d] || {};
+              dd[type] = (dd[type] || 0) + usd;
+              unmatchedUsd += usd;
+            }
           }
-          const days = Object.keys(byDayType).length || 1;
-          poolSummaries.push({ pool: pool.name, usd_day: total / days, allocated_pct: total > 0 ? Math.round(100 * allocated / total) : 100 });
-
-          // instancia del pool
-          const days2 = Object.keys(pool.daily).sort();
-          const inst = await npGet("/catalog/instances/infrastructure_cost/svc-pool-" + encodeURIComponent(pool.name));
-          const byDate = {};
-          for (const p of (inst && inst.daily) || []) if (p && p.d) byDate[p.d] = p;
-          for (const d of days2) {
-            const types = byDayType[d] || {};
-            const res = {};
-            for (const [t, usd] of Object.entries(types)) res[t] = { unit: "usd", billed_usd: usd };
-            const tot = Object.values(types).reduce((a, b) => a + b, 0);
-            byDate[d] = { d, cost_usd: tot, usage_usd: null, waste_usd: null, allocation: "finout_direct", resources: res };
-          }
-          const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
-          const costDay = days2.reduce((a, d) => a + Object.values(byDayType[d] || {}).reduce((x, y) => x + y, 0), 0) / (days2.length || 1);
-          const err = await npPatch("/catalog/instances/infrastructure_cost/svc-pool-" + encodeURIComponent(pool.name), {
-            id: "svc-pool-" + pool.name, entity_type: "shared", entity_name: pool.name,
-            dimensions: { cloud: pool.cloud, country: pool.country, environment: "prod" },
-            infrastructure_reference: { kind: "service_pool", id: pool.name, name: pool.name,
-              cloud_provider: pool.cloud, region: pool.region,
-              attributes: { source: "finout", pattern: "null-platform-services" } },
-            cost: { total_usd: costDay, usage_usd: null, waste_usd: null, currency: "USD", allocation: "finout_direct" },
-            usage: {}, daily,
-            sources: { finout: true, datadog: false, computed_at: new Date().toISOString(), workflow_execution_id: null }
-          });
-          if (err && errors.length < 5) errors.push(err);
         }
+        const nDays = Object.keys(daysSeen).length || 1;
 
-        // --- upsert por service ---
+        const errors = [];
+        // --- upsert por service (costo REAL del recurso) ---
         let upserted = 0;
         await mapLimit(Object.keys(perService), 10, async (sid) => {
           const ps = perService[sid];
@@ -329,14 +328,13 @@ steps:
           }
           const err = await npPatch("/catalog/instances/infrastructure_cost/service-" + sid, {
             id: "service-" + sid, nrn: s.nrn || null,
-            entity_type: "service", entity_id: sid, entity_name: s.name,
+            entity_type: "service", entity_id: sid, entity_name: s.rawName,
             account_id: nrnParts.account || null, namespace_id: nrnParts.namespace || null,
             application_id: nrnParts.application || null,
-            dimensions: { cloud: (s.dims.cloud || "").indexOf("gcp") === 0 ? "gcp" : "azure",
-                          country: s.dims.country || null, environment: "prod" },
-            infrastructure_reference: { kind: s.type, id: sid, name: s.name,
-              cloud_provider: (s.dims.cloud || "").indexOf("gcp") === 0 ? "gcp" : "azure", region: null,
-              attributes: { pool: ps.pool, split_method: "equal_within_pool", services_in_pool: ps.nPool } },
+            dimensions: { cloud: svcCloudFamily(s.dims), country: s.dims.country || null, environment: "prod" },
+            infrastructure_reference: { kind: s.type, id: Object.keys(ps.resNames).join(","), name: s.rawName,
+              cloud_provider: svcCloudFamily(s.dims), region: null,
+              attributes: { pool: ps.pool, split_method: "resource_name_match", resources: Object.keys(ps.resNames) } },
             cost: { total_usd: costDay, usage_usd: null, waste_usd: null, currency: "USD", allocation: "finout_direct" },
             cost_7d_usd: last7, cost_30d_usd: last30,
             usage: {},
@@ -348,10 +346,44 @@ steps:
           upserted++;
         });
 
+        // --- upsert por pool: SOLO el remanente sin matchear (evita doble conteo) ---
+        await mapLimit(Object.keys(remainder), 6, async (pool) => {
+          const rem = remainder[pool];
+          const inst = await npGet("/catalog/instances/infrastructure_cost/svc-pool-" + encodeURIComponent(pool));
+          const byDate = {};
+          for (const p of (inst && inst.daily) || []) if (p && p.d) byDate[p.d] = p;
+          for (const [d, types] of Object.entries(rem.daily)) {
+            const res = {};
+            for (const [t, usd] of Object.entries(types)) res[t] = { unit: "usd", billed_usd: usd };
+            const tot = Object.values(types).reduce((a, b) => a + b, 0);
+            byDate[d] = { d, cost_usd: tot, usage_usd: null, waste_usd: null, allocation: "shared_overhead", resources: res };
+          }
+          const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+          const dayList = Object.keys(rem.daily);
+          const costDay = dayList.reduce((a, d) => a + Object.values(rem.daily[d]).reduce((x, y) => x + y, 0), 0) / (dayList.length || 1);
+          const err = await npPatch("/catalog/instances/infrastructure_cost/svc-pool-" + encodeURIComponent(pool), {
+            id: "svc-pool-" + pool, entity_type: "shared", entity_name: pool + " (sin match)",
+            dimensions: { cloud: rem.cloud, country: rem.country, environment: "prod" },
+            infrastructure_reference: { kind: "service_pool", id: pool, name: pool,
+              cloud_provider: rem.cloud, region: rem.region,
+              attributes: { source: "finout", note: "remanente NO atribuido a services (storage, recursos sin match)",
+                            unmatched_resources: Object.keys(rem.unmatched).slice(0, 20) } },
+            cost: { total_usd: costDay, usage_usd: null, waste_usd: null, currency: "USD", allocation: "shared_overhead" },
+            usage: {}, daily,
+            sources: { finout: true, datadog: false, computed_at: new Date().toISOString(), workflow_execution_id: null }
+          });
+          if (err && errors.length < 5) errors.push(err);
+        });
+
+        const topUnmatched = [];
+        for (const [pool, rem] of Object.entries(remainder))
+          for (const u of Object.keys(rem.unmatched).slice(0, 4)) topUnmatched.push(pool.split("-null-platform")[0] + ": " + u);
         return {
-          pools: poolSummaries, services_matched: Object.keys(perService).length,
-          services_upserted: upserted, services_inventory: services.length,
-          unmatched_usd_day: Math.round(unmatchedUsd / 8 * 100) / 100, errors
+          services_inventory: services.length, services_matched: Object.keys(perService).length,
+          services_upserted: upserted,
+          matched_usd_day: Math.round(matchedUsd / nDays * 100) / 100,
+          unmatched_usd_day: Math.round(unmatchedUsd / nDays * 100) / 100,
+          top_unmatched: topUnmatched.slice(0, 15), errors
         };
 
   - id: report
