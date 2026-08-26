@@ -1,0 +1,369 @@
+id: cost-finout-service-costs
+name: "Cost: servicios NP (atribucion directa)"
+description: "Diario: costo AMORTIZADO de los pools de servicios NP (Azure rgs *-null-platform-services-*, GCP *-np-services-prod) desde Finout, mapeado a los services del catalogo NP (redis/postgres, lake services_services) repartiendo el costo del pool entre los services de su (cloud, pais, env). Upsertea infrastructure_cost: instancias svc-pool-* (pool) y service-* (cada service, allocation finout_direct)."
+folder: /cost-finout
+
+steps:
+  - id: manual
+    type: trigger
+    pluginType: manual
+    config:
+      inputs: {}
+
+  - id: daily
+    type: trigger
+    pluginType: cron
+    config:
+      schedule: "40 5 * * *"
+
+  # 1a. Azure: rgs *-null-platform-services-* por servicio (amortizado, lag 2d)
+  - id: finout_svc_az
+    type: module
+    pluginType: code-exec
+    joinStrategy: any
+    inputs:
+      finoutClientId: "${{ secrets.FINOUT_CLIENT_ID }}"
+      finoutSecretKey: "${{ secrets.FINOUT_SECRET_KEY }}"
+    config:
+      runtime:
+        kind: microvm
+        timeoutMs: 600000
+      network:
+        allowedHosts: ["app.finout.io"]
+      code: |
+        const H = { "x-finout-client-id": inputs.finoutClientId,
+                    "x-finout-secret-key": inputs.finoutSecretKey,
+                    "Content-Type": "application/json" };
+        async function call(method, path, body) {
+          const r = await fetch("https://app.finout.io" + path, { method,
+            headers: H, body: body === undefined ? undefined : JSON.stringify(body) });
+          if (!r.ok) throw new Error(method + " " + path + " -> " + r.status + " " + (await r.text()).slice(0, 200));
+          return r.json();
+        }
+        async function runQuery(q) {
+          const gen = await call("POST", "/v2/data/cost-usage/generate-query", q);
+          const qid = gen.data.queryId;
+          for (let i = 0; i < 110; i++) {
+            const st = (await call("GET", "/v2/data/cost-usage/" + qid + "/status")).data;
+            if (st.status === "completed") break;
+            if (st.status === "failed" || st.status === "expired") throw new Error("finout query " + st.status);
+            await new Promise((r) => setTimeout(r, 4000));
+          }
+          let rows = [], cursor = null;
+          while (true) {
+            const res = await call("GET", "/v2/data/cost-usage/" + qid + "/results?pageSize=10000" + (cursor ? "&cursor=" + cursor : ""));
+            rows = rows.concat(res.data || []);
+            if (!res.pagination || !res.pagination.hasMore) break;
+            cursor = res.pagination.nextCursor;
+          }
+          return rows;
+        }
+        const DAY = 86400000;
+        const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
+        const LAG_DAYS = 2; // billing Azure llega parcial los ultimos ~2 dias
+        const windowEnd = endOfYesterday - LAG_DAYS * DAY;
+        const q = {
+          date: { unixTimeMillisecondsStart: windowEnd - 8 * DAY, unixTimeMillisecondsEnd: windowEnd - 1 },
+          timeInterval: { interval: "day" },
+          measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
+          dimensions: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
+                       { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }],
+          filters: { AND: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "null-platform-services" }] },
+          rowLimit: 50000
+        };
+        // pools[rg] = { daily: { fecha: { <svc>: usd } } }
+        const pools = {};
+        for (const r of await runQuery(q)) {
+          const rg = r.Azure_billing_enrichment_resourcegroup || "";
+          if (rg.indexOf("null-platform-services") < 0) continue;
+          const svc = (r.Azure_billing_dimension_cloud_service || "otros").toLowerCase();
+          const day = (r.Day || r.day || "").slice(0, 10);
+          if (!day) continue;
+          const p = pools[rg] = pools[rg] || { daily: {} };
+          const d = p.daily[day] = p.daily[day] || {};
+          d[svc] = (d[svc] || 0) + (r.amortizedCost_sum || 0);
+        }
+        return { pools, count: Object.keys(pools).length };
+
+  # 1b. GCP: proyectos *-np-services-* por servicio (amortizado, lag 1d)
+  - id: finout_svc_gcp
+    type: module
+    pluginType: code-exec
+    joinStrategy: any
+    inputs:
+      finoutClientId: "${{ secrets.FINOUT_CLIENT_ID }}"
+      finoutSecretKey: "${{ secrets.FINOUT_SECRET_KEY }}"
+    config:
+      runtime:
+        kind: microvm
+        timeoutMs: 600000
+      network:
+        allowedHosts: ["app.finout.io"]
+      code: |
+        const H = { "x-finout-client-id": inputs.finoutClientId,
+                    "x-finout-secret-key": inputs.finoutSecretKey,
+                    "Content-Type": "application/json" };
+        async function call(method, path, body) {
+          const r = await fetch("https://app.finout.io" + path, { method,
+            headers: H, body: body === undefined ? undefined : JSON.stringify(body) });
+          if (!r.ok) throw new Error(method + " " + path + " -> " + r.status + " " + (await r.text()).slice(0, 200));
+          return r.json();
+        }
+        async function runQuery(q) {
+          const gen = await call("POST", "/v2/data/cost-usage/generate-query", q);
+          const qid = gen.data.queryId;
+          for (let i = 0; i < 110; i++) {
+            const st = (await call("GET", "/v2/data/cost-usage/" + qid + "/status")).data;
+            if (st.status === "completed") break;
+            if (st.status === "failed" || st.status === "expired") throw new Error("finout query " + st.status);
+            await new Promise((r) => setTimeout(r, 4000));
+          }
+          let rows = [], cursor = null;
+          while (true) {
+            const res = await call("GET", "/v2/data/cost-usage/" + qid + "/results?pageSize=10000" + (cursor ? "&cursor=" + cursor : ""));
+            rows = rows.concat(res.data || []);
+            if (!res.pagination || !res.pagination.hasMore) break;
+            cursor = res.pagination.nextCursor;
+          }
+          return rows;
+        }
+        const DAY = 86400000;
+        const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
+        const LAG_DAYS = 1;
+        const windowEnd = endOfYesterday - LAG_DAYS * DAY;
+        const q = {
+          date: { unixTimeMillisecondsStart: windowEnd - 8 * DAY, unixTimeMillisecondsEnd: windowEnd - 1 },
+          timeInterval: { interval: "day" },
+          measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
+          dimensions: [{ costCenter: "GCP", key: "project_id", type: "tag" },
+                       { costCenter: "GCP", key: "cloud_service", type: "billing_dimension" }],
+          filters: { AND: [{ costCenter: "GCP", key: "project_id", type: "tag", operator: "contains", value: "-np-services-" }] },
+          rowLimit: 50000
+        };
+        const pools = {};
+        for (const r of await runQuery(q)) {
+          const proj = r.GCP_tag_project_id || "";
+          if (proj.indexOf("-np-services-") < 0) continue;
+          const svc = (r.GCP_billing_dimension_cloud_service || "otros").toLowerCase();
+          const day = (r.Day || r.day || "").slice(0, 10);
+          if (!day) continue;
+          const p = pools[proj] = pools[proj] || { daily: {} };
+          const d = p.daily[day] = p.daily[day] || {};
+          d[svc] = (d[svc] || 0) + (r.amortizedCost_sum || 0);
+        }
+        return { pools, count: Object.keys(pools).length };
+
+  # 2. Inventario de services NP (lake) + reparto del pool + upserts
+  - id: process
+    type: module
+    pluginType: code-exec
+    dependsOn: [finout_svc_az, finout_svc_gcp]
+    inputs:
+      azPools: "${{ steps.finout_svc_az.outputs.pools }}"
+      gcpPools: "${{ steps.finout_svc_gcp.outputs.pools }}"
+      npApiKey: "${{ secrets.COST_NP_API_KEY }}"
+    config:
+      runtime:
+        kind: microvm
+        timeoutMs: 600000
+      network:
+        allowedHosts: ["api.nullplatform.com"]
+      code: |
+        const NP = "https://api.nullplatform.com";
+        const tr = await fetch(NP + "/token", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ apikey: inputs.npApiKey }) });
+        if (!tr.ok) throw new Error("token mint failed: " + tr.status);
+        const TOKEN = (await tr.json()).access_token;
+        const H = { Authorization: "Bearer " + TOKEN, "Content-Type": "application/json" };
+        async function npGet(path) {
+          const r = await fetch(NP + path, { headers: H });
+          if (!r.ok) return null; // lecturas best-effort
+          return r.json();
+        }
+        async function npPatch(path, body) {
+          const r = await fetch(NP + path + "?upsert=true", { method: "PATCH", headers: H, body: JSON.stringify(body) });
+          if (!r.ok) return path + " -> " + r.status + " " + (await r.text()).slice(0, 120);
+          return null;
+        }
+        async function mapLimit(arr, limit, fn) {
+          const out = new Array(arr.length);
+          let i = 0;
+          await Promise.all(new Array(Math.min(limit, arr.length)).fill(0).map(async () => {
+            while (i < arr.length) { const idx = i++; out[idx] = await fn(arr[idx]); }
+          }));
+          return out;
+        }
+
+        // --- inventario de services (lake): redis/postgres prod con su app nrn ---
+        const SQL = "SELECT toString(s.id) AS id, s.name AS name, s.entity_nrn AS nrn, " +
+          "toString(s.dimensions) AS dims, sp.slug AS type " +
+          "FROM services_services AS s FINAL " +
+          "JOIN services_service_specifications AS sp FINAL ON s.specification_id = sp.id " +
+          "WHERE s._deleted = 0 AND s.deleted_at IS NULL AND s.status != 'deleted' " +
+          "AND sp.slug IN ('redis','postgres') FORMAT JSONEachRow";
+        const lr = await fetch(NP + "/data/lake/query", { method: "POST",
+          headers: { Authorization: "Bearer " + TOKEN, "Content-Type": "text/plain" }, body: SQL });
+        if (!lr.ok) throw new Error("lake query -> " + lr.status + " " + (await lr.text()).slice(0, 200));
+        const services = (await lr.text()).trim().split("\n").filter(Boolean).map((l) => {
+          const s = JSON.parse(l);
+          let dims = {};
+          try { dims = JSON.parse(s.dims || "{}"); } catch (e) { /* dims invalidas: queda {} */ }
+          return { id: s.id, name: s.name, nrn: s.nrn, type: s.type, dims };
+        }).filter((s) => (s.dims.environment || "") === "prod");
+
+        // --- pools prod: clave de matching (cloudFamily, country) ---
+        // Azure rg:  banco-cl-null-platform-services-eastus2-prod  -> azure, chile
+        // GCP proj:  bfa-cl-np-services-prod                       -> gcp, chile
+        const COUNTRY = { cl: "chile", pe: "peru", co: "colombia", mx: "mexico", ar: "argentina" };
+        function poolKey(name, cloud) {
+          const m = name.match(/(?:^|-)(cl|pe|co|mx|ar)(?:-|$)/);
+          return { cloud, country: m ? COUNTRY[m[1]] : null };
+        }
+        function svcCloudFamily(dims) {
+          const c = dims.cloud || "";
+          return c.indexOf("azure") === 0 ? "azure" : c.indexOf("gcp") === 0 ? "gcp" : null;
+        }
+        // tipo de service <-> servicio de la factura
+        function billedType(svcName) {
+          if (svcName.indexOf("redis") >= 0 || svcName.indexOf("memorystore") >= 0) return "redis";
+          if (svcName.indexOf("postgre") >= 0 || svcName.indexOf("cloud sql") >= 0) return "postgres";
+          return "otros";
+        }
+
+        const allPools = [];
+        for (const [name, p] of Object.entries(inputs.azPools || {})) {
+          if (!name.endsWith("prod") || name.indexOf("preprod") >= 0) continue;
+          allPools.push({ name, cloud: "azure", region: "eastus2", daily: p.daily, ...poolKey(name, "azure") });
+        }
+        for (const [name, p] of Object.entries(inputs.gcpPools || {})) {
+          if (!name.endsWith("prod") || name.indexOf("preprod") >= 0) continue;
+          allPools.push({ name, cloud: "gcp", region: "southamerica-west1", daily: p.daily, ...poolKey(name, "gcp") });
+        }
+
+        // acumulador por service: daily {fecha: usd}
+        const perService = {};
+        let unmatchedUsd = 0;
+        const errors = [], poolSummaries = [];
+        for (const pool of allPools) {
+          // costo por (dia, tipo facturado)
+          const byDayType = {};
+          for (const [day, svcs] of Object.entries(pool.daily)) {
+            for (const [svc, usd] of Object.entries(svcs)) {
+              const t = billedType(svc);
+              byDayType[day] = byDayType[day] || {};
+              byDayType[day][t] = (byDayType[day][t] || 0) + usd;
+            }
+          }
+          // services candidatos del pool
+          const members = {};
+          for (const t of ["redis", "postgres"]) {
+            members[t] = services.filter((s) => s.type === t && svcCloudFamily(s.dims) === pool.cloud &&
+              (!pool.country || (s.dims.country || "") === pool.country));
+          }
+          let allocated = 0, total = 0;
+          for (const [day, types] of Object.entries(byDayType)) {
+            for (const [t, usd] of Object.entries(types)) {
+              total += usd;
+              const ms = members[t] || [];
+              if (!ms.length) { unmatchedUsd += usd; continue; }
+              allocated += usd;
+              const share = usd / ms.length;
+              for (const s of ms) {
+                const ps = perService[s.id] = perService[s.id] || { svc: s, pool: pool.name, daily: {}, nPool: ms.length };
+                ps.daily[day] = (ps.daily[day] || 0) + share;
+              }
+            }
+          }
+          const days = Object.keys(byDayType).length || 1;
+          poolSummaries.push({ pool: pool.name, usd_day: total / days, allocated_pct: total > 0 ? Math.round(100 * allocated / total) : 100 });
+
+          // instancia del pool
+          const days2 = Object.keys(pool.daily).sort();
+          const inst = await npGet("/catalog/instances/infrastructure_cost/svc-pool-" + encodeURIComponent(pool.name));
+          const byDate = {};
+          for (const p of (inst && inst.daily) || []) if (p && p.d) byDate[p.d] = p;
+          for (const d of days2) {
+            const types = byDayType[d] || {};
+            const res = {};
+            for (const [t, usd] of Object.entries(types)) res[t] = { unit: "usd", billed_usd: usd };
+            const tot = Object.values(types).reduce((a, b) => a + b, 0);
+            byDate[d] = { d, cost_usd: tot, usage_usd: null, waste_usd: null, allocation: "finout_direct", resources: res };
+          }
+          const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+          const costDay = days2.reduce((a, d) => a + Object.values(byDayType[d] || {}).reduce((x, y) => x + y, 0), 0) / (days2.length || 1);
+          const err = await npPatch("/catalog/instances/infrastructure_cost/svc-pool-" + encodeURIComponent(pool.name), {
+            id: "svc-pool-" + pool.name, entity_type: "shared", entity_name: pool.name,
+            dimensions: { cloud: pool.cloud, country: pool.country, environment: "prod" },
+            infrastructure_reference: { kind: "service_pool", id: pool.name, name: pool.name,
+              cloud_provider: pool.cloud, region: pool.region,
+              attributes: { source: "finout", pattern: "null-platform-services" } },
+            cost: { total_usd: costDay, usage_usd: null, waste_usd: null, currency: "USD", allocation: "finout_direct" },
+            usage: {}, daily,
+            sources: { finout: true, datadog: false, computed_at: new Date().toISOString(), workflow_execution_id: null }
+          });
+          if (err && errors.length < 5) errors.push(err);
+        }
+
+        // --- upsert por service ---
+        let upserted = 0;
+        await mapLimit(Object.keys(perService), 10, async (sid) => {
+          const ps = perService[sid];
+          const s = ps.svc;
+          const inst = await npGet("/catalog/instances/infrastructure_cost/service-" + sid);
+          const byDate = {};
+          for (const p of (inst && inst.daily) || []) if (p && p.d) byDate[p.d] = p;
+          for (const [d, usd] of Object.entries(ps.daily)) {
+            byDate[d] = { d, cost_usd: usd, usage_usd: null, waste_usd: null, allocation: "finout_direct",
+                          resources: { [s.type]: { unit: "usd", billed_usd: usd } } };
+          }
+          const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+          const dayKeys = Object.keys(ps.daily);
+          const costDay = dayKeys.reduce((a, d) => a + ps.daily[d], 0) / (dayKeys.length || 1);
+          const last7 = daily.slice(-7).reduce((a, p) => a + (p.cost_usd || 0), 0);
+          const last30 = daily.slice(-30).reduce((a, p) => a + (p.cost_usd || 0), 0);
+          const nrnParts = {};
+          for (const part of (s.nrn || "").split(":")) {
+            const [k, v] = part.split("=");
+            if (k && v) nrnParts[k] = v;
+          }
+          const err = await npPatch("/catalog/instances/infrastructure_cost/service-" + sid, {
+            id: "service-" + sid, nrn: s.nrn || null,
+            entity_type: "service", entity_id: sid, entity_name: s.name,
+            account_id: nrnParts.account || null, namespace_id: nrnParts.namespace || null,
+            application_id: nrnParts.application || null,
+            dimensions: { cloud: (s.dims.cloud || "").indexOf("gcp") === 0 ? "gcp" : "azure",
+                          country: s.dims.country || null, environment: "prod" },
+            infrastructure_reference: { kind: s.type, id: sid, name: s.name,
+              cloud_provider: (s.dims.cloud || "").indexOf("gcp") === 0 ? "gcp" : "azure", region: null,
+              attributes: { pool: ps.pool, split_method: "equal_within_pool", services_in_pool: ps.nPool } },
+            cost: { total_usd: costDay, usage_usd: null, waste_usd: null, currency: "USD", allocation: "finout_direct" },
+            cost_7d_usd: last7, cost_30d_usd: last30,
+            usage: {},
+            resources: { [s.type]: { unit: "usd", billed_usd: costDay } },
+            daily,
+            sources: { finout: true, datadog: false, computed_at: new Date().toISOString(), workflow_execution_id: null }
+          });
+          if (err) { if (errors.length < 5) errors.push(err); return; }
+          upserted++;
+        });
+
+        return {
+          pools: poolSummaries, services_matched: Object.keys(perService).length,
+          services_upserted: upserted, services_inventory: services.length,
+          unmatched_usd_day: Math.round(unmatchedUsd / 8 * 100) / 100, errors
+        };
+
+  - id: report
+    type: module
+    pluginType: log
+    dependsOn: [process]
+    config:
+      level: info
+      message: "service-costs: ${{ steps.process.outputs.services_upserted }}/${{ steps.process.outputs.services_inventory }} services con costo directo | sin match: USD ${{ steps.process.outputs.unmatched_usd_day }}/dia"
+
+connections:
+  - { id: t1, from: manual, to: finout_svc_az }
+  - { id: t2, from: daily, to: finout_svc_az }
+  - { id: t3, from: manual, to: finout_svc_gcp }
+  - { id: t4, from: daily, to: finout_svc_gcp }
