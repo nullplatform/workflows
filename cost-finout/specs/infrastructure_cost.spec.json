@@ -499,6 +499,90 @@
                 "null"
               ],
               "description": "costo del uso real de memoria (uso x rate)"
+            },
+            "resources": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "mapa de dimensiones de recurso (k8s: cpu/mem/pods; db: instance/storage/transfer; ...); reemplaza a usage y a los campos planos cpu_*/mem_*/pods_* (deprecados, ya no se escriben)",
+              "additionalProperties": {
+                "type": "object",
+                "description": "dimension medible del recurso: metricas de uso + costo derivado (rate x metrica)",
+                "properties": {
+                  "unit": {
+                    "type": "string",
+                    "description": "unidad (core_h, gb_h, gb, hours, pods, usd)"
+                  },
+                  "reserved": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "cantidad reservada/solicitada"
+                  },
+                  "used": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "cantidad usada"
+                  },
+                  "p95": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "p95 del uso (medias horarias)"
+                  },
+                  "max": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "min": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "avg": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "utilization_pct": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "rate_usd_per_unit": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "rate aplicado (USD/unidad)"
+                  },
+                  "billed_usd": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "facturado: max(reserved,used) x rate (o costo directo)"
+                  },
+                  "usage_usd": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "uso real: used x rate"
+                  }
+                },
+                "additionalProperties": false
+              }
             }
           }
         }
@@ -536,6 +620,90 @@
           "string",
           "null"
         ]
+      },
+      "resources": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "mapa de dimensiones de recurso (k8s: cpu/mem/pods; db: instance/storage/transfer; ...); reemplaza a usage y a los campos planos cpu_*/mem_*/pods_* (deprecados, ya no se escriben)",
+        "additionalProperties": {
+          "type": "object",
+          "description": "dimension medible del recurso: metricas de uso + costo derivado (rate x metrica)",
+          "properties": {
+            "unit": {
+              "type": "string",
+              "description": "unidad (core_h, gb_h, gb, hours, pods, usd)"
+            },
+            "reserved": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "cantidad reservada/solicitada"
+            },
+            "used": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "cantidad usada"
+            },
+            "p95": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "p95 del uso (medias horarias)"
+            },
+            "max": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "min": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "avg": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "utilization_pct": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "rate_usd_per_unit": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "rate aplicado (USD/unidad)"
+            },
+            "billed_usd": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "facturado: max(reserved,used) x rate (o costo directo)"
+            },
+            "usage_usd": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "uso real: used x rate"
+            }
+          },
+          "additionalProperties": false
+        }
       }
     }
   }
