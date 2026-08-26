@@ -207,9 +207,13 @@ steps:
           return r.json();
         }
         async function npPatch(path, body) {
-          const r = await fetch(NP + path + "?upsert=true", { method: "PATCH", headers: H, body: JSON.stringify(body) });
-          if (!r.ok) return path + " -> " + r.status + " " + (await r.text()).slice(0, 120);
-          return null;
+          for (let i = 0; i < 3; i++) {
+            const r = await fetch(NP + path + "?upsert=true", { method: "PATCH", headers: H, body: JSON.stringify(body) });
+            if (r.ok) return null;
+            const txt = (await r.text()).slice(0, 120);
+            if (r.status < 500 || i === 2) return path + " -> " + r.status + " " + txt;
+            await new Promise((res) => setTimeout(res, 1500 * (i + 1)));
+          }
         }
         async function mapLimit(arr, limit, fn) {
           const out = new Array(arr.length);
