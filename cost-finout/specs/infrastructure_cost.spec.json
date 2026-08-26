@@ -704,6 +704,27 @@
           },
           "additionalProperties": false
         }
+      },
+      "application_name": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "nombre de la aplicacion (denormalizado para agrupar sin joins)"
+      },
+      "namespace_name": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "nombre del namespace"
+      },
+      "account_name": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "nombre de la cuenta"
       }
     }
   }
