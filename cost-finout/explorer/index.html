@@ -93,6 +93,11 @@ let SORT = { k: "cost", asc: false };
 
 try { $("#token").value = localStorage.getItem("npCostToken") || ""; } catch (e) {}
 
+if (location.protocol === "file:") {
+  $("#status").innerHTML = "<b>abriste el archivo directo</b> — corré <code>node serve.js</code> en esta carpeta y entrá a <a href='http://localhost:8787'>http://localhost:8787</a> (el server proxya la API de NP)";
+  $("#load").disabled = true;
+}
+
 const TABS = [
   ["app", "Apps"], ["ns", "Namespaces"], ["acc", "Cuentas"], ["scope", "Scopes"],
   ["cluster", "Clusters"], ["svc", "Servicios"], ["pool", "Pools servicios"],
