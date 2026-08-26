@@ -16,7 +16,7 @@ ns `nullplatform`), providers API + lake de NP. Todos los números en USD.
 | Plataforma: `*-cross-*` (11 clusters) | 276 | 8,3k |
 | Plataforma: `fif-monitoring` | 158 | 4,7k |
 | Plataforma: `*-chat-*`, `integracion-delta`, `mercurio` | 280 | 8,4k |
-| **Total "relacionado a null" en k8s** | ~2.520 | **~75k** (≈65k sin chat/integración/mercurio) |
+| **Total "relacionado a null" en k8s** | ~2.520 | **~75k** — ver §3bis: con vista por cuenta sube a ~87k |
 
 Reconcilia con el análisis paralelo de ~65k/mes: la diferencia entre 47k y 65k
 es la plataforma asociada que se incluya.
@@ -87,14 +87,38 @@ vs ~0,027-0,032 que daba el cálculo solo-compute: el rate por cuenta es
 ~1,4-2× porque incluye el costo real total (headroom, observabilidad, red).
 El spread entre pools (2×) confirma que un rate único org-wide mentiría.
 
-## 3. Azure (pendiente de completar en esta pasada)
+## 3. Azure: el boundary es el resource group (verificado)
 
-- Costo por cluster AKS vía resource group `mc_<cluster>` (nodos + LB + NAT del
-  cluster): NP prod ~$xxx/día — ver tabla del §1.
-- Las subscriptions son por unidad de negocio (canales digitales, seguros…),
-  NO por NP → el boundary Azure es el resource group, no la subscription.
-- FALTA: resource groups NP no-`mc_` (cluster resource, App Gateway, IPs,
-  Log Analytics) — query en curso, completar acá.
+Las subscriptions son por unidad de negocio ("canales digitales bfcl
+produccion", "seguros 2.0"…), NO por NP → el corte correcto es por
+**resource group**. Tres familias NP:
+
+| Familia | USD/día | ~USD/mes | Qué contiene |
+|---|---:|---:|---|
+| `mc_<cluster>` (46 rgs, prod+preprod) | 731 | 21,9k | Nodos + LBs + IPs + discos del cluster (AKS los agrupa ahí solo) |
+| `*-null-platform-services-*` (16 rgs) | 129 | **3,9k** | **Los services null de Azure**: Redis cache + PostgreSQL + vnet, por unidad×env |
+| `<cluster>` (rg propio del cluster) | ~40 | 1,2k | AKS fee ($1,5/día c/u) + Microsoft Defender + vnet |
+
+- El "networking declarado" de Azure ya queda adentro: LBs/IPs en `mc_*`,
+  vnets en el rg del cluster y en services.
+- Espejo del hallazgo GCP: los **services** (redis/postgres) tienen rgs
+  dedicados con naming limpio (`banco-cl-null-platform-services-eastus2-prod`:
+  redis $20,5/día + postgres $0,8) — la fase services tiene boundary en ambos
+  clouds, total services ≈ **$163/día ≈ 4,9k/mes** (Azure 3,9k + GCP 1k).
+
+## 3bis. Total NP consolidado (con visión por cuenta/rg completa)
+
+| | USD/día | ~USD/mes |
+|---|---:|---:|
+| GCP: 18 cuentas NP (compute+logging+monitoring+red+services) | 1.040 | 31,2k |
+| Azure: rgs NP (nodos+LB+services+fees+defender) | 902 | 27,1k |
+| **NP estricto TOTAL (prod+preprod, ambos clouds)** | **1.942** | **~58k** |
+| + plataforma asociada k8s (cd-tools, cross, monitoring, chat…) | +953 | +28,6k |
+| **Todo lo relacionado a null** | ~2.895 | **~87k** |
+
+El ~65k del análisis paralelo ≈ NP estricto (58k) + monitoring (4,7k) ≈ 63k —
+consistente; la vista por cuenta/rg le suma lo que ningún cost center de k8s
+ve (logging, defender, fees, services, vnets).
 
 ## 4. Cobertura de señal (Datadog)
 
