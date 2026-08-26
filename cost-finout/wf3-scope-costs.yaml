@@ -98,13 +98,15 @@ steps:
           .filter((c) => c && /^[a-z0-9][a-z0-9._-]*$/i.test(c) && c.toLowerCase() !== "n/a");
 
         // --- 2) blended rates del dia (fallback: rates vigentes) ---
+        // rate MENSUAL congelado: siempre el de cabecera del cluster (estimacion
+        // vigente de $/core-h y $/GB-h); la serie diaria del blended_rate queda
+        // solo como auditoria. La valuacion es aproximada a proposito.
         const rates = {};
         await mapLimit(clusters, 6, async (cl) => {
           const inst = await npGet("/catalog/instances/blended_rate/" + encodeURIComponent(cl));
           if (!inst) return;
-          let cpu = inst.rates && inst.rates.cpu_usd_core_hour;
-          let mem = inst.rates && inst.rates.mem_usd_gb_hour;
-          for (const p of inst.daily || []) if (p.d === day) { cpu = p.cpu_usd_core_hour; mem = p.mem_usd_gb_hour; }
+          const cpu = inst.rates && inst.rates.cpu_usd_core_hour;
+          const mem = inst.rates && inst.rates.mem_usd_gb_hour;
           if (cpu > 0 && mem > 0) rates[cl] = { cpu, mem };
         });
 
