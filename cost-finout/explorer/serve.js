@@ -5,7 +5,7 @@
 // no puede pegarle directo: este proxy (mismo origen) reenvia los GET agregando
 // el header Authorization que manda el front (el token se pega en la UI).
 //
-// Uso:  node serve.js [puerto]   (default 8787)  ->  http://localhost:8787
+// Uso:  node serve.js [puerto]   (default 8917)  ->  http://localhost:8917
 // Solo GET, solo /catalog/* — herramienta de exploracion read-only.
 import http from "node:http";
 import https from "node:https";
@@ -14,7 +14,7 @@ import { dirname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const API = "api.nullplatform.com";
-const PORT = Number(process.argv[2]) || 8787;
+const PORT = Number(process.argv[2]) || 8917;
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 const server = http.createServer(async (req, res) => {
