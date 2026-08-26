@@ -310,6 +310,34 @@
               "number",
               "null"
             ]
+          },
+          "cpu_use_p95_core": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "p95 de cores usados (sobre medias horarias del dia)"
+          },
+          "cpu_use_max_core": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "maximo horario de cores usados"
+          },
+          "mem_use_p95_gb": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "p95 de GB usados (sobre medias horarias del dia)"
+          },
+          "mem_use_max_gb": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "maximo horario de GB usados"
           }
         }
       },
@@ -387,6 +415,34 @@
             },
             "allocation": {
               "type": "string"
+            },
+            "cpu_use_p95_core": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "p95 de cores usados (sobre medias horarias del dia)"
+            },
+            "cpu_use_max_core": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "maximo horario de cores usados"
+            },
+            "mem_use_p95_gb": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "p95 de GB usados (sobre medias horarias del dia)"
+            },
+            "mem_use_max_gb": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "maximo horario de GB usados"
             }
           }
         }

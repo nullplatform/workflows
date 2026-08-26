@@ -116,7 +116,8 @@ steps:
           ["kubernetes.cpu.requests", "cpuReq", 1],
           ["kubernetes.cpu.usage.total", "cpuUse", 1e-9],           // nanocores → cores
           ["kubernetes.memory.requests", "memReq", 1 / 1073741824], // bytes → GB
-          ["kubernetes.memory.working_set", "memUse", 1 / 1073741824]
+          ["kubernetes.memory.working_set", "memUse", 1 / 1073741824],
+          ["kubernetes.pods.running", "pods", 1]
         ];
         await mapLimit(clusters, 3, async (cl) => {
           for (const [metric, field, factor] of METRICS) {
@@ -148,13 +149,22 @@ steps:
           const rate = rates[sc.cluster];
           if (!rate) { noRate++; return; }
           let reqCpuH = 0, useCpuH = 0, reqMemH = 0, useMemH = 0, total = 0, usage = 0;
+          const cpuHours = [], memHours = [], podHours = [];
           for (const ts of Object.keys(sc.hours)) {
             const h = sc.hours[ts];
             const cpuReq = h.cpuReq || 0, cpuUse = h.cpuUse || 0, memReq = h.memReq || 0, memUse = h.memUse || 0;
             reqCpuH += cpuReq; useCpuH += cpuUse; reqMemH += memReq; useMemH += memUse;
             total += Math.max(cpuReq, cpuUse) * rate.cpu + Math.max(memReq, memUse) * rate.mem;
             usage += cpuUse * rate.cpu + memUse * rate.mem;
+            cpuHours.push(cpuUse); memHours.push(memUse);
+            if (h.pods != null) podHours.push(h.pods);
           }
+          // percentiles/picos sobre las medias horarias del dia
+          const p95 = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.ceil(0.95 * s.length) - 1)]; };
+          const mx = (a) => a.length ? Math.max(...a) : null;
+          const podsMin = podHours.length ? Math.round(Math.min(...podHours)) : null;
+          const podsMax = podHours.length ? Math.round(Math.max(...podHours)) : null;
+          const podsAvg = podHours.length ? Math.round((podHours.reduce((x, y) => x + y, 0) / podHours.length) * 10) / 10 : null;
           const inst = await npGet("/catalog/instances/infrastructure_cost/scope-" + sid);
           if (!inst) { notInCenso++; return; }
           const prevRef = inst.infrastructure_reference || {};
@@ -168,7 +178,9 @@ steps:
             d: day, cost_usd: total, usage_usd: usage, waste_usd: total - usage,
             cpu_req_core_h: reqCpuH, cpu_used_core_h: useCpuH,
             mem_req_gb_h: reqMemH, mem_used_gb_h: useMemH,
-            pods_min: null, pods_max: null, pods_avg: null,
+            cpu_use_p95_core: p95(cpuHours), cpu_use_max_core: mx(cpuHours),
+            mem_use_p95_gb: p95(memHours), mem_use_max_gb: mx(memHours),
+            pods_min: podsMin, pods_max: podsMax, pods_avg: podsAvg,
             allocation: "blended"
           };
           const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
@@ -191,7 +203,9 @@ steps:
               mem_req_gb_h: reqMemH, mem_used_gb_h: useMemH,
               cpu_utilization_pct: reqCpuH > 0 ? Math.round((useCpuH / reqCpuH) * 100) : null,
               mem_utilization_pct: reqMemH > 0 ? Math.round((useMemH / reqMemH) * 100) : null,
-              pods_min: null, pods_max: null, pods_avg: null
+              cpu_use_p95_core: p95(cpuHours), cpu_use_max_core: mx(cpuHours),
+              mem_use_p95_gb: p95(memHours), mem_use_max_gb: mx(memHours),
+              pods_min: podsMin, pods_max: podsMax, pods_avg: podsAvg
             },
             daily,
             sources: { finout: true, datadog: true, computed_at: now.toISOString(),
