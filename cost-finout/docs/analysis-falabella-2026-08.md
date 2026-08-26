@@ -147,3 +147,41 @@ ve (logging, defender, fees, services, vnets).
    contra el número real (~65-75k), aunque no haya allocation por scope.
 6. Logging/monitoring dentro del rate (parte del costo de la cuenta) — y
    además vigilados como anomalía propia (caso Perú).
+
+## 6. Alcance de Finout y ubicación de bases/caches (preguntas de Gabriel)
+
+### Finout ve SOLO Falabella Financiero
+- Azure: 41 subscriptions, todas financiero (canales digitales, seguros,
+  payments, peinau PCI, fif networking). Cero Sodimac/Tottus/retail.
+- GCP: 775/805 proyectos con prefijo financiero; los 29 "opacos" (`pr-…`)
+  resultaron ser los proyectos-conducto del marketplace de **MongoDB Atlas**
+  (~$1,7k/día) — también financiero.
+- OCI: Flexcube / core bancario.
+- ⚠️ A verificar con Falabella: la factura de **Datadog** dentro de Finout
+  (206k/mes) — el org DD es corporativo cross-negocio (reportan clusters de
+  Sodimac/Tottus), así que financiero podría estar pagando observabilidad de
+  otros negocios.
+
+### Las subscriptions tienen MUCHO más que k8s
+Ejemplos (USD/día): "canales digitales regional prod" 4.698 = VMs 1.785 +
+storage 942 + SQL 463 + **GitHub 447** + MySQL 250 + bandwidth 188. "bfcl
+prod" 4.425 = VMs 2.458 + storage 740 + MySQL 327 + **foundry models (IA)
+208** + redis 145. "bfcl-lift-and-shift" = specialized compute 508. Los
+clusters NP son ~$200/día de los ~$6.700 de la subscription bfcl prod.
+
+### Dónde viven las bases y caches
+| Dónde | USD/día | Detalle |
+|---|---:|---|
+| Azure "canales digitales regional prod" | 814 | SQL 463 + MySQL 250 + redis/postgres |
+| Azure "canales digitales bfcl prod" | 601 | MySQL 327 + redis 145 + postgres 126 |
+| Azure "seguros 2.0" | 410 | SQL 229 + postgres 167 |
+| GCP MongoDB Atlas (marketplace, proyectos `pr-…`) | ~1.700 | **~50k/mes** — private offer 587 + PAYG 545 + 244 + … |
+| GCP Cloud SQL (proyectos por app) | ~400 | quadrature 155, cvd 40, loyalty-ldr 34, … |
+| NP services (ya mapeado §2/§3) | 163 | Azure redis+postgres 129 + GCP Memorystore 34 |
+
+### Implicancia para la fase services
+- Redis/PostgreSQL de NP: boundary limpio (rgs/cuentas dedicadas) → directo.
+- **MongoDB Atlas (el gordo, ~50k/mes)**: los proyectos marketplace son
+  opacos — la atribución por service NP (74 mongos activos) va a requerir la
+  API de Atlas (costo por cluster Atlas) o tags del lado Atlas, no sale de
+  Finout solo.
