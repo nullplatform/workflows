@@ -58,9 +58,10 @@ for slug in infrastructure_cost blended_rate; do
     echo "created $slug: $(jq -r '.id // "ok"' <<<"$res")"
   elif [[ "$st" == "409" || ( "$st" == "400" && "$res" == *exist* ) ]]; then
     sid=$(api GET "/catalog/specifications?nrn=organization=$ORG_ID&limit=200" | sed '$d' \
-      | jq -r --arg s "$slug" '(.results // .) | map(select(.slug==$s)) | .[0].id // empty')
+      | jq -r --arg s "$slug" '[.. | objects | select(.slug? == $s)] | .[0].id // empty')
     [[ -n "$sid" ]] || { echo "FAILED: $slug exists but id not resolvable: $res"; exit 1; }
-    patch=$(mktemp); jq '{schema: .schema, description: .description, name: .name}' "$f" > "$patch"
+    # NOTA: el PATCH rechaza la key `relations` dentro de schema (400) — se quita
+    patch=$(mktemp); jq '{schema: (.schema | del(.relations)), description: .description, name: .name}' "$f" > "$patch"
     out=$(api PATCH "/catalog/specifications/$sid" "$patch")
     st=$(tail -n1 <<<"$out")
     [[ "$st" =~ ^2 ]] && echo "updated $slug ($sid)" || { echo "FAILED patch $slug ($st): $(sed '$d' <<<"$out")"; exit 1; }
