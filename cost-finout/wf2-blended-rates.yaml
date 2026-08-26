@@ -66,8 +66,12 @@ steps:
           "bfa-cl-np-local-prod","bfa-cl-np-local-preprod"];
         const DAY = 86400000;
         const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
+        // Billing GCP llega con ~1 dia de lag; excluimos el ultimo dia para no
+        // promediar un dia parcial si Finout lo llegara a exponer a medio cargar.
+        const LAG_DAYS = 1;
+        const windowEnd = endOfYesterday - LAG_DAYS * DAY;
         const q = {
-          date: { unixTimeMillisecondsStart: endOfYesterday - 8 * DAY, unixTimeMillisecondsEnd: endOfYesterday - 1 },
+          date: { unixTimeMillisecondsStart: windowEnd - 8 * DAY, unixTimeMillisecondsEnd: windowEnd - 1 },
           timeInterval: { interval: "day" },
           measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
           dimensions: [{ costCenter: "GCP", key: "project_id", type: "tag" },
@@ -135,29 +139,49 @@ steps:
         }
         const DAY = 86400000;
         const endOfYesterday = Math.floor(Date.now() / DAY) * DAY;
+        // El billing de Azure llega con ~2 dias de lag: los ultimos dias aparecen
+        // PARCIALES en Finout (con valor bajo, no ausentes) y envenenan el promedio.
+        const LAG_DAYS = 2;
+        const windowEnd = endOfYesterday - LAG_DAYS * DAY;
         const NET = ["load balancer", "bandwidth", "nat gateway", "virtual network", "vpn gateway", "azure dns", "network watcher"];
-        const q = {
-          date: { unixTimeMillisecondsStart: endOfYesterday - 8 * DAY, unixTimeMillisecondsEnd: endOfYesterday - 1 },
-          timeInterval: { interval: "day" },
-          measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
-          dimensions: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
-                       { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }],
-          filters: { AND: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "mc_" }] },
-          rowLimit: 50000
-        };
+        function baseQuery(filter) {
+          return {
+            date: { unixTimeMillisecondsStart: windowEnd - 8 * DAY, unixTimeMillisecondsEnd: windowEnd - 1 },
+            timeInterval: { interval: "day" },
+            measurements: [{ type: "amortizedCost", operator: "sum", sortDirection: "descending" }],
+            dimensions: [{ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment" },
+                         { costCenter: "Azure", key: "cloud_service", type: "billing_dimension" }],
+            filters: { AND: [filter], },
+            rowLimit: 50000
+          };
+        }
         const costs = {};
-        for (const r of await runQuery(q)) {
-          const rg = r.Azure_billing_enrichment_resourcegroup || "";
-          if (!rg.startsWith("mc_")) continue;
-          const cl = rg.slice(3);
-          const svc = (r.Azure_billing_dimension_cloud_service || "").toLowerCase();
-          const day = (r.Day || r.day || "").slice(0, 10);
-          const amt = r.amortizedCost_sum || 0;
-          if (!day) continue;
+        function add(cl, day, svc, amt) {
           const c = costs[cl] = costs[cl] || { daily: {} };
           const d = c.daily[day] = c.daily[day] || { total: 0, network: 0 };
           d.total += amt;
           if (NET.some((s) => svc.includes(s))) d.network += amt;
+        }
+        // 1) nodos + LB + IPs del cluster (rg mc_<cluster>)
+        for (const r of await runQuery(baseQuery({ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "contains", value: "mc_" }))) {
+          const rg = r.Azure_billing_enrichment_resourcegroup || "";
+          if (!rg.startsWith("mc_")) continue;
+          const svc = (r.Azure_billing_dimension_cloud_service || "").toLowerCase();
+          const day = (r.Day || r.day || "").slice(0, 10);
+          if (!day) continue;
+          add(rg.slice(3), day, svc, r.amortizedCost_sum || 0);
+        }
+        // 2) rg propio del cluster (fee AKS, Defender, vnet, monitor) — mismo nombre sin mc_
+        const clusterNames = Object.keys(costs);
+        if (clusterNames.length) {
+          for (const r of await runQuery(baseQuery({ costCenter: "Azure", key: "resourcegroup", type: "billing_enrichment", operator: "oneOf", value: clusterNames }))) {
+            const rg = r.Azure_billing_enrichment_resourcegroup || "";
+            if (!costs[rg]) continue;
+            const svc = (r.Azure_billing_dimension_cloud_service || "").toLowerCase();
+            const day = (r.Day || r.day || "").slice(0, 10);
+            if (!day) continue;
+            add(rg, day, svc, r.amortizedCost_sum || 0);
+          }
         }
         return { costs, count: Object.keys(costs).length };
 
@@ -252,7 +276,7 @@ steps:
             const days = Object.keys(daily);
             const t = days.reduce((a, d) => a + daily[d].total, 0) / days.length;
             const n = days.reduce((a, d) => a + (daily[d].network || 0), 0) / days.length;
-            compo = "Costo AMORTIZADO 7d del resource group mc_" + cl + " (nodos+discos+LBs+IPs del cluster AKS): $" + t.toFixed(1) + "/dia, de los cuales networking (LB/NAT/bandwidth/vnet) $" + n.toFixed(1) + "/dia. Dividido por reservas Datadog del cluster (" + Math.round(u.cores) + " cores, " + Math.round(u.gb) + " GB). Split CPU/RAM por ratio de precio vCPU:GB 7:1. NO incluye: rg del cluster (AKS fee+Defender+vnet ~$2-4/dia), services (redis/postgres/atlas) ni factura Datadog.";
+            compo = "Costo AMORTIZADO 7d (ventana con 2 dias de lag de billing excluidos) de los resource groups mc_" + cl + " (nodos+discos+LBs+IPs del cluster AKS) + " + cl + " (fee AKS, Defender, vnet, monitor): $" + t.toFixed(1) + "/dia, de los cuales networking (LB/NAT/bandwidth/vnet) $" + n.toFixed(1) + "/dia. Las reservas/RIs entran amortizadas dentro del rg. Dividido por reservas Datadog del cluster (" + Math.round(u.cores) + " cores, " + Math.round(u.gb) + " GB). Split CPU/RAM por ratio de precio vCPU:GB 7:1. NO incluye: services (redis/postgres/atlas) ni factura Datadog.";
           } else if (proj && gcpPools[proj]) {
             const members = poolMembers[proj] || [cl];
             const totCores = members.reduce((a, m) => a + (res[m] ? res[m].cores : 0), 0);
@@ -282,6 +306,11 @@ steps:
           const existing = exResp.ok ? await exResp.json() : null;
           const byDate = {};
           for (const p of (existing && existing.daily) || []) if (p && p.d) byDate[p.d] = p;
+          // Purga entradas mas nuevas que la ventana: fueron escritas por corridas
+          // viejas con billing parcial (lag) y se reescriben sanas cuando la ventana
+          // las alcance. Ningun run futuro escribe mas alla de su ventana.
+          const lastWindowDay = days[days.length - 1];
+          for (const d of Object.keys(byDate)) if (d > lastWindowDay) delete byDate[d];
           for (const d of days) {
             byDate[d] = { d,
               cpu_usd_core_hour: (daily[d].total * wCpu) / cpuAlloc,
