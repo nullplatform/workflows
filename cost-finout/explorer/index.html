@@ -134,7 +134,18 @@ async function loadAll() {
   } finally { $("#load").disabled = false; }
 }
 
-function dayEntry(inst, d) { return (inst.daily || []).find((p) => p.d === d) || null; }
+function dayEntry(inst, d) {
+  const dl = inst.daily || [];
+  const exact = dl.find((p) => p.d === d);
+  if (exact) return exact;
+  // services/pools (finout_direct) traen la serie con lag de billing:
+  // si el dia pedido no existe, usar la ultima entrada anterior disponible
+  if (/^(service-|svc-pool-)/.test(String(inst.id))) {
+    const prev = dl.filter((p) => p.d <= d).sort((a, b) => a.d < b.d ? -1 : 1);
+    return prev[prev.length - 1] || null;
+  }
+  return null;
+}
 
 // agrega una lista de instancias-scope para el dia DAY
 function aggregate(insts) {
