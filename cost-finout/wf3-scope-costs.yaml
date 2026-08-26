@@ -148,17 +148,20 @@ steps:
           const sc = byScope[sid];
           const rate = rates[sc.cluster];
           if (!rate) { noRate++; return; }
-          let reqCpuH = 0, useCpuH = 0, reqMemH = 0, useMemH = 0, total = 0, usage = 0;
+          let reqCpuH = 0, useCpuH = 0, reqMemH = 0, useMemH = 0;
+          let cpuBill = 0, memBill = 0, cpuUseUsd = 0, memUseUsd = 0;
           const cpuHours = [], memHours = [], podHours = [];
           for (const ts of Object.keys(sc.hours)) {
             const h = sc.hours[ts];
             const cpuReq = h.cpuReq || 0, cpuUse = h.cpuUse || 0, memReq = h.memReq || 0, memUse = h.memUse || 0;
             reqCpuH += cpuReq; useCpuH += cpuUse; reqMemH += memReq; useMemH += memUse;
-            total += Math.max(cpuReq, cpuUse) * rate.cpu + Math.max(memReq, memUse) * rate.mem;
-            usage += cpuUse * rate.cpu + memUse * rate.mem;
+            cpuBill += Math.max(cpuReq, cpuUse) * rate.cpu;
+            memBill += Math.max(memReq, memUse) * rate.mem;
+            cpuUseUsd += cpuUse * rate.cpu; memUseUsd += memUse * rate.mem;
             cpuHours.push(cpuUse); memHours.push(memUse);
             if (h.pods != null) podHours.push(h.pods);
           }
+          const total = cpuBill + memBill, usage = cpuUseUsd + memUseUsd;
           // percentiles/picos sobre las medias horarias del dia
           const p95 = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.ceil(0.95 * s.length) - 1)]; };
           const mx = (a) => a.length ? Math.max(...a) : null;
@@ -176,6 +179,8 @@ steps:
           for (const p of inst.daily || []) if (p && p.d) byDate[p.d] = p;
           byDate[day] = {
             d: day, cost_usd: total, usage_usd: usage, waste_usd: total - usage,
+            cpu_cost_usd: cpuBill, mem_cost_usd: memBill,
+            cpu_usage_usd: cpuUseUsd, mem_usage_usd: memUseUsd,
             cpu_req_core_h: reqCpuH, cpu_used_core_h: useCpuH,
             mem_req_gb_h: reqMemH, mem_used_gb_h: useMemH,
             cpu_use_p95_core: p95(cpuHours), cpu_use_max_core: mx(cpuHours),
@@ -196,6 +201,8 @@ steps:
             },
             rate_ref: sc.cluster,
             cost: { total_usd: total, usage_usd: usage, waste_usd: total - usage,
+                    cpu_cost_usd: cpuBill, mem_cost_usd: memBill,
+                    cpu_usage_usd: cpuUseUsd, mem_usage_usd: memUseUsd,
                     currency: "USD", allocation: "blended" },
             cost_7d_usd: last7, cost_30d_usd: last30,
             usage: {

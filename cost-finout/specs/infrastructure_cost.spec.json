@@ -237,6 +237,34 @@
               "shared_overhead"
             ],
             "description": "blended: usage Datadog × blended_rate. finout_direct: allocation por pod label en Finout (hoy solo clusters cmrmx). shared_overhead: costo compartido distribuido."
+          },
+          "cpu_cost_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "costo facturado de CPU: max(request, uso) por hora x rate cpu"
+          },
+          "mem_cost_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "costo facturado de memoria: max(request, uso) por hora x rate mem"
+          },
+          "cpu_usage_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "costo del uso real de CPU (uso x rate)"
+          },
+          "mem_usage_usd": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "costo del uso real de memoria (uso x rate)"
           }
         }
       },
@@ -443,6 +471,34 @@
                 "null"
               ],
               "description": "maximo horario de GB usados"
+            },
+            "cpu_cost_usd": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "costo facturado de CPU: max(request, uso) por hora x rate cpu"
+            },
+            "mem_cost_usd": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "costo facturado de memoria: max(request, uso) por hora x rate mem"
+            },
+            "cpu_usage_usd": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "costo del uso real de CPU (uso x rate)"
+            },
+            "mem_usage_usd": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "description": "costo del uso real de memoria (uso x rate)"
             }
           }
         }
