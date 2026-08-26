@@ -1,0 +1,291 @@
+{
+  "name": "Infrastructure Cost Daily",
+  "slug": "infrastructure_cost_daily",
+  "description": "Tabla de HECHOS de costos: una instancia por (entidad, dia), campos planos para sumarizar en el lake. El estado/resumen vive en infrastructure_cost.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "primaryKey": true,
+        "autoGenerate": false,
+        "description": "<entity_id>-<yyyy-mm-dd>"
+      },
+      "d": {
+        "type": "string",
+        "description": "dia UTC YYYY-MM-DD",
+        "index": [
+          "filter"
+        ]
+      },
+      "entity_type": {
+        "type": "string",
+        "description": "scope|service|cluster|shared",
+        "index": [
+          "filter"
+        ]
+      },
+      "entity_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "entity_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "application_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "application_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "namespace_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "namespace_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "nrn": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cluster": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cloud": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "country": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "environment": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "allocation": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "blended|finout_direct|shared_overhead"
+      },
+      "cost_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "usage_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "waste_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_cost_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_cost_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_usage_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_usage_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_req_core_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_used_core_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_p95_core": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_max_core": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_req_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_used_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_p95_gb": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_max_gb": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "pods_min": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "pods_max": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "pods_avg": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "rate_cpu_usd_core_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "rate_mem_usd_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "additionalProperties": false,
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 1061226164,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 1061226164,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

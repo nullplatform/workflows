@@ -218,6 +218,27 @@ steps:
                        workflow_execution_id: inputs.executionId || null }
           });
           if (err) { if (errors.length < 5) errors.push("scope-" + sid + " " + err); return; }
+          // hecho plano (entidad, dia) para analitica: infrastructure_cost_daily
+          const fErr = await npPatch("/catalog/instances/infrastructure_cost_daily/scope-" + sid + "-" + day, {
+            id: "scope-" + sid + "-" + day, d: day, entity_type: "scope",
+            entity_id: sid, entity_name: inst.entity_name || null,
+            application_id: inst.application_id || null, application_name: inst.application_name || null,
+            namespace_id: inst.namespace_id || null, namespace_name: inst.namespace_name || null,
+            account_id: inst.account_id || null, account_name: inst.account_name || null,
+            nrn: inst.nrn || null, cluster: sc.cluster, cloud,
+            country: dims.country || null, environment: dims.environment || null,
+            allocation: "blended",
+            cost_usd: total, usage_usd: usage, waste_usd: total - usage,
+            cpu_cost_usd: cpuBill, mem_cost_usd: memBill,
+            cpu_usage_usd: cpuUseUsd, mem_usage_usd: memUseUsd,
+            cpu_req_core_h: reqCpuH, cpu_used_core_h: useCpuH,
+            cpu_p95_core: p95(cpuHours), cpu_max_core: mx(cpuHours),
+            mem_req_gb_h: reqMemH, mem_used_gb_h: useMemH,
+            mem_p95_gb: p95(memHours), mem_max_gb: mx(memHours),
+            pods_min: podsMin, pods_max: podsMax, pods_avg: podsAvg,
+            rate_cpu_usd_core_h: rate.cpu, rate_mem_usd_gb_h: rate.mem
+          });
+          if (fErr && errors.length < 5) errors.push(fErr);
           costed++; orgCost += total;
           const ca = clusterAgg[sc.cluster] = clusterAgg[sc.cluster] || { total: 0, usage: 0, scopes: 0, dims: {} };
           ca.total += total; ca.usage += usage; ca.scopes++;
@@ -236,6 +257,13 @@ steps:
           byDate[day] = { d: day, cost_usd: ca.total, usage_usd: ca.usage, waste_usd: ca.total - ca.usage,
                           allocation: "blended" };
           const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
+          await npPatch("/catalog/instances/infrastructure_cost_daily/cluster-" + encodeURIComponent(cl) + "-" + day, {
+            id: "cluster-" + cl + "-" + day, d: day, entity_type: "cluster",
+            entity_id: cl, entity_name: cl, cluster: cl, cloud,
+            country: topDims.country || null, environment: topDims.environment || null,
+            allocation: "blended",
+            cost_usd: ca.total, usage_usd: ca.usage, waste_usd: ca.total - ca.usage
+          });
           await npPatch("/catalog/instances/infrastructure_cost/cluster-" + encodeURIComponent(cl), {
             id: "cluster-" + cl, entity_type: "cluster", entity_name: cl,
             dimensions: topDims,

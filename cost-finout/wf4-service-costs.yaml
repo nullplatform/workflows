@@ -385,6 +385,21 @@ steps:
             sources: { finout: true, datadog: false, computed_at: new Date().toISOString(), workflow_execution_id: null }
           });
           if (err) { if (errors.length < 5) errors.push(err); return; }
+          // hechos (service, dia)
+          for (const d of Object.keys(allDates)) {
+            let tot = 0;
+            for (const dim of Object.values(ps.byDim)) tot += dim[d] || 0;
+            const fErr = await npPatch("/catalog/instances/infrastructure_cost_daily/service-" + sid + "-" + d, {
+              id: "service-" + sid + "-" + d, d, entity_type: "service",
+              entity_id: sid, entity_name: s.rawName,
+              application_id: nrnParts.application || null,
+              namespace_id: nrnParts.namespace || null, account_id: nrnParts.account || null,
+              nrn: s.nrn || null, cloud: svcCloudFamily(s.dims),
+              country: s.dims.country || null, environment: "prod",
+              allocation: "finout_direct", cost_usd: tot
+            });
+            if (fErr && errors.length < 5) errors.push(fErr);
+          }
           upserted++;
         });
 
