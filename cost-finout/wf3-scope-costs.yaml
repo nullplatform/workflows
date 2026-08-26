@@ -71,8 +71,7 @@ steps:
         }
         async function npGet(path) {
           const r = await fetch(NP + path, { headers: H });
-          if (r.status === 404) return null;
-          if (!r.ok) throw new Error("GET " + path + " -> " + r.status);
+          if (!r.ok) return null; // lecturas best-effort: 404/500 = sin dato
           return r.json();
         }
         async function npPatch(path, body) {
@@ -95,7 +94,8 @@ steps:
 
         // --- 1) clusters con workloads NP en el dia ---
         const clSeries = await dd("sum:kubernetes.cpu.requests{kube_namespace:nullplatform} by {kube_cluster_name}.rollup(avg, 3600)");
-        const clusters = clSeries.map((s) => tag(s, "kube_cluster_name")).filter(Boolean);
+        const clusters = clSeries.map((s) => tag(s, "kube_cluster_name"))
+          .filter((c) => c && /^[a-z0-9][a-z0-9._-]*$/i.test(c) && c.toLowerCase() !== "n/a");
 
         // --- 2) blended rates del dia (fallback: rates vigentes) ---
         const rates = {};
