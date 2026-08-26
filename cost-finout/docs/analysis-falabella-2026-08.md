@@ -231,3 +231,24 @@ Consecuencias:
    spread entre pools se achica pero sigue siendo real.
 3. El "gasto sin atribución" (~$437k/mes en unblended) se reduce
    drásticamente en amortizado — la navegación por cuenta pasa a cubrir ~92%+.
+
+## 9. Logs por app (Datadog): allocation probada
+
+Mecanismo: métrica `datadog.estimated_usage.logs.ingested_bytes by {service}`
+(24h, 3.168 services) × cruce del `service` DD contra los app-slugs de NP del
+lake (normalizando separadores y sufijos -cl/-pe/-prod…).
+
+- Total org: **1,70 TB/día** de logs ingeridos.
+- Matcheado a apps NP: **801 services = 172,9 GB/día = 10,2%** del total.
+- Porción NP de la factura de logs DD (~$2.323/día): **≈ $237/día ≈ $7,1k/mes**.
+- Top apps NP: `api-any-customer-information` 9,7 GB/día, `api-any-authify`
+  7,6, `api-any-riskify` 6,0, `kco-bfcl-credit-card-additional-purchase-…` 5,8.
+  Por cuenta: fif ~168 GB/día, seguros 4, BFCL-Local 0,8.
+- 🔎 Los top loggers del org son de RETAIL (falabella-bu-cart 853 GB/día,
+  bu-authn 646, manage-orders 586…) — refuerza la pregunta del contrato DD:
+  financiero no debería absorber esa factura completa.
+
+Automatizable: mismo patrón que el resto de la suite (una query DD diaria por
+service + cruce con lake) → campo de costo de observabilidad por app en
+`infrastructure_cost` (sujeto `application`), y la misma familia de métricas
+`datadog.estimated_usage.*` cubre APM, infra hosts, custom metrics, etc.
