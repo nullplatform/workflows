@@ -269,25 +269,55 @@ steps:
         }
 
         // --- procesar recursos (az + gcp), solo pools prod ---
+        // matchService sin restriccion de tipo (para private endpoints)
+        function matchServiceAnyType(resName, cloud, country) {
+          const base = resName.toLowerCase();
+          const cands = services.filter((s) => svcCloudFamily(s.dims) === cloud &&
+            (base === s.name || base.indexOf(s.name + "-") === 0));
+          if (!cands.length) return [];
+          const maxLen = Math.max(...cands.map((s) => s.name.length));
+          let best = cands.filter((s) => s.name.length === maxLen);
+          if (best.length > 1 && country) {
+            const byCountry = best.filter((s) => (s.dims.country || "") === country);
+            if (byCountry.length) best = byCountry;
+          }
+          return best;
+        }
         const all = [];
         for (const r of (inputs.azResources || [])) all.push({ ...r, cloud: "azure", region: "eastus2" });
         for (const r of (inputs.gcpResources || [])) all.push({ ...r, cloud: "gcp", region: "southamerica-west1" });
-        const perService = {};   // service_id -> { svc, daily {d: usd}, resNames: Set-like {} }
+        const perService = {};   // service_id -> { svc, byDim {dim: {daily}}, resNames, pool, methods }
         const remainder = {};    // pool -> { cloud, region, country, daily {d: {tipo: usd}}, unmatched {} }
         let matchedUsd = 0, unmatchedUsd = 0, daysSeen = {};
+        const PE = "-private-endpoint";
         for (const r of all) {
           if (!r.rg || r.rg.indexOf("preprod") >= 0 || !/prod$/.test(r.rg)) continue;
           const country = poolCountry(r.rg);
           const type = billedType(r.svc);
           for (const d of Object.keys(r.daily)) daysSeen[d] = true;
-          const targets = (type !== "otros" && r.res) ? matchService(r.res, type, r.cloud, country) : [];
+          let targets = [], dimKey = type, method = "resource_name_match";
+          if (r.res && r.res.toLowerCase().endsWith(PE)) {
+            // el PE se llama <recurso-o-service>-private-endpoint: va al service dueno
+            targets = matchServiceAnyType(r.res.slice(0, -PE.length), r.cloud, country);
+            dimKey = "private_endpoint";
+          } else if (r.res && type !== "otros") {
+            targets = matchService(r.res, type, r.cloud, country);
+          } else if (!r.res && type !== "otros") {
+            // GCP Memorystore no exporta nombre de recurso en billing: split
+            // igualitario entre los services del (tipo, nube, pais) — aproximado
+            targets = services.filter((s) => s.type === type && svcCloudFamily(s.dims) === r.cloud &&
+              (!country || (s.dims.country || "") === country));
+            method = "equal_within_pool";
+          }
           if (targets.length) {
             const share = 1 / targets.length;
             for (const t of targets) {
-              const ps = perService[t.id] = perService[t.id] || { svc: t, daily: {}, resNames: {}, pool: r.rg };
-              ps.resNames[r.res] = true;
+              const ps = perService[t.id] = perService[t.id] || { svc: t, byDim: {}, resNames: {}, pool: r.rg, methods: {} };
+              if (r.res) ps.resNames[r.res] = true;
+              ps.methods[method] = true;
+              const dim = ps.byDim[dimKey] = ps.byDim[dimKey] || {};
               for (const [d, usd] of Object.entries(r.daily)) {
-                ps.daily[d] = (ps.daily[d] || 0) + usd * share;
+                dim[d] = (dim[d] || 0) + usd * share;
                 matchedUsd += usd * share;
               }
             }
@@ -304,7 +334,7 @@ steps:
         const nDays = Object.keys(daysSeen).length || 1;
 
         const errors = [];
-        // --- upsert por service (costo REAL del recurso) ---
+        // --- upsert por service (costo REAL por recurso, dimensiones separadas) ---
         let upserted = 0;
         await mapLimit(Object.keys(perService), 10, async (sid) => {
           const ps = perService[sid];
@@ -312,13 +342,25 @@ steps:
           const inst = await npGet("/catalog/instances/infrastructure_cost/service-" + sid);
           const byDate = {};
           for (const p of (inst && inst.daily) || []) if (p && p.d) byDate[p.d] = p;
-          for (const [d, usd] of Object.entries(ps.daily)) {
-            byDate[d] = { d, cost_usd: usd, usage_usd: null, waste_usd: null, allocation: "finout_direct",
-                          resources: { [s.type]: { unit: "usd", billed_usd: usd } } };
+          const allDates = {};
+          for (const dim of Object.values(ps.byDim)) for (const d of Object.keys(dim)) allDates[d] = true;
+          const avgByDim = {};
+          for (const d of Object.keys(allDates)) {
+            const res = {};
+            let tot = 0;
+            for (const [k, dim] of Object.entries(ps.byDim)) {
+              if (dim[d] == null) continue;
+              res[k] = { unit: "usd", billed_usd: dim[d] };
+              tot += dim[d];
+              avgByDim[k] = (avgByDim[k] || 0) + dim[d];
+            }
+            byDate[d] = { d, cost_usd: tot, usage_usd: null, waste_usd: null, allocation: "finout_direct", resources: res };
           }
           const daily = Object.values(byDate).sort((a, b) => a.d < b.d ? -1 : 1).slice(-365);
-          const dayKeys = Object.keys(ps.daily);
-          const costDay = dayKeys.reduce((a, d) => a + ps.daily[d], 0) / (dayKeys.length || 1);
+          const nD = Object.keys(allDates).length || 1;
+          const costDay = Object.values(avgByDim).reduce((a, b) => a + b, 0) / nD;
+          const resTop = {};
+          for (const [k, v] of Object.entries(avgByDim)) resTop[k] = { unit: "usd", billed_usd: v / nD };
           const last7 = daily.slice(-7).reduce((a, p) => a + (p.cost_usd || 0), 0);
           const last30 = daily.slice(-30).reduce((a, p) => a + (p.cost_usd || 0), 0);
           const nrnParts = {};
@@ -332,13 +374,13 @@ steps:
             account_id: nrnParts.account || null, namespace_id: nrnParts.namespace || null,
             application_id: nrnParts.application || null,
             dimensions: { cloud: svcCloudFamily(s.dims), country: s.dims.country || null, environment: "prod" },
-            infrastructure_reference: { kind: s.type, id: Object.keys(ps.resNames).join(","), name: s.rawName,
+            infrastructure_reference: { kind: s.type, id: Object.keys(ps.resNames).join(",") || sid, name: s.rawName,
               cloud_provider: svcCloudFamily(s.dims), region: null,
-              attributes: { pool: ps.pool, split_method: "resource_name_match", resources: Object.keys(ps.resNames) } },
+              attributes: { pool: ps.pool, split_method: Object.keys(ps.methods).join("+"), resources: Object.keys(ps.resNames) } },
             cost: { total_usd: costDay, usage_usd: null, waste_usd: null, currency: "USD", allocation: "finout_direct" },
             cost_7d_usd: last7, cost_30d_usd: last30,
             usage: {},
-            resources: { [s.type]: { unit: "usd", billed_usd: costDay } },
+            resources: resTop,
             daily,
             sources: { finout: true, datadog: false, computed_at: new Date().toISOString(), workflow_execution_id: null }
           });
