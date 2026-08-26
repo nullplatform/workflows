@@ -213,3 +213,21 @@ con la **API de Atlas** (invoices por organización → proyecto → cluster) o
 tags en Atlas. Con eso: costo por cluster × tabla de consumo (repartido entre
 las apps que lo comparten) = allocation completa de los ~$50k/mes de Atlas.
 Pendiente: pedir API key de la org Atlas de falabella (read-only billing).
+
+## 8. Unblended vs amortizado: la medida oficial es AMORTIZADO
+
+Verificado empíricamente (ventana 7d):
+
+| Corte | Unblended $/día | Amortizado $/día | Δ |
+|---|---:|---:|---|
+| VMs Azure sin resource group | 4.900 (74% de las VMs) | **434 (8%)** | las reservas se redistribuyen a los rgs que las consumen |
+| Clusters NP AKS (mc_*) | 869 | **1.079** | **+24%** — los nodos consumen reservas; estábamos subestimando |
+| Cuentas NP GCP | 996 | **830** | **-17%** — los projects pagan commitments que amortizado reparte |
+
+Consecuencias:
+1. **Toda la suite (wf2, reportes) usa `amortizedCost`** — es el criterio
+   FinOps correcto para chargeback: quien consume la reserva paga la reserva.
+2. Los blended rates por pool cambian: AKS sube ~24%, GCP baja ~17% — el
+   spread entre pools se achica pero sigue siendo real.
+3. El "gasto sin atribución" (~$437k/mes en unblended) se reduce
+   drásticamente en amortizado — la navegación por cuenta pasa a cubrir ~92%+.
