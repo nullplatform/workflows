@@ -8,12 +8,9 @@ steps:
     type: trigger
     pluginType: manual
     config: {}
-  - id: daily
-    type: trigger
-    pluginType: cron
-    config:
-      schedule: "10 3 * * *"
-      timezone: UTC
+  # RETIRADO 2026-08-26: el censo ahora lo hace wf3 directo del lake y los
+  # nombres van denormalizados en los hechos (infrastructure_cost_daily).
+  # Sin cron; queda solo el trigger manual por si hiciera falta re-censar.
 
   # 1. Scopes prod activos en GKE/AKS con dimensiones y jerarquia — una fila
   #    por scope, emitida como item (ids casteados a string en SQL: el schema
@@ -67,4 +64,3 @@ steps:
 
 connections:
   - { id: t1, from: manual, to: list_scopes }
-  - { id: t2, from: daily, to: list_scopes }
