@@ -93,6 +93,9 @@ let SORT = { k: "cost", asc: false };
 
 try { $("#token").value = localStorage.getItem("npCostToken") || ""; } catch (e) {}
 
+// DEPRECADO 2026-08-27: leia infrastructure_cost (spec borrado; ahora todo
+// vive en infrastructure_cost_daily). Usar el dashboard NP "Costos y
+// Eficiencia de Infraestructura". Adaptable a hechos si hiciera falta.
 if (location.protocol === "file:") {
   $("#status").innerHTML = "<b>abriste el archivo directo</b> — corré <code>node serve.js</code> en esta carpeta y entrá a <a href='http://localhost:8917'>http://localhost:8917</a> (el server proxya la API de NP)";
   $("#load").disabled = true;
