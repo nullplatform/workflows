@@ -190,8 +190,10 @@ steps:
         const clusterAgg = {};
         await mapLimit(scopeIds, 10, async (sid) => {
           const sc = byScope[sid];
-          const rate = rates[sc.cluster];
-          if (!rate) { noRate++; return; }
+          // rate OPCIONAL: sin blended_rate el hecho se escribe igual con las
+          // metricas de uso y requests; los campos de costo quedan null
+          const rate = rates[sc.cluster] || null;
+          if (!rate) noRate++;
           const cen = censo[sid];
           if (!cen) { notInCenso++; return; }
           let reqCpuH = 0, useCpuH = 0, reqMemH = 0, useMemH = 0;
@@ -201,13 +203,16 @@ steps:
             const h = sc.hours[ts];
             const cpuReq = h.cpuReq || 0, cpuUse = h.cpuUse || 0, memReq = h.memReq || 0, memUse = h.memUse || 0;
             reqCpuH += cpuReq; useCpuH += cpuUse; reqMemH += memReq; useMemH += memUse;
-            cpuBill += Math.max(cpuReq, cpuUse) * rate.cpu;
-            memBill += Math.max(memReq, memUse) * rate.mem;
-            cpuUseUsd += cpuUse * rate.cpu; memUseUsd += memUse * rate.mem;
+            if (rate) {
+              cpuBill += Math.max(cpuReq, cpuUse) * rate.cpu;
+              memBill += Math.max(memReq, memUse) * rate.mem;
+              cpuUseUsd += cpuUse * rate.cpu; memUseUsd += memUse * rate.mem;
+            }
             cpuHours.push(cpuUse); memHours.push(memUse);
             if (h.pods != null) podHours.push(h.pods);
           }
-          const total = cpuBill + memBill, usage = cpuUseUsd + memUseUsd;
+          const total = rate ? cpuBill + memBill : null;
+          const usage = rate ? cpuUseUsd + memUseUsd : null;
           const p95 = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.ceil(0.95 * s.length) - 1)]; };
           const mx = (a) => a.length ? Math.max(...a) : null;
           const podsMin = podHours.length ? Math.round(Math.min(...podHours)) : null;
@@ -224,22 +229,23 @@ steps:
             cloud: (cen.cloud || "").indexOf("gcp") === 0 ? "gcp" : (cen.cloud || "").indexOf("azure") === 0 ? "azure" : null,
             country: cen.country || null, environment: cen.environment || null,
             allocation: "blended",
-            cost_usd: total, usage_usd: usage, waste_usd: total - usage,
-            cpu_cost_usd: cpuBill, mem_cost_usd: memBill,
-            cpu_usage_usd: cpuUseUsd, mem_usage_usd: memUseUsd,
+            cost_usd: total, usage_usd: usage,
+            waste_usd: rate ? total - usage : null,
+            cpu_cost_usd: rate ? cpuBill : null, mem_cost_usd: rate ? memBill : null,
+            cpu_usage_usd: rate ? cpuUseUsd : null, mem_usage_usd: rate ? memUseUsd : null,
             cpu_req_core_h: reqCpuH, cpu_used_core_h: useCpuH,
             cpu_p95_core: p95(cpuHours), cpu_max_core: mx(cpuHours),
             mem_req_gb_h: reqMemH, mem_used_gb_h: useMemH,
             mem_p95_gb: p95(memHours), mem_max_gb: mx(memHours),
             pods_min: podsMin, pods_max: podsMax, pods_avg: podsAvg,
-            rate_cpu_usd_core_h: rate.cpu, rate_mem_usd_gb_h: rate.mem,
+            rate_cpu_usd_core_h: rate ? rate.cpu : null, rate_mem_usd_gb_h: rate ? rate.mem : null,
             requests_total: requests[sid] != null ? Math.round(requests[sid]) : null,
             requests_source: requests[sid] != null ? "nullplatform" : null
           });
           if (err) { if (errors.length < 5) errors.push("scope-" + sid + " " + err); return; }
-          costed++; orgCost += total;
+          costed++; orgCost += total || 0;
           const ca = clusterAgg[sc.cluster] = clusterAgg[sc.cluster] || { total: 0, usage: 0, scopes: 0, dims: {} };
-          ca.total += total; ca.usage += usage; ca.scopes++;
+          ca.total += total || 0; ca.usage += usage || 0; ca.scopes++;
           const dk = JSON.stringify({ cloud: cen.cloud || null, country: cen.country || null, environment: cen.environment || null });
           ca.dims[dk] = (ca.dims[dk] || 0) + 1;
         });
