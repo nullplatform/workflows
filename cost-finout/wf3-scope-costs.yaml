@@ -140,16 +140,17 @@ steps:
           if (cpu > 0 && mem > 0) rates[cl] = { cpu, mem };
         });
 
-        // --- 2b) requests reales del dia (istio, cubre ~344 scopes) ---
+        // --- 2b) requests del dia: metrica PROPIA de NP (norte-sur, por scope_id,
+        //     cubre toda la flota ~3.1k scopes; istio quedaba en 2 clusters y
+        //     ademas cuenta trafico este-oeste del mesh) ---
         const requests = {};
         {
-          const ser = await dd("sum:istio.mesh.request.count.total{destination_workload_namespace:nullplatform} by {destination_workload}.as_count()");
+          const ser = await dd("sum:nullplatform.scope.request_count{*} by {scope_id}.as_count()");
           for (const s of ser) {
-            const w = tag(s, "destination_workload") || "";
-            const m = w.match(SCOPE_RE);
-            if (!m) continue;
+            const sid = tag(s, "scope_id");
+            if (!sid) continue;
             const tot = (s.pointlist || []).reduce((a, p) => a + (p[1] || 0), 0);
-            requests[m[1]] = (requests[m[1]] || 0) + tot;
+            requests[sid] = (requests[sid] || 0) + tot;
           }
         }
 
@@ -233,7 +234,7 @@ steps:
             pods_min: podsMin, pods_max: podsMax, pods_avg: podsAvg,
             rate_cpu_usd_core_h: rate.cpu, rate_mem_usd_gb_h: rate.mem,
             requests_total: requests[sid] != null ? Math.round(requests[sid]) : null,
-            requests_source: requests[sid] != null ? "istio" : null
+            requests_source: requests[sid] != null ? "nullplatform" : null
           });
           if (err) { if (errors.length < 5) errors.push("scope-" + sid + " " + err); return; }
           costed++; orgCost += total;
