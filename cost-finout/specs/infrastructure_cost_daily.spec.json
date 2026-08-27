@@ -164,12 +164,6 @@
           "null"
         ]
       },
-      "cpu_p95_core": {
-        "type": [
-          "number",
-          "null"
-        ]
-      },
       "cpu_max_core": {
         "type": [
           "number",
@@ -183,12 +177,6 @@
         ]
       },
       "mem_used_gb_h": {
-        "type": [
-          "number",
-          "null"
-        ]
-      },
-      "mem_p95_gb": {
         "type": [
           "number",
           "null"
@@ -243,6 +231,20 @@
           "null"
         ],
         "description": "origen de la metrica de requests (istio)"
+      },
+      "cpu_p_95_core": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": " (nombre con alias del catalogo: p95 -> p_95)"
+      },
+      "mem_p_95_gb": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": " (nombre con alias del catalogo: p95 -> p_95)"
       }
     },
     "additionalProperties": false,
