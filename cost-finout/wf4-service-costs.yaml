@@ -226,9 +226,13 @@ steps:
 
         // --- inventario de services (lake): redis/postgres prod con su app nrn ---
         const SQL = "SELECT toString(s.id) AS id, s.name AS name, s.entity_nrn AS nrn, " +
-          "toString(s.dimensions) AS dims, sp.slug AS type " +
+          "toString(s.dimensions) AS dims, sp.slug AS type, " +
+          "app.app_name AS app_name, n.namespace_name AS ns_name, a.account_name AS acc_name " +
           "FROM services_services AS s FINAL " +
           "JOIN services_service_specifications AS sp FINAL ON s.specification_id = sp.id " +
+          "LEFT JOIN core_entities_application AS app FINAL ON toString(app.app_id) = extract(s.entity_nrn, 'application=(\\d+)') " +
+          "LEFT JOIN core_entities_namespace AS n FINAL ON n.namespace_id = app.namespace_id " +
+          "LEFT JOIN core_entities_account AS a FINAL ON a.account_id = n.account_id " +
           "WHERE s._deleted = 0 AND s.deleted_at IS NULL AND s.status != 'deleted' " +
           "AND sp.slug IN ('redis','postgres') FORMAT JSONEachRow";
         const lr = await fetch(NP + "/data/lake/query", { method: "POST",
@@ -238,7 +242,7 @@ steps:
           const s = JSON.parse(l);
           let dims = {};
           try { dims = JSON.parse(s.dims || "{}"); } catch (e) { /* dims invalidas */ }
-          return { id: s.id, name: (s.name || "").toLowerCase(), rawName: s.name, nrn: s.nrn, type: s.type, dims };
+          return { id: s.id, name: (s.name || "").toLowerCase(), rawName: s.name, nrn: s.nrn, type: s.type, dims, appName: s.app_name || null, nsName: s.ns_name || null, accName: s.acc_name || null };
         }).filter((s) => (s.dims.environment || "") === "prod");
 
         function svcCloudFamily(dims) {
@@ -357,8 +361,9 @@ steps:
             const fErr = await npPatch("/catalog/instances/infrastructure_cost_daily/service-" + sid + "-" + d, {
               id: "service-" + sid + "-" + d, d, entity_type: "service",
               entity_id: sid, entity_name: s.rawName,
-              application_id: nrnParts.application || null,
-              namespace_id: nrnParts.namespace || null, account_id: nrnParts.account || null,
+              application_id: nrnParts.application || null, application_name: s.appName,
+              namespace_id: nrnParts.namespace || null, namespace_name: s.nsName,
+              account_id: nrnParts.account || null, account_name: s.accName,
               nrn: s.nrn || null, cloud: svcCloudFamily(s.dims),
               country: s.dims.country || null, environment: "prod",
               allocation: "finout_direct", cost_usd: tot
