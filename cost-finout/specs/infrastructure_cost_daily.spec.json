@@ -229,6 +229,20 @@
           "number",
           "null"
         ]
+      },
+      "requests_total": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "requests HTTP recibidas en el dia (fuente real, no estimada)"
+      },
+      "requests_source": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "origen de la metrica de requests (istio)"
       }
     },
     "additionalProperties": false,
