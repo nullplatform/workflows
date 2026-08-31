@@ -35,13 +35,27 @@ export function mergeParsed(perEcosystem) {
 }
 
 /**
- * STEP 5 — assemble one metadata payload per asset.
+ * Identity fields of the catalog-entity document. `id` is the ASSET id — one
+ * entity per asset, upserts pinned to it. `nrn` is omitted (not nulled) when
+ * the caller does not know it: the spec declares it a plain string.
+ */
+function identity(assetId, nrn, buildId, releaseId) {
+  return {
+    id: String(assetId),
+    ...(nrn ? { nrn } : {}),
+    build_id: String(buildId),
+    release_id: releaseId == null ? null : String(releaseId),
+  };
+}
+
+/**
+ * STEP 5 — assemble one catalog-entity document per asset.
  *
  * `parsed` is the merge of every `parseEcosystem` result. Builds that never got
  * past an earlier step arrive via `unscannable`/`failed` and still produce a
  * record — an asset with NO record must mean "never visited", nothing else.
  */
-export function buildPayloads({ resolutions, parsed, unreachable, now }) {
+export function buildPayloads({ resolutions, parsed, unreachable, now, releaseId }) {
   const rows = [];
 
   for (const { build, status, status_detail } of unreachable ?? []) {
@@ -53,7 +67,7 @@ export function buildPayloads({ resolutions, parsed, unreachable, now }) {
         build_id: build.build_id,
         app_id: build.app_id,
         data: payload({
-          repository_url: build.repository_url || null,
+          ...identity(a.id, a.nrn, build.build_id, releaseId),
           commit: build.commit || null,
           scanned_at: now,
           status,
@@ -65,7 +79,6 @@ export function buildPayloads({ resolutions, parsed, unreachable, now }) {
 
   for (const r of resolutions) {
     const base = {
-      repository_url: r.plan.repository_url || null,
       commit: r.plan.commit || null,
       scanned_at: now,
     };
@@ -77,8 +90,10 @@ export function buildPayloads({ resolutions, parsed, unreachable, now }) {
         build_id: r.plan.build_id,
         app_id: r.plan.app_id,
       };
+      const who = identity(asset.asset_id, asset.asset_nrn, r.plan.build_id, releaseId);
       if (!asset.hit) {
         row.data = payload({
+          ...who,
           ...base,
           status: 'unresolved',
           status_detail: `no directory in ${r.plan.owner}/${r.plan.repo} matches asset name "${asset.asset_name}"`,
@@ -89,6 +104,7 @@ export function buildPayloads({ resolutions, parsed, unreachable, now }) {
 
       const languages = [...new Set(asset.manifests.map((m) => m.ecosystem))].sort();
       const common = {
+        ...who,
         ...base,
         repository_path: asset.hit.dir,
         match_level: asset.hit.level,

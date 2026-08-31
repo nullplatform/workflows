@@ -4,6 +4,13 @@
 **Status:** increment 1 implemented and live on the reference organization (scoped to one application)
 **Implementation:** [`workflows/lib-inventory/`](../../../workflows/lib-inventory/)
 
+> **Update 2026-08-31:** the store moved from asset *metadata* to one
+> `dependency-inventory` **catalog entity** per asset (upsert by asset id,
+> lake table `catalog_entities`). Where this document says "metadata record",
+> read "catalog entity"; the design — one record per asset, absence means
+> never visited, commit-pinned scans — is unchanged. See the README's
+> "The entity document" section.
+
 ## Goal
 
 Detect internal libraries that are obsolete or need replacing, per scope, and

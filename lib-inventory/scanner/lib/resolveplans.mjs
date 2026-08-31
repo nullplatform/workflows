@@ -31,6 +31,7 @@ export function resolveAssetsForPlans(plans, manifestResults) {
         return {
           asset_id: a.id,
           asset_name: a.name,
+          asset_nrn: a.nrn,
           exists: a.exists === true,
           hit: null,
           manifests: [],
@@ -38,6 +39,7 @@ export function resolveAssetsForPlans(plans, manifestResults) {
       return {
         asset_id: a.id,
         asset_name: a.name,
+        asset_nrn: a.nrn,
         exists: a.exists === true,
         hit,
         manifests: manifestsUnder(idx, hit.dir).slice(0, 8),

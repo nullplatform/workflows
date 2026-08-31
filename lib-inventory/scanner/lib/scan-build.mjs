@@ -15,10 +15,17 @@ export async function scanBuild(build, gh, opts) {
   const now = opts.now;
   const assets = build.assets || [];
   const base = {
-    repository_url: build.repository_url || null,
     commit: build.commit || null,
     scanned_at: now,
   };
+  // Catalog-entity identity: one document per asset, upserts pinned to the
+  // asset id. `nrn` is omitted when the caller does not carry it.
+  const who = (a) => ({
+    id: String(a.id),
+    ...(a.nrn ? { nrn: a.nrn } : {}),
+    build_id: String(build.build_id),
+    release_id: build.release_id == null ? null : String(build.release_id),
+  });
 
   const fail = (status, detail) =>
     assets.map((a) => ({
@@ -26,7 +33,7 @@ export async function scanBuild(build, gh, opts) {
       asset_name: a.name,
       build_id: build.build_id,
       app_id: build.app_id,
-      data: payload({ ...base, status, status_detail: detail }),
+      data: payload({ ...who(a), ...base, status, status_detail: detail }),
     }));
 
   const repo = parseRepoUrl(build.repository_url);
@@ -111,6 +118,7 @@ export async function scanBuild(build, gh, opts) {
     };
     if (!hit) {
       row.data = payload({
+        ...who(asset),
         ...base,
         status: 'unresolved',
         status_detail: `no directory in ${repo.owner}/${repo.repo} matches asset name "${asset.name}"`,
@@ -121,6 +129,7 @@ export async function scanBuild(build, gh, opts) {
     const found = perAsset.get(asset.id) || [];
     const languages = [...new Set(found.map((m) => m.ecosystem))].sort();
     const common = {
+      ...who(asset),
       ...base,
       repository_path: hit.dir,
       match_level: hit.level,

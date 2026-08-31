@@ -1,7 +1,7 @@
 # Library inventory — scan ONE build.
 #
-# The scanner. Everything that knows how to turn a repository into dependency
-# metadata lives here and NOWHERE else: the backfill (wf-l1) and the
+# The scanner. Everything that knows how to turn a repository into a dependency
+# inventory lives here and NOWHERE else: the backfill (wf-l1) and the
 # per-release path both invoke this workflow rather than carrying their own
 # copy of the pipeline.
 #
@@ -15,7 +15,7 @@
 #                         ├─ parse_maven ─── pure
 #                         └─ parse_python ── pure
 #                              └─ build_payloads ── pure
-#                                   └─ write_metadata ── np-api-call
+#                                   └─ write_entities ── np-api-call (catalog upsert)
 #                                        └─ result
 #
 # Every GitHub call is an `http-request` — the plugin the platform already
@@ -32,13 +32,16 @@
 # magnitude of headroom. The cost is one Temporal execution per build, which is
 # what buys the parallelism back.
 #
-# EVERY asset handed to this workflow gets a metadata record, including ones
-# that could not be scanned (`status` carries the reason). An asset with NO
-# record was never visited — that distinction is the whole design, and it makes
-# coverage a lake query instead of an act of faith.
+# EVERY asset handed to this workflow gets a `dependency-inventory` catalog
+# entity, including ones that could not be scanned (`status` carries the
+# reason). An asset with NO entity was never visited — that distinction is the
+# whole design, and it makes coverage a lake query instead of an act of faith.
+# The entity spec is created by setup/01-entity-spec.sh; writes are
+# PATCH /catalog/instances/dependency-inventory/{asset_id}?upsert=true, so
+# create and refresh are the same request.
 #
 # Per-org configuration (config entries on folder /lib-inventory):
-#   NP_API_KEY               (secret) org credential for the metadata writes
+#   NP_API_KEY               (secret) org credential for the catalog writes
 #   GITHUB_TOKEN             (secret) PAT with read access to the repositories
 #   LIB_INTERNAL_PATTERNS    JSON array of regex sources marking a dep internal
 #
@@ -51,8 +54,8 @@ name: "Library Inventory — Scan Build"
 description: >
   Resolves each asset of one build to a subtree of its application's repository
   at that build's commit, extracts the dependency manifests found there, and
-  writes one `dependencies` metadata record per asset — including for assets
-  that could not be scanned, so coverage is always measurable.
+  upserts one `dependency-inventory` catalog entity per asset — including for
+  assets that could not be scanned, so coverage is always measurable.
 path: "/lib-inventory"
 semantic_version: 1.0.0
 
@@ -74,7 +77,15 @@ inputs:
   build_id:
     type: string
     required: true
-    description: "NP build id. Stored on the record so a scan is traceable."
+    description: "NP build id. Stored on the entity so a scan is traceable."
+  release_id:
+    type: string
+    required: false
+    description: >
+      The release that triggered this scan, when there is one (wf-l2 passes it;
+      the backfill does not). Stored on the entity as provenance — a build can
+      be released more than once, so the lake's release→build join remains the
+      complete answer.
   commit:
     type: string
     required: true
@@ -87,13 +98,14 @@ inputs:
     required: true
     description: >
       The build's assets. Named after the lake column both callers select it
-      from (`toJSONString(groupUniqArray((id, name, type)))`), so a lake row can
-      be forwarded whole with no unpacking. A real `[{id, name, type}]` array is
-      accepted just as well.
+      from (`toJSONString(groupUniqArray((id, name, type, nrn)))`), so a lake
+      row can be forwarded whole with no unpacking. A real
+      `[{id, name, type, nrn}]` array is accepted just as well; `nrn` is
+      optional and lands on the entity when present.
   dry_run:
     type: boolean
     required: false
-    description: "Scan and report, but write no metadata."
+    description: "Scan and report, but write no entities."
 
 steps:
   - id: start_manual
@@ -110,6 +122,7 @@ steps:
         app_name: { type: string, required: false }
         repository_url: { type: string, required: false }
         build_id: { type: string, required: true }
+        release_id: { type: string, required: false }
         commit: { type: string, required: true }
         assets_json: { type: string, required: true }
         dry_run: { type: boolean, required: false }
@@ -369,7 +382,7 @@ steps:
           build_id: r.build_id,
           commit: r.commit,
           assets: (typeof r.assets_json === 'string' ? JSON.parse(r.assets_json) : r.assets_json || []).map(
-            (a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2] } : a),
+            (a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2], nrn: a[3] } : a),
           ),
         }));
 
@@ -996,6 +1009,7 @@ steps:
                 return {
                   asset_id: a.id,
                   asset_name: a.name,
+                  asset_nrn: a.nrn,
                   exists: a.exists === true,
                   hit: null,
                   manifests: [],
@@ -1003,6 +1017,7 @@ steps:
               return {
                 asset_id: a.id,
                 asset_name: a.name,
+                asset_nrn: a.nrn,
                 exists: a.exists === true,
                 hit,
                 manifests: manifestsUnder(idx, hit.dir).slice(0, 8),
@@ -2469,9 +2484,10 @@ steps:
   - id: build_payloads
     type: module
     plugin_type: code-exec
-    name: "Build Asset Metadata Records"
+    name: "Build Asset Inventory Entities"
     inputs:
       resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      releaseId: "${{ workflow.inputs.release_id }}"
       # One entry per ecosystem step. `build_payloads` merges them, so adding
       # an ecosystem is a new node plus a line here — never a branch inside a
       # parser.
@@ -2592,13 +2608,23 @@ steps:
           transitive_external_dropped: 0,
         };
 
+        /**
+         * One catalog-entity document per asset (spec `dependency-inventory`).
+         *
+         * Identity and provenance (`id`, `nrn`, `build_id`, `release_id`) come from
+         * the caller; everything the platform already knows about the asset's
+         * application or namespace is deliberately NOT here — the entity's `nrn`
+         * encodes the hierarchy and the lake joins the rest. The spec declares
+         * `additionalProperties: false`, so every key emitted here must stay declared
+         * there: one unknown property rejects the ENTIRE record.
+         */
         function payload(fields) {
           return {
             status: 'ok',
             status_detail: null,
+            release_id: null,
             primary_language: null,
             languages: [],
-            repository_url: null,
             repository_path: null,
             commit: null,
             match_level: null,
@@ -2646,13 +2672,27 @@ steps:
         }
 
         /**
-         * STEP 5 — assemble one metadata payload per asset.
+         * Identity fields of the catalog-entity document. `id` is the ASSET id — one
+         * entity per asset, upserts pinned to it. `nrn` is omitted (not nulled) when
+         * the caller does not know it: the spec declares it a plain string.
+         */
+        function identity(assetId, nrn, buildId, releaseId) {
+          return {
+            id: String(assetId),
+            ...(nrn ? { nrn } : {}),
+            build_id: String(buildId),
+            release_id: releaseId == null ? null : String(releaseId),
+          };
+        }
+
+        /**
+         * STEP 5 — assemble one catalog-entity document per asset.
          *
          * `parsed` is the merge of every `parseEcosystem` result. Builds that never got
          * past an earlier step arrive via `unscannable`/`failed` and still produce a
          * record — an asset with NO record must mean "never visited", nothing else.
          */
-        function buildPayloads({ resolutions, parsed, unreachable, now }) {
+        function buildPayloads({ resolutions, parsed, unreachable, now, releaseId }) {
           const rows = [];
 
           for (const { build, status, status_detail } of unreachable ?? []) {
@@ -2664,7 +2704,7 @@ steps:
                 build_id: build.build_id,
                 app_id: build.app_id,
                 data: payload({
-                  repository_url: build.repository_url || null,
+                  ...identity(a.id, a.nrn, build.build_id, releaseId),
                   commit: build.commit || null,
                   scanned_at: now,
                   status,
@@ -2676,7 +2716,6 @@ steps:
 
           for (const r of resolutions) {
             const base = {
-              repository_url: r.plan.repository_url || null,
               commit: r.plan.commit || null,
               scanned_at: now,
             };
@@ -2688,8 +2727,10 @@ steps:
                 build_id: r.plan.build_id,
                 app_id: r.plan.app_id,
               };
+              const who = identity(asset.asset_id, asset.asset_nrn, r.plan.build_id, releaseId);
               if (!asset.hit) {
                 row.data = payload({
+                  ...who,
                   ...base,
                   status: 'unresolved',
                   status_detail: `no directory in ${r.plan.owner}/${r.plan.repo} matches asset name "${asset.asset_name}"`,
@@ -2700,6 +2741,7 @@ steps:
 
               const languages = [...new Set(asset.manifests.map((m) => m.ecosystem))].sort();
               const common = {
+                ...who,
                 ...base,
                 repository_path: asset.hit.dir,
                 match_level: asset.hit.level,
@@ -2751,7 +2793,7 @@ steps:
         }
 
         /**
-         * STEP `build_payloads` — one metadata record per asset. No network.
+         * STEP `build_payloads` — one catalog-entity document per asset. No network.
          *
          * Merges every parse step's output. Builds that never got past an earlier step
          * arrive through `unreachable` and STILL produce a record: an asset with no
@@ -2764,6 +2806,7 @@ steps:
           parsed,
           unreachable: [...(inputs.unscannable || []), ...(inputs.failed || [])],
           now: new Date().toISOString(),
+          releaseId: inputs.releaseId || null,
         });
 
         const byStatus = {};
@@ -2773,30 +2816,33 @@ steps:
         return {
           rows,
           by_status: byStatus,
-          // POST only: the lake query already excluded assets that have a record, and
-          // the metadata API is create-or-update, not upsert (POST on an existing one
-          // is a 400). An asset is pinned to an immutable commit, so there is nothing
-          // to update — only assets never seen before reach this step.
+          // PATCH + `upsert=true` on the catalog: create and update are the same
+          // request, so a rescan (forced by deleting nothing — just run it) simply
+          // replaces the document. Two writers racing on a fresh asset can hit a 409
+          // on the create path; the step's retry takes the update path a moment later.
           write_requests: rows.map((r) => ({
-            path: `/metadata/asset/${r.asset_id}/dependencies`,
+            path: `/catalog/instances/dependency-inventory/${r.asset_id}?upsert=true`,
             body: r.data,
           })),
         };
         // <<< END build_payloads
 
-  # ── Write one metadata record per asset ──────────────────────────────────
-  # POST /metadata/asset/{id}/dependencies is an upsert; re-running the backfill
-  # is idempotent and simply refreshes `scanned_at`.
-  - id: write_metadata
+  # ── Upsert one catalog entity per asset ──────────────────────────────────
+  # PATCH /catalog/instances/dependency-inventory/{asset_id}?upsert=true:
+  # create and update are the same request, so re-running a scan is idempotent
+  # and simply replaces the document. Two writers racing on a fresh asset
+  # (listener vs backfill) can 409 on the create path — the retry policy takes
+  # the update path a moment later, same as the deploy-analysis suite.
+  - id: write_entities
     type: module
     plugin_type: np-api-call
-    name: "Write Asset Dependencies Metadata"
+    name: "Upsert Asset Dependency Inventory"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       failOnHttpError: true
-      method: POST
+      method: PATCH
       # Placeholder: validateConfig() runs before per-item inputs merge.
-      path: "/metadata/asset/0/dependencies"
+      path: "/catalog/instances/dependency-inventory/0"
     error_handling:
       retry_policy:
         max_attempts: 3
@@ -2811,7 +2857,7 @@ steps:
       maxConcurrency: 20
 
   # ── What the caller aggregates ───────────────────────────────────────────
-  # Reached either from `build_payloads` (dry run) or from `write_metadata`.
+  # Reached either from `build_payloads` (dry run) or from `write_entities`.
   # The default `all` join would wait forever on the branch never traversed:
   # a `condition: false` edge is not reliably marked skipped.
   #
@@ -2824,8 +2870,8 @@ steps:
     join_strategy: any
     inputs:
       scanned: "${{ steps.build_payloads.outputs.rows }}"
-      writtenCount: "${{ steps.write_metadata.outputs.count }}"
-      writeFailed: "${{ steps.write_metadata.outputs.failed }}"
+      writtenCount: "${{ steps.write_entities.outputs.count }}"
+      writeFailed: "${{ steps.write_entities.outputs.failed }}"
       levels: "${{ steps.resolve_assets.outputs.levels }}"
       dryRun: "${{ workflow.inputs.dry_run }}"
       buildId: "${{ workflow.inputs.build_id }}"
@@ -2899,9 +2945,9 @@ connections:
   - { id: c7b, from: parse_node, to: build_payloads }
   - { id: c7c, from: parse_maven, to: build_payloads }
   - { id: c7d, from: parse_python, to: build_payloads }
-  - { id: c8, from: build_payloads, to: write_metadata, condition: "workflow.inputs.dry_run != true" }
+  - { id: c8, from: build_payloads, to: write_entities, condition: "workflow.inputs.dry_run != true" }
   - { id: c9, from: build_payloads, to: result, condition: "workflow.inputs.dry_run == true" }
-  - { id: c10, from: write_metadata, to: result }
+  - { id: c10, from: write_entities, to: result }
 
 # The sub-workflow plugin returns THESE to the caller — a workflow with no
 # `outputs:` block hands back `{}` no matter what its last step computed, and

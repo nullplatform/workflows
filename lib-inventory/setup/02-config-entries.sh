@@ -16,7 +16,8 @@
 #   ./02-config-entries.sh --env-file ../../../.env.the reference organization \
 #     [--scope-nrn organization=X:account=Y:namespace=Z:application=W] \
 #     [--internal-patterns '["^github\\.com/acme/"]'] \
-#     [--max-builds 50] [--min-coverage 95] [--github-token ghp_…]
+#     [--max-builds 50] [--min-coverage 95] [--lookback-days 15] \
+#     [--github-token ghp_…]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../cost/setup/lib.sh
@@ -28,6 +29,9 @@ SCOPE_NRN=""
 INTERNAL_PATTERNS=""
 MAX_BUILDS="50"
 MIN_COVERAGE="95"
+# The backfill scans what is ACTIVE plus anything deployed within this many
+# days — recent history, so a rollback candidate's inventory already exists.
+LOOKBACK_DAYS="15"
 GH_TOKEN=""
 
 while [[ $# -gt 0 ]]; do
@@ -37,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --internal-patterns) INTERNAL_PATTERNS="$2";  shift 2 ;;
     --max-builds)        MAX_BUILDS="$2";         shift 2 ;;
     --min-coverage)      MIN_COVERAGE="$2";       shift 2 ;;
+    --lookback-days)     LOOKBACK_DAYS="$2";      shift 2 ;;
     --github-token)      GH_TOKEN="$2";           shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
   esac
@@ -94,6 +99,7 @@ put LIB_SCAN_NRN_PREFIX   "$SCOPE_NRN"          false "/lib-inventory"
 put LIB_INTERNAL_PATTERNS "$INTERNAL_PATTERNS"  false "/lib-inventory"
 put LIB_MAX_BUILDS        "$MAX_BUILDS"         false "/lib-inventory"
 put LIB_MIN_COVERAGE_PCT  "$MIN_COVERAGE"       false "/lib-inventory"
+put LIB_BACKFILL_LOOKBACK_DAYS "$LOOKBACK_DAYS" false "/lib-inventory"
 put GITHUB_TOKEN          "$GH_TOKEN"           true  "/lib-inventory"
 
 echo "Checking root secret NP_API_KEY (path /):"

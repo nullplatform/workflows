@@ -416,6 +416,53 @@ require (
     expect(row.data.internal_count).toBe(2);
   });
 
+  it('stamps the catalog-entity identity on every record: id, nrn, build_id, release_id', async () => {
+    const gh = fakeGh({ 'lambdas/go/get-toggles-aws-lambda/go.mod': GO_MOD });
+    const [row] = await scanBuild(
+      build({
+        release_id: 55,
+        assets: [
+          {
+            id: 100,
+            name: 'get-toggles-aws-lambda',
+            type: 'lambda',
+            nrn: 'organization=1:build=10:asset=100',
+          },
+        ],
+      }),
+      gh,
+      { internalPatterns: INTERNAL, now: NOW },
+    );
+    // The document IS the entity: `id` is the asset id (the upsert key) and the
+    // rest is provenance. All strings — the spec declares them so.
+    expect(row.data.id).toBe('100');
+    expect(row.data.nrn).toBe('organization=1:build=10:asset=100');
+    expect(row.data.build_id).toBe('10');
+    expect(row.data.release_id).toBe('55');
+    // Not on the spec: the application's repository lives on the application
+    // entity. An undeclared property would reject the ENTIRE document
+    // (`additionalProperties: false`), so its absence here is load-bearing.
+    expect('repository_url' in row.data).toBe(false);
+  });
+
+  it('omits nrn when the caller does not carry it, and nulls release_id on the backfill path', async () => {
+    const gh = fakeGh({ 'lambdas/go/get-toggles-aws-lambda/go.mod': GO_MOD });
+    const [row] = await scanBuild(build(), gh, { internalPatterns: INTERNAL, now: NOW });
+    expect('nrn' in row.data).toBe(false);
+    expect(row.data.release_id).toBeNull();
+    expect(row.data.id).toBe('100');
+  });
+
+  it('stamps the identity on unscannable records too — repo_missing is still an entity', async () => {
+    const [row] = await scanBuild(build({ repository_url: '' }), fakeGh({}), {
+      internalPatterns: INTERNAL,
+      now: NOW,
+    });
+    expect(row.data.status).toBe('repo_missing');
+    expect(row.data.id).toBe('100');
+    expect(row.data.build_id).toBe('10');
+  });
+
   it('stores the whole SBOM when keepTransitiveExternal is set', async () => {
     const gh = fakeGh({ 'lambdas/go/get-toggles-aws-lambda/go.mod': GO_MOD });
     const [row] = await scanBuild(build(), gh, {

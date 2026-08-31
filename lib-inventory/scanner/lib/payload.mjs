@@ -8,13 +8,23 @@ export const EMPTY_COUNTS = {
   transitive_external_dropped: 0,
 };
 
+/**
+ * One catalog-entity document per asset (spec `dependency-inventory`).
+ *
+ * Identity and provenance (`id`, `nrn`, `build_id`, `release_id`) come from
+ * the caller; everything the platform already knows about the asset's
+ * application or namespace is deliberately NOT here — the entity's `nrn`
+ * encodes the hierarchy and the lake joins the rest. The spec declares
+ * `additionalProperties: false`, so every key emitted here must stay declared
+ * there: one unknown property rejects the ENTIRE record.
+ */
 export function payload(fields) {
   return {
     status: 'ok',
     status_detail: null,
+    release_id: null,
     primary_language: null,
     languages: [],
-    repository_url: null,
     repository_path: null,
     commit: null,
     match_level: null,
