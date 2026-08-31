@@ -57,7 +57,13 @@ SPEC=$(jq -n --arg admin "$ADMIN_USER" '
     schema: {
       type: "object",
       additionalProperties: false,
-      relations: {},
+      # No `relations` key: it is optional, and the specification PATCH
+      # endpoint rejects a schema that carries it ("keyword relations value
+      # is invalid") even though POST accepts the same document — so the
+      # idempotent update path must not send it. Also: PATCH MERGES the
+      # schema properties instead of replacing them; renaming a property
+      # leaves the old one declared (harmless under additionalProperties
+      # false, but do not expect a removal to stick).
       properties: {
         id:               { type: "string", alias: "asset_id", primaryKey: true, autoGenerate: false },
         nrn:              { type: "string", nrn: true, index: ["filter"] },
