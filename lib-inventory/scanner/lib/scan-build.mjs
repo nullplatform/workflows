@@ -205,7 +205,7 @@ export async function scanBuild(build, gh, opts) {
       ...common,
       status: 'ok',
       status_detail: unparsed.length ? `not parsed yet: ${unparsed.join(', ')}` : null,
-      dependencies,
+      libraries: dependencies,
       manifest_config: manifestConfig,
       // Counts describe consumed libraries; in-repo `replace` targets are code
       // this asset ships, not a library it depends on.

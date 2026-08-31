@@ -78,15 +78,14 @@ SPEC=$(jq -n --arg admin "$ADMIN_USER" '
         manifests:        { type: "array", items: { type: "object", additionalProperties: true } },
         manifest_config:  { type: ["object","null"], additionalProperties: true },
 
-        dependencies:     { type: "array", items: {
-                              type: "object", additionalProperties: true,
-                              properties: {
-                                name:      { type: "string" },
-                                version:   { type: "string" },
-                                direct:    { type: "boolean" },
-                                internal:  { type: "boolean" },
-                                local:     { type: "boolean" },
-                                ecosystem: { type: "string" } } } },
+        # `libraries`, NOT `dependencies`: the catalog API silently DROPS a
+        # property named `dependencies` on write — a legacy JSON-Schema
+        # keyword its schema engine treats specially (hit live 2026-08-31:
+        # every probe lost the array while sibling keys survived). Items stay
+        # schemaless-open like deployment-analysis arrays, the shape proven in
+        # production; each row carries name/version/direct/internal/local/
+        # ecosystem plus per-ecosystem extras (dev, optional, peer, scope).
+        libraries:        { type: "array", items: { type: "object", additionalProperties: true } },
 
         total_count:                 { type: "integer" },
         direct_count:                { type: "integer" },

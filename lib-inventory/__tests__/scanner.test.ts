@@ -456,7 +456,7 @@ describe('scanBuild resolves branch-named assets through the application', () =>
     expect(row.data.status).toBe('ok');
     expect(row.data.match_level).toBe('ROOT');
     expect(row.data.repository_path).toBe('');
-    const names = row.data.dependencies.map((d: { name: string }) => d.name);
+    const names = row.data.libraries.map((d: { name: string }) => d.name);
     expect(names).toContain('org.x:lib');
     expect(names).toContain('org.y:other');
   });
@@ -489,7 +489,7 @@ require (
     const [row] = await scanBuild(build(), gh, { internalPatterns: INTERNAL, now: NOW });
 
     expect(row.data.status).toBe('ok');
-    expect(row.data.dependencies.map((d: { name: string }) => d.name)).toEqual([
+    expect(row.data.libraries.map((d: { name: string }) => d.name)).toEqual([
       'github.com/acme/goala/ulog',
       'github.com/acme/goala/uenv',
     ]);
@@ -554,7 +554,7 @@ require (
       now: NOW,
       keepTransitiveExternal: true,
     });
-    expect(row.data.dependencies).toHaveLength(3);
+    expect(row.data.libraries).toHaveLength(3);
     expect(row.data.transitive_external_dropped).toBe(0);
   });
 
@@ -641,14 +641,14 @@ require (
 
     expect(row.data.status).toBe('ok');
     expect(row.data.languages.sort()).toEqual(['go', 'node']);
-    const names = row.data.dependencies.map((d: { name: string }) => d.name);
+    const names = row.data.libraries.map((d: { name: string }) => d.name);
     expect(names).toContain('github.com/acme/goala/ulog');
     expect(names).toContain('@acme/ui');
     expect(names).toContain('react');
     // An npm scope is an internal marker the GitHub-owner pattern cannot see —
     // that is why `LIB_INTERNAL_PATTERNS` is a list, not one regex.
     expect(
-      row.data.dependencies.find((d: { name: string }) => d.name === '@acme/ui'),
+      row.data.libraries.find((d: { name: string }) => d.name === '@acme/ui'),
     ).toMatchObject({ internal: true });
   });
 });

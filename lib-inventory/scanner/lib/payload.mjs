@@ -29,7 +29,11 @@ export function payload(fields) {
     commit: null,
     match_level: null,
     manifests: [],
-    dependencies: [],
+    // `libraries`, NOT `dependencies`: the catalog API silently DROPS a
+    // property named `dependencies` on write (a legacy JSON-Schema keyword its
+    // schema engine treats specially) — every probe shape lost the array while
+    // its sibling keys survived, hit live 2026-08-31.
+    libraries: [],
     manifest_config: {},
     ...EMPTY_COUNTS,
     scanned_at: fields.scanned_at,

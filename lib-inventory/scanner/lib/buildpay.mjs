@@ -140,7 +140,7 @@ export function buildPayloads({ resolutions, parsed, unreachable, now, releaseId
         ...common,
         status: 'ok',
         status_detail: unparsed.length ? `not parsed yet: ${unparsed.join(', ')}` : null,
-        dependencies: deps,
+        libraries: deps,
         total_count: deps.filter((d) => !d.local).length,
         direct_count: deps.filter((d) => d.direct && !d.local).length,
         internal_count: deps.filter((d) => d.internal && !d.local).length,

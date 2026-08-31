@@ -45,7 +45,7 @@ name for whichever library you are chasing.
 
 ```sql
 WITH inv AS (
-  SELECT JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
+  SELECT JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries') AS deps
   FROM customers_lake.catalog_entities AS m FINAL
   WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
                                   WHERE slug = 'dependency-inventory' AND _deleted = 0)
@@ -73,7 +73,7 @@ migration.
 WITH inv AS (
   SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id'))                                        AS asset_id,
          JSONExtractString(assumeNotNull(m.data), 'status')          AS status,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies')  AS deps,
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries')  AS deps,
          has(JSONExtractArrayRaw(assumeNotNull(m.data), 'languages'), '"go"') AS is_go
   FROM customers_lake.catalog_entities AS m FINAL
   WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
@@ -118,7 +118,7 @@ WITH inv AS (
          JSONExtractString(assumeNotNull(m.data), 'status')           AS status,
          JSONExtractString(assumeNotNull(m.data), 'repository_path')  AS path,
          JSONExtractString(assumeNotNull(m.data), 'repository_url')   AS repo,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies')   AS deps,
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries')   AS deps,
          has(JSONExtractArrayRaw(assumeNotNull(m.data), 'languages'), '"go"') AS is_go
   FROM customers_lake.catalog_entities AS m FINAL
   WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
@@ -254,7 +254,7 @@ live AS (
 inv AS (
   SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id'))                                       AS asset_id,
          JSONExtractString(assumeNotNull(m.data), 'status')         AS status,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries') AS deps
   FROM customers_lake.catalog_entities AS m FINAL
   WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
                                   WHERE slug = 'dependency-inventory' AND _deleted = 0)
@@ -313,7 +313,7 @@ live AS (
 ),
 inv AS (
   SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id'))                                       AS asset_id,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries') AS deps
   FROM customers_lake.catalog_entities AS m FINAL
   WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
                                   WHERE slug = 'dependency-inventory' AND _deleted = 0)

@@ -80,7 +80,7 @@ create and refresh are the same request. In the lake it lands in
   "repository_path": "lambdas/go/get-toggles-aws-lambda", "match_level": "L1",
   "primary_language": "go", "languages": ["go"],
   "manifests": [{ "path": "…/go.mod", "language": "go" }],
-  "dependencies": [
+  "libraries": [
     { "name": "github.com/acme/goala/ulog", "version": "v1.1.3",
       "direct": true, "internal": true, "local": false, "ecosystem": "go" }
   ],
@@ -126,15 +126,26 @@ the asset ships, not a library it consumes. Excluded from the counts.
 
 ## How an asset is matched to code
 
-A ladder, measured over 479 real the reference organization assets:
+A ladder. L1–L4 were measured over 479 real assets of the reference
+organization; A1–A3 and ROOT exist because other organizations name assets
+after the BRANCH (`main`, `develop`), which broke both assumptions the
+original ladder made (measured live 2026-08-31: 30/30 assets of a maven pilot
+L1-matched `src/main`):
 
-| Rung | Rule | Assets |
-|---|---|---|
-| L1 | asset name == a directory basename anywhere in the tree | 476 (99.4%) |
-| L2 | the name declared *inside* a manifest (Maven `<artifactId>`, `package.json` `name`, `go.mod` `module`) | 2 (0.4%) |
-| L3 | normalized basename (strips `-aws-lambda`, `-aws-uks`, `-service`, …) | 0 |
-| L4 | the repo has exactly one manifest, at the root | 1 (0.2%) |
-| L5 | unresolved → `status: unresolved` | **0** |
+| Rung | Rule |
+|---|---|
+| L1 | asset name == a directory basename anywhere in the tree |
+| L2 | the name declared *inside* a manifest (Maven `<artifactId>`, `package.json` `name`, `go.mod` `module`) |
+| L3 | normalized basename (strips `-aws-lambda`, `-aws-uks`, `-service`, …) |
+| A1–A3 | the same three rungs over the APPLICATION name — monorepos whose assets are branch-named |
+| L4 | the repo has exactly one manifest, at the root |
+| ROOT | a manifest lives at the repository root — the multi-module maven case L4 can never satisfy |
+| L5 | unresolved → `status: unresolved` |
+
+A hit only settles if its subtree contains a manifest; otherwise the later
+rungs keep trying. The one exception: when nothing else fires, a manifestless
+asset-name hit survives as the last resort so a Dockerfile-only directory
+still reads `no_manifest` at its real path instead of `unresolved`.
 
 Two rules carry it from 98.5% to 100%:
 
