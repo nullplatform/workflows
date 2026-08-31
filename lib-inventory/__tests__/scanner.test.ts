@@ -376,6 +376,90 @@ describe('resolution ladder', () => {
     const idx = indexTree(['a/go.mod', 'b/go.mod']);
     expect(resolveAsset('totally-unrelated', idx, null)).toBeNull();
   });
+
+  // Branch-named assets, the itti convention: assets are called `main` or
+  // `develop`, so the asset name says nothing about the code layout. Measured
+  // live 2026-08-31: 30/30 assets of a maven pilot false-matched `src/main`.
+  it('a name match without manifests does not beat later rungs — `main` must not land on src/main', () => {
+    const idx = indexTree(['pom.xml', 'svc/pom.xml', 'svc/src/main/java/App.java']);
+    // Multi-module maven: L4 (exactly one manifest) never fires, and `main`
+    // L1-matches `svc/src/main`. The manifest guard drops that and the root
+    // rung takes it — the root pom IS the project.
+    expect(resolveAsset('main', idx, null)).toEqual({ level: 'ROOT', dir: '' });
+  });
+
+  it('A1: the APPLICATION name resolves a monorepo when the asset name is a branch', () => {
+    const idx = indexTree([
+      'apps/conto-api/package.json',
+      'apps/conto-jobs/package.json',
+      'docs/readme.md',
+    ]);
+    expect(resolveAsset('develop', idx, null, 'conto-api')).toEqual({
+      level: 'A1',
+      dir: 'apps/conto-api',
+    });
+    // Normalized form of the app name works too.
+    expect(resolveAsset('develop', idx, null, 'conto-jobs-service')).toEqual({
+      level: 'A3',
+      dir: 'apps/conto-jobs',
+    });
+  });
+
+  it('asset-name rungs still beat app-name rungs when both carry manifests', () => {
+    const idx = indexTree(['apps/worker/package.json', 'apps/api/package.json']);
+    expect(resolveAsset('worker', idx, null, 'api')).toEqual({ level: 'L1', dir: 'apps/worker' });
+  });
+
+  it('keeps the manifestless L1 hit as a LAST resort so no_manifest stays honest', () => {
+    // A repo that is genuinely just a Dockerfile: the matched directory has no
+    // manifest and no other rung can fire — the old hit survives so the record
+    // says no_manifest AT that path instead of unresolved.
+    const idx = indexTree(['lambdas/get-toggles-aws-lambda/Dockerfile']);
+    expect(resolveAsset('get-toggles-aws-lambda', idx, null)).toEqual({
+      level: 'L1',
+      dir: 'lambdas/get-toggles-aws-lambda',
+    });
+  });
+
+  it('ROOT never fires when the root holds no manifest', () => {
+    const idx = indexTree(['a/go.mod', 'b/go.mod', 'README.md']);
+    expect(resolveAsset('main', idx, null)).toBeNull();
+  });
+});
+
+describe('scanBuild resolves branch-named assets through the application', () => {
+  const POM_ROOT = `<project><groupId>g</groupId><artifactId>root</artifactId>
+<dependencies><dependency><groupId>org.x</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies></project>`;
+  const POM_SVC = `<project><artifactId>svc</artifactId>
+<dependencies><dependency><groupId>org.y</groupId><artifactId>other</artifactId><version>2.0</version></dependency></dependencies></project>`;
+
+  it('an asset named `main` in a multi-module maven repo scans the whole project from the root', async () => {
+    const gh = {
+      tree: async () => ['pom.xml', 'svc/pom.xml', 'svc/src/main/java/App.java'],
+      blobs: async (_o: string, _r: string, _ref: string, paths: string[]) =>
+        Object.fromEntries(
+          paths.map((p) => [p, p === 'pom.xml' ? POM_ROOT : POM_SVC]).filter(([p]) => p !== 'svc/src/main/java/App.java'),
+        ),
+    };
+    const [row] = await scanBuild(
+      {
+        app_id: 1,
+        app_name: 'compensation-management',
+        repository_url: 'https://github.com/acme/repo',
+        build_id: 10,
+        commit: 'abc123',
+        assets: [{ id: 100, name: 'main', type: 'docker-image' }],
+      },
+      gh,
+      { internalPatterns: INTERNAL, now: NOW },
+    );
+    expect(row.data.status).toBe('ok');
+    expect(row.data.match_level).toBe('ROOT');
+    expect(row.data.repository_path).toBe('');
+    const names = row.data.dependencies.map((d: { name: string }) => d.name);
+    expect(names).toContain('org.x:lib');
+    expect(names).toContain('org.y:other');
+  });
 });
 
 describe('manifestsUnder', () => {

@@ -59,7 +59,10 @@ export async function scanBuild(build, gh, opts) {
   const idx = indexTree(paths);
 
   // L1/L3/L4 first; only build the (expensive) L2 index if something needs it.
-  const first = assets.map((a) => ({ asset: a, hit: resolveAsset(a.name, idx, null) }));
+  const first = assets.map((a) => ({
+    asset: a,
+    hit: resolveAsset(a.name, idx, null, build.app_name),
+  }));
   let declaredIndex = null;
   if (first.some((r) => !r.hit)) {
     declaredIndex = new Map();
@@ -82,7 +85,8 @@ export async function scanBuild(build, gh, opts) {
         if (!declaredIndex.has(nn)) declaredIndex.set(nn, dir);
       }
     }
-    for (const r of first) if (!r.hit) r.hit = resolveAsset(r.asset.name, idx, declaredIndex);
+    for (const r of first)
+      if (!r.hit) r.hit = resolveAsset(r.asset.name, idx, declaredIndex, build.app_name);
   }
 
   // Collect every manifest we must read, across all assets, then fetch once.

@@ -26,7 +26,7 @@ export function resolveAssetsForPlans(plans, manifestResults) {
     }
 
     const assets = (plan.assets || []).map((a) => {
-      const hit = resolveAsset(a.name, idx, declaredIndex);
+      const hit = resolveAsset(a.name, idx, declaredIndex, plan.app_name);
       if (!hit)
         return {
           asset_id: a.id,
