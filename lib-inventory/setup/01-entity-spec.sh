@@ -49,6 +49,10 @@ SPEC=$(jq -n --arg admin "$ADMIN_USER" '
   def admin_grant: {actions: ["*"], principals: [{type: "user", id: ($admin | tonumber)}]};
   {
     name: "Dependency Inventory",
+    # Explicit, because the API derives a slug from the name with UNDERSCORES
+    # ("dependency_inventory") and every write path and lake query in this
+    # suite says `dependency-inventory`. Hit live on the first rollout.
+    slug: "dependency-inventory",
     description: "Libraries in use per asset (lib-inventory suite), read from the application repository at the exact commit of the build. One entity per asset; a missing entity means never scanned.",
     schema: {
       type: "object",
