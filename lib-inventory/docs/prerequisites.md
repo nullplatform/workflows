@@ -20,8 +20,9 @@ something:
 |---|---|---|
 | `repository_url` set on the **application** entity | The only link from a deployed asset back to source | Asset is permanently `repo_missing` — it can never be scanned, and the gap is invisible unless you count it |
 | `commit` recorded on the **build** entity | The whole premise is reading source *at the commit that was built* | Falls back to branch HEAD, which is a different codebase than the one running |
-| Metadata spec `dependencies` created in the org | The write target | `POST /metadata/asset/:id/dependencies` → 400, and a parallel `forEach` **absorbs** the failure so the run still looks green |
-| Metadata spec accepts every field the parsers emit | Schema validation is all-or-nothing | One unknown property rejects the **entire** record. A missing `scope` field kept every Java asset at zero for hours while the run reported success |
+| Catalog entity spec `dependency-inventory` created in the org (`setup/01-entity-spec.sh`, needs a USER session bearer) | The write target | `PATCH /catalog/instances/dependency-inventory/:id?upsert=true` → 404, and a parallel `forEach` **absorbs** the failure so the run still looks green |
+| The spec's `schema.authorization` block grants the org `create`/`write` on entities | Without it the org API key 403s on every write even with full entity grants (hit live 2026-08-21) | Every scan writes nothing while the run reports success |
+| Entity spec accepts every field the parsers emit (`additionalProperties: false` is all-or-nothing) | Schema validation rejects the **entire** document on one unknown property | A missing `scope` field kept every Java asset at zero for hours while the run reported success |
 | Config entries: `GITHUB_TOKEN`, `LIB_INTERNAL_PATTERNS`, `LIB_SCAN_NRN_PREFIX` | Credentials and scoping | Secrets in YAML, or a scan that walks the whole org when it should be scoped |
 | Egress allowlist: `api.github.com` (+ `api.osv.dev` for the vulnerability layer) | Runtime-owned SSRF policy | `EGRESS_BLOCKED` at the first fetch |
 

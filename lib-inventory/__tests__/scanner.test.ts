@@ -14,6 +14,8 @@ import {
   manifestsUnder,
   mergeParsed,
   normalizeName,
+  csprojConfig,
+  parseCsproj,
   parseGoMod,
   parsePackageJson,
   parsePomXml,
@@ -376,6 +378,122 @@ describe('resolution ladder', () => {
     const idx = indexTree(['a/go.mod', 'b/go.mod']);
     expect(resolveAsset('totally-unrelated', idx, null)).toBeNull();
   });
+
+  // Branch-named assets, a live organization’s convention: assets are called `main` or
+  // `develop`, so the asset name says nothing about the code layout. Measured
+  // live 2026-08-31: 30/30 assets of a maven pilot false-matched `src/main`.
+  it('a name match without manifests does not beat later rungs — `main` must not land on src/main', () => {
+    const idx = indexTree(['pom.xml', 'svc/pom.xml', 'svc/src/main/java/App.java']);
+    // Multi-module maven: L4 (exactly one manifest) never fires, and `main`
+    // L1-matches `svc/src/main`. The manifest guard drops that and the root
+    // rung takes it — the root pom IS the project.
+    expect(resolveAsset('main', idx, null)).toEqual({ level: 'ROOT', dir: '' });
+  });
+
+  it('A1: the APPLICATION name resolves a monorepo when the asset name is a branch', () => {
+    const idx = indexTree([
+      'apps/acme-api/package.json',
+      'apps/acme-jobs/package.json',
+      'docs/readme.md',
+    ]);
+    expect(resolveAsset('develop', idx, null, 'acme-api')).toEqual({
+      level: 'A1',
+      dir: 'apps/acme-api',
+    });
+    // Normalized form of the app name works too.
+    expect(resolveAsset('develop', idx, null, 'acme-jobs-service')).toEqual({
+      level: 'A3',
+      dir: 'apps/acme-jobs',
+    });
+  });
+
+  it('asset-name rungs still beat app-name rungs when both carry manifests', () => {
+    const idx = indexTree(['apps/worker/package.json', 'apps/api/package.json']);
+    expect(resolveAsset('worker', idx, null, 'api')).toEqual({ level: 'L1', dir: 'apps/worker' });
+  });
+
+  it('keeps the manifestless L1 hit as a LAST resort so no_manifest stays honest', () => {
+    // A repo that is genuinely just a Dockerfile: the matched directory has no
+    // manifest and no other rung can fire — the old hit survives so the record
+    // says no_manifest AT that path instead of unresolved.
+    const idx = indexTree(['lambdas/get-toggles-aws-lambda/Dockerfile']);
+    expect(resolveAsset('get-toggles-aws-lambda', idx, null)).toEqual({
+      level: 'L1',
+      dir: 'lambdas/get-toggles-aws-lambda',
+    });
+  });
+
+  it('ROOT never fires when the root holds no manifest', () => {
+    const idx = indexTree(['a/go.mod', 'b/go.mod', 'README.md']);
+    expect(resolveAsset('main', idx, null)).toBeNull();
+  });
+});
+
+describe('scanBuild parses a .NET monorepo end to end', () => {
+  it('branch-named asset + PascalCase module resolves via the app name and parses the csproj', async () => {
+    const CSPROJ = `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+      <PackageReference Include="Serilog" Version="3.1.1" />
+      <ProjectReference Include="..\\Acme.Domain\\Acme.Domain.csproj" />
+    </ItemGroup></Project>`;
+    const gh = fakeGh({
+      'Acme.Api/Acme.Api.csproj': CSPROJ,
+      'Acme.Domain/Acme.Domain.csproj': '<Project></Project>',
+    });
+    const [row] = await scanBuild(
+      {
+        app_id: 1,
+        app_name: 'acme-api',
+        repository_url: 'https://github.com/acme/repo',
+        build_id: 10,
+        commit: 'abc123',
+        assets: [{ id: 100, name: 'develop', type: 'docker-image' }],
+      },
+      gh,
+      { internalPatterns: INTERNAL, now: NOW },
+    );
+    expect(row.data.status).toBe('ok');
+    expect(row.data.match_level).toBe('A3');
+    expect(row.data.primary_language).toBe('dotnet');
+    expect(row.data.libraries.map((d: { name: string }) => d.name)).toContain('Serilog');
+    expect(row.data.libraries.find((d: { name: string }) => d.name === 'Acme.Domain')).toMatchObject(
+      { local: true },
+    );
+  });
+});
+
+describe('scanBuild resolves branch-named assets through the application', () => {
+  const POM_ROOT = `<project><groupId>g</groupId><artifactId>root</artifactId>
+<dependencies><dependency><groupId>org.x</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies></project>`;
+  const POM_SVC = `<project><artifactId>svc</artifactId>
+<dependencies><dependency><groupId>org.y</groupId><artifactId>other</artifactId><version>2.0</version></dependency></dependencies></project>`;
+
+  it('an asset named `main` in a multi-module maven repo scans the whole project from the root', async () => {
+    const gh = {
+      tree: async () => ['pom.xml', 'svc/pom.xml', 'svc/src/main/java/App.java'],
+      blobs: async (_o: string, _r: string, _ref: string, paths: string[]) =>
+        Object.fromEntries(
+          paths.map((p) => [p, p === 'pom.xml' ? POM_ROOT : POM_SVC]).filter(([p]) => p !== 'svc/src/main/java/App.java'),
+        ),
+    };
+    const [row] = await scanBuild(
+      {
+        app_id: 1,
+        app_name: 'compensation-management',
+        repository_url: 'https://github.com/acme/repo',
+        build_id: 10,
+        commit: 'abc123',
+        assets: [{ id: 100, name: 'main', type: 'docker-image' }],
+      },
+      gh,
+      { internalPatterns: INTERNAL, now: NOW },
+    );
+    expect(row.data.status).toBe('ok');
+    expect(row.data.match_level).toBe('ROOT');
+    expect(row.data.repository_path).toBe('');
+    const names = row.data.libraries.map((d: { name: string }) => d.name);
+    expect(names).toContain('org.x:lib');
+    expect(names).toContain('org.y:other');
+  });
 });
 
 describe('manifestsUnder', () => {
@@ -387,6 +505,90 @@ describe('manifestsUnder', () => {
       'containers/scoreboard-aws-uks/social_scrapers/requirements.txt',
     ]);
     expect(manifestsUnder(idx, 'containers/scoreboard-aws-uks')).toHaveLength(3);
+  });
+});
+
+describe('parseCsproj', () => {
+  const CSPROJ = `<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Serilog">
+      <Version>3.1.1</Version>
+    </PackageReference>
+    <PackageReference Include="Central.Managed" />
+    <!--<PackageReference Include="Commented.Out" Version="9.9" />-->
+    <ProjectReference Include="..\\Acme.Domain\\Acme.Domain.csproj" />
+  </ItemGroup>
+</Project>`;
+
+  it('reads PackageReference with Version as attribute or child element', () => {
+    const deps = parseCsproj(CSPROJ);
+    expect(deps.find((d: { name: string }) => d.name === 'Newtonsoft.Json')).toMatchObject({
+      version: '13.0.3',
+      direct: true,
+      ecosystem: 'dotnet',
+      local: false,
+    });
+    expect(deps.find((d: { name: string }) => d.name === 'Serilog')).toMatchObject({
+      version: '3.1.1',
+    });
+  });
+
+  it('keeps a version-less reference (central package management) with an empty version', () => {
+    // The version lives in Directory.Packages.props, which is not a detected
+    // manifest — an empty version is the honest declared state.
+    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Central.Managed')).toMatchObject(
+      { version: '' },
+    );
+  });
+
+  it('flags a ProjectReference as local in-repo code, named by its project file', () => {
+    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Acme.Domain')).toMatchObject(
+      { local: true },
+    );
+  });
+
+  it('does not inventory a commented-out reference', () => {
+    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Commented.Out')).toBeUndefined();
+  });
+
+  it('reads TargetFramework and Sdk as manifest config', () => {
+    expect(csprojConfig(CSPROJ)).toMatchObject({
+      target_framework: 'net8.0',
+      sdk: 'Microsoft.NET.Sdk',
+    });
+  });
+});
+
+describe('dot-normalized resolution (.NET module naming)', () => {
+  it('A3: app `acme-api` finds the `Acme.Api` directory', () => {
+    // .NET monorepos name modules `Acme.Api` while the NP application is
+    // `acme-api` — measured live 2026-09-01: 110 unresolved assets in one
+    // repo for exactly this mismatch.
+    const idx = indexTree(['Acme.Api/Acme.Api.csproj', 'Acme.Domain/Acme.Domain.csproj']);
+    expect(resolveAsset('develop', idx, null, 'acme-api')).toEqual({
+      level: 'A3',
+      dir: 'Acme.Api',
+    });
+  });
+
+  it('A3 via squash: app `acme-api` finds the `AcmeApi` directory (no separators at all)', () => {
+    // The live layout that dots-into-dashes did NOT cover: PascalCase
+    // CONCATENATED module dirs (AcmeApi, AcmeJobs) — 110 assets stayed
+    // unresolved after the first fix (2026-09-01). Squashing every separator
+    // out of both sides is what finally makes the spellings meet.
+    const idx = indexTree(['AcmeApi/AcmeApi.csproj', 'AcmeJobs/AcmeJobs.csproj']);
+    expect(resolveAsset('develop', idx, null, 'acme-api')).toEqual({
+      level: 'A3',
+      dir: 'AcmeApi',
+    });
+  });
+
+  it('normalizeName folds dots into dashes so both spellings meet', () => {
+    // Both land on 'acme' — the dot becomes a dash and '-api' is one of the
+    // stripped suffixes. What matters is that the two spellings CONVERGE.
+    expect(normalizeName('Acme.Api')).toBe(normalizeName('acme-api'));
   });
 });
 
@@ -405,7 +607,7 @@ require (
     const [row] = await scanBuild(build(), gh, { internalPatterns: INTERNAL, now: NOW });
 
     expect(row.data.status).toBe('ok');
-    expect(row.data.dependencies.map((d: { name: string }) => d.name)).toEqual([
+    expect(row.data.libraries.map((d: { name: string }) => d.name)).toEqual([
       'github.com/acme/goala/ulog',
       'github.com/acme/goala/uenv',
     ]);
@@ -416,6 +618,53 @@ require (
     expect(row.data.internal_count).toBe(2);
   });
 
+  it('stamps the catalog-entity identity on every record: id, nrn, build_id, release_id', async () => {
+    const gh = fakeGh({ 'lambdas/go/get-toggles-aws-lambda/go.mod': GO_MOD });
+    const [row] = await scanBuild(
+      build({
+        release_id: 55,
+        assets: [
+          {
+            id: 100,
+            name: 'get-toggles-aws-lambda',
+            type: 'lambda',
+            nrn: 'organization=1:build=10:asset=100',
+          },
+        ],
+      }),
+      gh,
+      { internalPatterns: INTERNAL, now: NOW },
+    );
+    // The document IS the entity: `id` is the asset id (the upsert key) and the
+    // rest is provenance. All strings — the spec declares them so.
+    expect(row.data.id).toBe('100');
+    expect(row.data.nrn).toBe('organization=1:build=10:asset=100');
+    expect(row.data.build_id).toBe('10');
+    expect(row.data.release_id).toBe('55');
+    // Not on the spec: the application's repository lives on the application
+    // entity. An undeclared property would reject the ENTIRE document
+    // (`additionalProperties: false`), so its absence here is load-bearing.
+    expect('repository_url' in row.data).toBe(false);
+  });
+
+  it('omits nrn when the caller does not carry it, and nulls release_id on the backfill path', async () => {
+    const gh = fakeGh({ 'lambdas/go/get-toggles-aws-lambda/go.mod': GO_MOD });
+    const [row] = await scanBuild(build(), gh, { internalPatterns: INTERNAL, now: NOW });
+    expect('nrn' in row.data).toBe(false);
+    expect(row.data.release_id).toBeNull();
+    expect(row.data.id).toBe('100');
+  });
+
+  it('stamps the identity on unscannable records too — repo_missing is still an entity', async () => {
+    const [row] = await scanBuild(build({ repository_url: '' }), fakeGh({}), {
+      internalPatterns: INTERNAL,
+      now: NOW,
+    });
+    expect(row.data.status).toBe('repo_missing');
+    expect(row.data.id).toBe('100');
+    expect(row.data.build_id).toBe('10');
+  });
+
   it('stores the whole SBOM when keepTransitiveExternal is set', async () => {
     const gh = fakeGh({ 'lambdas/go/get-toggles-aws-lambda/go.mod': GO_MOD });
     const [row] = await scanBuild(build(), gh, {
@@ -423,7 +672,7 @@ require (
       now: NOW,
       keepTransitiveExternal: true,
     });
-    expect(row.data.dependencies).toHaveLength(3);
+    expect(row.data.libraries).toHaveLength(3);
     expect(row.data.transitive_external_dropped).toBe(0);
   });
 
@@ -510,14 +759,14 @@ require (
 
     expect(row.data.status).toBe('ok');
     expect(row.data.languages.sort()).toEqual(['go', 'node']);
-    const names = row.data.dependencies.map((d: { name: string }) => d.name);
+    const names = row.data.libraries.map((d: { name: string }) => d.name);
     expect(names).toContain('github.com/acme/goala/ulog');
     expect(names).toContain('@acme/ui');
     expect(names).toContain('react');
     // An npm scope is an internal marker the GitHub-owner pattern cannot see —
     // that is why `LIB_INTERNAL_PATTERNS` is a list, not one regex.
     expect(
-      row.data.dependencies.find((d: { name: string }) => d.name === '@acme/ui'),
+      row.data.libraries.find((d: { name: string }) => d.name === '@acme/ui'),
     ).toMatchObject({ internal: true });
   });
 });

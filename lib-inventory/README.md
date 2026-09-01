@@ -1,8 +1,11 @@
 # Library Inventory
 
-Records which libraries every deployed asset actually uses, as `dependencies`
-metadata on the NP **asset** entity, by reading the application's repository at
-the exact commit its build was made from.
+Records which libraries every deployed asset actually uses, as one
+`dependency-inventory` **catalog entity** per NP asset, by reading the
+application's repository at the exact commit its build was made from.
+(Earlier revisions of this suite wrote asset *metadata* instead; the catalog
+is now the only write target — upsert semantics, first-class in the catalog
+UI/search, and queryable in the lake via `catalog_entities`.)
 
 The point is to answer, per scope / application / asset: *who is on which
 version of which internal library, and who is behind*. Detection of "obsolete"
@@ -48,8 +51,8 @@ compare against.
 
 | File | What it is |
 |---|---|
-| `wf-l0-scan-build.yaml` | **The scanner.** One build per execution: plan → fetch trees (`http-request`) → plan → fetch manifests (`http-request`) → resolve → parse → build records → write metadata. Every caller goes through this; nothing else knows about GitHub. |
-| `wf-l1-backfill.yaml` | Four steps: ONE lake query for the live assets that still have no record → a `wf-l0` sub-execution per build → coverage summary that FAILS the run below a threshold. `dry_run: true` scans and summarises without writing. |
+| `wf-l0-scan-build.yaml` | **The scanner.** One build per execution: plan → fetch trees (`http-request`) → plan → fetch manifests (`http-request`) → resolve → parse → build documents → upsert catalog entities. Every caller goes through this; nothing else knows about GitHub. |
+| `wf-l1-backfill.yaml` | Four steps: ONE lake query for the in-scope assets (active + recently deployed) that still have no entity → a `wf-l0` sub-execution per build → coverage summary that FAILS the run below a threshold. `dry_run: true` scans and summarises without writing. |
 | `scanner/lib/*.mjs` | The scanning logic, one module per concern, unit-tested. **Source of truth** for the generated step bodies. |
 | `scanner/steps/*.mjs` | The five `code-exec` bodies, each a few lines wiring `inputs` to `lib/`. Not modules — function bodies, which is why Biome ignores them. |
 | `scripts/build-workflow.mjs` | Inlines, per step, only the `lib/` modules that step uses (`code-exec` has no include mechanism) and refuses to emit a body that does not compile. `--check` fails if the YAML is stale. |
@@ -57,33 +60,48 @@ compare against.
 | `setup/*` | Configuration runbook (below). |
 | `__tests__/scanner.test.ts` | Ladder rungs, parser rules and every non-`ok` status. |
 
-## The metadata record
+## The entity document
 
-One `dependencies` record per asset, under an org-level specification hidden
-from the UI (`visibleOn: []`). It lands in the lake as
-`core_entities_metadata` with `entity='asset'`, which is what the dashboard
-queries — note it does **not** appear in `core_entities_asset.metadata`.
+One `dependency-inventory` catalog entity per asset (`setup/01-entity-spec.sh`
+declares the spec). The document's `id` IS the asset id — the upsert key —
+and wf-l0 writes it with
+`PATCH /catalog/instances/dependency-inventory/{asset_id}?upsert=true`, so
+create and refresh are the same request. In the lake it lands in
+`catalog_entities` (join `catalog_entity_specifications` on
+`slug = 'dependency-inventory'`; the document is in `data`).
 
 ```json
 {
+  "id": "1375758981",
+  "nrn": "organization=…:account=…:namespace=…:application=…:build=…:asset=1375758981",
   "status": "ok | no_manifest | unresolved | repo_unreachable | repo_missing | lang_unsupported",
   "status_detail": "why, when it is not ok",
+  "build_id": "1517184658", "release_id": "…| null", "commit": "05e71c05…",
+  "repository_path": "lambdas/go/get-toggles-aws-lambda", "match_level": "L1",
   "primary_language": "go", "languages": ["go"],
-  "repository_url": "…", "repository_path": "lambdas/go/get-toggles-aws-lambda",
-  "commit": "05e71c05…", "match_level": "L1",
   "manifests": [{ "path": "…/go.mod", "language": "go" }],
-  "dependencies": [
+  "libraries": [
     { "name": "github.com/acme/goala/ulog", "version": "v1.1.3",
       "direct": true, "internal": true, "local": false, "ecosystem": "go" }
   ],
   "total_count": 4, "direct_count": 2, "internal_count": 4, "local_count": 1,
   "transitive_external_dropped": 59,
+  "manifest_config": { "go.go": "1.22.3" },
   "scanned_at": "…", "scanner_version": "lib-inventory/1.0.0"
 }
 ```
 
-**Every in-scope asset gets a record, including the ones that could not be
-scanned.** An asset with no record was never visited. That distinction is the
+Deliberately NOT here: anything the platform already knows about the asset's
+application or namespace (`application_name`, `repository_url`, …). The `nrn`
+encodes the hierarchy for prefix filtering and the lake joins the rest.
+`release_id` is provenance of the scan that wrote the document (the listener
+passes it, the backfill leaves it null) — a build can be released more than
+once, so the lake's release→build join remains the complete answer. The spec
+declares `additionalProperties: false`: a parser that emits a new field
+without declaring it in `01-entity-spec.sh` gets the WHOLE document rejected.
+
+**Every in-scope asset gets an entity, including the ones that could not be
+scanned.** An asset with no entity was never visited. That distinction is the
 whole design: coverage is a lake query, not an assumption.
 
 ## What is stored, and what is not
@@ -108,15 +126,26 @@ the asset ships, not a library it consumes. Excluded from the counts.
 
 ## How an asset is matched to code
 
-A ladder, measured over 479 real the reference organization assets:
+A ladder. L1–L4 were measured over 479 real assets of the reference
+organization; A1–A3 and ROOT exist because other organizations name assets
+after the BRANCH (`main`, `develop`), which broke both assumptions the
+original ladder made (measured live 2026-08-31: 30/30 assets of a maven pilot
+L1-matched `src/main`):
 
-| Rung | Rule | Assets |
-|---|---|---|
-| L1 | asset name == a directory basename anywhere in the tree | 476 (99.4%) |
-| L2 | the name declared *inside* a manifest (Maven `<artifactId>`, `package.json` `name`, `go.mod` `module`) | 2 (0.4%) |
-| L3 | normalized basename (strips `-aws-lambda`, `-aws-uks`, `-service`, …) | 0 |
-| L4 | the repo has exactly one manifest, at the root | 1 (0.2%) |
-| L5 | unresolved → `status: unresolved` | **0** |
+| Rung | Rule |
+|---|---|
+| L1 | asset name == a directory basename anywhere in the tree |
+| L2 | the name declared *inside* a manifest (Maven `<artifactId>`, `package.json` `name`, `go.mod` `module`) |
+| L3 | normalized basename (strips `-aws-lambda`, `-aws-uks`, `-service`, …) |
+| A1–A3 | the same three rungs over the APPLICATION name — monorepos whose assets are branch-named |
+| L4 | the repo has exactly one manifest, at the root |
+| ROOT | a manifest lives at the repository root — the multi-module maven case L4 can never satisfy |
+| L5 | unresolved → `status: unresolved` |
+
+A hit only settles if its subtree contains a manifest; otherwise the later
+rungs keep trying. The one exception: when nothing else fires, a manifestless
+asset-name hit survives as the last resort so a Dockerfile-only directory
+still reads `no_manifest` at its real path instead of `unresolved`.
 
 Two rules carry it from 98.5% to 100%:
 
@@ -134,9 +163,9 @@ would go, and the dashboard would show exactly how many assets needed it.
 
 ## Ecosystems
 
-Only **go** is parsed today (279 of the reference organization's 375 deployed repos contain it). A
-manifest in any other language is recorded with `status: lang_unsupported` and
-its `languages`, so the cost of enabling each parser is a query away.
+**go, node, maven, python and dotnet** are parsed today. A manifest in any other
+language is recorded with `status: lang_unsupported` and its `languages`, so
+the cost of enabling each parser is a query away.
 
 Go is also the only ecosystem that gives the direct/transitive split for free:
 `go.mod` carries the `// indirect` marker written by `go mod tidy`, so it is
@@ -155,6 +184,7 @@ Caveat worth knowing: `// indirect` is only as accurate as the last
 | `/lib-inventory` | `LIB_INTERNAL_PATTERNS` | no | JSON array of regex sources marking a dependency internal, e.g. `["^github\\.com/acme/"]`. **Required** — without it everything looks external |
 | `/lib-inventory` | `LIB_MAX_BUILDS` | no | Builds per run — the fan-out width. Not a state guard any more: each build is its own sub-execution |
 | `/lib-inventory` | `LIB_MIN_COVERAGE_PCT` | no | The run FAILS below this % of assets written |
+| `/lib-inventory` | `LIB_BACKFILL_LOOKBACK_DAYS` | no | Besides what is ACTIVE, the backfill also scans anything deployed within this many days (default 15) |
 | `/lib-inventory` | `GITHUB_TOKEN` | **yes** | Read access to the repositories in scope |
 | `/` | `NP_API_KEY` | **yes** | Shared org credential — written once, never overwritten |
 
@@ -171,15 +201,18 @@ the runner rejects a `secrets.*` reference in an `initialValue` outright.
 
 ```bash
 cd workflows/lib-inventory/setup
-./01-metadata-spec.sh --env-file ../../../.env.the reference organization
-./02-config-entries.sh --env-file ../../../.env.the reference organization \
+NP_SESSION_TOKEN=… ./01-entity-spec.sh --env-file ../../../.env.<org> \
+  --admin-user <your np user id>
+./02-config-entries.sh --env-file ../../../.env.<org> \
   --github-token ghp_… \
   --scope-nrn 'organization=<ORG_ID>:account=646905903:namespace=1424491255:application=1412378069' \
   --internal-patterns '["^github\\.com/acme/"]'
 cd ../../.. && NP_API_KEY=… pnpm tsx workflows/lib-inventory/setup/03-upload-workflows.mjs
 ```
 
-Both scripts are idempotent. `02` verifies up front that the GitHub token can
+Both scripts are idempotent. `01` needs a USER SESSION bearer (catalog
+specifications cannot be managed with an org API key; instances can, which is
+all the workflows need). `02` verifies up front that the GitHub token can
 actually list repositories — a fine-grained PAT that sees none fails every scan
 with `repo_unreachable` and looks exactly like an NP permissions bug.
 
@@ -212,12 +245,7 @@ scanner, and uploading a stale one ships stale scanner code.
 
 ## Known gaps
 
-- **Ecosystems**: node, maven, python and dotnet are detected but not parsed.
-- **Near-real-time**: population on release creation is not built yet; today
-  the inventory only refreshes when the backfill runs. It needs a generic
-  audit-entity trigger (an `audit` notification channel filtered to
-  `entity=release`) — the existing `np-*-trigger` plugins are all
-  service-action based, so none of them can carry it.
+- **Ecosystems**: gradle, dart and php are detected but not parsed (gradle is the big one — no lockfile and a Groovy/Kotlin DSL, so direct-deps extraction is heuristic work).
 - **Whole-org runs are cron-shaped, not a loop**: `LIB_MAX_BUILDS` bounds one
   run and the lake query only ever returns work that is still outstanding, so
   repeated runs converge with no cursor and no `split-in-batches`.

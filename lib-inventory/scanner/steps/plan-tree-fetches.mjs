@@ -12,7 +12,7 @@ const builds = (inputs.rows || []).map((r) => ({
   build_id: r.build_id,
   commit: r.commit,
   assets: (typeof r.assets_json === 'string' ? JSON.parse(r.assets_json) : r.assets_json || []).map(
-    (a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2] } : a),
+    (a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2], nrn: a[3] } : a),
   ),
 }));
 

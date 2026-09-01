@@ -1,3 +1,6 @@
 node_modules/
 *.tgz
 package-lock.json
+
+# per-org uploader state — carries live org/workflow ids
+**/setup/.uploaded.json

@@ -1,7 +1,7 @@
 # Library inventory — scan ONE build.
 #
-# The scanner. Everything that knows how to turn a repository into dependency
-# metadata lives here and NOWHERE else: the backfill (wf-l1) and the
+# The scanner. Everything that knows how to turn a repository into a dependency
+# inventory lives here and NOWHERE else: the backfill (wf-l1) and the
 # per-release path both invoke this workflow rather than carrying their own
 # copy of the pipeline.
 #
@@ -13,9 +13,10 @@
 #                         ├─ parse_go ────── pure  (one step per ecosystem)
 #                         ├─ parse_node ──── pure
 #                         ├─ parse_maven ─── pure
-#                         └─ parse_python ── pure
+#                         ├─ parse_python ── pure
+#                         └─ parse_dotnet ── pure
 #                              └─ build_payloads ── pure
-#                                   └─ write_metadata ── np-api-call
+#                                   └─ write_entities ── np-api-call (catalog upsert)
 #                                        └─ result
 #
 # Every GitHub call is an `http-request` — the plugin the platform already
@@ -32,13 +33,16 @@
 # magnitude of headroom. The cost is one Temporal execution per build, which is
 # what buys the parallelism back.
 #
-# EVERY asset handed to this workflow gets a metadata record, including ones
-# that could not be scanned (`status` carries the reason). An asset with NO
-# record was never visited — that distinction is the whole design, and it makes
-# coverage a lake query instead of an act of faith.
+# EVERY asset handed to this workflow gets a `dependency-inventory` catalog
+# entity, including ones that could not be scanned (`status` carries the
+# reason). An asset with NO entity was never visited — that distinction is the
+# whole design, and it makes coverage a lake query instead of an act of faith.
+# The entity spec is created by setup/01-entity-spec.sh; writes are
+# PATCH /catalog/instances/dependency-inventory/{asset_id}?upsert=true, so
+# create and refresh are the same request.
 #
 # Per-org configuration (config entries on folder /lib-inventory):
-#   NP_API_KEY               (secret) org credential for the metadata writes
+#   NP_API_KEY               (secret) org credential for the catalog writes
 #   GITHUB_TOKEN             (secret) PAT with read access to the repositories
 #   LIB_INTERNAL_PATTERNS    JSON array of regex sources marking a dep internal
 #
@@ -51,8 +55,8 @@ name: "Library Inventory — Scan Build"
 description: >
   Resolves each asset of one build to a subtree of its application's repository
   at that build's commit, extracts the dependency manifests found there, and
-  writes one `dependencies` metadata record per asset — including for assets
-  that could not be scanned, so coverage is always measurable.
+  upserts one `dependency-inventory` catalog entity per asset — including for
+  assets that could not be scanned, so coverage is always measurable.
 path: "/lib-inventory"
 semantic_version: 1.0.0
 
@@ -74,7 +78,15 @@ inputs:
   build_id:
     type: string
     required: true
-    description: "NP build id. Stored on the record so a scan is traceable."
+    description: "NP build id. Stored on the entity so a scan is traceable."
+  release_id:
+    type: string
+    required: false
+    description: >
+      The release that triggered this scan, when there is one (wf-l2 passes it;
+      the backfill does not). Stored on the entity as provenance — a build can
+      be released more than once, so the lake's release→build join remains the
+      complete answer.
   commit:
     type: string
     required: true
@@ -87,13 +99,14 @@ inputs:
     required: true
     description: >
       The build's assets. Named after the lake column both callers select it
-      from (`toJSONString(groupUniqArray((id, name, type)))`), so a lake row can
-      be forwarded whole with no unpacking. A real `[{id, name, type}]` array is
-      accepted just as well.
+      from (`toJSONString(groupUniqArray((id, name, type, nrn)))`), so a lake
+      row can be forwarded whole with no unpacking. A real
+      `[{id, name, type, nrn}]` array is accepted just as well; `nrn` is
+      optional and lands on the entity when present.
   dry_run:
     type: boolean
     required: false
-    description: "Scan and report, but write no metadata."
+    description: "Scan and report, but write no entities."
 
 steps:
   - id: start_manual
@@ -110,6 +123,7 @@ steps:
         app_name: { type: string, required: false }
         repository_url: { type: string, required: false }
         build_id: { type: string, required: true }
+        release_id: { type: string, required: false }
         commit: { type: string, required: true }
         assets_json: { type: string, required: true }
         dry_run: { type: boolean, required: false }
@@ -180,7 +194,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -188,8 +202,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -369,7 +396,7 @@ steps:
           build_id: r.build_id,
           commit: r.commit,
           assets: (typeof r.assets_json === 'string' ? JSON.parse(r.assets_json) : r.assets_json || []).map(
-            (a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2] } : a),
+            (a) => (Array.isArray(a) ? { id: a[0], name: a[1], type: a[2], nrn: a[3] } : a),
           ),
         }));
 
@@ -485,7 +512,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -493,8 +520,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -762,7 +802,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -770,8 +810,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -865,6 +918,7 @@ steps:
           };
           const byBase = new Map();
           const byNorm = new Map();
+          const bySquash = new Map();
           for (const d of dirs) {
             if (!d) continue;
             const base = d.slice(d.lastIndexOf('/') + 1);
@@ -873,11 +927,15 @@ steps:
             const n = normalizeName(base);
             if (!byNorm.has(n)) byNorm.set(n, []);
             byNorm.get(n).push(d);
+            const q = squashName(base);
+            if (!bySquash.has(q)) bySquash.set(q, []);
+            bySquash.get(q).push(d);
           }
           for (const list of byBase.values()) list.sort(rank);
           for (const list of byNorm.values()) list.sort(rank);
+          for (const list of bySquash.values()) list.sort(rank);
 
-          return { manifests, manifestDirs, byBase, byNorm, hasManifestUnder };
+          return { manifests, manifestDirs, byBase, byNorm, bySquash, hasManifestUnder };
         }
 
         /**
@@ -907,24 +965,73 @@ steps:
         }
 
         /**
-         * Resolve one asset name to a repository subtree.
+         * Resolve one asset to a repository subtree.
          * Returns `{ level, dir }`, or null when nothing matched (rung L5).
+         *
+         * Two rules beyond the original name ladder, both forced by organizations
+         * that name assets after the BRANCH (`main`, `develop`) rather than the
+         * component (measured live 2026-08-31: 30/30 assets of a maven pilot
+         * L1-matched `src/main` — every maven repo has one):
+         *
+         * - A hit only SETTLES if its subtree contains a manifest; otherwise the
+         *   later rungs keep trying. The one exception is the very end: if nothing
+         *   else fired, a manifestless asset-name hit is returned so the record says
+         *   `no_manifest` at that path instead of `unresolved` — that is the honest
+         *   status for a directory that really is just a Dockerfile.
+         * - The APPLICATION name gets its own rungs (A1 exact / A2 declared /
+         *   A3 normalized) after the asset-name ones, and a final ROOT rung resolves
+         *   to the repository root when a manifest lives there — the multi-module
+         *   maven case, where L4 ("exactly one manifest") can never fire.
          */
-        function resolveAsset(assetName, idx, declaredIndex) {
-          const exact = idx.byBase.get(assetName);
-          if (exact && exact.length) return { level: 'L1', dir: exact[0] };
+        function resolveAsset(assetName, idx, declaredIndex, appName) {
+          const settled = (hit) => (hit && idx.hasManifestUnder(hit.dir) ? hit : null);
 
-          if (declaredIndex) {
-            const d = declaredIndex.get(assetName) || declaredIndex.get(normalizeName(assetName));
-            if (d) return { level: 'L2', dir: d };
+          const nameRungs = (name, levels) => {
+            if (!name) return null;
+            const exact = idx.byBase.get(name);
+            if (exact && exact.length && idx.hasManifestUnder(exact[0]))
+              return { level: levels[0], dir: exact[0] };
+
+            if (declaredIndex) {
+              const d = declaredIndex.get(name) || declaredIndex.get(normalizeName(name));
+              const hit = d !== undefined ? settled({ level: levels[1], dir: d }) : null;
+              if (hit) return hit;
+            }
+
+            const norm = idx.byNorm.get(normalizeName(name));
+            if (norm && norm.length && idx.hasManifestUnder(norm[0]))
+              return { level: levels[2], dir: norm[0] };
+
+            // Same rung, last spelling: every separator removed from both sides.
+            // `acme-api` meets `AcmeApi` — .NET names module directories in
+            // concatenated PascalCase, which no dash/dot rule reaches (110 assets
+            // stayed unresolved on the dots-into-dashes fix alone, 2026-09-01).
+            const sq = idx.bySquash.get(squashName(name));
+            if (sq && sq.length && idx.hasManifestUnder(sq[0])) return { level: levels[2], dir: sq[0] };
+            return null;
+          };
+
+          const byAsset = nameRungs(assetName, ['L1', 'L2', 'L3']);
+          if (byAsset) return byAsset;
+
+          if (appName && appName !== assetName) {
+            const byApp = nameRungs(appName, ['A1', 'A2', 'A3']);
+            if (byApp) return byApp;
           }
-
-          const norm = idx.byNorm.get(normalizeName(assetName));
-          if (norm && norm.length) return { level: 'L3', dir: norm[0] };
 
           if (idx.manifestDirs.size === 1) {
             return { level: 'L4', dir: [...idx.manifestDirs][0] };
           }
+
+          if (idx.manifestDirs.has('')) {
+            return { level: 'ROOT', dir: '' };
+          }
+
+          // Last resort: the manifestless asset-name hit, so `no_manifest` keeps its
+          // path. This is the pre-guard L1 behavior, now demoted to the bottom.
+          const exact = idx.byBase.get(assetName);
+          if (exact && exact.length) return { level: 'L1', dir: exact[0] };
+
           return null;
         }
 
@@ -991,11 +1098,12 @@ steps:
             }
 
             const assets = (plan.assets || []).map((a) => {
-              const hit = resolveAsset(a.name, idx, declaredIndex);
+              const hit = resolveAsset(a.name, idx, declaredIndex, plan.app_name);
               if (!hit)
                 return {
                   asset_id: a.id,
                   asset_name: a.name,
+                  asset_nrn: a.nrn,
                   exists: a.exists === true,
                   hit: null,
                   manifests: [],
@@ -1003,6 +1111,7 @@ steps:
               return {
                 asset_id: a.id,
                 asset_name: a.name,
+                asset_nrn: a.nrn,
                 exists: a.exists === true,
                 hit,
                 manifests: manifestsUnder(idx, hit.dir).slice(0, 8),
@@ -1091,7 +1200,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1099,8 +1208,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -1378,7 +1500,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1386,8 +1508,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -1679,7 +1814,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1687,8 +1822,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -2087,7 +2235,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -2095,8 +2243,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -2466,12 +2627,293 @@ steps:
         return { parsed };
         // <<< END parse_python
 
+  - id: parse_dotnet
+    type: module
+    plugin_type: code-exec
+    name: "Parse .NET Dependencies"
+    inputs:
+      resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      code: |
+        // >>> GENERATED parse_dotnet — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
+        function normalizeName(name) {
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /**
+         * .NET (`*.csproj`) dependency parsing.
+         *
+         * DIRECT DEPENDENCIES ONLY, same contract as node and maven: NuGet states
+         * transitivity in `packages.lock.json`/`project.assets.json`, artifacts that
+         * are either not committed or large enough to reintroduce the payload problem
+         * the per-build split exists to solve. Nothing here runs a restore.
+         *
+         * `version` is the DECLARED value. A `<PackageReference>` with no version at
+         * all is Central Package Management — the version lives in
+         * `Directory.Packages.props`, which is not a detected manifest — so the empty
+         * string is the honest declared state, exactly like an unresolvable Maven
+         * `${property}` staying verbatim.
+         *
+         * `<ProjectReference>` is code this repository ships, not a consumed library:
+         * flagged `local`, named by its project file's basename, excluded from the
+         * counts — the same treatment as Go's `replace`-to-a-path and npm's
+         * `workspace:*`.
+         */
+
+        /** Strip XML comments before any matching — same rule as the maven parser. */
+        function stripComments(text) {
+          return String(text).replace(/<!--[\s\S]*?-->/g, '');
+        }
+
+        function parseCsproj(text) {
+          const body = stripComments(text);
+          const deps = [];
+          const seen = new Set();
+
+          // <PackageReference Include="X" Version="1.2.3" /> — attribute order is
+          // free, and Version may instead be a child element on the following lines.
+          const pkgRe = /<PackageReference\b([^>]*?)(\/>|>([\s\S]*?)<\/PackageReference>)/g;
+          for (const m of body.matchAll(pkgRe)) {
+            const attrs = m[1];
+            const inner = m[3] ?? '';
+            const name = /\bInclude\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
+            if (!name || seen.has(name)) continue;
+            seen.add(name);
+            const version =
+              /\bVersion\s*=\s*"([^"]+)"/.exec(attrs)?.[1] ??
+              /<Version>\s*([^<]+?)\s*<\/Version>/.exec(inner)?.[1] ??
+              '';
+            deps.push({ name, version, direct: true, ecosystem: 'dotnet', local: false });
+          }
+
+          const projRe = /<ProjectReference\b[^>]*?\bInclude\s*=\s*"([^"]+)"/g;
+          for (const m of body.matchAll(projRe)) {
+            // `..\Acme.Domain\Acme.Domain.csproj` → `Acme.Domain`
+            const base = m[1].split(/[\\/]/).pop() ?? m[1];
+            const name = base.replace(/\.[a-z0-9]+proj$/i, '');
+            if (!name || seen.has(name)) continue;
+            seen.add(name);
+            deps.push({ name, version: '', direct: true, ecosystem: 'dotnet', local: true });
+          }
+
+          return deps;
+        }
+
+        /**
+         * What the project declares about ITSELF: the SDK and target framework answer
+         * "which assets still target net6.0" — a runtime question no dependency list
+         * answers.
+         */
+        function csprojConfig(text) {
+          const body = stripComments(text);
+          const config = {};
+          const sdk = /<Project\b[^>]*?\bSdk\s*=\s*"([^"]+)"/.exec(body)?.[1];
+          if (sdk) config.sdk = sdk;
+          const tf =
+            /<TargetFramework>\s*([^<]+?)\s*<\/TargetFramework>/.exec(body)?.[1] ??
+            /<TargetFrameworks>\s*([^<]+?)\s*<\/TargetFrameworks>/.exec(body)?.[1];
+          if (tf) config.target_framework = tf;
+          return config;
+        }
+
+        /**
+         * STEP 4 — parse the manifests of ONE ecosystem.
+         *
+         * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
+         * canvas feeding `build_payloads`, not another branch inside a growing blob.
+         * Returns `{ [asset_id]: { dependencies, transitive_external_dropped, config } }`.
+         *
+         * `config` is what the manifests declare about THEMSELVES (`engines.node`, the
+         * `go` directive, the package manager) — runtime statements that answer
+         * "which assets still declare node 16", a question no dependency array can.
+         * Keys are prefixed with the ecosystem so two manifests never collide.
+         *
+         * The parser is PASSED IN rather than looked up in a registry. Importing the
+         * registry would drag every ecosystem's parser into every parse step's inlined
+         * bundle — the Maven step carrying the Go and Python parsers it never calls —
+         * which is exactly the "each step gets only what it uses" property the module
+         * split exists to preserve. It went from 780 lines a step back to ~300.
+         */
+        function parseEcosystem(resolutions, ecosystem, opts) {
+          const parse = opts.parse;
+          if (!parse) throw new Error(`no parser passed for ecosystem "${ecosystem}"`);
+          const readConfig = opts.readConfig;
+          const keepAll = opts.keepTransitiveExternal === true;
+          const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
+
+          const out = {};
+          for (const r of resolutions) {
+            for (const asset of r.assets) {
+              const mine = asset.manifests.filter((m) => m.ecosystem === ecosystem);
+              if (!mine.length) continue;
+
+              const seen = new Set();
+              const deps = [];
+              const config = {};
+              let dropped = 0;
+              for (const m of mine) {
+                const text = r.texts[m.path];
+                if (text == null) continue;
+                if (readConfig) {
+                  // Last manifest wins on a collision. An asset with several manifests
+                  // of one ecosystem is a monorepo subtree; the deepest one is listed
+                  // last and is the more specific statement.
+                  for (const [k, v] of Object.entries(readConfig(text, m.path, r.texts))) {
+                    config[`${ecosystem}.${k}`] = v;
+                  }
+                }
+                // The whole repository's fetched manifests, so a parser can resolve a
+                // SIBLING file without a network call. Maven needs it: a module pom
+                // inherits its `<properties>` from a parent pom that, in a monorepo of
+                // lambdas, sits at the repository root and has already been fetched.
+                for (const d of parse(text, m.path, r.texts)) {
+                  const key = `${d.ecosystem} ${d.name} ${d.version}`;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const internal = isInternal(d.name);
+                  if (!keepAll && !d.direct && !internal && !d.local) {
+                    dropped += 1;
+                    continue;
+                  }
+                  deps.push({ local: false, ...d, internal });
+                }
+              }
+              out[asset.asset_id] = { dependencies: deps, transitive_external_dropped: dropped, config };
+            }
+          }
+          return out;
+        }
+
+        /**
+         * STEP `parse_dotnet` — extract dependencies from the `*.csproj` files.
+         * No network.
+         *
+         * A sibling of the other parse steps, one ecosystem per canvas node. .NET
+         * reports DIRECT dependencies only (NuGet states transitivity in lock/assets
+         * files that are not committed manifests); `<ProjectReference>` rows come out
+         * flagged `local`. See `parseCsproj`.
+         */
+        const parsed = parseEcosystem(inputs.resolutions || [], 'dotnet', {
+          parse: parseCsproj,
+          readConfig: csprojConfig,
+          internalPatterns: compileInternalPatterns(inputs.internalPatterns),
+          keepTransitiveExternal: inputs.keepTransitiveExternal === true,
+        });
+        log.info(`parsed dotnet for ${Object.keys(parsed).length} assets`);
+        return { parsed };
+        // <<< END parse_dotnet
+
   - id: build_payloads
     type: module
     plugin_type: code-exec
-    name: "Build Asset Metadata Records"
+    name: "Build Asset Inventory Entities"
     inputs:
       resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      releaseId: "${{ workflow.inputs.release_id }}"
       # One entry per ecosystem step. `build_payloads` merges them, so adding
       # an ecosystem is a new node plus a line here — never a branch inside a
       # parser.
@@ -2480,6 +2922,7 @@ steps:
         - "${{ steps.parse_node.outputs.parsed }}"
         - "${{ steps.parse_maven.outputs.parsed }}"
         - "${{ steps.parse_python.outputs.parsed }}"
+        - "${{ steps.parse_dotnet.outputs.parsed }}"
       unscannable: "${{ steps.plan_tree_fetches.outputs.unscannable }}"
       failed: "${{ steps.plan_manifest_fetches.outputs.failed }}"
     error_handling:
@@ -2532,7 +2975,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -2540,8 +2983,21 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -2592,18 +3048,32 @@ steps:
           transitive_external_dropped: 0,
         };
 
+        /**
+         * One catalog-entity document per asset (spec `dependency-inventory`).
+         *
+         * Identity and provenance (`id`, `nrn`, `build_id`, `release_id`) come from
+         * the caller; everything the platform already knows about the asset's
+         * application or namespace is deliberately NOT here — the entity's `nrn`
+         * encodes the hierarchy and the lake joins the rest. The spec declares
+         * `additionalProperties: false`, so every key emitted here must stay declared
+         * there: one unknown property rejects the ENTIRE record.
+         */
         function payload(fields) {
           return {
             status: 'ok',
             status_detail: null,
+            release_id: null,
             primary_language: null,
             languages: [],
-            repository_url: null,
             repository_path: null,
             commit: null,
             match_level: null,
             manifests: [],
-            dependencies: [],
+            // `libraries`, NOT `dependencies`: the catalog API silently DROPS a
+            // property named `dependencies` on write (a legacy JSON-Schema keyword its
+            // schema engine treats specially) — every probe shape lost the array while
+            // its sibling keys survived, hit live 2026-08-31.
+            libraries: [],
             manifest_config: {},
             ...EMPTY_COUNTS,
             scanned_at: fields.scanned_at,
@@ -2646,13 +3116,27 @@ steps:
         }
 
         /**
-         * STEP 5 — assemble one metadata payload per asset.
+         * Identity fields of the catalog-entity document. `id` is the ASSET id — one
+         * entity per asset, upserts pinned to it. `nrn` is omitted (not nulled) when
+         * the caller does not know it: the spec declares it a plain string.
+         */
+        function identity(assetId, nrn, buildId, releaseId) {
+          return {
+            id: String(assetId),
+            ...(nrn ? { nrn } : {}),
+            build_id: String(buildId),
+            release_id: releaseId == null ? null : String(releaseId),
+          };
+        }
+
+        /**
+         * STEP 5 — assemble one catalog-entity document per asset.
          *
          * `parsed` is the merge of every `parseEcosystem` result. Builds that never got
          * past an earlier step arrive via `unscannable`/`failed` and still produce a
          * record — an asset with NO record must mean "never visited", nothing else.
          */
-        function buildPayloads({ resolutions, parsed, unreachable, now }) {
+        function buildPayloads({ resolutions, parsed, unreachable, now, releaseId }) {
           const rows = [];
 
           for (const { build, status, status_detail } of unreachable ?? []) {
@@ -2664,7 +3148,7 @@ steps:
                 build_id: build.build_id,
                 app_id: build.app_id,
                 data: payload({
-                  repository_url: build.repository_url || null,
+                  ...identity(a.id, a.nrn, build.build_id, releaseId),
                   commit: build.commit || null,
                   scanned_at: now,
                   status,
@@ -2676,7 +3160,6 @@ steps:
 
           for (const r of resolutions) {
             const base = {
-              repository_url: r.plan.repository_url || null,
               commit: r.plan.commit || null,
               scanned_at: now,
             };
@@ -2688,8 +3171,10 @@ steps:
                 build_id: r.plan.build_id,
                 app_id: r.plan.app_id,
               };
+              const who = identity(asset.asset_id, asset.asset_nrn, r.plan.build_id, releaseId);
               if (!asset.hit) {
                 row.data = payload({
+                  ...who,
                   ...base,
                   status: 'unresolved',
                   status_detail: `no directory in ${r.plan.owner}/${r.plan.repo} matches asset name "${asset.asset_name}"`,
@@ -2700,6 +3185,7 @@ steps:
 
               const languages = [...new Set(asset.manifests.map((m) => m.ecosystem))].sort();
               const common = {
+                ...who,
                 ...base,
                 repository_path: asset.hit.dir,
                 match_level: asset.hit.level,
@@ -2735,7 +3221,7 @@ steps:
                 ...common,
                 status: 'ok',
                 status_detail: unparsed.length ? `not parsed yet: ${unparsed.join(', ')}` : null,
-                dependencies: deps,
+                libraries: deps,
                 total_count: deps.filter((d) => !d.local).length,
                 direct_count: deps.filter((d) => d.direct && !d.local).length,
                 internal_count: deps.filter((d) => d.internal && !d.local).length,
@@ -2751,7 +3237,7 @@ steps:
         }
 
         /**
-         * STEP `build_payloads` — one metadata record per asset. No network.
+         * STEP `build_payloads` — one catalog-entity document per asset. No network.
          *
          * Merges every parse step's output. Builds that never got past an earlier step
          * arrive through `unreachable` and STILL produce a record: an asset with no
@@ -2764,6 +3250,7 @@ steps:
           parsed,
           unreachable: [...(inputs.unscannable || []), ...(inputs.failed || [])],
           now: new Date().toISOString(),
+          releaseId: inputs.releaseId || null,
         });
 
         const byStatus = {};
@@ -2773,30 +3260,40 @@ steps:
         return {
           rows,
           by_status: byStatus,
-          // POST only: the lake query already excluded assets that have a record, and
-          // the metadata API is create-or-update, not upsert (POST on an existing one
-          // is a 400). An asset is pinned to an immutable commit, so there is nothing
-          // to update — only assets never seen before reach this step.
+          // PATCH + `upsert=true` on the catalog: create and update are the same
+          // request, so a rescan (forced by deleting nothing — just run it) simply
+          // replaces the document. Two writers racing on a fresh asset can hit a 409
+          // on the create path; the step's retry takes the update path a moment later.
           write_requests: rows.map((r) => ({
-            path: `/metadata/asset/${r.asset_id}/dependencies`,
+            path: `/catalog/instances/dependency-inventory/${r.asset_id}?upsert=true`,
             body: r.data,
           })),
         };
         // <<< END build_payloads
 
-  # ── Write one metadata record per asset ──────────────────────────────────
-  # POST /metadata/asset/{id}/dependencies is an upsert; re-running the backfill
-  # is idempotent and simply refreshes `scanned_at`.
-  - id: write_metadata
+  # ── Upsert one catalog entity per asset ──────────────────────────────────
+  # PATCH /catalog/instances/dependency-inventory/{asset_id}?upsert=true:
+  # create and update are the same request, so re-running a scan is idempotent
+  # and simply replaces the document. Two writers racing on a fresh asset
+  # (listener vs backfill) can 409 on the create path — the retry policy takes
+  # the update path a moment later, same as the deploy-analysis suite.
+  - id: write_entities
     type: module
     plugin_type: np-api-call
-    name: "Write Asset Dependencies Metadata"
+    name: "Upsert Asset Dependency Inventory"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       failOnHttpError: true
-      method: POST
+      method: PATCH
       # Placeholder: validateConfig() runs before per-item inputs merge.
-      path: "/metadata/asset/0/dependencies"
+      path: "/catalog/instances/dependency-inventory/0"
+    # Each slot shrinks to `{status}` — `result` counts 2xx slots to know how
+    # many writes actually landed. The forEach aggregate exposes no failure
+    # count (a parallel forEach absorbs a failed iteration as an EMPTY slot),
+    # so the items themselves are the only honest evidence. Projected, N
+    # assets cost N tiny objects instead of N echoed entity documents.
+    output_projection:
+      - status
     error_handling:
       retry_policy:
         max_attempts: 3
@@ -2811,7 +3308,7 @@ steps:
       maxConcurrency: 20
 
   # ── What the caller aggregates ───────────────────────────────────────────
-  # Reached either from `build_payloads` (dry run) or from `write_metadata`.
+  # Reached either from `build_payloads` (dry run) or from `write_entities`.
   # The default `all` join would wait forever on the branch never traversed:
   # a `condition: false` edge is not reliably marked skipped.
   #
@@ -2824,8 +3321,7 @@ steps:
     join_strategy: any
     inputs:
       scanned: "${{ steps.build_payloads.outputs.rows }}"
-      writtenCount: "${{ steps.write_metadata.outputs.count }}"
-      writeFailed: "${{ steps.write_metadata.outputs.failed }}"
+      writeResults: "${{ steps.write_entities.outputs.items }}"
       levels: "${{ steps.resolve_assets.outputs.levels }}"
       dryRun: "${{ workflow.inputs.dry_run }}"
       buildId: "${{ workflow.inputs.build_id }}"
@@ -2847,22 +3343,26 @@ steps:
           for (const l of r.data.languages || []) byLanguage[l] = (byLanguage[l] || 0) + 1;
         }
 
-        // `count` is the iterations ATTEMPTED and `failed` the ones that
-        // exhausted their retries. Counting the ITEMS array instead shipped
-        // 113 KB into this sandbox and took 302s against 0.8-6.9s for every
-        // other step — measured on the batched shape, 2026-07-26.
-        //
-        // `failed` is NOT optional here. A `forEach` in parallel mode absorbs a
-        // failed iteration, so a rejected write leaves the step `completed` and
-        // only this number says otherwise. Treating a missing `failed` as zero
-        // is how a build reported `assets_written: 1` while the API had
-        // answered 400 and written nothing — the exact silent success this
-        // design exists to prevent. When it is absent the count is UNKNOWN, and
-        // unknown must not read as success.
-        const attempted = Number(inputs.writtenCount || 0);
-        const failedRaw = inputs.writeFailed;
-        const failed = failedRaw === undefined || failedRaw === null ? null : Number(failedRaw);
-        const written = inputs.dryRun ? 0 : failed === null ? 0 : Math.max(0, attempted - failed);
+        // Success is counted from the write step's ITEMS, one slot per asset,
+        // each projected down to `{status}` by `output_projection`. This is
+        // the only honest evidence: a parallel `forEach` absorbs a failed
+        // iteration as an EMPTY slot and the aggregate exposes no failure
+        // count (the engine used to emit `failed`; the current one emits only
+        // `{items, count}`, which silently zeroed every run's assets_written —
+        // hit live on the first live rollout, 2026-08-31). Anything that is
+        // not a 2xx slot — empty, junk, 4xx — counts as a failed write.
+        // Un-projected this was 113 KB/302s on the batched shape (2026-07-26);
+        // projected it is one tiny object per asset of ONE build.
+        const slots = inputs.writeResults;
+        const attempted = Array.isArray(slots) ? slots.length : 0;
+        const written = inputs.dryRun
+          ? 0
+          : (Array.isArray(slots) ? slots : []).filter(
+              (s) => s && typeof s === 'object' && Number(s.status) >= 200 && Number(s.status) < 300,
+            ).length;
+        // `null` (unknown) only when the step ran but handed back no array at
+        // all — unknown must not read as success.
+        const failed = inputs.dryRun ? 0 : Array.isArray(slots) ? attempted - written : null;
 
         const result = {
           build_id: inputs.buildId,
@@ -2895,13 +3395,15 @@ connections:
   - { id: c6b, from: resolve_assets, to: parse_node }
   - { id: c6c, from: resolve_assets, to: parse_maven }
   - { id: c6d, from: resolve_assets, to: parse_python }
+  - { id: c6e, from: resolve_assets, to: parse_dotnet }
   - { id: c7, from: parse_go, to: build_payloads }
   - { id: c7b, from: parse_node, to: build_payloads }
   - { id: c7c, from: parse_maven, to: build_payloads }
   - { id: c7d, from: parse_python, to: build_payloads }
-  - { id: c8, from: build_payloads, to: write_metadata, condition: "workflow.inputs.dry_run != true" }
+  - { id: c7e, from: parse_dotnet, to: build_payloads }
+  - { id: c8, from: build_payloads, to: write_entities, condition: "workflow.inputs.dry_run != true" }
   - { id: c9, from: build_payloads, to: result, condition: "workflow.inputs.dry_run == true" }
-  - { id: c10, from: write_metadata, to: result }
+  - { id: c10, from: write_entities, to: result }
 
 # The sub-workflow plugin returns THESE to the caller — a workflow with no
 # `outputs:` block hands back `{}` no matter what its last step computed, and

@@ -1,4 +1,4 @@
-import { manifestLang, normalizeName } from './manifests.mjs';
+import { manifestLang, normalizeName, squashName } from './manifests.mjs';
 
 /**
  * Build the lookup structures a repo tree needs to answer "which subtree is
@@ -51,6 +51,7 @@ export function indexTree(paths) {
   };
   const byBase = new Map();
   const byNorm = new Map();
+  const bySquash = new Map();
   for (const d of dirs) {
     if (!d) continue;
     const base = d.slice(d.lastIndexOf('/') + 1);
@@ -59,11 +60,15 @@ export function indexTree(paths) {
     const n = normalizeName(base);
     if (!byNorm.has(n)) byNorm.set(n, []);
     byNorm.get(n).push(d);
+    const q = squashName(base);
+    if (!bySquash.has(q)) bySquash.set(q, []);
+    bySquash.get(q).push(d);
   }
   for (const list of byBase.values()) list.sort(rank);
   for (const list of byNorm.values()) list.sort(rank);
+  for (const list of bySquash.values()) list.sort(rank);
 
-  return { manifests, manifestDirs, byBase, byNorm, hasManifestUnder };
+  return { manifests, manifestDirs, byBase, byNorm, bySquash, hasManifestUnder };
 }
 
 /**
@@ -93,24 +98,73 @@ export function declaredName(ecosystem, text) {
 }
 
 /**
- * Resolve one asset name to a repository subtree.
+ * Resolve one asset to a repository subtree.
  * Returns `{ level, dir }`, or null when nothing matched (rung L5).
+ *
+ * Two rules beyond the original name ladder, both forced by organizations
+ * that name assets after the BRANCH (`main`, `develop`) rather than the
+ * component (measured live 2026-08-31: 30/30 assets of a maven pilot
+ * L1-matched `src/main` — every maven repo has one):
+ *
+ * - A hit only SETTLES if its subtree contains a manifest; otherwise the
+ *   later rungs keep trying. The one exception is the very end: if nothing
+ *   else fired, a manifestless asset-name hit is returned so the record says
+ *   `no_manifest` at that path instead of `unresolved` — that is the honest
+ *   status for a directory that really is just a Dockerfile.
+ * - The APPLICATION name gets its own rungs (A1 exact / A2 declared /
+ *   A3 normalized) after the asset-name ones, and a final ROOT rung resolves
+ *   to the repository root when a manifest lives there — the multi-module
+ *   maven case, where L4 ("exactly one manifest") can never fire.
  */
-export function resolveAsset(assetName, idx, declaredIndex) {
-  const exact = idx.byBase.get(assetName);
-  if (exact && exact.length) return { level: 'L1', dir: exact[0] };
+export function resolveAsset(assetName, idx, declaredIndex, appName) {
+  const settled = (hit) => (hit && idx.hasManifestUnder(hit.dir) ? hit : null);
 
-  if (declaredIndex) {
-    const d = declaredIndex.get(assetName) || declaredIndex.get(normalizeName(assetName));
-    if (d) return { level: 'L2', dir: d };
+  const nameRungs = (name, levels) => {
+    if (!name) return null;
+    const exact = idx.byBase.get(name);
+    if (exact && exact.length && idx.hasManifestUnder(exact[0]))
+      return { level: levels[0], dir: exact[0] };
+
+    if (declaredIndex) {
+      const d = declaredIndex.get(name) || declaredIndex.get(normalizeName(name));
+      const hit = d !== undefined ? settled({ level: levels[1], dir: d }) : null;
+      if (hit) return hit;
+    }
+
+    const norm = idx.byNorm.get(normalizeName(name));
+    if (norm && norm.length && idx.hasManifestUnder(norm[0]))
+      return { level: levels[2], dir: norm[0] };
+
+    // Same rung, last spelling: every separator removed from both sides.
+    // `acme-api` meets `AcmeApi` — .NET names module directories in
+    // concatenated PascalCase, which no dash/dot rule reaches (110 assets
+    // stayed unresolved on the dots-into-dashes fix alone, 2026-09-01).
+    const sq = idx.bySquash.get(squashName(name));
+    if (sq && sq.length && idx.hasManifestUnder(sq[0])) return { level: levels[2], dir: sq[0] };
+    return null;
+  };
+
+  const byAsset = nameRungs(assetName, ['L1', 'L2', 'L3']);
+  if (byAsset) return byAsset;
+
+  if (appName && appName !== assetName) {
+    const byApp = nameRungs(appName, ['A1', 'A2', 'A3']);
+    if (byApp) return byApp;
   }
-
-  const norm = idx.byNorm.get(normalizeName(assetName));
-  if (norm && norm.length) return { level: 'L3', dir: norm[0] };
 
   if (idx.manifestDirs.size === 1) {
     return { level: 'L4', dir: [...idx.manifestDirs][0] };
   }
+
+  if (idx.manifestDirs.has('')) {
+    return { level: 'ROOT', dir: '' };
+  }
+
+  // Last resort: the manifestless asset-name hit, so `no_manifest` keeps its
+  // path. This is the pre-guard L1 behavior, now demoted to the bottom.
+  const exact = idx.byBase.get(assetName);
+  if (exact && exact.length) return { level: 'L1', dir: exact[0] };
+
   return null;
 }
 

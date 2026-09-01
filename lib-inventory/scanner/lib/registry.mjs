@@ -16,6 +16,7 @@
 import { goModConfig, parseGoMod } from './parsers-go.mjs';
 import { parsePomXml, pomConfig } from './parsers-maven.mjs';
 import { packageJsonConfig, parsePackageJson } from './parsers-node.mjs';
+import { csprojConfig, parseCsproj } from './parsers-dotnet.mjs';
 import { parsePython, pythonConfig } from './parsers-python.mjs';
 
 export const PARSERS = {
@@ -23,6 +24,7 @@ export const PARSERS = {
   node: parsePackageJson,
   'java-maven': parsePomXml,
   python: parsePython,
+  dotnet: parseCsproj,
 };
 
 export const CONFIG_READERS = {
@@ -30,4 +32,5 @@ export const CONFIG_READERS = {
   node: packageJsonConfig,
   'java-maven': pomConfig,
   python: pythonConfig,
+  dotnet: csprojConfig,
 };

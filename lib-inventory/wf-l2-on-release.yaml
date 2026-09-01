@@ -40,8 +40,9 @@ id: lib_inventory_on_release
 name: "Library Inventory — On Release"
 description: >
   Scans a release's build as soon as NP audits its creation, so the asset's
-  dependency metadata exists before anyone asks for it. The audit payload is
-  only a poke — the build, commit and assets are re-read from the lake.
+  dependency-inventory entity exists before anyone asks for it. The audit
+  payload is only a poke — the build, commit and assets are re-read from the
+  lake.
 path: "/lib-inventory"
 semantic_version: 1.0.0
 
@@ -87,9 +88,11 @@ steps:
   # because its build is about to run somewhere, and the asset is immutable, so
   # scanning it now is work the backfill would have done later anyway.
   #
-  # `existing` still guards it — a release re-created for an already-scanned
-  # build (or a duplicate audit delivery) must not POST a metadata record that
-  # is already there; the API answers 400 to a create-over-existing.
+  # `existing` still guards it — the catalog upsert would happily rewrite an
+  # entity that is already there, but the asset is pinned to an immutable
+  # commit, so a re-created release or a duplicate audit delivery would spend
+  # a whole scan to write the same document again. The guard turns that into
+  # zero rows.
   - id: fetch_build
     type: module
     plugin_type: np-lake-query
@@ -100,33 +103,42 @@ steps:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
         WITH existing AS (
-          SELECT toInt32OrZero(m.id) AS asset_id
-          FROM core_entities_metadata AS m FINAL
-          WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-            AND m.data IS NOT NULL
-            -- FINAL and `_deleted = 0`, both load-bearing. Without them a
-            -- DELETED record still counts as present, so the asset is skipped
-            -- FOREVER — deleting a record to force a rescan silently does
-            -- nothing. Found live 2026-07-26: 341 assets stranded that way,
-            -- including every Java one, after their records were deliberately
-            -- deleted so the new Maven parser would re-read them. Without
-            -- FINAL the ReplacingMergeTree can also return a superseded row.
-            AND m._deleted = 0
+          SELECT toInt64OrZero(JSONExtractString(e.data, 'id')) AS asset_id
+          FROM catalog_entities AS e FINAL
+          INNER JOIN catalog_entity_specifications AS sp FINAL
+            ON sp.id = e.entity_specification_id
+          WHERE sp.slug = 'dependency-inventory'
+            AND e.data IS NOT NULL
+            -- FINAL, `_deleted = 0` and `deleted_at IS NULL`, all load-bearing.
+            -- Without them a DELETED entity still counts as present, so the
+            -- asset is skipped FOREVER — deleting an entity to force a rescan
+            -- silently does nothing (the same trap was hit live on the
+            -- metadata store, 2026-07-26: 341 assets stranded). Without FINAL
+            -- the ReplacingMergeTree can also return a superseded row.
+            AND e._deleted = 0 AND e.deleted_at IS NULL
         )
         SELECT
           toString(a.app_id)   AS app_id,
           a.app_name           AS app_name,
           a.repository_url     AS repository_url,
           toString(b.id)       AS build_id,
+          toString(r.id)       AS release_id,
           b.commit             AS commit,
-          toJSONString(groupUniqArray((x.id, x.name, x.type))) AS assets_json
+          -- `core_entities_asset.nrn` stops at `application=` — append the
+          -- build and asset segments so the entity carries the canonical
+          -- asset NRN (same shape the catalog uses everywhere else). NOTE:
+          -- the lake validator splits statements on any semicolon, even
+          -- inside a comment, so the character may not appear ANYWHERE in
+          -- this query (hit live, 2026-08-31).
+          toJSONString(groupUniqArray((x.id, x.name, x.type,
+            concat(x.nrn, ':build=', toString(b.id), ':asset=', toString(x.id))))) AS assets_json
         FROM core_entities_release AS r FINAL
         INNER JOIN core_entities_build       AS b FINAL ON b.id = r.build_id
         INNER JOIN core_entities_application AS a FINAL ON a.app_id = b.app_id
         INNER JOIN core_entities_asset       AS x FINAL ON x.build_id = b.id
         WHERE r.id = ${{ inputs.releaseId }}
           AND x.id NOT IN (SELECT asset_id FROM existing)
-        GROUP BY a.app_id, a.app_name, a.repository_url, b.id, b.commit
+        GROUP BY a.app_id, a.app_name, a.repository_url, b.id, r.id, b.commit
 
   # One row in practice (a release names one build), but the fan-out costs
   # nothing and keeps this identical to the backfill's call.

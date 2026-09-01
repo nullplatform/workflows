@@ -8,14 +8,18 @@ curl -s -X POST https://api.nullplatform.com/data/lake/query \
   -d '{"query": "… FORMAT JSONEachRow"}'
 ```
 
-Three things that will bite you if nobody says them first:
+Things that will bite you if nobody says them first:
 
-- **A deleted METADATA RECORD still looks present.** `core_entities_metadata`
-  keeps deleted rows with `_deleted = 1`, so any "has this asset been scanned"
-  CTE needs `FINAL` and `AND m._deleted = 0`. Without them, deleting a record to
-  force a rescan silently does nothing — the asset is skipped forever. That
-  stranded 341 assets, every Java one among them, after their records were
-  deliberately deleted so a new parser would re-read them (2026-07-26).
+- **The inventory lives in the CATALOG.** One `dependency-inventory` entity
+  per asset; the document is in `data` (its `id` is the asset id), the table's
+  `nrn` column carries the asset NRN for prefix scoping, and the spec is found
+  by joining `catalog_entity_specifications` on `slug`.
+- **A deleted ENTITY still looks present.** `catalog_entities` keeps deleted
+  rows (`_deleted = 1`, `deleted_at` set), so any "has this asset been scanned"
+  CTE needs `FINAL`, `AND m._deleted = 0` and `AND m.deleted_at IS NULL`.
+  Without them, deleting an entity to force a rescan silently does nothing —
+  the asset is skipped forever. The same trap on the old metadata store
+  stranded 341 assets, every Java one among them (2026-07-26).
 - **A deleted scope still looks deployed.** Its deployments keep
   `status_in_scope = 'active'` in the lake, so the "what is live" CTE has to
   carry `AND s.status != 'deleted'` or it reports on builds nothing runs — 37%
@@ -41,10 +45,11 @@ name for whichever library you are chasing.
 
 ```sql
 WITH inv AS (
-  SELECT JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
-  FROM customers_lake.core_entities_metadata AS m FINAL
-  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+  SELECT JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries') AS deps
+  FROM customers_lake.catalog_entities AS m FINAL
+  WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0 AND m.deleted_at IS NULL
 )
 SELECT JSONExtractString(d, 'name')    AS name,
        JSONExtractString(d, 'version') AS version,
@@ -66,13 +71,14 @@ migration.
 
 ```sql
 WITH inv AS (
-  SELECT toInt64OrZero(m.id)                                        AS asset_id,
+  SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id'))                                        AS asset_id,
          JSONExtractString(assumeNotNull(m.data), 'status')          AS status,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies')  AS deps,
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries')  AS deps,
          has(JSONExtractArrayRaw(assumeNotNull(m.data), 'languages'), '"go"') AS is_go
-  FROM customers_lake.core_entities_metadata AS m FINAL
-  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+  FROM customers_lake.catalog_entities AS m FINAL
+  WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0 AND m.deleted_at IS NULL
 ),
 hit AS (
   SELECT asset_id,
@@ -108,15 +114,16 @@ query 4 for what that filter excludes.
 
 ```sql
 WITH inv AS (
-  SELECT toInt64OrZero(m.id)                                         AS asset_id,
+  SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id'))                                         AS asset_id,
          JSONExtractString(assumeNotNull(m.data), 'status')           AS status,
          JSONExtractString(assumeNotNull(m.data), 'repository_path')  AS path,
          JSONExtractString(assumeNotNull(m.data), 'repository_url')   AS repo,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies')   AS deps,
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries')   AS deps,
          has(JSONExtractArrayRaw(assumeNotNull(m.data), 'languages'), '"go"') AS is_go
-  FROM customers_lake.core_entities_metadata AS m FINAL
-  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+  FROM customers_lake.catalog_entities AS m FINAL
+  WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0 AND m.deleted_at IS NULL
 ),
 hit AS (
   SELECT asset_id,
@@ -161,9 +168,10 @@ scan still writes a record.
 
 ```sql
 SELECT JSONExtractString(assumeNotNull(m.data), 'status') AS status, count() AS assets
-FROM customers_lake.core_entities_metadata AS m FINAL
-WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-  AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+FROM customers_lake.catalog_entities AS m FINAL
+WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+  AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0 AND m.deleted_at IS NULL
 GROUP BY status ORDER BY assets DESC
 FORMAT JSONEachRow
 ```
@@ -181,10 +189,11 @@ WITH live AS (
     AND s.status != 'deleted'
 ),
 existing AS (
-  SELECT toInt32OrZero(m.id) AS asset_id
-  FROM customers_lake.core_entities_metadata AS m FINAL
-  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-    AND m.data IS NOT NULL AND m._deleted = 0
+  SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id')) AS asset_id
+  FROM customers_lake.catalog_entities AS m FINAL
+  WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+    AND m.data IS NOT NULL AND m._deleted = 0 AND m.deleted_at IS NULL
 )
 SELECT count(DISTINCT x.id)                                              AS live_assets,
        countDistinctIf(x.id, x.id IN (SELECT asset_id FROM existing))    AS scanned
@@ -209,9 +218,10 @@ SELECT JSONExtractString(assumeNotNull(m.data), 'manifest_config') AS cfg,
        JSONExtractString(cfg, 'node.engines.node')                 AS node_engine,
        JSONExtractString(cfg, 'go.go')                             AS go_version,
        count() AS assets
-FROM customers_lake.core_entities_metadata AS m FINAL
-WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-  AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+FROM customers_lake.catalog_entities AS m FINAL
+WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+  AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0 AND m.deleted_at IS NULL
   AND JSONExtractString(assumeNotNull(m.data), 'status') = 'ok'
 GROUP BY cfg, node_engine, go_version
 ORDER BY assets DESC
@@ -242,12 +252,13 @@ live AS (
     AND s.status != 'deleted'
 ),
 inv AS (
-  SELECT toInt64OrZero(m.id)                                       AS asset_id,
+  SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id'))                                       AS asset_id,
          JSONExtractString(assumeNotNull(m.data), 'status')         AS status,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
-  FROM customers_lake.core_entities_metadata AS m FINAL
-  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries') AS deps
+  FROM customers_lake.catalog_entities AS m FINAL
+  WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0 AND m.deleted_at IS NULL
 ),
 hit AS (
   SELECT asset_id,
@@ -301,11 +312,12 @@ live AS (
     AND s.name = '<SCOPE_NAME>'
 ),
 inv AS (
-  SELECT toInt64OrZero(m.id)                                       AS asset_id,
-         JSONExtractArrayRaw(assumeNotNull(m.data), 'dependencies') AS deps
-  FROM customers_lake.core_entities_metadata AS m FINAL
-  WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0
+  SELECT toInt64OrZero(JSONExtractString(assumeNotNull(m.data), 'id'))                                       AS asset_id,
+         JSONExtractArrayRaw(assumeNotNull(m.data), 'libraries') AS deps
+  FROM customers_lake.catalog_entities AS m FINAL
+  WHERE m.entity_specification_id IN (SELECT id FROM customers_lake.catalog_entity_specifications FINAL
+                                  WHERE slug = 'dependency-inventory' AND _deleted = 0)
+    AND m.nrn LIKE 'organization=<ORG_ID>%' AND m._deleted = 0 AND m.deleted_at IS NULL
 )
 SELECT JSONExtractString(d, 'name')    AS library,
        JSONExtractString(d, 'version') AS version,

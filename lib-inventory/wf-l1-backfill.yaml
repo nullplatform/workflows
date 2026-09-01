@@ -36,10 +36,12 @@
 # ZERO rows — the count it finds is the health signal for the listener.
 #
 # Per-org configuration (config entries on folder /lib-inventory):
-#   NP_API_KEY               (secret) org credential for the lake query
-#   LIB_SCAN_NRN_PREFIX      detection scope, prefix-matched against the app NRN
-#   LIB_MAX_BUILDS           builds per run — the fan-out width
-#   LIB_MIN_COVERAGE_PCT     run fails below this % of assets written
+#   NP_API_KEY                  (secret) org credential for the lake query
+#   LIB_SCAN_NRN_PREFIX         detection scope, prefix-matched against the app NRN
+#   LIB_MAX_BUILDS              builds per run — the fan-out width
+#   LIB_MIN_COVERAGE_PCT        run fails below this % of assets written
+#   LIB_BACKFILL_LOOKBACK_DAYS  besides what is ACTIVE, also scan anything
+#                               deployed within this many days
 # wf-l0 additionally needs GITHUB_TOKEN and LIB_INTERNAL_PATTERNS; they are
 # read there, not here.
 
@@ -63,7 +65,7 @@ inputs:
     required: false
     description: >
       Scan and summarise, but write nothing. Use it to check coverage and the
-      resolved repository paths before touching any metadata. Forwarded to
+      resolved repository paths before writing any entities. Forwarded to
       every sub-execution.
 
 steps:
@@ -72,12 +74,12 @@ steps:
     plugin_type: manual
     name: "Run Backfill Now"
     config:
-      description: "Scans the next batch of unscanned live assets and writes their dependency metadata."
+      description: "Scans the next batch of unscanned in-scope assets and upserts their dependency-inventory entities."
       inputs:
         dry_run:
           type: boolean
           required: false
-          description: "Scan and summarise without writing metadata"
+          description: "Scan and summarise without writing entities"
 
   # ── The reconciler ───────────────────────────────────────────────────────
   # `wf-l2-on-release` owns LATENCY — a new release is scanned within seconds.
@@ -112,9 +114,12 @@ steps:
       schedule: "0 4 * * *"
       timezone: "America/Argentina/Buenos_Aires"
 
-  # ── ONE lake query: every live asset that still has no record ────────────
+  # ── ONE lake query: every in-scope asset that still has no entity ────────
   # `live` is the set of (build, asset name) pairs reachable from an ACTIVE
-  # deployment — that is what "currently deployed" means; the build table alone
+  # deployment, PLUS anything deployed in the last
+  # `LIB_BACKFILL_LOOKBACK_DAYS` days — recent history is in scope even when a
+  # newer deployment already superseded it, so a rollback candidate's
+  # inventory exists BEFORE anyone rolls back to it. The build table alone
   # would also return builds never released or long superseded.
   #
   # `groupUniqArray`, not `groupArray`: a release with several active
@@ -123,7 +128,7 @@ steps:
   # What is actually RUNNING: a scope points at ONE asset by name, so the other
   # assets of the same build were produced but nobody executes them. Measured on
   # a real org: 6,733 assets in these builds, only 2,863 referenced by a scope.
-  # Scanning the rest would be 57% more metadata writes — the dominant cost —
+  # Scanning the rest would be 57% more entity writes — the dominant cost —
   # for artifacts that answer no question this workflow is asked.
   #
   # NOTE: the query must START with WITH/SELECT. The lake validator decides
@@ -144,7 +149,9 @@ steps:
           FROM core_entities_deployment AS d FINAL
           INNER JOIN core_entities_release AS r FINAL ON r.id = d.release_id
           INNER JOIN core_entities_scope   AS s FINAL ON s.id = d.scope_id
-          WHERE d.status_in_scope = 'active' AND s.asset_name != ''
+          WHERE (d.status_in_scope = 'active'
+                 OR d.created_at > now() - INTERVAL ${{ vars.LIB_BACKFILL_LOOKBACK_DAYS }} DAY)
+            AND s.asset_name != ''
             -- A DELETED scope is not deployed. Its deployments keep
             -- `status_in_scope = 'active'` in the lake, so without this the
             -- inventory scans builds nothing runs any more: 37% of one org's
@@ -156,22 +163,24 @@ steps:
             AND s.status != 'deleted'
         ),
         live_builds AS (SELECT DISTINCT build_id FROM live),
-        -- Which assets ALREADY carry a `dependencies` record. Anything in here
-        -- is done forever: the record names an immutable commit.
+        -- Which assets ALREADY carry a `dependency-inventory` catalog entity.
+        -- Anything in here is done forever: the entity names an immutable
+        -- commit. The entity document's `id` IS the asset id (spec primaryKey).
         existing AS (
-          SELECT toInt32OrZero(m.id) AS asset_id
-          FROM core_entities_metadata AS m FINAL
-          WHERE m.entity = 'asset' AND m.metadata_type = 'dependencies'
-            AND m.data IS NOT NULL
-            -- FINAL and `_deleted = 0`, both load-bearing. Without them a
-            -- DELETED record still counts as present, so the asset is excluded
-            -- from the backfill FOREVER — deleting a record to force a rescan
-            -- silently does nothing. Found live 2026-07-26: 341 assets stranded
-            -- that way, including every Java one, after the records were
-            -- deliberately deleted so the new Maven parser would re-read them.
-            -- Without FINAL the ReplacingMergeTree can also return a superseded
-            -- version of the row.
-            AND m._deleted = 0
+          SELECT toInt64OrZero(JSONExtractString(e.data, 'id')) AS asset_id
+          FROM catalog_entities AS e FINAL
+          INNER JOIN catalog_entity_specifications AS sp FINAL
+            ON sp.id = e.entity_specification_id
+          WHERE sp.slug = 'dependency-inventory'
+            AND e.data IS NOT NULL
+            -- FINAL, `_deleted = 0` and `deleted_at IS NULL`, all load-bearing.
+            -- Without them a DELETED entity still counts as present, so the
+            -- asset is excluded from the backfill FOREVER — deleting an entity
+            -- to force a rescan silently does nothing (the same trap was hit
+            -- live on the metadata store, 2026-07-26: 341 assets stranded).
+            -- Without FINAL the ReplacingMergeTree can also return a
+            -- superseded version of the row.
+            AND e._deleted = 0 AND e.deleted_at IS NULL
         )
         SELECT
           toString(a.app_id)   AS app_id,
@@ -179,7 +188,14 @@ steps:
           a.repository_url     AS repository_url,
           toString(b.id)       AS build_id,
           b.commit             AS commit,
-          toJSONString(groupUniqArray((x.id, x.name, x.type))) AS assets_json
+          -- `core_entities_asset.nrn` stops at `application=` — append the
+          -- build and asset segments so the entity carries the canonical
+          -- asset NRN (same shape the catalog uses everywhere else). NOTE:
+          -- the lake validator splits statements on any semicolon, even
+          -- inside a comment, so the character may not appear ANYWHERE in
+          -- this query (hit live, 2026-08-31).
+          toJSONString(groupUniqArray((x.id, x.name, x.type,
+            concat(x.nrn, ':build=', toString(b.id), ':asset=', toString(x.id))))) AS assets_json
         FROM live_builds AS lb
         INNER JOIN core_entities_build       AS b FINAL ON b.id = lb.build_id
         INNER JOIN core_entities_application AS a FINAL ON a.app_id = b.app_id

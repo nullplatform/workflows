@@ -1,5 +1,5 @@
 /**
- * STEP `build_payloads` — one metadata record per asset. No network.
+ * STEP `build_payloads` — one catalog-entity document per asset. No network.
  *
  * Merges every parse step's output. Builds that never got past an earlier step
  * arrive through `unreachable` and STILL produce a record: an asset with no
@@ -12,6 +12,7 @@ const rows = buildPayloads({
   parsed,
   unreachable: [...(inputs.unscannable || []), ...(inputs.failed || [])],
   now: new Date().toISOString(),
+  releaseId: inputs.releaseId || null,
 });
 
 const byStatus = {};
@@ -21,12 +22,12 @@ log.info(`built ${rows.length} asset records`, byStatus);
 return {
   rows,
   by_status: byStatus,
-  // POST only: the lake query already excluded assets that have a record, and
-  // the metadata API is create-or-update, not upsert (POST on an existing one
-  // is a 400). An asset is pinned to an immutable commit, so there is nothing
-  // to update — only assets never seen before reach this step.
+  // PATCH + `upsert=true` on the catalog: create and update are the same
+  // request, so a rescan (forced by deleting nothing — just run it) simply
+  // replaces the document. Two writers racing on a fresh asset can hit a 409
+  // on the create path; the step's retry takes the update path a moment later.
   write_requests: rows.map((r) => ({
-    path: `/metadata/asset/${r.asset_id}/dependencies`,
+    path: `/catalog/instances/dependency-inventory/${r.asset_id}?upsert=true`,
     body: r.data,
   })),
 };

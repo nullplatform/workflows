@@ -26,11 +26,12 @@ export function resolveAssetsForPlans(plans, manifestResults) {
     }
 
     const assets = (plan.assets || []).map((a) => {
-      const hit = resolveAsset(a.name, idx, declaredIndex);
+      const hit = resolveAsset(a.name, idx, declaredIndex, plan.app_name);
       if (!hit)
         return {
           asset_id: a.id,
           asset_name: a.name,
+          asset_nrn: a.nrn,
           exists: a.exists === true,
           hit: null,
           manifests: [],
@@ -38,6 +39,7 @@ export function resolveAssetsForPlans(plans, manifestResults) {
       return {
         asset_id: a.id,
         asset_name: a.name,
+        asset_nrn: a.nrn,
         exists: a.exists === true,
         hit,
         manifests: manifestsUnder(idx, hit.dir).slice(0, 8),

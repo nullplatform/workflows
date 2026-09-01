@@ -15,10 +15,17 @@ export async function scanBuild(build, gh, opts) {
   const now = opts.now;
   const assets = build.assets || [];
   const base = {
-    repository_url: build.repository_url || null,
     commit: build.commit || null,
     scanned_at: now,
   };
+  // Catalog-entity identity: one document per asset, upserts pinned to the
+  // asset id. `nrn` is omitted when the caller does not carry it.
+  const who = (a) => ({
+    id: String(a.id),
+    ...(a.nrn ? { nrn: a.nrn } : {}),
+    build_id: String(build.build_id),
+    release_id: build.release_id == null ? null : String(build.release_id),
+  });
 
   const fail = (status, detail) =>
     assets.map((a) => ({
@@ -26,7 +33,7 @@ export async function scanBuild(build, gh, opts) {
       asset_name: a.name,
       build_id: build.build_id,
       app_id: build.app_id,
-      data: payload({ ...base, status, status_detail: detail }),
+      data: payload({ ...who(a), ...base, status, status_detail: detail }),
     }));
 
   const repo = parseRepoUrl(build.repository_url);
@@ -52,7 +59,10 @@ export async function scanBuild(build, gh, opts) {
   const idx = indexTree(paths);
 
   // L1/L3/L4 first; only build the (expensive) L2 index if something needs it.
-  const first = assets.map((a) => ({ asset: a, hit: resolveAsset(a.name, idx, null) }));
+  const first = assets.map((a) => ({
+    asset: a,
+    hit: resolveAsset(a.name, idx, null, build.app_name),
+  }));
   let declaredIndex = null;
   if (first.some((r) => !r.hit)) {
     declaredIndex = new Map();
@@ -75,7 +85,8 @@ export async function scanBuild(build, gh, opts) {
         if (!declaredIndex.has(nn)) declaredIndex.set(nn, dir);
       }
     }
-    for (const r of first) if (!r.hit) r.hit = resolveAsset(r.asset.name, idx, declaredIndex);
+    for (const r of first)
+      if (!r.hit) r.hit = resolveAsset(r.asset.name, idx, declaredIndex, build.app_name);
   }
 
   // Collect every manifest we must read, across all assets, then fetch once.
@@ -111,6 +122,7 @@ export async function scanBuild(build, gh, opts) {
     };
     if (!hit) {
       row.data = payload({
+        ...who(asset),
         ...base,
         status: 'unresolved',
         status_detail: `no directory in ${repo.owner}/${repo.repo} matches asset name "${asset.name}"`,
@@ -121,6 +133,7 @@ export async function scanBuild(build, gh, opts) {
     const found = perAsset.get(asset.id) || [];
     const languages = [...new Set(found.map((m) => m.ecosystem))].sort();
     const common = {
+      ...who(asset),
       ...base,
       repository_path: hit.dir,
       match_level: hit.level,
@@ -192,7 +205,7 @@ export async function scanBuild(build, gh, opts) {
       ...common,
       status: 'ok',
       status_detail: unparsed.length ? `not parsed yet: ${unparsed.join(', ')}` : null,
-      dependencies,
+      libraries: dependencies,
       manifest_config: manifestConfig,
       // Counts describe consumed libraries; in-repo `replace` targets are code
       // this asset ships, not a library it depends on.
