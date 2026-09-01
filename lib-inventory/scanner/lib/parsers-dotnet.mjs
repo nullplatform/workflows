@@ -46,7 +46,7 @@ export function parseCsproj(text) {
 
   const projRe = /<ProjectReference\b[^>]*?\bInclude\s*=\s*"([^"]+)"/g;
   for (const m of body.matchAll(projRe)) {
-    // `..\Conto.Domain\Conto.Domain.csproj` → `Conto.Domain`
+    // `..\Acme.Domain\Acme.Domain.csproj` → `Acme.Domain`
     const base = m[1].split(/[\\/]/).pop() ?? m[1];
     const name = base.replace(/\.[a-z0-9]+proj$/i, '');
     if (!name || seen.has(name)) continue;
