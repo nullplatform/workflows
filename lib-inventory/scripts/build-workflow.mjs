@@ -34,6 +34,7 @@ const STEPS = {
   parse_node: ['manifests', 'parsers-node', 'parseeco', 'steps/parse-node'],
   parse_maven: ['manifests', 'parsers-maven', 'parseeco', 'steps/parse-maven'],
   parse_python: ['manifests', 'parsers-python', 'parseeco', 'steps/parse-python'],
+  parse_dotnet: ['manifests', 'parsers-dotnet', 'parseeco', 'steps/parse-dotnet'],
   build_payloads: ['manifests', 'payload', 'buildpay', 'steps/build-payloads'],
 };
 

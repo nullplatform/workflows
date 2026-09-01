@@ -163,7 +163,7 @@ would go, and the dashboard would show exactly how many assets needed it.
 
 ## Ecosystems
 
-**go, node, maven and python** are parsed today. A manifest in any other
+**go, node, maven, python and dotnet** are parsed today. A manifest in any other
 language is recorded with `status: lang_unsupported` and its `languages`, so
 the cost of enabling each parser is a query away.
 
@@ -245,7 +245,7 @@ scanner, and uploading a stale one ships stale scanner code.
 
 ## Known gaps
 
-- **Ecosystems**: dotnet and gradle are detected but not parsed.
+- **Ecosystems**: gradle, dart and php are detected but not parsed (gradle is the big one — no lockfile and a Groovy/Kotlin DSL, so direct-deps extraction is heuristic work).
 - **Whole-org runs are cron-shaped, not a loop**: `LIB_MAX_BUILDS` bounds one
   run and the lake query only ever returns work that is still outstanding, so
   repeated runs converge with no cursor and no `split-in-batches`.

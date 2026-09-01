@@ -23,6 +23,7 @@ export * from './lib/parsers-go.mjs';
 export * from './lib/parsers-node.mjs';
 export * from './lib/parsers-maven.mjs';
 export * from './lib/parsers-python.mjs';
+export * from './lib/parsers-dotnet.mjs';
 export * from './lib/registry.mjs';
 export * from './lib/resolve.mjs';
 export * from './lib/payload.mjs';

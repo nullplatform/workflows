@@ -34,7 +34,7 @@ const NAME_SUFFIXES = [
 ];
 
 /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-export const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+export const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
 export function manifestLang(basename) {
   if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -43,7 +43,9 @@ export function manifestLang(basename) {
 }
 
 export function normalizeName(name) {
-  let s = String(name).toLowerCase();
+  // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+  // NP application is `conto-api` (110 unresolved assets in one live repo).
+  let s = String(name).toLowerCase().replaceAll('.', '-');
   for (let changed = true; changed; ) {
     changed = false;
     for (const suf of NAME_SUFFIXES) {

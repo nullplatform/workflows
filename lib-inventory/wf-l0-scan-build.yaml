@@ -13,7 +13,8 @@
 #                         ├─ parse_go ────── pure  (one step per ecosystem)
 #                         ├─ parse_node ──── pure
 #                         ├─ parse_maven ─── pure
-#                         └─ parse_python ── pure
+#                         ├─ parse_python ── pure
+#                         └─ parse_dotnet ── pure
 #                              └─ build_payloads ── pure
 #                                   └─ write_entities ── np-api-call (catalog upsert)
 #                                        └─ result
@@ -193,7 +194,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -202,7 +203,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -498,7 +501,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -507,7 +510,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -775,7 +780,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -784,7 +789,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -1148,7 +1155,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1157,7 +1164,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -1435,7 +1444,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1444,7 +1453,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -1736,7 +1747,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -1745,7 +1756,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -2144,7 +2157,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -2153,7 +2166,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -2523,6 +2538,275 @@ steps:
         return { parsed };
         // <<< END parse_python
 
+  - id: parse_dotnet
+    type: module
+    plugin_type: code-exec
+    name: "Parse .NET Dependencies"
+    inputs:
+      resolutions: "${{ steps.resolve_assets.outputs.resolutions }}"
+      internalPatterns: "${{ vars.LIB_INTERNAL_PATTERNS }}"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    config:
+      code: |
+        // >>> GENERATED parse_dotnet — do not edit by hand (build-workflow.mjs)
+        const SCANNER_VERSION = 'lib-inventory/1.0.0';
+
+        /** Manifest filename -> ecosystem. */
+        const MANIFEST_LANGS = {
+          'go.mod': 'go',
+          'package.json': 'node',
+          'pom.xml': 'java-maven',
+          'build.gradle': 'java-gradle',
+          'build.gradle.kts': 'java-gradle',
+          'requirements.txt': 'python',
+          'pyproject.toml': 'python',
+          Pipfile: 'python',
+          Gemfile: 'ruby',
+          'Cargo.toml': 'rust',
+          'composer.json': 'php',
+          'pubspec.yaml': 'dart',
+        };
+
+        /**
+         * Asset-name suffixes that describe the deployment shape rather than the code,
+         * stripped before the L3 normalized comparison.
+         */
+        const NAME_SUFFIXES = [
+          '-aws-lambda',
+          '-aws-uks',
+          '-lambda',
+          '-service',
+          '-local',
+          '-docker-image',
+          '-image',
+          '-asset',
+          '-app',
+          '-api',
+        ];
+
+        /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
+
+        function manifestLang(basename) {
+          if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
+          if (basename.endsWith('.csproj')) return 'dotnet';
+          return null;
+        }
+
+        function normalizeName(name) {
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
+          for (let changed = true; changed; ) {
+            changed = false;
+            for (const suf of NAME_SUFFIXES) {
+              if (s.endsWith(suf)) {
+                s = s.slice(0, -suf.length);
+                changed = true;
+              }
+            }
+          }
+          return s.replace(/[^a-z0-9]/g, '');
+        }
+
+        /** `https://github.com/acme/x(.git)` -> `{owner, repo}`; null when not GitHub. */
+        function parseRepoUrl(url) {
+          const m = /github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(String(url || ''));
+          return m ? { owner: m[1], repo: m[2] } : null;
+        }
+
+        /**
+         * Compile the configured internal-library patterns once.
+         * Accepts an array or the JSON string a config entry delivers (entries are
+         * always strings, so `LIB_INTERNAL_PATTERNS` arrives as `'["^github\\.com/Acme/"]'`).
+         */
+        function compileInternalPatterns(patterns) {
+          let list = patterns;
+          if (typeof list === 'string') {
+            const raw = list.trim();
+            if (!raw) return [];
+            try {
+              list = JSON.parse(raw);
+            } catch {
+              // Tolerate a bare comma-separated list so a mis-typed entry still works.
+              list = raw
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+            }
+          }
+          if (!Array.isArray(list)) return [];
+          return list.map((p) => new RegExp(p));
+        }
+
+        /**
+         * .NET (`*.csproj`) dependency parsing.
+         *
+         * DIRECT DEPENDENCIES ONLY, same contract as node and maven: NuGet states
+         * transitivity in `packages.lock.json`/`project.assets.json`, artifacts that
+         * are either not committed or large enough to reintroduce the payload problem
+         * the per-build split exists to solve. Nothing here runs a restore.
+         *
+         * `version` is the DECLARED value. A `<PackageReference>` with no version at
+         * all is Central Package Management — the version lives in
+         * `Directory.Packages.props`, which is not a detected manifest — so the empty
+         * string is the honest declared state, exactly like an unresolvable Maven
+         * `${property}` staying verbatim.
+         *
+         * `<ProjectReference>` is code this repository ships, not a consumed library:
+         * flagged `local`, named by its project file's basename, excluded from the
+         * counts — the same treatment as Go's `replace`-to-a-path and npm's
+         * `workspace:*`.
+         */
+
+        /** Strip XML comments before any matching — same rule as the maven parser. */
+        function stripComments(text) {
+          return String(text).replace(/<!--[\s\S]*?-->/g, '');
+        }
+
+        function parseCsproj(text) {
+          const body = stripComments(text);
+          const deps = [];
+          const seen = new Set();
+
+          // <PackageReference Include="X" Version="1.2.3" /> — attribute order is
+          // free, and Version may instead be a child element on the following lines.
+          const pkgRe = /<PackageReference\b([^>]*?)(\/>|>([\s\S]*?)<\/PackageReference>)/g;
+          for (const m of body.matchAll(pkgRe)) {
+            const attrs = m[1];
+            const inner = m[3] ?? '';
+            const name = /\bInclude\s*=\s*"([^"]+)"/.exec(attrs)?.[1];
+            if (!name || seen.has(name)) continue;
+            seen.add(name);
+            const version =
+              /\bVersion\s*=\s*"([^"]+)"/.exec(attrs)?.[1] ??
+              /<Version>\s*([^<]+?)\s*<\/Version>/.exec(inner)?.[1] ??
+              '';
+            deps.push({ name, version, direct: true, ecosystem: 'dotnet', local: false });
+          }
+
+          const projRe = /<ProjectReference\b[^>]*?\bInclude\s*=\s*"([^"]+)"/g;
+          for (const m of body.matchAll(projRe)) {
+            // `..\Conto.Domain\Conto.Domain.csproj` → `Conto.Domain`
+            const base = m[1].split(/[\\/]/).pop() ?? m[1];
+            const name = base.replace(/\.[a-z0-9]+proj$/i, '');
+            if (!name || seen.has(name)) continue;
+            seen.add(name);
+            deps.push({ name, version: '', direct: true, ecosystem: 'dotnet', local: true });
+          }
+
+          return deps;
+        }
+
+        /**
+         * What the project declares about ITSELF: the SDK and target framework answer
+         * "which assets still target net6.0" — a runtime question no dependency list
+         * answers.
+         */
+        function csprojConfig(text) {
+          const body = stripComments(text);
+          const config = {};
+          const sdk = /<Project\b[^>]*?\bSdk\s*=\s*"([^"]+)"/.exec(body)?.[1];
+          if (sdk) config.sdk = sdk;
+          const tf =
+            /<TargetFramework>\s*([^<]+?)\s*<\/TargetFramework>/.exec(body)?.[1] ??
+            /<TargetFrameworks>\s*([^<]+?)\s*<\/TargetFrameworks>/.exec(body)?.[1];
+          if (tf) config.target_framework = tf;
+          return config;
+        }
+
+        /**
+         * STEP 4 — parse the manifests of ONE ecosystem.
+         *
+         * Kept per-ecosystem on purpose: adding Node or Maven becomes a new step on the
+         * canvas feeding `build_payloads`, not another branch inside a growing blob.
+         * Returns `{ [asset_id]: { dependencies, transitive_external_dropped, config } }`.
+         *
+         * `config` is what the manifests declare about THEMSELVES (`engines.node`, the
+         * `go` directive, the package manager) — runtime statements that answer
+         * "which assets still declare node 16", a question no dependency array can.
+         * Keys are prefixed with the ecosystem so two manifests never collide.
+         *
+         * The parser is PASSED IN rather than looked up in a registry. Importing the
+         * registry would drag every ecosystem's parser into every parse step's inlined
+         * bundle — the Maven step carrying the Go and Python parsers it never calls —
+         * which is exactly the "each step gets only what it uses" property the module
+         * split exists to preserve. It went from 780 lines a step back to ~300.
+         */
+        function parseEcosystem(resolutions, ecosystem, opts) {
+          const parse = opts.parse;
+          if (!parse) throw new Error(`no parser passed for ecosystem "${ecosystem}"`);
+          const readConfig = opts.readConfig;
+          const keepAll = opts.keepTransitiveExternal === true;
+          const isInternal = (name) => opts.internalPatterns.some((re) => re.test(name));
+
+          const out = {};
+          for (const r of resolutions) {
+            for (const asset of r.assets) {
+              const mine = asset.manifests.filter((m) => m.ecosystem === ecosystem);
+              if (!mine.length) continue;
+
+              const seen = new Set();
+              const deps = [];
+              const config = {};
+              let dropped = 0;
+              for (const m of mine) {
+                const text = r.texts[m.path];
+                if (text == null) continue;
+                if (readConfig) {
+                  // Last manifest wins on a collision. An asset with several manifests
+                  // of one ecosystem is a monorepo subtree; the deepest one is listed
+                  // last and is the more specific statement.
+                  for (const [k, v] of Object.entries(readConfig(text, m.path, r.texts))) {
+                    config[`${ecosystem}.${k}`] = v;
+                  }
+                }
+                // The whole repository's fetched manifests, so a parser can resolve a
+                // SIBLING file without a network call. Maven needs it: a module pom
+                // inherits its `<properties>` from a parent pom that, in a monorepo of
+                // lambdas, sits at the repository root and has already been fetched.
+                for (const d of parse(text, m.path, r.texts)) {
+                  const key = `${d.ecosystem} ${d.name} ${d.version}`;
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const internal = isInternal(d.name);
+                  if (!keepAll && !d.direct && !internal && !d.local) {
+                    dropped += 1;
+                    continue;
+                  }
+                  deps.push({ local: false, ...d, internal });
+                }
+              }
+              out[asset.asset_id] = { dependencies: deps, transitive_external_dropped: dropped, config };
+            }
+          }
+          return out;
+        }
+
+        /**
+         * STEP `parse_dotnet` — extract dependencies from the `*.csproj` files.
+         * No network.
+         *
+         * A sibling of the other parse steps, one ecosystem per canvas node. .NET
+         * reports DIRECT dependencies only (NuGet states transitivity in lock/assets
+         * files that are not committed manifests); `<ProjectReference>` rows come out
+         * flagged `local`. See `parseCsproj`.
+         */
+        const parsed = parseEcosystem(inputs.resolutions || [], 'dotnet', {
+          parse: parseCsproj,
+          readConfig: csprojConfig,
+          internalPatterns: compileInternalPatterns(inputs.internalPatterns),
+          keepTransitiveExternal: inputs.keepTransitiveExternal === true,
+        });
+        log.info(`parsed dotnet for ${Object.keys(parsed).length} assets`);
+        return { parsed };
+        // <<< END parse_dotnet
+
   - id: build_payloads
     type: module
     plugin_type: code-exec
@@ -2538,6 +2822,7 @@ steps:
         - "${{ steps.parse_node.outputs.parsed }}"
         - "${{ steps.parse_maven.outputs.parsed }}"
         - "${{ steps.parse_python.outputs.parsed }}"
+        - "${{ steps.parse_dotnet.outputs.parsed }}"
       unscannable: "${{ steps.plan_tree_fetches.outputs.unscannable }}"
       failed: "${{ steps.plan_manifest_fetches.outputs.failed }}"
     error_handling:
@@ -2590,7 +2875,7 @@ steps:
         ];
 
         /** Ecosystems we can currently parse. Everything else is reported, not parsed. */
-        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python']);
+        const SUPPORTED_ECOSYSTEMS = new Set(['go', 'node', 'java-maven', 'python', 'dotnet']);
 
         function manifestLang(basename) {
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
@@ -2599,7 +2884,9 @@ steps:
         }
 
         function normalizeName(name) {
-          let s = String(name).toLowerCase();
+          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
+          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
             for (const suf of NAME_SUFFIXES) {
@@ -2997,10 +3284,12 @@ connections:
   - { id: c6b, from: resolve_assets, to: parse_node }
   - { id: c6c, from: resolve_assets, to: parse_maven }
   - { id: c6d, from: resolve_assets, to: parse_python }
+  - { id: c6e, from: resolve_assets, to: parse_dotnet }
   - { id: c7, from: parse_go, to: build_payloads }
   - { id: c7b, from: parse_node, to: build_payloads }
   - { id: c7c, from: parse_maven, to: build_payloads }
   - { id: c7d, from: parse_python, to: build_payloads }
+  - { id: c7e, from: parse_dotnet, to: build_payloads }
   - { id: c8, from: build_payloads, to: write_entities, condition: "workflow.inputs.dry_run != true" }
   - { id: c9, from: build_payloads, to: result, condition: "workflow.inputs.dry_run == true" }
   - { id: c10, from: write_entities, to: result }

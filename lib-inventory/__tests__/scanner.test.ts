@@ -14,6 +14,8 @@ import {
   manifestsUnder,
   mergeParsed,
   normalizeName,
+  csprojConfig,
+  parseCsproj,
   parseGoMod,
   parsePackageJson,
   parsePomXml,
@@ -427,6 +429,38 @@ describe('resolution ladder', () => {
   });
 });
 
+describe('scanBuild parses a .NET monorepo end to end', () => {
+  it('branch-named asset + PascalCase module resolves via the app name and parses the csproj', async () => {
+    const CSPROJ = `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+      <PackageReference Include="Serilog" Version="3.1.1" />
+      <ProjectReference Include="..\\Conto.Domain\\Conto.Domain.csproj" />
+    </ItemGroup></Project>`;
+    const gh = fakeGh({
+      'Conto.Api/Conto.Api.csproj': CSPROJ,
+      'Conto.Domain/Conto.Domain.csproj': '<Project></Project>',
+    });
+    const [row] = await scanBuild(
+      {
+        app_id: 1,
+        app_name: 'conto-api',
+        repository_url: 'https://github.com/acme/repo',
+        build_id: 10,
+        commit: 'abc123',
+        assets: [{ id: 100, name: 'develop', type: 'docker-image' }],
+      },
+      gh,
+      { internalPatterns: INTERNAL, now: NOW },
+    );
+    expect(row.data.status).toBe('ok');
+    expect(row.data.match_level).toBe('A3');
+    expect(row.data.primary_language).toBe('dotnet');
+    expect(row.data.libraries.map((d: { name: string }) => d.name)).toContain('Serilog');
+    expect(row.data.libraries.find((d: { name: string }) => d.name === 'Conto.Domain')).toMatchObject(
+      { local: true },
+    );
+  });
+});
+
 describe('scanBuild resolves branch-named assets through the application', () => {
   const POM_ROOT = `<project><groupId>g</groupId><artifactId>root</artifactId>
 <dependencies><dependency><groupId>org.x</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies></project>`;
@@ -471,6 +505,78 @@ describe('manifestsUnder', () => {
       'containers/scoreboard-aws-uks/social_scrapers/requirements.txt',
     ]);
     expect(manifestsUnder(idx, 'containers/scoreboard-aws-uks')).toHaveLength(3);
+  });
+});
+
+describe('parseCsproj', () => {
+  const CSPROJ = `<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="Serilog">
+      <Version>3.1.1</Version>
+    </PackageReference>
+    <PackageReference Include="Central.Managed" />
+    <!--<PackageReference Include="Commented.Out" Version="9.9" />-->
+    <ProjectReference Include="..\\Conto.Domain\\Conto.Domain.csproj" />
+  </ItemGroup>
+</Project>`;
+
+  it('reads PackageReference with Version as attribute or child element', () => {
+    const deps = parseCsproj(CSPROJ);
+    expect(deps.find((d: { name: string }) => d.name === 'Newtonsoft.Json')).toMatchObject({
+      version: '13.0.3',
+      direct: true,
+      ecosystem: 'dotnet',
+      local: false,
+    });
+    expect(deps.find((d: { name: string }) => d.name === 'Serilog')).toMatchObject({
+      version: '3.1.1',
+    });
+  });
+
+  it('keeps a version-less reference (central package management) with an empty version', () => {
+    // The version lives in Directory.Packages.props, which is not a detected
+    // manifest — an empty version is the honest declared state.
+    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Central.Managed')).toMatchObject(
+      { version: '' },
+    );
+  });
+
+  it('flags a ProjectReference as local in-repo code, named by its project file', () => {
+    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Conto.Domain')).toMatchObject(
+      { local: true },
+    );
+  });
+
+  it('does not inventory a commented-out reference', () => {
+    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Commented.Out')).toBeUndefined();
+  });
+
+  it('reads TargetFramework and Sdk as manifest config', () => {
+    expect(csprojConfig(CSPROJ)).toMatchObject({
+      target_framework: 'net8.0',
+      sdk: 'Microsoft.NET.Sdk',
+    });
+  });
+});
+
+describe('dot-normalized resolution (.NET module naming)', () => {
+  it('A3: app `conto-api` finds the `Conto.Api` directory', () => {
+    // .NET monorepos name modules `Conto.Api` while the NP application is
+    // `conto-api` — measured live 2026-09-01: 110 unresolved assets in one
+    // repo for exactly this mismatch.
+    const idx = indexTree(['Conto.Api/Conto.Api.csproj', 'Conto.Domain/Conto.Domain.csproj']);
+    expect(resolveAsset('develop', idx, null, 'conto-api')).toEqual({
+      level: 'A3',
+      dir: 'Conto.Api',
+    });
+  });
+
+  it('normalizeName folds dots into dashes so both spellings meet', () => {
+    // Both land on 'conto' — the dot becomes a dash and '-api' is one of the
+    // stripped suffixes. What matters is that the two spellings CONVERGE.
+    expect(normalizeName('Conto.Api')).toBe(normalizeName('conto-api'));
   });
 });
 
