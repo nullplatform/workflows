@@ -42,6 +42,17 @@ export function manifestLang(basename) {
   return null;
 }
 
+/**
+ * The last-resort spelling: lowercase with every separator removed.
+ * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+ * concatenation is how .NET names module directories, and no dash/dot rule
+ * reaches it. No suffix stripping here: removing separators first would keep
+ * the suffix list from ever matching, so the two normal forms coexist.
+ */
+export function squashName(name) {
+  return String(name).toLowerCase().replace(/[-._ ]/g, '');
+}
+
 export function normalizeName(name) {
   // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
   // NP application is `conto-api` (110 unresolved assets in one live repo).

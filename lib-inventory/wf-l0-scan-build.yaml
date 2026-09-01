@@ -202,6 +202,17 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
           // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
           // NP application is `conto-api` (110 unresolved assets in one live repo).
@@ -509,6 +520,17 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
           // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
           // NP application is `conto-api` (110 unresolved assets in one live repo).
@@ -788,6 +810,17 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
           // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
           // NP application is `conto-api` (110 unresolved assets in one live repo).
@@ -885,6 +918,7 @@ steps:
           };
           const byBase = new Map();
           const byNorm = new Map();
+          const bySquash = new Map();
           for (const d of dirs) {
             if (!d) continue;
             const base = d.slice(d.lastIndexOf('/') + 1);
@@ -893,11 +927,15 @@ steps:
             const n = normalizeName(base);
             if (!byNorm.has(n)) byNorm.set(n, []);
             byNorm.get(n).push(d);
+            const q = squashName(base);
+            if (!bySquash.has(q)) bySquash.set(q, []);
+            bySquash.get(q).push(d);
           }
           for (const list of byBase.values()) list.sort(rank);
           for (const list of byNorm.values()) list.sort(rank);
+          for (const list of bySquash.values()) list.sort(rank);
 
-          return { manifests, manifestDirs, byBase, byNorm, hasManifestUnder };
+          return { manifests, manifestDirs, byBase, byNorm, bySquash, hasManifestUnder };
         }
 
         /**
@@ -963,6 +1001,13 @@ steps:
             const norm = idx.byNorm.get(normalizeName(name));
             if (norm && norm.length && idx.hasManifestUnder(norm[0]))
               return { level: levels[2], dir: norm[0] };
+
+            // Same rung, last spelling: every separator removed from both sides.
+            // `conto-api` meets `ContoApi` — .NET names module directories in
+            // concatenated PascalCase, which no dash/dot rule reaches (110 assets
+            // stayed unresolved on the dots-into-dashes fix alone, 2026-09-01).
+            const sq = idx.bySquash.get(squashName(name));
+            if (sq && sq.length && idx.hasManifestUnder(sq[0])) return { level: levels[2], dir: sq[0] };
             return null;
           };
 
@@ -1161,6 +1206,17 @@ steps:
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
           if (basename.endsWith('.csproj')) return 'dotnet';
           return null;
+        }
+
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
         }
 
         function normalizeName(name) {
@@ -1450,6 +1506,17 @@ steps:
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
           if (basename.endsWith('.csproj')) return 'dotnet';
           return null;
+        }
+
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
         }
 
         function normalizeName(name) {
@@ -1753,6 +1820,17 @@ steps:
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
           if (basename.endsWith('.csproj')) return 'dotnet';
           return null;
+        }
+
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
         }
 
         function normalizeName(name) {
@@ -2163,6 +2241,17 @@ steps:
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
           if (basename.endsWith('.csproj')) return 'dotnet';
           return null;
+        }
+
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
         }
 
         function normalizeName(name) {
@@ -2598,6 +2687,17 @@ steps:
           return null;
         }
 
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
+        }
+
         function normalizeName(name) {
           // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
           // NP application is `conto-api` (110 unresolved assets in one live repo).
@@ -2881,6 +2981,17 @@ steps:
           if (MANIFEST_LANGS[basename]) return MANIFEST_LANGS[basename];
           if (basename.endsWith('.csproj')) return 'dotnet';
           return null;
+        }
+
+        /**
+         * The last-resort spelling: lowercase with every separator removed.
+         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * concatenation is how .NET names module directories, and no dash/dot rule
+         * reaches it. No suffix stripping here: removing separators first would keep
+         * the suffix list from ever matching, so the two normal forms coexist.
+         */
+        function squashName(name) {
+          return String(name).toLowerCase().replace(/[-._ ]/g, '');
         }
 
         function normalizeName(name) {

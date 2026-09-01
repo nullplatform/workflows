@@ -573,6 +573,18 @@ describe('dot-normalized resolution (.NET module naming)', () => {
     });
   });
 
+  it('A3 via squash: app `conto-api` finds the `ContoApi` directory (no separators at all)', () => {
+    // The live layout that dots-into-dashes did NOT cover: PascalCase
+    // CONCATENATED module dirs (ContoApi, ContoJobs) — 110 assets stayed
+    // unresolved after the first fix (2026-09-01). Squashing every separator
+    // out of both sides is what finally makes the spellings meet.
+    const idx = indexTree(['ContoApi/ContoApi.csproj', 'ContoJobs/ContoJobs.csproj']);
+    expect(resolveAsset('develop', idx, null, 'conto-api')).toEqual({
+      level: 'A3',
+      dir: 'ContoApi',
+    });
+  });
+
   it('normalizeName folds dots into dashes so both spellings meet', () => {
     // Both land on 'conto' — the dot becomes a dash and '-api' is one of the
     // stripped suffixes. What matters is that the two spellings CONVERGE.
