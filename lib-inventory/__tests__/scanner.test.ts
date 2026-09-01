@@ -379,7 +379,7 @@ describe('resolution ladder', () => {
     expect(resolveAsset('totally-unrelated', idx, null)).toBeNull();
   });
 
-  // Branch-named assets, the itti convention: assets are called `main` or
+  // Branch-named assets, a live organization’s convention: assets are called `main` or
   // `develop`, so the asset name says nothing about the code layout. Measured
   // live 2026-08-31: 30/30 assets of a maven pilot false-matched `src/main`.
   it('a name match without manifests does not beat later rungs — `main` must not land on src/main', () => {
@@ -392,18 +392,18 @@ describe('resolution ladder', () => {
 
   it('A1: the APPLICATION name resolves a monorepo when the asset name is a branch', () => {
     const idx = indexTree([
-      'apps/conto-api/package.json',
-      'apps/conto-jobs/package.json',
+      'apps/acme-api/package.json',
+      'apps/acme-jobs/package.json',
       'docs/readme.md',
     ]);
-    expect(resolveAsset('develop', idx, null, 'conto-api')).toEqual({
+    expect(resolveAsset('develop', idx, null, 'acme-api')).toEqual({
       level: 'A1',
-      dir: 'apps/conto-api',
+      dir: 'apps/acme-api',
     });
     // Normalized form of the app name works too.
-    expect(resolveAsset('develop', idx, null, 'conto-jobs-service')).toEqual({
+    expect(resolveAsset('develop', idx, null, 'acme-jobs-service')).toEqual({
       level: 'A3',
-      dir: 'apps/conto-jobs',
+      dir: 'apps/acme-jobs',
     });
   });
 
@@ -433,16 +433,16 @@ describe('scanBuild parses a .NET monorepo end to end', () => {
   it('branch-named asset + PascalCase module resolves via the app name and parses the csproj', async () => {
     const CSPROJ = `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
       <PackageReference Include="Serilog" Version="3.1.1" />
-      <ProjectReference Include="..\\Conto.Domain\\Conto.Domain.csproj" />
+      <ProjectReference Include="..\\Acme.Domain\\Acme.Domain.csproj" />
     </ItemGroup></Project>`;
     const gh = fakeGh({
-      'Conto.Api/Conto.Api.csproj': CSPROJ,
-      'Conto.Domain/Conto.Domain.csproj': '<Project></Project>',
+      'Acme.Api/Acme.Api.csproj': CSPROJ,
+      'Acme.Domain/Acme.Domain.csproj': '<Project></Project>',
     });
     const [row] = await scanBuild(
       {
         app_id: 1,
-        app_name: 'conto-api',
+        app_name: 'acme-api',
         repository_url: 'https://github.com/acme/repo',
         build_id: 10,
         commit: 'abc123',
@@ -455,7 +455,7 @@ describe('scanBuild parses a .NET monorepo end to end', () => {
     expect(row.data.match_level).toBe('A3');
     expect(row.data.primary_language).toBe('dotnet');
     expect(row.data.libraries.map((d: { name: string }) => d.name)).toContain('Serilog');
-    expect(row.data.libraries.find((d: { name: string }) => d.name === 'Conto.Domain')).toMatchObject(
+    expect(row.data.libraries.find((d: { name: string }) => d.name === 'Acme.Domain')).toMatchObject(
       { local: true },
     );
   });
@@ -518,7 +518,7 @@ describe('parseCsproj', () => {
     </PackageReference>
     <PackageReference Include="Central.Managed" />
     <!--<PackageReference Include="Commented.Out" Version="9.9" />-->
-    <ProjectReference Include="..\\Conto.Domain\\Conto.Domain.csproj" />
+    <ProjectReference Include="..\\Acme.Domain\\Acme.Domain.csproj" />
   </ItemGroup>
 </Project>`;
 
@@ -544,7 +544,7 @@ describe('parseCsproj', () => {
   });
 
   it('flags a ProjectReference as local in-repo code, named by its project file', () => {
-    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Conto.Domain')).toMatchObject(
+    expect(parseCsproj(CSPROJ).find((d: { name: string }) => d.name === 'Acme.Domain')).toMatchObject(
       { local: true },
     );
   });
@@ -562,33 +562,33 @@ describe('parseCsproj', () => {
 });
 
 describe('dot-normalized resolution (.NET module naming)', () => {
-  it('A3: app `conto-api` finds the `Conto.Api` directory', () => {
-    // .NET monorepos name modules `Conto.Api` while the NP application is
-    // `conto-api` — measured live 2026-09-01: 110 unresolved assets in one
+  it('A3: app `acme-api` finds the `Acme.Api` directory', () => {
+    // .NET monorepos name modules `Acme.Api` while the NP application is
+    // `acme-api` — measured live 2026-09-01: 110 unresolved assets in one
     // repo for exactly this mismatch.
-    const idx = indexTree(['Conto.Api/Conto.Api.csproj', 'Conto.Domain/Conto.Domain.csproj']);
-    expect(resolveAsset('develop', idx, null, 'conto-api')).toEqual({
+    const idx = indexTree(['Acme.Api/Acme.Api.csproj', 'Acme.Domain/Acme.Domain.csproj']);
+    expect(resolveAsset('develop', idx, null, 'acme-api')).toEqual({
       level: 'A3',
-      dir: 'Conto.Api',
+      dir: 'Acme.Api',
     });
   });
 
-  it('A3 via squash: app `conto-api` finds the `ContoApi` directory (no separators at all)', () => {
+  it('A3 via squash: app `acme-api` finds the `AcmeApi` directory (no separators at all)', () => {
     // The live layout that dots-into-dashes did NOT cover: PascalCase
-    // CONCATENATED module dirs (ContoApi, ContoJobs) — 110 assets stayed
+    // CONCATENATED module dirs (AcmeApi, AcmeJobs) — 110 assets stayed
     // unresolved after the first fix (2026-09-01). Squashing every separator
     // out of both sides is what finally makes the spellings meet.
-    const idx = indexTree(['ContoApi/ContoApi.csproj', 'ContoJobs/ContoJobs.csproj']);
-    expect(resolveAsset('develop', idx, null, 'conto-api')).toEqual({
+    const idx = indexTree(['AcmeApi/AcmeApi.csproj', 'AcmeJobs/AcmeJobs.csproj']);
+    expect(resolveAsset('develop', idx, null, 'acme-api')).toEqual({
       level: 'A3',
-      dir: 'ContoApi',
+      dir: 'AcmeApi',
     });
   });
 
   it('normalizeName folds dots into dashes so both spellings meet', () => {
-    // Both land on 'conto' — the dot becomes a dash and '-api' is one of the
+    // Both land on 'acme' — the dot becomes a dash and '-api' is one of the
     // stripped suffixes. What matters is that the two spellings CONVERGE.
-    expect(normalizeName('Conto.Api')).toBe(normalizeName('conto-api'));
+    expect(normalizeName('Acme.Api')).toBe(normalizeName('acme-api'));
   });
 });
 

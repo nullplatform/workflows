@@ -204,7 +204,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -214,8 +214,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -522,7 +522,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -532,8 +532,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -812,7 +812,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -822,8 +822,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -1003,7 +1003,7 @@ steps:
               return { level: levels[2], dir: norm[0] };
 
             // Same rung, last spelling: every separator removed from both sides.
-            // `conto-api` meets `ContoApi` — .NET names module directories in
+            // `acme-api` meets `AcmeApi` — .NET names module directories in
             // concatenated PascalCase, which no dash/dot rule reaches (110 assets
             // stayed unresolved on the dots-into-dashes fix alone, 2026-09-01).
             const sq = idx.bySquash.get(squashName(name));
@@ -1210,7 +1210,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -1220,8 +1220,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -1510,7 +1510,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -1520,8 +1520,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -1824,7 +1824,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -1834,8 +1834,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -2245,7 +2245,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -2255,8 +2255,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -2689,7 +2689,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -2699,8 +2699,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -2985,7 +2985,7 @@ steps:
 
         /**
          * The last-resort spelling: lowercase with every separator removed.
-         * `conto-api`, `Conto.Api` and `ContoApi` all land on `contoapi` — PascalCase
+         * `acme-api`, `Acme.Api` and `AcmeApi` all land on `contoapi` — PascalCase
          * concatenation is how .NET names module directories, and no dash/dot rule
          * reaches it. No suffix stripping here: removing separators first would keep
          * the suffix list from ever matching, so the two normal forms coexist.
@@ -2995,8 +2995,8 @@ steps:
         }
 
         function normalizeName(name) {
-          // Dots fold into dashes: .NET monorepos name modules `Conto.Api` while the
-          // NP application is `conto-api` (110 unresolved assets in one live repo).
+          // Dots fold into dashes: .NET monorepos name modules `Acme.Api` while the
+          // NP application is `acme-api` (110 unresolved assets in one live repo).
           let s = String(name).toLowerCase().replaceAll('.', '-');
           for (let changed = true; changed; ) {
             changed = false;
@@ -3349,7 +3349,7 @@ steps:
         // iteration as an EMPTY slot and the aggregate exposes no failure
         // count (the engine used to emit `failed`; the current one emits only
         // `{items, count}`, which silently zeroed every run's assets_written —
-        // hit live on the first itti rollout, 2026-08-31). Anything that is
+        // hit live on the first live rollout, 2026-08-31). Anything that is
         // not a 2xx slot — empty, junk, 4xx — counts as a failed write.
         // Un-projected this was 113 KB/302s on the batched shape (2026-07-26);
         // projected it is one tiny object per asset of ONE build.

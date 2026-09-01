@@ -136,7 +136,7 @@ export function resolveAsset(assetName, idx, declaredIndex, appName) {
       return { level: levels[2], dir: norm[0] };
 
     // Same rung, last spelling: every separator removed from both sides.
-    // `conto-api` meets `ContoApi` — .NET names module directories in
+    // `acme-api` meets `AcmeApi` — .NET names module directories in
     // concatenated PascalCase, which no dash/dot rule reaches (110 assets
     // stayed unresolved on the dots-into-dashes fix alone, 2026-09-01).
     const sq = idx.bySquash.get(squashName(name));
