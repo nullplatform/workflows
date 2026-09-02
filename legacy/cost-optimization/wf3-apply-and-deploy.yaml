@@ -1,0 +1,327 @@
+# Cost Optimization — Apply Accepted Suggestion & Deploy
+#
+# Triggered when a user accepts a cost-optimization suggestion on an
+# action item. Reads the approved suggestion, patches the scope's
+# resource config (cpu/memory), waits for the resulting deployment to
+# finish, then marks the suggestion as applied (or failed on error).
+#
+# Called as a sub-workflow from `on_action_item_event` via the
+# `onSuggestionAccepted` port.
+
+id: apply_and_deploy
+name: "Apply & Deploy (cost optimization)"
+description: >
+  Applies an accepted cost-optimization suggestion: patches the scope's
+  resource configuration and waits for the deployment to complete.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+inputs:
+  action_item_id:
+    type: string
+    required: true
+    description: "Action item whose suggestion was accepted"
+  suggestion_id:
+    type: string
+    required: true
+    description: "Accepted suggestion ID"
+  nrn:
+    type: string
+    required: true
+    description: "NRN of the scope (e.g. organization=4:account=17:...scope=12345)"
+  np_api_base:
+    type: string
+    required: false
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+variables:
+  scope_id:        { initialValue: null }
+  scope:           { initialValue: null }
+  suggestion:      { initialValue: null }
+  new_spec:        { initialValue: null }
+  deployment_id:   { initialValue: null }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start Apply & Deploy"
+    config:
+      description: "Apply a cost-optimization suggestion and deploy the change."
+      inputs:
+        action_item_id:
+          type: string
+          required: true
+        suggestion_id:
+          type: string
+          required: true
+        nrn:
+          type: string
+          required: true
+          description: "Scope NRN (e.g. organization=4:account=17:...scope=12345)"
+
+  # ── 0. Extract scope_id from NRN ─────────────────────────────────────
+  - id: extract_scope_id
+    type: module
+    plugin_type: code-exec
+    name: "Extract Scope ID"
+    inputs:
+      nrn: "${{ workflow.inputs.nrn }}"
+    config:
+      code: |
+        var nrn = inputs.nrn || '';
+        var match = nrn.match(/scope=(\d+)/);
+        return { scope_id: match ? parseInt(match[1], 10) : null };
+
+  - id: stash_scope_id
+    type: module
+    plugin_type: set-variable
+    name: "Stash Scope ID"
+    config:
+      path: scope_id
+      value: "${{ steps.extract_scope_id.outputs.scope_id }}"
+
+  # ── 1. Fetch current scope details ────────────────────────────────────
+  - id: fetch_scope
+    type: module
+    plugin_type: http-request
+    name: "Fetch Scope"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/scope/${{ variables.scope_id }}"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  - id: stash_scope
+    type: module
+    plugin_type: set-variable
+    name: "Stash Scope"
+    config:
+      path: scope
+      value: "${{ steps.fetch_scope.outputs.body }}"
+
+  # ── 2. Fetch the accepted suggestion ──────────────────────────────────
+  - id: fetch_suggestion
+    type: module
+    plugin_type: http-request
+    name: "Fetch Suggestion"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/governance/action_item/${{ workflow.inputs.action_item_id }}/suggestions/${{ workflow.inputs.suggestion_id }}"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  - id: stash_suggestion
+    type: module
+    plugin_type: set-variable
+    name: "Stash Suggestion"
+    config:
+      path: suggestion
+      value: "${{ steps.fetch_suggestion.outputs.body }}"
+
+  # ── 3. Compute new spec from suggestion ───────────────────────────────
+  - id: compute_spec
+    type: module
+    plugin_type: code-exec
+    name: "Compute New Spec"
+    inputs:
+      scope: "${{ variables.scope }}"
+      suggestion: "${{ variables.suggestion }}"
+    config:
+      code: |
+        var scope = inputs.scope || {};
+        var suggestion = inputs.suggestion || {};
+        var changes = suggestion.changes || suggestion.recommended_changes || {};
+        var currentSpec = scope.specification || {};
+        var currentResources = currentSpec.resources || {};
+        var newResources = {};
+        for (var key in currentResources) {
+          newResources[key] = currentResources[key];
+        }
+        if (changes.cpu != null) newResources.cpu = changes.cpu;
+        if (changes.memory != null) newResources.memory = changes.memory;
+        if (changes.resources) {
+          if (changes.resources.cpu != null) newResources.cpu = changes.resources.cpu;
+          if (changes.resources.memory != null) newResources.memory = changes.resources.memory;
+        }
+        return {
+          specification: {
+            resources: newResources,
+            replicas: changes.replicas != null ? changes.replicas : (currentSpec.replicas || 1)
+          }
+        };
+
+  - id: stash_new_spec
+    type: module
+    plugin_type: set-variable
+    name: "Stash New Spec"
+    config:
+      path: new_spec
+      value: "${{ steps.compute_spec.outputs }}"
+
+  # ── 4. Patch scope with new resources ─────────────────────────────────
+  - id: patch_scope
+    type: module
+    plugin_type: http-request
+    name: "Patch Scope"
+    config:
+      method: PATCH
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/scope/${{ variables.scope_id }}"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+        Content-Type: "application/json"
+      body: "${{ variables.new_spec }}"
+
+  # ── 5. Comment on action item that we're applying ─────────────────────
+  - id: comment_applying
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Applying"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      text: "Applying suggestion ${{ workflow.inputs.suggestion_id }}: patching scope ${{ variables.scope_id }} with new resource spec. Deployment will follow."
+
+  # ── 6. Get the deployment that was triggered ──────────────────────────
+  # After PATCH, NP creates a deployment automatically. Fetch latest.
+  - id: get_deployment
+    type: module
+    plugin_type: http-request
+    name: "Get Latest Deployment"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/scope/${{ variables.scope_id }}"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  - id: extract_deployment_id
+    type: module
+    plugin_type: code-exec
+    name: "Extract Deployment ID"
+    inputs:
+      body: "${{ steps.get_deployment.outputs.body }}"
+    config:
+      code: |
+        var body = inputs.body || {};
+        var deploymentId = body.active_deployment || body.current_active_deployment || null;
+        return { deployment_id: deploymentId };
+
+  - id: stash_deployment_id
+    type: module
+    plugin_type: set-variable
+    name: "Stash Deployment ID"
+    config:
+      path: deployment_id
+      value: "${{ steps.extract_deployment_id.outputs.deployment_id }}"
+
+  # ── 7. Poll deployment until terminal ─────────────────────────────────
+  - id: wait_deployment
+    type: module
+    plugin_type: http-request
+    name: "Check Deployment Status"
+    config:
+      method: GET
+      url: "${{ (workflow.inputs.np_api_base || 'https://api.nullplatform.com') }}/deployment/${{ variables.deployment_id }}?include_messages=true"
+      headers:
+        Authorization: "Bearer ${{ secrets.np_api_token }}"
+
+  - id: check_done
+    type: decider
+    plugin_type: conditional
+    name: "Deployment Done?"
+    config:
+      expression: "steps.wait_deployment.outputs.body.status == 'finalized' || steps.wait_deployment.outputs.body.status == 'rolled_back' || steps.wait_deployment.outputs.body.status == 'failed' || steps.wait_deployment.outputs.body.status == 'cancelled'"
+
+  - id: wait_30s
+    type: module
+    plugin_type: delay
+    name: "Wait 30s"
+    config:
+      duration: "30s"
+
+  # ── 8. Handle result ──────────────────────────────────────────────────
+  - id: check_success
+    type: decider
+    plugin_type: conditional
+    name: "Deployment Succeeded?"
+    config:
+      expression: "steps.wait_deployment.outputs.body.status == 'finalized'"
+
+  - id: mark_applied
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Applied"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-applied
+
+  - id: comment_success
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Success"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      text: "Deployment ${{ variables.deployment_id }} finalized successfully. Suggestion applied."
+
+  - id: mark_failed
+    type: module
+    plugin_type: np-action-item-suggestion-update
+    name: "Mark Failed"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      suggestionId: "${{ workflow.inputs.suggestion_id }}"
+      action: mark-failed
+      reason: "Deployment ${{ variables.deployment_id }} ended with status: ${{ steps.wait_deployment.outputs.body.status }}"
+
+  - id: comment_failure
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment: Failed"
+    config:
+      actionItemId: "${{ workflow.inputs.action_item_id }}"
+      text: "Deployment ${{ variables.deployment_id }} failed (status: ${{ steps.wait_deployment.outputs.body.status }}). Suggestion marked as failed."
+
+  - id: log_done
+    type: module
+    plugin_type: log
+    name: "Done"
+    config:
+      level: info
+      message: "Apply & deploy complete for scope ${{ variables.scope_id }}, deployment ${{ variables.deployment_id }}"
+
+connections:
+  - { id: c0a, from: start,               to: extract_scope_id }
+  - { id: c0b, from: extract_scope_id,    to: stash_scope_id }
+  - { id: c1,  from: stash_scope_id,      to: fetch_scope }
+  - { id: c2,  from: fetch_scope,          to: stash_scope }
+  - { id: c3,  from: stash_scope,          to: fetch_suggestion }
+  - { id: c4,  from: fetch_suggestion,     to: stash_suggestion }
+  - { id: c5,  from: stash_suggestion,     to: compute_spec }
+  - { id: c6,  from: compute_spec,         to: stash_new_spec }
+  - { id: c7,  from: stash_new_spec,       to: patch_scope }
+  - { id: c8,  from: patch_scope,          to: comment_applying }
+  - { id: c9,  from: comment_applying,     to: get_deployment }
+  - { id: c10, from: get_deployment,       to: extract_deployment_id }
+  - { id: c11, from: extract_deployment_id, to: stash_deployment_id }
+  - { id: c12, from: stash_deployment_id,  to: wait_deployment }
+  # Poll loop: check → not done → wait 30s → poll again
+  - { id: c13, from: wait_deployment,      to: check_done }
+  - { id: c14, from: check_done,           to: wait_30s,       source_port: "false" }
+  - { id: c15, from: wait_30s,             to: wait_deployment }
+  # Terminal: done → success/failure routing
+  - { id: c16, from: check_done,           to: check_success,  source_port: "true" }
+  - { id: c17, from: check_success,        to: mark_applied,   source_port: "true" }
+  - { id: c18, from: mark_applied,         to: comment_success }
+  - { id: c19, from: comment_success,      to: log_done }
+  - { id: c20, from: check_success,        to: mark_failed,    source_port: "false" }
+  - { id: c21, from: mark_failed,          to: comment_failure }
+  - { id: c22, from: comment_failure,      to: log_done }
+
+outputs:
+  deployment_id: "${{ variables.deployment_id }}"
+  action_item_id: "${{ workflow.inputs.action_item_id }}"
+  suggestion_id: "${{ workflow.inputs.suggestion_id }}"
+  scope_id: "${{ variables.scope_id }}"

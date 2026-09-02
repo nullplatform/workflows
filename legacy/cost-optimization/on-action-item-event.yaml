@@ -1,0 +1,94 @@
+id: on_action_item_event
+name: "On Action Item Event"
+description: >
+  Routes action item events to handler workflows.
+  onCreated → remediation planner, onSuggestionAccepted → apply & deploy,
+  onSuggestionRejected → log, onCommentAdded/onUpdated/onResolved → log.
+path: "/nullplatform/cost-optimization"
+semantic_version: 1.0.0
+
+secrets:
+  np_api_token:
+    key: "np.api.token"
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-action-item-trigger
+    name: "Action Item Events"
+    config:
+      pathPrefix: np-cost-events
+      mode: start
+      # NP channel auto-creation: requires both npApiToken AND nrn. Without
+      # them, the trigger only registers the local webhook URL but no
+      # channel is created on the NP side, so events never arrive.
+      npApiToken: "${{ secrets.np_api_token }}"
+      nrn: "organization=4"
+      labelFilters:
+        workflow_type: cost-optimization
+
+  - id: on_created
+    type: module
+    plugin_type: sub-workflow
+    name: "Plan Remediation"
+    config:
+      workflowId: remediation_planner
+      waitForCompletion: true
+    # Child inputs MUST live under `inputs:` — fields in `config:` are for
+    # the sub-workflow plugin itself (workflowId/alias/waitForCompletion)
+    # and are NOT forwarded to the child. Only `inputs:` maps 1:1 to
+    # `workflow.inputs.*` inside the child.
+    inputs:
+      action_item_id: "${{ $item.actionItem.id }}"
+
+  - id: on_suggestion_accepted
+    type: module
+    plugin_type: sub-workflow
+    name: "Apply & Deploy"
+    config:
+      workflowId: apply_and_deploy
+      waitForCompletion: true
+    inputs:
+      action_item_id: "${{ $item.actionItem.id }}"
+      suggestion_id: "${{ $item.suggestion.id }}"
+      nrn: "${{ $item.actionItem.nrn }}"
+
+  - id: on_suggestion_rejected
+    type: module
+    plugin_type: log
+    name: "Suggestion Rejected"
+    config:
+      level: info
+      message: "User rejected suggestion ${{ $item.suggestion.id }} on ${{ $item.actionItem.id }}"
+
+  - id: on_comment
+    type: module
+    plugin_type: log
+    name: "Comment Added"
+    config:
+      level: info
+      message: "Comment on ${{ $item.actionItem.id }} by ${{ $item.userEmail }}"
+
+  - id: on_updated
+    type: module
+    plugin_type: log
+    name: "Item Updated"
+    config:
+      level: info
+      message: "Action item ${{ $item.actionItem.id }} updated to ${{ $item.actionItem.status }}"
+
+  - id: on_resolved
+    type: module
+    plugin_type: log
+    name: "Item Resolved"
+    config:
+      level: info
+      message: "Action item ${{ $item.actionItem.id }} resolved"
+
+connections:
+  - { id: c1, from: trigger, to: on_created, source_port: onCreated }
+  - { id: c2, from: trigger, to: on_suggestion_accepted, source_port: onSuggestionAccepted }
+  - { id: c3, from: trigger, to: on_suggestion_rejected, source_port: onSuggestionRejected }
+  - { id: c4, from: trigger, to: on_comment, source_port: onCommentAdded }
+  - { id: c5, from: trigger, to: on_updated, source_port: onUpdated }
+  - { id: c6, from: trigger, to: on_resolved, source_port: onResolved }
