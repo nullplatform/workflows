@@ -9,6 +9,36 @@
 # close reason is added before closing (the close transition itself
 # carries no reason field).
 #
+# v2.2 FIX (2026-07-28) — post-incident, on a customer org.
+# Symptom: 8 already-closed ami-drift items collected 54 duplicate
+# "Closing automatically" comments between 2026-07-18 and 2026-07-22, and
+# the nightly run failed outright on 07-22.
+#
+# Root cause chain (each link is independently fixed below):
+#   1. The NP action_item LISTING leaked `closed` rows out of a
+#      `status=open` query. Proven from the stored engine state of run
+#      fa05435f-…: find returned 95 items = 87 open + 8 closed. The list
+#      query itself was correct. This is a server-side filter leak we do
+#      not control, so the workflow must be robust to it.
+#   2. The closer had no client-side status guard, so those closed rows
+#      were treated as closeable. (Already fixed in v2.1: `decide`
+#      double-guards `status !== 'open'` → keep. v2.1 was authored but
+#      NEVER ACTIVATED on that org — the `live` alias still pointed at rev 1,
+#      which is why the guard did not save us. Activation is the other
+#      half of this fix; see the deploy note at the bottom.)
+#   3. Comment came BEFORE close, so the comment landed even though the
+#      close then failed → the visible spam. v2.2 inverts this: close
+#      first, then comment ONLY the ids that actually transitioned
+#      (attribution by response `actionItem.id`, not by index).
+#   4. `close` on an already-closed item returns 400 "Invalid action item
+#      status transition", which failed the step terminally and — with no
+#      per-item attribution on a forEach failure — discarded the whole
+#      page. v2.2 sets `ignoreInvalidTransition: true` so that specific
+#      400 becomes a no-op (`skipped: true`) instead. Requires the engine
+#      change shipped alongside this revision; on an older engine the flag
+#      is simply ignored (unknown config keys are dropped), and the
+#      reordering in (3) still prevents the spam on its own.
+#
 # v2.1 FIX (2026-07-21): v2.0 only ever closed items on the FIRST page —
 # `np-action-item-find` was called once with `limit: 200` and no cursor, so
 # an org with >200 open ami-drift items silently left the rest open
@@ -126,7 +156,7 @@ description: >
   of the drift set. Streams every page of open ami-drift items (not just the
   first 200).
 path: "/action-items/ami-drift"
-semantic_version: 2.1.0
+semantic_version: 2.2.0
 
 variables:
   # Phase A's output: drift_key set for scopes still genuinely drifted
@@ -474,25 +504,6 @@ steps:
           all: decisions
         };
 
-  # ── Close (comment first — the close transition has no reason field) ──
-  # forEach injects each id as inputs.actionItemId; the np plugins merge
-  # ctx.inputs over config, so the id lands per iteration. Empty to_close
-  # → forEach no-ops (zero calls), so a page with nothing to close is free.
-  - id: comment_closing
-    type: module
-    plugin_type: np-action-item-add-comment
-    name: "Comment Close Reason"
-    forEach:
-      expression: "${{ steps.select_to_close.outputs.to_close }}"
-      itemVariable: actionItemId
-    config:
-      apiKey: "${{ secrets.NP_API_KEY }}"
-      # Placeholder so validateConfig() passes; forEach injects
-      # inputs.actionItemId per iteration (merged over config).
-      actionItemId: "__foreach_placeholder__"
-      author: "agent:ami-drift-closer"
-      content: "Closing automatically: AMI drift no longer detected (scope redeployed with a configured AMI, scope no longer active, or the AMI is now configured)."
-
   # Engine fact — `error_handling.fallback_step` does NOT work on a
   # `forEach` step: the runner's forEach branch (workflow-runner.ts,
   # `step.forEach !== undefined`) only ever consults
@@ -520,6 +531,12 @@ steps:
     # pagination loop so the sweep continues.
     error_handling:
       continueOnError: true
+    # Per-iteration trim: select_closed only needs to know WHICH id actually
+    # transitioned and whether it was a no-op. Without this the whole
+    # ActionItem (description + audit_logs + comments) rides back per item.
+    output_projection:
+      - actionItem.id
+      - skipped
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       # Placeholder so validateConfig() passes; forEach injects
@@ -527,6 +544,15 @@ steps:
       actionItemId: "__foreach_placeholder__"
       action: close
       actor: "agent:ami-drift-closer"
+      # Idempotent close (v2.2). If the item is ALREADY closed the NP API
+      # answers 400 "Invalid action item status transition"; without this
+      # flag that fails the step terminally and — because a forEach failure
+      # has no per-item attribution — takes the whole page (and, before
+      # continueOnError, the whole sweep) down with it. That is exactly what
+      # happened live between 2026-07-18 and 2026-07-22. With the
+      # flag the already-closed item is a no-op (`skipped: true`) and the
+      # rest of the page closes normally. Any OTHER error still fails.
+      ignoreInvalidTransition: true
 
   # Did the close actually succeed for this page? (See the engine-fact
   # note above `close_items` — this is how failure is detected instead of
@@ -538,17 +564,120 @@ steps:
     config:
       expression: "steps.close_items.status == 'completed'"
 
-  # Accumulator: appends this page's full per-item decision list into a
+  # v2.2 — comment AFTER a confirmed close, and only for the ids that
+  # actually transitioned.
+  #
+  # v2.1 and earlier commented BEFORE closing, so every failed close still
+  # left a "Closing automatically" comment behind on an item that stayed
+  # open (or, in the incident, on one that was already closed — 54
+  # spurious comments across 8 items). Ordering alone is not enough
+  # though: with `ignoreInvalidTransition` a close can legitimately no-op,
+  # and a no-op must not be announced either.
+  #
+  # Attribution is by RESPONSE first: a successful transition echoes the
+  # item it acted on (`actionItem.id`), while a skipped one returns
+  # `actionItem: null` + `skipped: true`.
+  #
+  # The positional fallback matters. `close_items` carries an
+  # `output_projection`, and a plugin/API that does not echo the item back
+  # (or an older engine that drops the projected path) would otherwise
+  # yield an EMPTY closed_ids — i.e. items closed silently with no comment,
+  # a silent regression that is much worse than the bug being fixed. So when
+  # the response has no usable id AND the result array lines up 1:1 with
+  # the ids we asked to close, fall back to position. The length check is
+  # what makes this safe: a partial/misaligned array never mis-attributes,
+  # it just yields no id for that slot.
+  - id: select_closed
+    type: module
+    plugin_type: code-exec
+    metadata: { fanOutPerItem: false }
+    name: "Select Actually-Closed Items (this page)"
+    inputs:
+      # forEach steps expose their per-iteration outputs as `outputs.items`
+      # (same shape build_provider_index consumes from
+      # fetch_runtime_configs above).
+      close_results: "${{ steps.close_items.outputs.items }}"
+      attempted:     "${{ steps.select_to_close.outputs.to_close }}"
+      decisions:     "${{ steps.select_to_close.outputs.all }}"
+    config:
+      code: |
+        var res = inputs.close_results || [];
+        var attempted = inputs.attempted || [];
+        // Only trust position when the two arrays describe the same set.
+        var aligned = res.length === attempted.length;
+        var closedIds = [];
+        var skippedIds = [];
+        for (var i = 0; i < res.length; i++) {
+          var r = res[i] || {};
+          var ai = r.actionItem || {};
+          var id = ai.id || (aligned ? attempted[i] : null);
+          if (r.skipped === true) {
+            // Already in a status where `close` is not legal — virtually
+            // always "already closed". Nothing happened, so say nothing.
+            if (id) skippedIds.push(id);
+            continue;
+          }
+          if (id) closedIds.push(id);
+        }
+        // Re-label this page's decisions so the run summary can tell a real
+        // close apart from a no-op. select_to_close owns the raw verdicts;
+        // this step owns the OUTCOME, and is the single place downstream
+        // accumulators read from.
+        var decisions = inputs.decisions || [];
+        var out = [];
+        for (var j = 0; j < decisions.length; j++) {
+          var d = decisions[j] || {};
+          if (d.verdict === 'close' && d.item_id && skippedIds.indexOf(d.item_id) !== -1) {
+            out.push({ item_id: d.item_id, verdict: 'close_skipped', drift_key: d.drift_key || null });
+          } else {
+            out.push(d);
+          }
+        }
+        log.info('AMI drift close outcome (page)', {
+          closed: closedIds.length,
+          skipped_noop: skippedIds.length
+        });
+        return {
+          closed_ids: closedIds,
+          closed_count: closedIds.length,
+          skipped_count: skippedIds.length,
+          all: out
+        };
+
+  # ── Comment (only on ids that genuinely transitioned) ─────────────────
+  # forEach injects each id as inputs.actionItemId; the np plugins merge
+  # ctx.inputs over config, so the id lands per iteration. Empty
+  # closed_ids → forEach no-ops (zero calls), so a page that closed
+  # nothing posts nothing.
+  - id: comment_closing
+    type: module
+    plugin_type: np-action-item-add-comment
+    name: "Comment Close Reason"
+    forEach:
+      expression: "${{ steps.select_closed.outputs.closed_ids }}"
+      itemVariable: actionItemId
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      # Placeholder so validateConfig() passes; forEach injects
+      # inputs.actionItemId per iteration (merged over config).
+      actionItemId: "__foreach_placeholder__"
+      author: "agent:ami-drift-closer"
+      content: "Closed automatically: AMI drift no longer detected (scope redeployed with a configured AMI, scope no longer active, or the AMI is now configured)."
+
+  # Accumulator: appends this page's full per-item outcome list into a
   # workflow variable. Runs once per page (set-variable defaults to
   # executeMode='all').
+  # `fanOutPerItem: false` for the same reason as acc_close_failed below.
+  # (This replaces a `flipPorts: true` inherited from v2.1 — that key does
+  # not exist anywhere in the engine or the DSL; it was dead metadata.)
   - id: acc_results
     type: module
     plugin_type: set-variable
     name: "Accumulate Item Decisions"
-    metadata: { flipPorts: true }
+    metadata: { fanOutPerItem: false }
     config:
       path: results
-      value: "${{ concat(variables.results, steps.select_to_close.outputs.all) }}"
+      value: "${{ concat(variables.results, steps.select_closed.outputs.all) }}"
 
   # ── failure lane (close_ok:false target) ──────────────────────────────
   # close_items failed for this page's to_close ids — discard per-item
@@ -579,14 +708,25 @@ steps:
           affected_item_ids: ids
         };
 
+  # Aggregate step: NEVER dispatch per upstream item. Without the explicit
+  # `fanOutPerItem: false` the graph validator treats this as a per-item
+  # dispatch and rejects the `$items` below with FANOUT_ITEMS_UNAVAILABLE.
+  # In production that error stayed hidden: `pinnedDescriptors` supply
+  # set-variable's `executeMode: 'all'` at validation time, and the failure
+  # lane only runs when `close_items` fails — so a pin-less validation (or a
+  # single close failure) would have surfaced it as a runtime graph error.
+  # Exactly the "passes create-time, fails at runtime" trap. Caught by the
+  # live Temporal reproduction, not by any hermetic test.
   - id: acc_close_failed
     type: module
     plugin_type: set-variable
     name: "Accumulate Item Decisions (close failure lane)"
-    metadata: { flipPorts: true }
+    metadata: { fanOutPerItem: false }
     config:
       path: results
-      value: "${{ concat(variables.results, $items) }}"
+      # Read the failure-lane record explicitly rather than via `$items`,
+      # so this no longer depends on batch-vs-per-item dispatch at all.
+      value: "${{ concat(variables.results, steps.close_failed.items) }}"
 
   - id: summary
     type: module
@@ -600,7 +740,7 @@ steps:
     config:
       code: |
         var results = inputs.results || [];
-        var checked = 0, stillValid = 0, closed = 0, closeFailed = 0;
+        var checked = 0, stillValid = 0, closed = 0, closeFailed = 0, closeSkipped = 0;
         for (var i = 0; i < results.length; i++) {
           // Live engine wraps each fan-out/forEach item plainly here (no
           // {outputs,...} envelope — decide/close_failed both return flat
@@ -609,12 +749,17 @@ steps:
           var v = String(r.verdict || 'other');
           if (v === 'close') { checked++; closed++; }
           else if (v === 'keep') { checked++; stillValid++; }
+          // v2.2: the close was a no-op (item already in a status where
+          // `close` is not legal — normally already closed). Counted as
+          // checked, but NOT as closed, and no comment was posted.
+          else if (v === 'close_skipped') { checked++; closeSkipped++; }
           else if (v === 'close_failed') { checked += Number(r.checked) || 0; closeFailed += (r.affected_item_ids || []).length; }
         }
         return {
           checked: checked,
           still_valid: stillValid,
           closed: closed,
+          close_skipped: closeSkipped,
           close_failed: closeFailed
         };
 
@@ -624,7 +769,7 @@ steps:
     name: "Closer Complete"
     config:
       level: info
-      message: "AMI drift closer complete. Checked ${{ steps.summary.outputs.checked }} open items — still valid: ${{ steps.summary.outputs.still_valid }}, closed: ${{ steps.summary.outputs.closed }}, close failed: ${{ steps.summary.outputs.close_failed }}."
+      message: "AMI drift closer complete. Checked ${{ steps.summary.outputs.checked }} open items — still valid: ${{ steps.summary.outputs.still_valid }}, closed: ${{ steps.summary.outputs.closed }}, already closed (no-op): ${{ steps.summary.outputs.close_skipped }}, close failed: ${{ steps.summary.outputs.close_failed }}."
 
 connections:
   - { id: c1,  from: start_manual,        to: lake_deployments }
@@ -639,10 +784,12 @@ connections:
   # fetch_items streams: `loop` port → decide (per-page items fan out).
   - { id: c10, from: fetch_items,   to: decide,          source_port: loop }
   - { id: c11, from: decide,        to: select_to_close }
-  - { id: c12, from: select_to_close, to: comment_closing }
-  - { id: c13, from: comment_closing, to: close_items }
+  # v2.2: close FIRST, then comment only what actually closed (c14t lane).
+  - { id: c12, from: select_to_close, to: close_items }
   - { id: c14, from: close_items,   to: close_ok }
-  - { id: c14t, from: close_ok,     to: acc_results,     source_port: "true" }
+  - { id: c14t, from: close_ok,     to: select_closed,   source_port: "true" }
+  - { id: c13, from: select_closed, to: comment_closing }
+  - { id: c13b, from: comment_closing, to: acc_results }
   - { id: c14f, from: close_ok,     to: close_failed,    source_port: "false" }
   - { id: c14g, from: close_failed, to: acc_close_failed }
   # Both the success lane and the failure lane re-enter
@@ -659,4 +806,5 @@ outputs:
   checked:        "${{ steps.summary.outputs.checked }}"
   still_valid:    "${{ steps.summary.outputs.still_valid }}"
   closed:         "${{ steps.summary.outputs.closed }}"
+  close_skipped:  "${{ steps.summary.outputs.close_skipped }}"
   close_failed:   "${{ steps.summary.outputs.close_failed }}"
