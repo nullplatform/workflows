@@ -156,7 +156,11 @@ NP_API_KEY=… node autofix/setup/04-build-channel.mjs --nrn organization=X:acco
 
 Order matters: the channel is created against the webhook URL the engine
 mints at activation (token-bearing, one org). Re-activating an alias mints a
-new token — re-run step 4, it converges.
+new token — re-run step 4, it converges. Engine facts met on the way (2026-09-08):
+an alias is CREATED with `POST …/aliases {name, revision}` (PUT only repoints
+an existing one, 404 otherwise); a live trigger row reports `status: "live"`;
+a category named "Security" got the slug `security-1` because the name was
+taken — always read the slug back.
 
 **Verify before widening.** Trigger a real build on a watched branch, or replay
 one: `POST <webhookUrl>` with
@@ -186,14 +190,16 @@ per-item `fix_error`.
 - **Writes that are not idempotent are not retried** (item POST, close,
   comment); idempotent GET/PATCH passes are. A failed iteration is an absorbed
   `{}` slot at the same index — every pass is zipped index-aligned and counted.
-- **The agent assumes git + `gh` + toolchains in the E2B sandbox** and reaches
-  GitHub and the registries through `allowedHosts`. The plugin catalog in this
-  repo still says "no subprocess by default": confirm on your deployment with
-  one fixer run on a throwaway finding before pointing the channel at an org.
-  The token reaches the agent only as `env`, never as prompt text; the agent
-  is told never to print it, never to force-push, never to touch the base
-  branch, and never to invent a PR URL (wf-a2 downgrades a URL-less
-  `pr_opened` to `failed`).
+- **The sandbox blocks subprocesses by default.** The live `claude-code-agent`
+  descriptor exposes `sandbox.blockSubprocess` (default `true`); wf-a2 sets it
+  to `false` so git, npm, `gh` and the toolchains run. Egress is
+  `allowedHosts` (GitHub + the public registries). Which binaries the default
+  E2B template ships is a deployment fact — the prompt falls back to the GitHub
+  REST API when `gh` is missing; run one fixer on a throwaway finding before
+  widening the channel to an organization. The token reaches the agent only as
+  `env`, never as prompt text; the agent is told never to print it, never to
+  force-push, never to touch the base branch, and never to invent a PR URL
+  (wf-a2 downgrades a URL-less `pr_opened` to `failed`).
 - **Agent budget**: `claude-opus-4-8`, `maxIterations` 120, step timeout 60 min
   (`metadata.executionTimeoutMs`), verification capped at ~15 min by prompt.
   Ten groups per build is the spend cap; lower `max_fix_groups_per_build` for
