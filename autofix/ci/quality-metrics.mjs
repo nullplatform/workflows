@@ -172,7 +172,17 @@ for (const r of results) {
           ),
           command: fixType === 'upgrade_package' ? clip(upgradeCommand(eco, v.PkgName, fixed), 500) : undefined,
         })
-      : { available: false, auto_fixable: false, type: 'manual', recommendation: `No fixed version of ${v.PkgName} is published yet; mitigate or replace the package` };
+      : compact({
+          available: false,
+          auto_fixable: false,
+          // Keep the PLAYBOOK even without a fix: an OS package is remedied by
+          // a newer base image when the distro ships one, so every OS finding
+          // of a Dockerfile groups into that one change downstream.
+          type: fixType === 'base_image_update' ? 'base_image_update' : 'manual',
+          recommendation: fixType === 'base_image_update'
+            ? `No fixed ${v.PkgName} in the distro yet; move to a newer base image tag in ${dockerfile} when one ships it`
+            : `No fixed version of ${v.PkgName} is published yet; mitigate or replace the package`,
+        });
 
     const cvss = v.CVSS?.nvd ?? v.CVSS?.ghsa ?? v.CVSS?.redhat ?? Object.values(v.CVSS ?? {})[0];
     const cwe = (v.CweIDs ?? []).find((c) => /^CWE-[0-9]+$/.test(c));

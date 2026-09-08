@@ -555,8 +555,18 @@ steps:
           const p = f.package || {};
           const ciFixable = fix.available === true && fix.auto_fixable === true;
           const autoFixable = fixAll || ciFixable;
+          // Playbook when CI gave none (or said manual but the fix is forced):
+          // a package with a fixed version is an upgrade; an image-layer /
+          // OS-package finding is a base-image bump; a misconfiguration is a
+          // config change; everything else is a code change.
+          const loc0 = f.location || {};
           let fixType = str(fix.type);
-          if (autoFixable && (!fixType || fixType === 'manual')) fixType = p.fixed_version ? 'upgrade_package' : 'code_change';
+          if (autoFixable && (!fixType || fixType === 'manual')) {
+            if (p.fixed_version) fixType = 'upgrade_package';
+            else if (loc0.type === 'image_layer' || /^(alpine|debian|ubuntu|rpm|os)$/.test(str(p.ecosystem))) fixType = 'base_image_update';
+            else if (str(f.category) === 'misconfiguration') fixType = 'config_change';
+            else fixType = 'code_change';
+          }
           if (!autoFixable) fixType = fixType || 'manual';
           const fixGroup = autoFixable ? fixGroupKey(f, fixType) : '';
           const severity = sev(f.severity);

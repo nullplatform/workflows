@@ -8,9 +8,15 @@
  *   …/04-build-channel.mjs --dry-run              # show what would be created
  *   …/04-build-channel.mjs --delete               # remove the channel (stops autofix)
  *   …/04-build-channel.mjs --workflow-id wf_…     # bypass setup/.uploaded.json
- *   …/04-build-channel.mjs --methods PATCH,POST   # audit methods to forward (default PATCH)
- *   …/04-build-channel.mjs --nrn organization=X:account=Y:namespace=Z:application=W
- *                                                 # scope the channel to one application (staging); default: the org
+ *   …/04-build-channel.mjs --methods PATCH,POST   # forward only these audit methods (default: all)
+ *   …/04-build-channel.mjs --nrn organization=X   # channel NRN (default: the org)
+ *
+ * SCOPE THE CHANNEL TO THE ORGANIZATION. Build audit events are NOT matched by
+ * a channel scoped to the application NRN (verified live 2026-09-08: an
+ * application-scoped channel received nothing for a build status update; the
+ * same filter at organization level delivered within seconds). Stage the
+ * rollout with AUTOFIX_BRANCHES and by which applications' CI writes
+ * quality_metrics — a build without findings costs one skipped execution.
  *
  * Widening later: `--delete --nrn <the app nrn>` first, then re-run for the org —
  * channels are matched by description AND nrn, so an app-scoped channel is not
@@ -47,7 +53,11 @@ const argValue = (flag) => {
 };
 const WORKFLOW_ID_ARG = argValue('--workflow-id');
 const NRN_ARG = argValue('--nrn');
-const METHODS = (argValue('--methods') ?? 'PATCH').split(',').map((s) => s.trim()).filter(Boolean);
+// Default: every audited build mutation (create, status flips, patches) —
+// the listener discards what is not a successful build anyway. Narrow with
+// --methods only once you have confirmed which HTTP method your CI's status
+// update is audited as.
+const METHODS = (argValue('--methods') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
 
 /** The workflow whose webhook the channel targets, by client key. */
 const WORKFLOW_KEY = 'autofix-on-build';
@@ -144,16 +154,17 @@ async function main() {
     source: ['audit'],
     type: 'http',
     configuration: { url },
-    // Server-side filter: only build UPDATES reach the webhook (status flips
-    // and metadata writes are PATCHes; creates are `pending` builds nobody
-    // needs). Without it every audited mutation in the org would hit the
-    // endpoint and be discarded by `extract_build`.
-    filters: {
-      $and: [
-        { entity: { $eq: 'build' } },
-        METHODS.length === 1 ? { method: { $eq: METHODS[0] } } : { method: { $in: METHODS } },
-      ],
-    },
+    // Server-side filter: only BUILD audit events reach the webhook. Without
+    // it every audited mutation in the org would hit the endpoint and be
+    // discarded by `extract_build`.
+    filters: METHODS.length === 0
+      ? { entity: { $eq: 'build' } }
+      : {
+          $and: [
+            { entity: { $eq: 'build' } },
+            METHODS.length === 1 ? { method: { $eq: METHODS[0] } } : { method: { $in: METHODS } },
+          ],
+        },
   };
 
   if (DRY_RUN) {

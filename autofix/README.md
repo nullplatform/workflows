@@ -165,9 +165,10 @@ NP_API_KEY=… autofix/setup/01-config-entries.sh --github-token ghp_… \
 # 3. upload wf-a2 then wf-a1 (child reference patched to the wf_ id), point + activate `live`
 NP_API_KEY=… node autofix/setup/03-upload-workflows.mjs --alias live
 
-# 4. GO-LIVE SWITCH: NP audit channel (entity=build, method=PATCH) → wf-a1's webhook.
-#    Stage it: --nrn to one application first; widen to the org when the first PR looks right.
-NP_API_KEY=… node autofix/setup/04-build-channel.mjs --nrn organization=X:account=Y:namespace=Z:application=W
+# 4. GO-LIVE SWITCH: NP audit channel (entity=build) → wf-a1's webhook, at ORG scope.
+#    An application-scoped channel receives no build audit events (verified live);
+#    stage the rollout through AUTOFIX_BRANCHES and by which repos' CI writes quality_metrics.
+NP_API_KEY=… node autofix/setup/04-build-channel.mjs
 ```
 
 Order matters: the channel is created against the webhook URL the engine
