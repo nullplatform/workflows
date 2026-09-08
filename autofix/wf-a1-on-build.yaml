@@ -296,10 +296,12 @@ steps:
         const total = Number(summary.total);
         const truncated = summary.truncated === true || (Number.isFinite(returned) && Number.isFinite(total) && returned < total);
         const gates = Array.isArray(qm.gates) ? qm.gates : [];
-        // A gate that neither passed nor failed (error/skipped/timeout) did not
-        // scan: its findings' absence proves nothing, so closing is blocked.
+        // A gate that did not actually scan (error / skipped / timeout) proves
+        // nothing about absence, so closing is blocked. passed, failed and
+        // warning are all real scan outcomes (the contract's enum).
+        const SCANNED = { passed: 1, failed: 1, warning: 1 };
         const unhealthyGates = gates
-          .filter((g) => g && g.result && !['passed', 'failed'].includes(str(g.result).toLowerCase()))
+          .filter((g) => g && g.result && SCANNED[str(g.result).toLowerCase()] !== 1)
           .map((g) => str(g.name || g.tool || 'gate'));
         const applicationNrn = str(app.nrn) || ('organization=' + str(inputs.org_id));
 

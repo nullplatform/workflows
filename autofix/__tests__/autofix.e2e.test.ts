@@ -451,6 +451,12 @@ describe('wf-a1 autofix-on-build (E2E)', () => {
     const r2 = await runOnBuild({ existing: [gone], builds: [gateError] });
     expect(r2.closes).toHaveLength(0);
     expect(String(r2.result.outputs.closing_blocked_reason)).toBe('gate_not_run:sast');
+
+    // 'warning' is a real scan outcome (only medium/low findings) — it must NOT block closing.
+    const gateWarning = build({ metadata: { quality_metrics: qualityMetrics(FINDINGS, { gateResult: 'warning' }) } });
+    const r3 = await runOnBuild({ existing: [gone], builds: [gateWarning] });
+    expect(r3.closes).toHaveLength(1);
+    expect(r3.result.outputs.closing_blocked_reason).toBe(null);
   });
 
   it('applies the re-dispatch policy: fresh in_progress and exhausted never, failed below the cap yes', async () => {
