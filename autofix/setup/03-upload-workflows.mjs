@@ -106,11 +106,20 @@ async function dryRun() {
 }
 
 async function pointAndActivate(headers, wfId, alias, revision) {
-  const put = await fetch(`${API_BASE}/workflows/definitions/${wfId}/aliases/${alias}`, {
+  // PUT repoints an EXISTING alias; a missing one answers 404 and is created
+  // with POST on the collection (verified live 2026-09-08).
+  let put = await fetch(`${API_BASE}/workflows/definitions/${wfId}/aliases/${alias}`, {
     method: 'PUT',
     headers,
     body: JSON.stringify({ revision }),
   });
+  if (put.status === 404) {
+    put = await fetch(`${API_BASE}/workflows/definitions/${wfId}/aliases`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: alias, revision }),
+    });
+  }
   if (!put.ok) throw new Error(`could not point alias '${alias}' at rev ${revision} (${put.status})`);
   const act = await fetch(`${API_BASE}/workflows/definitions/${wfId}/aliases/${alias}/activate`, {
     method: 'POST',

@@ -265,8 +265,13 @@ steps:
       pr_title: "${{ steps.plan.outputs.pr_title }}"
       build_id: "${{ steps.plan.outputs.build_id }}"
     config:
-      model: claude-opus-4-8
+      model: claude-opus-5
       maxIterations: 120
+      # The E2B sandbox blocks the Bash/subprocess tool BY DEFAULT — git, npm,
+      # gh and every toolchain need it, so it is switched on here explicitly.
+      # (Live plugin descriptor: sandbox.blockSubprocess, default true.)
+      sandbox:
+        blockSubprocess: false
       env:
         GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
