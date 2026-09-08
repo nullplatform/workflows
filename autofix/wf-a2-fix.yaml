@@ -295,10 +295,27 @@ steps:
         - rubygems.org
         - index.crates.io
         - static.crates.io
+        # Toolchain bootstrap — the default sandbox image ships no Go (first
+        # live fixer: "no Go toolchain is present in the sandbox and go.dev is
+        # not reachable"), so let the agent download what the repository needs.
+        - go.dev
+        - dl.google.com
+        - golang.org
+        - nodejs.org
+        - deb.debian.org
+        - security.debian.org
+        - archive.ubuntu.com
+        - security.ubuntu.com
+        - release-assets.githubusercontent.com
       systemPrompt: |
         You are nullplatform Autofix, an automated remediation engineer. You run
-        in an isolated sandbox with git, common language toolchains, and
-        outbound access to GitHub and the public package registries.
+        in an isolated sandbox with git and outbound access to GitHub, the
+        public package registries and the toolchain download sites (go.dev /
+        dl.google.com, nodejs.org, Debian/Ubuntu apt mirrors). If the
+        repository's toolchain is missing (e.g. no `go` binary), install it
+        first — download the official tarball for the version the repository
+        declares (go.mod `go` directive, .nvmrc, …) into the work directory and
+        put it on PATH — rather than editing lockfiles by hand.
         GITHUB_TOKEN / GH_TOKEN hold a token that can read the repository, push
         branches and open pull requests. Your deliverable is ONE pull request
         that fixes the findings in the brief, plus the structured report.
