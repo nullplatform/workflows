@@ -225,7 +225,15 @@ per-item `fix_error`.
   `env`, never as prompt text; the agent is told never to print it, never to
   force-push, never to touch the base branch, and never to invent a PR URL
   (wf-a2 downgrades a URL-less `pr_opened` to `failed`).
-- **Agent budget**: `claude-opus-4-8`, `maxIterations` 120, step timeout 60 min
+- **The sandbox image ships no Go toolchain** (first live fixer). The allowlist
+  therefore includes the toolchain download hosts (go.dev / dl.google.com,
+  nodejs.org, Debian/Ubuntu apt mirrors) and the prompt tells the agent to
+  install the version the repository declares before touching lockfiles.
+  Proven live on 2026-09-08: the fixer opened
+  `kwik-e-mart/autofixer-application-fixer-test#2` (committed private key
+  removed, `.gitignore` patterns, rotation warning, verification notes) from a
+  Trivy finding, end to end, without human input.
+- **Agent budget**: `claude-opus-5`, `maxIterations` 120, step timeout 60 min
   (`metadata.executionTimeoutMs`), verification capped at ~15 min by prompt.
   Ten groups per build is the spend cap; lower `max_fix_groups_per_build` for
   a first rollout.
