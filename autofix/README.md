@@ -230,10 +230,13 @@ per-item `fix_error`.
   therefore includes the toolchain download hosts (go.dev / dl.google.com,
   nodejs.org, Debian/Ubuntu apt mirrors) and the prompt tells the agent to
   install the version the repository declares before touching lockfiles.
-  Proven live on 2026-09-08: the fixer opened
-  `kwik-e-mart/autofixer-application-fixer-test#2` (committed private key
-  removed, `.gitignore` patterns, rotation warning, verification notes) from a
-  Trivy finding, end to end, without human input.
+  Proven live on 2026-09-08 in `kwik-e-mart/autofixer-application-fixer-test`:
+  73 findings → 73 items → 11 fixer PRs (secret removed, echo and every
+  `golang.org/x/*` module upgraded with the Go 1.26 builder, jwt-go dropped,
+  Dockerfile pinned/non-root/HEALTHCHECK, runtime moved to distroless/static
+  with a static binary). After merging five of them (six were superseded or
+  duplicates) the next build reported 1 finding and the listener closed the
+  other 73 items, each with a comment naming the build, commit and fix PR.
 - **Agent budget**: `claude-opus-5`, `maxIterations` 120, step timeout 60 min
   (`metadata.executionTimeoutMs`), verification capped at ~15 min by prompt.
   Ten groups per build is the spend cap; lower `max_fix_groups_per_build` for
