@@ -1,0 +1,986 @@
+# Autofix — on build.
+#
+# Turns a SUCCESSFUL build's normalized findings (build metadata
+# `quality_metrics.findings[]`, written by CI from Aqua / Checkmarx / jest /
+# Sonar / …) into governance action items — one item per raw finding, keyed to
+# survive across builds — and hands every auto-fixable group of findings to the
+# fixer (`wf-a2-fix`), which opens the pull request.
+#
+#   on_build ──────────── webhook (NP audit channel: entity=build, method=PATCH)
+#     └─ extract_build ── pure: the build id, nothing else, out of the poke
+#          └─ fetch_build ─────── np-api-call GET /build/{id}          ◄─┐ loop
+#               └─ fetch_metadata ── np-api-call GET /metadata/build/{id}  │
+#                    └─ fetch_application ── np-api-call GET /application  │
+#                         └─ guard ── pure: successful? watched branch?      │
+#                              │       findings present? → proceed|wait|skip│
+#                              └─ route (case)                              │
+#                                   ├─ wait ── bump_wait → wait_for_metadata ┘
+#                                   ├─ skip ── skip (result)
+#                                   └─ proceed
+#                                        └─ find_open_items ── live autofix items for repo@branch
+#                                             └─ diff ── pure: creates / updates / closes / fix candidates
+#                                                  ├─ create_item ── np-api-call POST (per new finding)
+#                                                  ├─ update_item ── np-api-call PATCH (per known finding)
+#                                                  ├─ close_item ─── np-api-call POST close (per vanished finding)
+#                                                  └─ zip ── pure: ids ← results, fix groups
+#                                                       ├─ close_comment ── np-api-call POST comment
+#                                                       ├─ dispatch_fix ─── sub-workflow wf-a2-fix (fire-and-forget)
+#                                                       └─ summary → stash_summary
+#
+# THE PAYLOAD IS A POKE, NOT A SOURCE OF TRUTH (same rule as lib-inventory):
+# the only thing read off the inbound body is a build id. Status, branch,
+# metadata, application and repository are re-read from the NP API with the
+# org's own credential. A forged or replayed POST can cost one wasted lookup.
+#
+# ONE ITEM PER RAW FINDING, KEYED ACROSS BUILDS. The idempotency key is
+# `metadata.finding_key = "<owner/repo>@<branch>|<finding.id>"` — the finding
+# id comes normalized from CI (e.g. `aqua:GHSA-xxxx:axios@1.7.4`), so the same
+# finding reported by ten builds is ONE item whose `last_build_id` /
+# `seen_builds` move, never ten items. Different branches are different items:
+# they are different PR targets. The lookup is one GET filtered by
+# `metadata.finding_scope` (= "<owner/repo>@<branch>") + `labels.workflow_type`.
+#
+# THE FIX IS GROUPED, THE ITEMS ARE NOT. Every auto-fixable finding (CI decides:
+# `fix.auto_fixable`) is bucketed by the CHANGE that fixes it — all CVEs on the
+# same package with the same fixed version share `fix_group` and get ONE pull
+# request; a code_change finding is its own group. wf-a2 links the PR back to
+# every item in the group.
+#
+# THE LISTENER IS ALSO THE CLOSER. A finding that a later successful build on
+# the same branch no longer reports is closed here, with a comment — that is
+# exactly the signal a merged fix PR produces. Closing is refused when the
+# report is truncated or a gate did not run (absence is not proven). Closed
+# items cannot be reopened (platform rule); a finding that comes back gets a
+# fresh item on the next build, which is the house pattern.
+#
+# METADATA-ORDERING DEFENSE. If CI flips `status` before it writes the
+# findings, the first delivery sees a successful build with no findings. The
+# guard then parks once (`metadata_grace_seconds`, a Temporal timer — no
+# compute) and re-reads; a second miss exits `metadata_not_ready`. Any later
+# PATCH on the build re-fires the channel anyway, and the find-then-create
+# diff makes that second execution converge instead of duplicating.
+#
+# Per-org configuration (config entries on folder /autofix):
+#   NP_API_KEY             (secret) org credential for every NP call
+#   NP_ORGANIZATION_ID     (var)    numeric org id — search scope for the item lookup
+#   AUTOFIX_BRANCHES       (var)    comma-separated branches to watch, `*` wildcards ok ("main,master,release/*")
+#   AUTOFIX_CATEGORY_SLUG  (var)    action item category slug (setup/02-category.sh prints it)
+# wf-a2 additionally needs GITHUB_TOKEN; it is read there.
+
+id: autofix_on_build
+key: autofix-on-build
+name: "Autofix — On Build"
+description: >
+  Listens to build updates (NP audit channel → webhook), keeps only successful
+  builds on watched branches, and reconciles the build's normalized findings
+  against governance action items: one item per finding keyed across builds,
+  closes findings that vanished, and dispatches the fixer once per fix group.
+path: "/autofix"
+semantic_version: 1.0.0
+
+variables:
+  # Runtime constants live here on purpose: an input `default:` is NOT applied
+  # at runtime, `initialValue` is.
+  metadata_grace_seconds: { initialValue: 120 }
+  max_metadata_waits: { initialValue: 1 }
+  metadata_wait_attempts: { initialValue: 0 }
+  find_limit: { initialValue: 200 }
+  max_items_per_build: { initialValue: 200 }
+  max_fix_groups_per_build: { initialValue: 10 }
+  max_fix_attempts: { initialValue: 3 }
+  stale_fix_hours: { initialValue: 2 }
+  result: { initialValue: { status: "unknown" } }
+
+steps:
+  - id: on_build
+    type: trigger
+    plugin_type: webhook
+    name: "Build Updated (NP audit)"
+    config:
+      path: "/autofix/build"
+      method: POST
+      mode: start
+
+  - id: extract_build
+    type: module
+    plugin_type: code-exec
+    name: "Read The Build Id"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      body: "${{ steps.on_build.outputs.body }}"
+    config:
+      code: |
+        // The ONLY thing taken from the payload. NP's audit shape is
+        // `{ source: 'audit', notification: { entity, entity_id, method, … } }`;
+        // flat forms are accepted so a manual curl can drive this too.
+        const body = inputs.body || {};
+        const n = body.notification || body;
+        const buildId = String(n.entity_id || n.build_id || body.build_id || body.id || '').trim();
+        const entity = String(n.entity || 'build');
+        if (!buildId || !/^[0-9]+$/.test(buildId)) {
+          // Loud, not silent: a channel wired to the wrong entity would
+          // otherwise look like a workflow that runs and finds nothing.
+          throw new Error(
+            `no numeric build id in the notification (entity=${entity}) — check the notification channel filters`,
+          );
+        }
+        log.info(`build ${buildId} updated`, { entity, method: n.method || '' });
+        return { build_id: buildId };
+
+  # ── Re-read the truth from our own side ──────────────────────────────────
+  # `join_strategy: any`: this is the re-entry target of the metadata wait
+  # loop (wait_for_metadata → fetch_build). Only the back-edge TARGET declares
+  # it — the proven loop topology from the progressive deploy.
+  # Explicit `inputs:` on every np-api-call: a step without an inputs map
+  # inherits its predecessor's raw output, and an upstream np-api-call's
+  # RESPONSE headers would clobber this request's headers.
+  - id: fetch_build
+    type: module
+    plugin_type: np-api-call
+    name: "Build (NP API)"
+    join_strategy: any
+    inputs:
+      method: GET
+      path: "/build/${{ steps.extract_build.outputs.build_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/build"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+
+  # Build metadata may be embedded on the build entity (`build.metadata.
+  # quality_metrics`) or live as metadata instances (`GET /metadata/build/{id}`
+  # → `{ quality_metrics: {…}, … }`). Read both; the guard prefers the embedded
+  # one. `failOnHttpError: false`: a 404 here is normal for a build without
+  # metadata instances and must not abort the execution.
+  - id: fetch_metadata
+    type: module
+    plugin_type: np-api-call
+    name: "Build Metadata Instances (NP API)"
+    inputs:
+      method: GET
+      path: "/metadata/build/${{ steps.extract_build.outputs.build_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: false
+      path: "/metadata/build"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+
+  - id: fetch_application
+    type: module
+    plugin_type: np-api-call
+    name: "Application (NP API)"
+    inputs:
+      method: GET
+      path: "/application/${{ steps.fetch_build.outputs.body.application_id }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/application"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+
+  # ── Guard: successful? watched branch? findings present? ─────────────────
+  - id: guard
+    type: module
+    plugin_type: code-exec
+    name: "Successful? Watched Branch? Findings Present?"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      build: "${{ steps.fetch_build.outputs.body }}"
+      metadata_response: "${{ steps.fetch_metadata.outputs }}"
+      application: "${{ steps.fetch_application.outputs.body }}"
+      build_id: "${{ steps.extract_build.outputs.build_id }}"
+      branches: "${{ vars.AUTOFIX_BRANCHES }}"
+      org_id: "${{ vars.NP_ORGANIZATION_ID }}"
+      grace_seconds: "${{ variables.metadata_grace_seconds }}"
+      max_waits: "${{ variables.max_metadata_waits }}"
+      wait_attempts: "${{ variables.metadata_wait_attempts }}"
+    config:
+      code: |
+        const build = inputs.build || {};
+        const app = inputs.application || {};
+        const metaResp = inputs.metadata_response || {};
+        const buildId = String(build.id || inputs.build_id || '');
+        const graceSeconds = Number(inputs.grace_seconds) || 0;
+        const maxWaits = Number(inputs.max_waits) || 0;
+        const waitAttempts = Number(inputs.wait_attempts) || 0;
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+
+        const skip = (reason, extra) => {
+          log.info(`build ${buildId} skipped: ${reason}`, extra || {});
+          return Object.assign({ verdict: 'skip', reason, build_id: buildId, context: null }, extra || {});
+        };
+
+        // 1. Only SUCCESSFUL builds. Every PATCH on a build reaches this
+        //    webhook (status transitions, metadata writes); the rest exit here.
+        const status = str(build.status).toLowerCase();
+        if (status !== 'successful') return skip('build_not_successful', { status });
+
+        // 2. Findings: embedded on the build, else from the metadata instances.
+        const embedded = build.metadata && build.metadata.quality_metrics;
+        const apiOk = metaResp && Number(metaResp.status) > 0 && Number(metaResp.status) < 400 && metaResp.body;
+        const apiBody = apiOk ? metaResp.body : null;
+        const fromApi = apiBody && (apiBody.quality_metrics || (apiBody.data && apiBody.data.quality_metrics));
+        const qm = embedded || fromApi || null;
+        const source = (qm && qm.source) || {};
+
+        // 3. Only WATCHED branches. `AUTOFIX_BRANCHES` is comma-separated;
+        //    `*` is a wildcard ("release/*"); a lone `*` watches everything.
+        //    Empty or unresolved → the default trunk names.
+        const branch = str(build.branch || source.branch).trim();
+        if (!branch) return skip('branch_unknown');
+        const rawBranches = str(inputs.branches).trim();
+        const configured = rawBranches && !rawBranches.includes('${{') ? rawBranches : 'main,master';
+        const patterns = configured.split(',').map((s) => s.trim()).filter(Boolean);
+        const matches = patterns.some((p) => {
+          if (p === '*') return true;
+          if (!p.includes('*')) return p === branch;
+          const re = new RegExp('^' + p.split('*').map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
+          return re.test(branch);
+        });
+        if (!matches) return skip('branch_not_watched', { branch, watched: patterns });
+
+        // 4. Findings present? If CI wrote `status` before the findings, park
+        //    once and re-read (the wait loop); a second miss exits.
+        if (!qm || !Array.isArray(qm.findings)) {
+          if (graceSeconds > 0 && waitAttempts < maxWaits) {
+            log.info(`build ${buildId}: successful but no quality_metrics.findings yet — waiting ${graceSeconds}s`);
+            return { verdict: 'wait', reason: 'metadata_not_ready', build_id: buildId, branch, context: null };
+          }
+          return skip('metadata_not_ready', { branch, waited: waitAttempts });
+        }
+
+        // 5. Repository: the application's repository_url is the truth; the
+        //    report's `source` is the fallback. Normalized to "owner/repo".
+        const normalizeRepo = (u) => {
+          let s = str(u).trim();
+          if (!s) return '';
+          s = s.replace(/^git@github\.com:/i, '').replace(/^https?:\/\/(www\.)?github\.com\//i, '');
+          s = s.replace(/\.git$/i, '').replace(/\/+$/, '');
+          return /^[^/\s]+\/[^/\s]+$/.test(s) ? s : '';
+        };
+        const repository = normalizeRepo(app.repository_url) || normalizeRepo(source.repository_url) || normalizeRepo(source.repository);
+        if (!repository) return skip('repository_unknown', { branch, repository_url: str(app.repository_url) });
+        const repositoryUrl = 'https://github.com/' + repository;
+
+        const commitSha = str((build.commit && (build.commit.id || build.commit.sha)) || build.commit_sha || source.commit_sha);
+        const summary = qm.findings_summary || {};
+        const returned = Number(summary.returned);
+        const total = Number(summary.total);
+        const truncated = summary.truncated === true || (Number.isFinite(returned) && Number.isFinite(total) && returned < total);
+        const gates = Array.isArray(qm.gates) ? qm.gates : [];
+        // A gate that neither passed nor failed (error/skipped/timeout) did not
+        // scan: its findings' absence proves nothing, so closing is blocked.
+        const unhealthyGates = gates
+          .filter((g) => g && g.result && !['passed', 'failed'].includes(str(g.result).toLowerCase()))
+          .map((g) => str(g.name || g.tool || 'gate'));
+        const applicationNrn = str(app.nrn) || ('organization=' + str(inputs.org_id));
+
+        log.info(`build ${buildId} on ${repository}@${branch}: ${qm.findings.length} findings`, {
+          truncated, unhealthy_gates: unhealthyGates,
+        });
+        return {
+          verdict: 'proceed',
+          reason: null,
+          build_id: buildId,
+          branch,
+          context: {
+            build_id: buildId,
+            application_id: str(build.application_id || app.id),
+            application_name: str(app.name),
+            application_nrn: applicationNrn,
+            repository,
+            repository_url: repositoryUrl,
+            branch,
+            commit_sha: commitSha,
+            finding_scope: repository + '@' + branch,
+            findings: qm.findings,
+            findings_total: Number.isFinite(total) ? total : qm.findings.length,
+            truncated,
+            unhealthy_gates: unhealthyGates,
+            dockerfile: str(source.dockerfile),
+            manifests: Array.isArray(source.manifests) ? source.manifests : [],
+          },
+        };
+
+  - id: route
+    type: decider
+    plugin_type: case
+    name: "Proceed / Wait / Skip"
+    config:
+      expression: "$item.verdict"
+      cases:
+        - { match: "proceed", port: "proceed" }
+        - { match: "wait", port: "wait" }
+      default: "skip"
+
+  # ── Wait branch: park once, then re-read the build ───────────────────────
+  - id: bump_wait
+    type: module
+    plugin_type: set-variable
+    name: "Count The Wait"
+    config:
+      path: metadata_wait_attempts
+      value: "${{ variables.metadata_wait_attempts + 1 }}"
+
+  # A Temporal timer, no compute. `onTimeout: continue` exits via the DEFAULT
+  # port — never route an edge off a module plugin's `timeout` port (the
+  # in-sandbox validator does not know it). A human can nudge it early by
+  # posting the signal.
+  - id: wait_for_metadata
+    type: module
+    plugin_type: signal-wait
+    name: "Park Until The Findings Land"
+    config:
+      signalName: autofix-metadata-nudge
+      correlationKey: "autofix:${{ execution.id }}"
+      timeout: "${{ variables.metadata_grace_seconds }}s"
+      onTimeout: continue
+
+  # ── Skip branch ──────────────────────────────────────────────────────────
+  - id: skip
+    type: module
+    plugin_type: set-variable
+    name: "Result: skipped"
+    inputs:
+      reason: "${{ steps.guard.outputs.reason }}"
+      build_id: "${{ steps.guard.outputs.build_id }}"
+      branch: "${{ steps.guard.outputs.branch }}"
+    config:
+      path: result
+      value:
+        status: "skipped"
+        reason: "${{ inputs.reason }}"
+        build_id: "${{ inputs.build_id }}"
+        branch: "${{ inputs.branch }}"
+
+  # ── Proceed branch ───────────────────────────────────────────────────────
+  # ONE live lookup for the whole repo@branch: every autofix item in scope,
+  # any status (the list endpoint's status filter is not relied upon — the
+  # diff applies the LIVE set client-side, like the runtime-lifecycle scanner).
+  - id: find_open_items
+    type: module
+    plugin_type: np-api-call
+    name: "Autofix Items For This Repo@Branch"
+    inputs:
+      method: GET
+      path: "/governance/action_item"
+      query:
+        nrn: "organization=${{ vars.NP_ORGANIZATION_ID }}"
+        "metadata.finding_scope": "${{ steps.guard.outputs.context.finding_scope }}"
+        "labels.workflow_type": "autofix"
+        limit: "${{ variables.find_limit }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+
+  # ── Diff findings vs live items → request arrays ─────────────────────────
+  # Emits index-aligned request/plan pairs for each write pass. Everything a
+  # downstream np-api-call needs is baked here; the per-item payloads stay
+  # small. PATCH bodies carry the FULL merged metadata: the API replaces
+  # `metadata` wholesale, it does not merge.
+  - id: diff
+    type: module
+    plugin_type: code-exec
+    name: "Diff Findings vs Live Items"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      context: "${{ steps.guard.outputs.context }}"
+      existing: "${{ steps.find_open_items.outputs.body }}"
+      category_slug: "${{ vars.AUTOFIX_CATEGORY_SLUG }}"
+      find_limit: "${{ variables.find_limit }}"
+      max_items: "${{ variables.max_items_per_build }}"
+      max_fix_attempts: "${{ variables.max_fix_attempts }}"
+      stale_fix_hours: "${{ variables.stale_fix_hours }}"
+    config:
+      code: |
+        // "Live" = every ActionItemStatus that is not resolved/rejected/closed.
+        const LIVE = { open: 1, deferred: 1, pending_deferral: 1, pending_verification: 1, pending_rejection: 1 };
+        const SEV = { critical: 0, high: 1, medium: 2, low: 3 };
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const sev = (s) => (SEV[str(s).toLowerCase()] !== undefined ? str(s).toLowerCase() : 'medium');
+        const short = (sha) => str(sha).slice(0, 7);
+        const link = (text, url) => (url ? `[${text}](${url})` : text);
+
+        const ctx = inputs.context || {};
+        const findings = Array.isArray(ctx.findings) ? ctx.findings : [];
+        const existingBody = inputs.existing || {};
+        const existingRows = Array.isArray(existingBody.results) ? existingBody.results : [];
+        const findLimit = Number(inputs.find_limit) || 200;
+        const maxItems = Number(inputs.max_items) || 200;
+        const maxAttempts = Number(inputs.max_fix_attempts) || 3;
+        const staleMs = (Number(inputs.stale_fix_hours) || 2) * 3600000;
+        const now = new Date().toISOString();
+        const nowMs = Date.parse(now);
+        const buildId = str(ctx.build_id);
+        const categorySlug = str(inputs.category_slug);
+
+        // Live items by finding_key. Duplicates (should never happen) are
+        // counted and the first one wins; the rest are left alone.
+        const liveByKey = {};
+        let liveCount = 0;
+        let duplicateLive = 0;
+        for (const it of existingRows) {
+          if (!it || LIVE[it.status] !== 1) continue;
+          const key = it.metadata && str(it.metadata.finding_key);
+          if (!key) continue;
+          liveCount++;
+          if (liveByKey[key]) { duplicateLive++; continue; }
+          liveByKey[key] = it;
+        }
+        // The lookup is one page; at the cap we may not be seeing every live
+        // item, so closing (which needs the complete set) is blocked.
+        const findPossiblyTruncated = existingRows.length >= findLimit;
+
+        // The change that fixes a finding. Same package + same fixed version →
+        // same PR, whatever the CVE id; anything else is its own PR.
+        const fixGroupKey = (f, fixType) => {
+          const p = f.package || {};
+          if (fixType === 'upgrade_package' && p.name) {
+            return `upgrade:${str(p.ecosystem || 'unknown')}:${p.name}:${str(p.fixed_version || 'latest')}`;
+          }
+          return `${fixType}:${f.id}`;
+        };
+
+        // Re-dispatch policy for a finding that already has an item.
+        const decideFix = (autoFixable, em) => {
+          if (!autoFixable) return 'manual';
+          const st = str(em.fix_status || 'pending');
+          const attempts = Number(em.fix_attempts) || 0;
+          if (st === 'pr_opened') return 'skip_pr_open';
+          if (st === 'in_progress' || st === 'queued') {
+            const started = Date.parse(str(em.fix_started_at)) || 0;
+            if (nowMs - started < staleMs) return 'skip_in_progress';
+            return attempts < maxAttempts ? 'dispatch' : 'skip_exhausted';
+          }
+          if (st === 'failed' || st === 'already_fixed' || st === 'no_change') {
+            return attempts < maxAttempts ? 'dispatch' : 'skip_exhausted';
+          }
+          return 'dispatch';
+        };
+
+        const describe = (f, severity, autoFixable, fixType) => {
+          const rule = f.rule || {};
+          const p = f.package || {};
+          const loc = f.location || {};
+          const fix = f.fix || {};
+          const risk = f.risk || {};
+          const lines = [];
+          lines.push(`**${str(f.title || f.id)}**`, '');
+          lines.push(`- **Tool**: ${str(f.tool || '—')} · **Category**: ${str(f.category || '—')} · **Severity**: ${severity}`);
+          if (rule.id) lines.push(`- **Rule**: ${link(str(rule.id), rule.url)}${rule.cwe ? ' · ' + str(rule.cwe) : ''}`);
+          if (p.name) {
+            lines.push(`- **Package**: \`${p.name}@${str(p.version || '?')}\` (${str(p.ecosystem || '?')}${p.direct === true ? ', direct' : p.direct === false ? ', transitive' : ''})` +
+              (p.fixed_version ? ` → fixed in \`${p.fixed_version}\`` : '') + (p.license ? ` · license ${p.license}` : ''));
+          }
+          if (loc.path) lines.push(`- **Location**: \`${loc.path}${loc.line ? ':' + loc.line : ''}\`${loc.type ? ' (' + str(loc.type) + ')' : ''}`);
+          if (loc.source && loc.source.path) lines.push(`- **Source**: \`${loc.source.path}:${str(loc.source.line)}\` · **Sink**: \`${str((loc.sink || {}).path)}:${str((loc.sink || {}).line)}\``);
+          if (risk.cvss_score !== undefined || risk.epss_score !== undefined || risk.exploit_available !== undefined) {
+            lines.push(`- **Risk**: ${risk.cvss_score !== undefined ? 'CVSS ' + risk.cvss_score : ''}${risk.epss_score !== undefined ? ' · EPSS ' + risk.epss_score : ''}${risk.exploit_available !== undefined ? ' · exploit ' + (risk.exploit_available ? 'available' : 'not known') : ''}`);
+          }
+          if (f.message) lines.push(`- **Message**: ${str(f.message)}`);
+          if (f.url) lines.push(`- **Report**: ${link('open in ' + str(f.tool || 'scanner'), f.url)}`);
+          if (loc.snippet) lines.push('', '```', str(loc.snippet), '```');
+          lines.push('');
+          if (fix.recommendation) lines.push(`**Recommended fix**: ${str(fix.recommendation)}${fix.command ? ' (`' + str(fix.command) + '`)' : ''}`, '');
+          if (autoFixable) {
+            lines.push(`**Autofix**: auto-fixable (${fixType}). A pull request against \`${ctx.branch}\` is opened automatically; its link is posted here as a comment when ready.`);
+          } else {
+            lines.push('**Autofix**: manual — no automatic fix is attempted for this finding.');
+          }
+          lines.push('', `Detected in build ${buildId} on \`${ctx.repository}@${ctx.branch}\`${ctx.commit_sha ? ' (commit ' + short(ctx.commit_sha) + ')' : ''}. ` +
+            'Closed automatically when a later successful build on this branch no longer reports it.');
+          return lines.join('\n');
+        };
+
+        const compactFinding = (f) => ({
+          id: f.id, tool: f.tool, category: f.category, severity: f.severity, title: f.title,
+          rule: f.rule || null, package: f.package || null, location: f.location || null,
+          fix: f.fix || null, risk: f.risk || null, message: f.message || null, url: f.url || null,
+        });
+
+        const seenKeys = {};
+        const createRequests = [];
+        const createPlan = [];
+        const updateRequests = [];
+        const updatePlan = [];
+        const counts = {
+          findings: findings.length, invalid: 0, duplicate_findings: 0, live_items: liveCount,
+          duplicate_live_items: duplicateLive, manual: 0, fix_dispatch_candidates: 0,
+          fix_skipped_pr_open: 0, fix_skipped_in_progress: 0, fix_skipped_exhausted: 0, create_truncated: 0,
+        };
+
+        for (const f of findings) {
+          if (!f || !f.id) { counts.invalid++; continue; }
+          const key = `${ctx.finding_scope}|${f.id}`;
+          if (seenKeys[key]) { counts.duplicate_findings++; continue; }
+          seenKeys[key] = 1;
+
+          const fix = f.fix || {};
+          const autoFixable = fix.available === true && fix.auto_fixable === true;
+          const fixType = str(fix.type || (autoFixable ? 'code_change' : 'manual'));
+          const fixGroup = autoFixable ? fixGroupKey(f, fixType) : '';
+          const severity = sev(f.severity);
+          const p = f.package || {};
+          const rule = f.rule || {};
+          const loc = f.location || {};
+
+          // Filterable keys are STRINGS: the NP metadata filter only matches strings.
+          const base = {
+            finding_key: key,
+            finding_scope: str(ctx.finding_scope),
+            finding_id: str(f.id),
+            tool: str(f.tool),
+            category: str(f.category),
+            severity,
+            rule_id: str(rule.id),
+            rule_url: str(rule.url),
+            cwe: str(rule.cwe),
+            package_name: str(p.name),
+            package_ecosystem: str(p.ecosystem),
+            package_version: str(p.version),
+            fixed_version: str(p.fixed_version),
+            location_path: str(loc.path),
+            location_line: str(loc.line),
+            repository: str(ctx.repository),
+            repository_url: str(ctx.repository_url),
+            branch: str(ctx.branch),
+            application_id: str(ctx.application_id),
+            report_url: str(f.url),
+            auto_fixable: autoFixable,
+            fix_type: fixType,
+            fix_group: fixGroup,
+          };
+
+          const existing = liveByKey[key];
+          if (existing) {
+            const em = existing.metadata || {};
+            const ids = Array.isArray(em.seen_build_ids) ? em.seen_build_ids.map(str) : [];
+            const alreadySeen = ids.includes(buildId);
+            if (!alreadySeen) ids.push(buildId);
+            const merged = Object.assign({}, em, base, {
+              first_build_id: str(em.first_build_id || buildId),
+              first_seen_at: str(em.first_seen_at || now),
+              last_build_id: buildId,
+              last_commit_sha: str(ctx.commit_sha),
+              last_seen_at: now,
+              seen_builds: (Number(em.seen_builds) || 0) + (alreadySeen ? 0 : 1),
+              seen_build_ids: ids.slice(-20),
+              fix_attempts: Number(em.fix_attempts) || 0,
+            });
+            // A finding that became fixable is queued; one that stopped being
+            // fixable is marked manual unless a PR is already out for it.
+            const st = str(em.fix_status);
+            if (autoFixable && (st === '' || st === 'manual')) merged.fix_status = 'pending';
+            if (!autoFixable && st !== 'pr_opened') merged.fix_status = 'manual';
+            if (!merged.fix_status) merged.fix_status = autoFixable ? 'pending' : 'manual';
+
+            const body = { metadata: merged, description: describe(f, severity, autoFixable, fixType) };
+            if (SEV[severity] < (SEV[str(existing.priority)] !== undefined ? SEV[str(existing.priority)] : 9)) body.priority = severity;
+            updateRequests.push({ path: `/governance/action_item/${existing.id}`, method: 'PATCH', body });
+            const decision = decideFix(autoFixable, em);
+            updatePlan.push({ finding_key: key, item_id: str(existing.id), finding: compactFinding(f), fix_group: fixGroup, fix: decision, severity });
+            if (decision === 'manual') counts.manual++;
+            else if (decision === 'dispatch') counts.fix_dispatch_candidates++;
+            else if (decision === 'skip_pr_open') counts.fix_skipped_pr_open++;
+            else if (decision === 'skip_in_progress') counts.fix_skipped_in_progress++;
+            else if (decision === 'skip_exhausted') counts.fix_skipped_exhausted++;
+            continue;
+          }
+
+          const meta = Object.assign({}, base, {
+            first_build_id: buildId,
+            first_seen_at: now,
+            last_build_id: buildId,
+            last_commit_sha: str(ctx.commit_sha),
+            last_seen_at: now,
+            seen_builds: 1,
+            seen_build_ids: [buildId],
+            fix_status: autoFixable ? 'pending' : 'manual',
+            fix_attempts: 0,
+          });
+          createRequests.push({
+            path: '/governance/action_item',
+            method: 'POST',
+            body: {
+              nrn: str(ctx.application_nrn),
+              title: `[${severity.toUpperCase()}] ${str(f.title || f.id)}`.slice(0, 140),
+              description: describe(f, severity, autoFixable, fixType),
+              category_slug: categorySlug,
+              priority: severity,
+              created_by: 'agent:autofix',
+              labels: {
+                workflow_type: 'autofix',
+                finding_category: str(f.category || 'unknown'),
+                tool: str(f.tool || 'unknown'),
+                severity,
+                auto_fixable: autoFixable ? 'true' : 'false',
+              },
+              metadata: meta,
+            },
+          });
+          createPlan.push({ finding_key: key, finding: compactFinding(f), fix_group: fixGroup, fix: autoFixable ? 'dispatch' : 'manual', severity });
+          if (autoFixable) counts.fix_dispatch_candidates++; else counts.manual++;
+        }
+
+        // Fan-out safety cap on the CREATE set (kept index-aligned).
+        if (createRequests.length > maxItems) {
+          counts.create_truncated = createRequests.length - maxItems;
+          log.warn('diff: create set exceeds the fan-out cap — truncating', { planned: createRequests.length, cap: maxItems });
+          createRequests.length = maxItems;
+          createPlan.length = maxItems;
+        }
+
+        // ── Closes: live items whose finding is gone from this build ─────────
+        // Absence must be PROVEN: a truncated report, a gate that did not
+        // run, or a possibly-truncated item lookup all block closing.
+        let closingBlocked = null;
+        if (ctx.truncated) closingBlocked = 'findings_truncated';
+        else if (Array.isArray(ctx.unhealthy_gates) && ctx.unhealthy_gates.length) closingBlocked = 'gate_not_run:' + ctx.unhealthy_gates.join(',');
+        else if (findPossiblyTruncated) closingBlocked = 'item_lookup_truncated';
+        const closeRequests = [];
+        const closePlan = [];
+        if (!closingBlocked) {
+          for (const key of Object.keys(liveByKey)) {
+            if (seenKeys[key]) continue;
+            const it = liveByKey[key];
+            const em = it.metadata || {};
+            closeRequests.push({ path: `/governance/action_item/${it.id}/close`, method: 'POST', body: { actor: 'agent:autofix' } });
+            closePlan.push({
+              item_id: str(it.id),
+              finding_key: key,
+              comment: `✅ Finding \`${str(em.finding_id || key)}\` is no longer reported by build ${buildId} on \`${ctx.repository}@${ctx.branch}\`` +
+                (ctx.commit_sha ? ` (commit ${short(ctx.commit_sha)})` : '') + '. Closed automatically by autofix.' +
+                (em.pr_url ? ` Fix PR: ${str(em.pr_url)}` : ''),
+            });
+          }
+        } else if (Object.keys(liveByKey).some((k) => !seenKeys[k])) {
+          log.warn(`diff: ${closingBlocked} — not closing vanished findings this run`);
+        }
+
+        log.info('diff', { creates: createRequests.length, updates: updateRequests.length, closes: closeRequests.length, counts });
+        return {
+          create_requests: createRequests,
+          create_plan: createPlan,
+          update_requests: updateRequests,
+          update_plan: updatePlan,
+          close_requests: closeRequests,
+          close_plan: closePlan,
+          closing_blocked_reason: closingBlocked,
+          counts,
+        };
+
+  # ── Create one item per NEW finding ──────────────────────────────────────
+  # `spreadItem` merges each request's {path, method, body} onto the per-
+  # iteration inputs; inputs override config, so `path` here is only the
+  # placeholder validateConfig() needs. NO retry_policy: POST is not
+  # idempotent — a lost-ack retry would duplicate the item, whereas a missed
+  # create self-heals on the next build (the lookup no longer sees it).
+  # A failed iteration is absorbed as a `{}` slot at the SAME index; zip
+  # detects it by the missing `body.id`.
+  - id: create_item
+    type: module
+    plugin_type: np-api-call
+    name: "Create Action Item (per new finding)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    forEach:
+      expression: "${{ steps.diff.outputs.create_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── Refresh every KNOWN finding's item (idempotent PATCH, retried) ───────
+  - id: update_item
+    type: module
+    plugin_type: np-api-call
+    name: "Refresh Action Item (per known finding)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.diff.outputs.update_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── Close every item whose finding vanished (close first, comment second) ─
+  # No retry: a close that lost its ack and is retried answers 400 (already
+  # closed) — harmless, but noisy; a missed close is retried by the next build.
+  - id: close_item
+    type: module
+    plugin_type: np-api-call
+    name: "Close Action Item (per vanished finding)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    forEach:
+      expression: "${{ steps.diff.outputs.close_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── Zip results ← plans (index-aligned), build the fix groups ────────────
+  - id: zip
+    type: module
+    plugin_type: code-exec
+    name: "Zip Results → Ids, Comments, Fix Groups"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      context: "${{ steps.guard.outputs.context }}"
+      create_plan: "${{ steps.diff.outputs.create_plan }}"
+      creates: "${{ steps.create_item.outputs.items }}"
+      update_plan: "${{ steps.diff.outputs.update_plan }}"
+      updates: "${{ steps.update_item.outputs.items }}"
+      close_plan: "${{ steps.diff.outputs.close_plan }}"
+      closes: "${{ steps.close_item.outputs.items }}"
+      max_fix_groups: "${{ variables.max_fix_groups_per_build }}"
+    config:
+      code: |
+        const SEV = { critical: 0, high: 1, medium: 2, low: 3 };
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const ctx = inputs.context || {};
+        const createPlan = inputs.create_plan || [];
+        const creates = inputs.creates || [];
+        const updatePlan = inputs.update_plan || [];
+        const updates = inputs.updates || [];
+        const closePlan = inputs.close_plan || [];
+        const closes = inputs.closes || [];
+        const maxGroups = Number(inputs.max_fix_groups) || 10;
+        const ok2xx = (r) => r && r.status && Number(r.status) < 400;
+
+        let created = 0, create_failed = 0, updated = 0, update_failed = 0, closed = 0, close_failed = 0;
+        const fixable = [];
+
+        // A successful create is `{status, body, headers}` with the new id in
+        // body.id; a failure is an absorbed `{}` slot (POSTs are not retried).
+        for (let i = 0; i < createPlan.length; i++) {
+          const cr = creates[i];
+          const id = cr && cr.body && cr.body.id;
+          if (!id) { create_failed++; continue; }
+          created++;
+          const p = createPlan[i];
+          if (p.fix === 'dispatch') fixable.push({ finding_key: p.finding_key, action_item_id: str(id), finding: p.finding, fix_group: p.fix_group, severity: p.severity });
+        }
+        // The item exists whether or not its refresh landed — a failed PATCH
+        // must not block the fix.
+        for (let i = 0; i < updatePlan.length; i++) {
+          if (ok2xx(updates[i])) updated++; else update_failed++;
+          const p = updatePlan[i];
+          if (p.fix === 'dispatch') fixable.push({ finding_key: p.finding_key, action_item_id: p.item_id, finding: p.finding, fix_group: p.fix_group, severity: p.severity });
+        }
+        // Comment ONLY on items that actually closed (2xx).
+        const commentRequests = [];
+        for (let i = 0; i < closePlan.length; i++) {
+          if (!ok2xx(closes[i])) { close_failed++; continue; }
+          closed++;
+          commentRequests.push({
+            path: `/governance/action_item/${closePlan[i].item_id}/comments`,
+            method: 'POST',
+            body: { author: 'agent:autofix', content: closePlan[i].comment },
+          });
+        }
+
+        // Group fixable findings by the change that fixes them.
+        const groups = {};
+        for (const c of fixable) {
+          const g = groups[c.fix_group] || (groups[c.fix_group] = {
+            group_key: c.fix_group,
+            fix_type: str((c.finding.fix || {}).type || 'code_change'),
+            repository: str(ctx.repository),
+            repository_url: str(ctx.repository_url),
+            branch: str(ctx.branch),
+            commit_sha: str(ctx.commit_sha),
+            build_id: str(ctx.build_id),
+            application_id: str(ctx.application_id),
+            application_nrn: str(ctx.application_nrn),
+            finding_scope: str(ctx.finding_scope),
+            dockerfile: str(ctx.dockerfile),
+            manifests: Array.isArray(ctx.manifests) ? ctx.manifests : [],
+            severity_rank: 9,
+            findings: [],
+          });
+          g.findings.push({ finding_key: c.finding_key, action_item_id: c.action_item_id, finding: c.finding });
+          const r = SEV[c.severity] !== undefined ? SEV[c.severity] : 2;
+          if (r < g.severity_rank) g.severity_rank = r;
+        }
+        // Worst severity first; the per-build cap keeps agent spend bounded —
+        // what is cut here is picked up by the next build (items stay pending).
+        let list = Object.values(groups).sort((a, b) => a.severity_rank - b.severity_rank || a.group_key.localeCompare(b.group_key));
+        const fixGroupsTotal = list.length;
+        if (list.length > maxGroups) {
+          log.warn('zip: fix groups exceed the per-build cap — deferring the rest to the next build', { total: list.length, cap: maxGroups });
+          list = list.slice(0, maxGroups);
+        }
+        const fixDispatch = list.map((g) => { const { severity_rank, ...rest } = g; return { fix_group: rest }; });
+
+        return {
+          comment_requests: commentRequests,
+          fix_dispatch: fixDispatch,
+          created, create_failed, updated, update_failed, closed, close_failed,
+          fix_groups_total: fixGroupsTotal,
+          fix_groups_dispatched: fixDispatch.length,
+          fix_findings_dispatched: fixDispatch.reduce((s, d) => s + d.fix_group.findings.length, 0),
+        };
+
+  - id: close_comment
+    type: module
+    plugin_type: np-api-call
+    name: "Comment on Closed Item (per closed)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    forEach:
+      expression: "${{ steps.zip.outputs.comment_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── One fixer execution per fix group, fire-and-forget ───────────────────
+  # `spreadItem` turns each `{ fix_group }` into the child's `fix_group`
+  # input. Not awaited: a fix (clone, edit, verify, push, PR) takes minutes;
+  # the fixer reports back on the items themselves.
+  - id: dispatch_fix
+    type: module
+    plugin_type: sub-workflow
+    name: "Dispatch Fixer (per fix group)"
+    forEach:
+      expression: "${{ steps.zip.outputs.fix_dispatch }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+    config:
+      # Client key of "Autofix — Fix"; setup/03-upload-workflows.mjs patches
+      # it to the per-org wf_ id on upload.
+      workflowId: autofix-fix
+      alias: live
+      waitForCompletion: false
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Build Summary"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      context: "${{ steps.guard.outputs.context }}"
+      counts: "${{ steps.diff.outputs.counts }}"
+      closing_blocked_reason: "${{ steps.diff.outputs.closing_blocked_reason }}"
+      zip: "${{ steps.zip.outputs }}"
+    config:
+      code: |
+        const ctx = inputs.context || {};
+        const c = inputs.counts || {};
+        const z = inputs.zip || {};
+        const summary = {
+          status: 'processed',
+          build_id: ctx.build_id,
+          repository: ctx.repository,
+          branch: ctx.branch,
+          commit_sha: ctx.commit_sha,
+          findings: c.findings || 0,
+          findings_truncated: ctx.truncated === true,
+          created: z.created || 0,
+          create_failed: z.create_failed || 0,
+          updated: z.updated || 0,
+          update_failed: z.update_failed || 0,
+          closed: z.closed || 0,
+          close_failed: z.close_failed || 0,
+          closing_blocked_reason: inputs.closing_blocked_reason || null,
+          manual: c.manual || 0,
+          fix_groups_total: z.fix_groups_total || 0,
+          fix_groups_dispatched: z.fix_groups_dispatched || 0,
+          fix_findings_dispatched: z.fix_findings_dispatched || 0,
+          fix_skipped_pr_open: c.fix_skipped_pr_open || 0,
+          fix_skipped_in_progress: c.fix_skipped_in_progress || 0,
+          fix_skipped_exhausted: c.fix_skipped_exhausted || 0,
+          create_truncated: c.create_truncated || 0,
+        };
+        log.info('build processed', summary);
+        return summary;
+
+  - id: stash_summary
+    type: module
+    plugin_type: set-variable
+    name: "Result: processed"
+    inputs:
+      s: "${{ steps.summary.outputs }}"
+    config:
+      path: result
+      value: "${{ inputs.s }}"
+
+connections:
+  - { id: c1,  from: on_build,          to: extract_build }
+  - { id: c2,  from: extract_build,     to: fetch_build }
+  - { id: c3,  from: fetch_build,       to: fetch_metadata }
+  - { id: c4,  from: fetch_metadata,    to: fetch_application }
+  - { id: c5,  from: fetch_application, to: guard }
+  - { id: c6,  from: guard,             to: route }
+  # Wait cycle: count → park → re-read the build (fetch_build joins with `any`).
+  - { id: c7,  from: route,             to: bump_wait,         source_port: "wait" }
+  - { id: c8,  from: bump_wait,         to: wait_for_metadata }
+  - { id: c9,  from: wait_for_metadata, to: fetch_build }
+  # Skip
+  - { id: c10, from: route,             to: skip,              source_port: "skip" }
+  # Proceed
+  - { id: c11, from: route,             to: find_open_items,   source_port: "proceed" }
+  - { id: c12, from: find_open_items,   to: diff }
+  - { id: c13, from: diff,              to: create_item }
+  - { id: c14, from: create_item,       to: update_item }
+  - { id: c15, from: update_item,       to: close_item }
+  - { id: c16, from: close_item,        to: zip }
+  - { id: c17, from: zip,               to: close_comment }
+  - { id: c18, from: close_comment,     to: dispatch_fix }
+  - { id: c19, from: dispatch_fix,      to: summary }
+  - { id: c20, from: summary,           to: stash_summary }
+
+outputs:
+  status: "${{ variables.result.status }}"
+  reason: "${{ variables.result.reason }}"
+  build_id: "${{ variables.result.build_id }}"
+  repository: "${{ variables.result.repository }}"
+  branch: "${{ variables.result.branch }}"
+  findings: "${{ variables.result.findings }}"
+  created: "${{ variables.result.created }}"
+  updated: "${{ variables.result.updated }}"
+  closed: "${{ variables.result.closed }}"
+  closing_blocked_reason: "${{ variables.result.closing_blocked_reason }}"
+  fix_groups_dispatched: "${{ variables.result.fix_groups_dispatched }}"
+  fix_findings_dispatched: "${{ variables.result.fix_findings_dispatched }}"

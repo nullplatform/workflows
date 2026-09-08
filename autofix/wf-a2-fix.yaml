@@ -1,0 +1,675 @@
+# Autofix — fix one group → one pull request.
+#
+# Invoked by wf-a1 once per FIX GROUP (fire-and-forget): the set of findings
+# that one change fixes — all CVEs on a package sharing a fixed version, or a
+# single code_change finding. A Claude Code agent in an E2B sandbox clones the
+# repository, applies the minimal fix, verifies cheaply, pushes a
+# deterministically named branch and opens the PR. Every item in the group is
+# stamped with the outcome and gets a comment with the PR link (or the reason
+# it could not be fixed).
+#
+#   start (manual / sub-workflow) ── inputs.fix_group
+#     └─ plan ─────────────── pure: branch name, PR title, agent brief, GETs
+#          └─ fetch_items ─── np-api-call GET item (per finding)   ← fresh metadata
+#               └─ mark_plan ── pure: merged metadata → fix_status=in_progress
+#                    └─ mark_in_progress ── np-api-call PATCH (per item)
+#                         └─ agent ── claude-code-agent (git + gh, E2B)
+#                              ├─ record ── pure: outcome → PATCH + comment bodies
+#                              │    └─ update_items → comment_items → stash_result
+#                              └─ (fallback_step) agent_failed ── pure
+#                                   └─ fail_update_items → fail_comment_items → stash_failed
+#
+# IDEMPOTENCY IS THE BRANCH NAME. `autofix/<slug>-<hash(group_key)>` is a pure
+# function of the fix group, so a duplicate dispatch (the same build delivered
+# twice, a stale in_progress retried) finds the branch/PR already there and
+# reports `already_open` instead of opening a second PR.
+#
+# METADATA IS FETCH-MERGE-WRITE. The governance API replaces `metadata`
+# wholesale on PATCH, so every write here starts from the item's CURRENT
+# metadata (fetched at the top of this run) and adds the fix_* fields. An item
+# whose GET failed is never patched blind — it only gets the comment.
+#
+# THE AGENT CANNOT INVENT A PR. It may report `pr_opened` only with the URL the
+# GitHub API returned; `record` treats a pr_opened without a URL as a failure.
+#
+# Per-org configuration (config entries on folder /autofix):
+#   NP_API_KEY    (secret) org credential for the item reads/writes
+#   GITHUB_TOKEN  (secret) GitHub token with contents:write + pull_requests:write on the repositories in scope
+
+id: autofix_fix
+key: autofix-fix
+name: "Autofix — Fix"
+description: >
+  Fixes one group of findings in one pull request: a Claude Code agent clones
+  the repository, applies the minimal fix, verifies, pushes a deterministic
+  branch and opens the PR; every action item in the group is stamped with the
+  outcome and commented with the PR link. Normally dispatched per fix group by
+  Autofix — On Build.
+path: "/autofix"
+semantic_version: 1.0.0
+
+inputs:
+  fix_group:
+    type: object
+    required: true
+    description: >
+      One fix group: {group_key, fix_type, repository ("owner/repo"), repository_url,
+      branch, commit_sha, build_id, application_id, application_nrn, finding_scope,
+      dockerfile, manifests[], findings: [{finding_key, action_item_id, finding}]}
+
+variables:
+  result: { initialValue: { status: "unknown" } }
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Start"
+    config:
+      description: "Fixes one group of findings in one PR (normally dispatched by Autofix — On Build)."
+      inputs:
+        fix_group:
+          type: object
+          required: true
+          description: "Fix group object (see workflow description)"
+
+  # ── Plan: branch name, PR title, the agent's brief, the item GETs ────────
+  - id: plan
+    type: module
+    plugin_type: code-exec
+    name: "Plan The Fix"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      fix_group: "${{ workflow.inputs.fix_group }}"
+    config:
+      code: |
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const g = inputs.fix_group || {};
+        const findings = Array.isArray(g.findings) ? g.findings.filter((x) => x && x.finding && x.finding.id) : [];
+        if (!g.group_key || !g.repository || !g.branch || findings.length === 0) {
+          // User-actionable, non-retryable: a malformed dispatch must fail
+          // loudly once, not poison-pill the queue.
+          throw new Error(`invalid fix_group: group_key=${str(g.group_key)} repository=${str(g.repository)} branch=${str(g.branch)} findings=${findings.length}`);
+        }
+        const repositoryUrl = str(g.repository_url) || `https://github.com/${g.repository}`;
+
+        // Deterministic work branch: slug of the group key + short hash of the
+        // full key (djb2 — no crypto in the sandbox needed). Two dispatches of
+        // the same group land on the same branch → the agent finds the PR.
+        const slug = str(g.group_key).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48).replace(/-+$/g, '');
+        let h = 5381;
+        for (const ch of str(g.group_key)) h = ((h * 33) ^ ch.charCodeAt(0)) >>> 0;
+        const branchName = `autofix/${slug || 'fix'}-${h.toString(16).padStart(8, '0')}`;
+
+        const first = findings[0].finding;
+        const pkg = first.package || {};
+        const ruleIds = Array.from(new Set(findings.map((x) => str((x.finding.rule || {}).id || x.finding.id)))).filter(Boolean);
+        let prTitle;
+        if (str(g.fix_type) === 'upgrade_package' && pkg.name) {
+          prTitle = `fix(security): upgrade ${pkg.name} to ${str(pkg.fixed_version || 'a patched version')} (${ruleIds.slice(0, 3).join(', ')}${ruleIds.length > 3 ? ', …' : ''})`;
+        } else {
+          prTitle = `fix(security): ${str(first.title || first.id)}`;
+        }
+        prTitle = prTitle.slice(0, 110);
+
+        const lines = [];
+        lines.push('# Autofix task', '');
+        lines.push(`- Repository: ${repositoryUrl} (\`${g.repository}\`)`);
+        lines.push(`- Base branch: \`${g.branch}\`${g.commit_sha ? ` (scanned commit \`${g.commit_sha}\`)` : ''}`);
+        lines.push(`- Work branch (use EXACTLY this name): \`${branchName}\``);
+        lines.push(`- Pull request title: ${prTitle}`);
+        lines.push(`- Fix type: ${str(g.fix_type) || 'code_change'}`);
+        lines.push(`- Source build: ${str(g.build_id)}`);
+        if (g.dockerfile) lines.push(`- Dockerfile (per CI): \`${g.dockerfile}\``);
+        if (Array.isArray(g.manifests) && g.manifests.length) lines.push(`- Manifests (per CI): ${g.manifests.map((m) => '`' + m + '`').join(', ')}`);
+        lines.push('', `## Findings to fix (${findings.length})`, '');
+        findings.forEach((x, i) => {
+          const f = x.finding;
+          const r = f.rule || {};
+          const p = f.package || {};
+          const loc = f.location || {};
+          const fix = f.fix || {};
+          lines.push(`### ${i + 1}. ${str(f.title || f.id)}`);
+          lines.push(`- finding_key: \`${x.finding_key}\``);
+          lines.push(`- action item: ${x.action_item_id}`);
+          lines.push(`- id: \`${f.id}\` · tool: ${str(f.tool)} · category: ${str(f.category)} · severity: ${str(f.severity)}`);
+          if (r.id) lines.push(`- rule: ${r.id}${r.cwe ? ' (' + r.cwe + ')' : ''}${r.url ? ' — ' + r.url : ''}`);
+          if (p.name) lines.push(`- package: ${p.name} ${str(p.version)} (${str(p.ecosystem)}${p.direct === true ? ', direct' : p.direct === false ? ', transitive' : ''})${p.fixed_version ? ' → fixed in ' + p.fixed_version : ''}${p.license ? ' · license ' + p.license : ''}`);
+          if (loc.path) lines.push(`- location: ${loc.path}${loc.line ? ':' + loc.line : ''}${loc.type ? ' (' + loc.type + ')' : ''}`);
+          if (loc.snippet) lines.push(`- snippet: \`${str(loc.snippet)}\``);
+          if (loc.source && loc.source.path) lines.push(`- source: ${loc.source.path}:${str(loc.source.line)} \`${str(loc.source.snippet)}\``);
+          if (loc.sink && loc.sink.path) lines.push(`- sink: ${loc.sink.path}:${str(loc.sink.line)} \`${str(loc.sink.snippet)}\``);
+          if (f.message) lines.push(`- message: ${str(f.message)}`);
+          if (fix.recommendation) lines.push(`- recommendation: ${str(fix.recommendation)}`);
+          if (fix.command) lines.push(`- suggested command: \`${str(fix.command)}\``);
+          if (f.url) lines.push(`- report: ${f.url}`);
+          lines.push('');
+        });
+        lines.push('## Raw findings (JSON)', '', '```json', JSON.stringify(findings.map((x) => ({ finding_key: x.finding_key, action_item_id: x.action_item_id, ...x.finding })), null, 2), '```');
+
+        return {
+          group: g,
+          repository: str(g.repository),
+          repository_url: repositoryUrl,
+          base_branch: str(g.branch),
+          commit_sha: str(g.commit_sha),
+          build_id: str(g.build_id),
+          branch_name: branchName,
+          pr_title: prTitle,
+          brief: lines.join('\n'),
+          finding_keys: findings.map((x) => x.finding_key),
+          item_ids: findings.map((x) => str(x.action_item_id)),
+          fetch_requests: findings.map((x) => ({ path: `/governance/action_item/${x.action_item_id}`, method: 'GET' })),
+        };
+
+  # Fresh metadata for every item in the group (fetch-merge-write). GET is
+  # idempotent → retried. A failed slot is `{}` at the same index; mark_plan
+  # then skips that item's PATCH rather than writing blind.
+  - id: fetch_items
+    type: module
+    plugin_type: np-api-call
+    name: "Fetch Action Item (per finding)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.plan.outputs.fetch_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  - id: mark_plan
+    type: module
+    plugin_type: code-exec
+    name: "Merge Metadata → in_progress"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      group: "${{ steps.plan.outputs.group }}"
+      item_ids: "${{ steps.plan.outputs.item_ids }}"
+      fetches: "${{ steps.fetch_items.outputs.items }}"
+      branch_name: "${{ steps.plan.outputs.branch_name }}"
+      execution_id: "${{ execution.id }}"
+    config:
+      code: |
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const ids = inputs.item_ids || [];
+        const fetches = inputs.fetches || [];
+        const now = new Date().toISOString();
+        const bases = [];
+        const patchRequests = [];
+        let fetch_failed = 0;
+        for (let i = 0; i < ids.length; i++) {
+          const r = fetches[i];
+          const item = r && r.status && Number(r.status) < 400 && r.body;
+          if (!item) { bases.push(null); fetch_failed++; continue; }
+          const merged = Object.assign({}, item.metadata || {}, {
+            fix_status: 'in_progress',
+            fix_started_at: now,
+            fix_attempts: (Number((item.metadata || {}).fix_attempts) || 0) + 1,
+            fix_execution_id: str(inputs.execution_id),
+            fix_group: str((inputs.group || {}).group_key),
+            fix_branch: str(inputs.branch_name),
+          });
+          bases.push(merged);
+          patchRequests.push({ path: `/governance/action_item/${ids[i]}`, method: 'PATCH', body: { metadata: merged } });
+        }
+        if (fetch_failed) log.warn(`mark_plan: ${fetch_failed} item(s) could not be fetched — they will be commented but not patched`);
+        return { bases, patch_requests: patchRequests, fetch_failed };
+
+  - id: mark_in_progress
+    type: module
+    plugin_type: np-api-call
+    name: "Stamp in_progress (per item)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.mark_plan.outputs.patch_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # ── The fixer ─────────────────────────────────────────────────────────────
+  # DECLARED inputs, mandatory: the prompts reference `inputs.*` only — a
+  # `steps.*` template inside this plugin's config resolves activity-side as
+  # the literal string "undefined". The token reaches the sandbox as env, never
+  # as prompt text. Registries are allow-listed so `npm install` & co. work.
+  - id: agent
+    type: module
+    plugin_type: claude-code-agent
+    name: "Fix + Open Pull Request (Claude Code)"
+    metadata:
+      executionTimeoutMs: 3600000
+    inputs:
+      brief: "${{ steps.plan.outputs.brief }}"
+      repository: "${{ steps.plan.outputs.repository }}"
+      repository_url: "${{ steps.plan.outputs.repository_url }}"
+      base_branch: "${{ steps.plan.outputs.base_branch }}"
+      branch_name: "${{ steps.plan.outputs.branch_name }}"
+      pr_title: "${{ steps.plan.outputs.pr_title }}"
+      build_id: "${{ steps.plan.outputs.build_id }}"
+    config:
+      model: claude-opus-4-8
+      maxIterations: 120
+      env:
+        GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        GIT_TERMINAL_PROMPT: "0"
+      allowedHosts:
+        - github.com
+        - api.github.com
+        - codeload.github.com
+        - objects.githubusercontent.com
+        - raw.githubusercontent.com
+        - registry.npmjs.org
+        - registry.yarnpkg.com
+        - pypi.org
+        - files.pythonhosted.org
+        - repo.maven.apache.org
+        - repo1.maven.org
+        - proxy.golang.org
+        - sum.golang.org
+        - storage.googleapis.com
+        - api.nuget.org
+        - rubygems.org
+        - index.crates.io
+        - static.crates.io
+      systemPrompt: |
+        You are nullplatform Autofix, an automated remediation engineer. You run
+        in an isolated sandbox with git, common language toolchains, and
+        outbound access to GitHub and the public package registries.
+        GITHUB_TOKEN / GH_TOKEN hold a token that can read the repository, push
+        branches and open pull requests. Your deliverable is ONE pull request
+        that fixes the findings in the brief, plus the structured report.
+
+        Procedure, in order:
+        1. Clone the base branch:
+           git clone --branch <base branch> https://x-access-token:${GITHUB_TOKEN}@github.com/<repository>.git repo
+           Then: git -C repo config user.name "nullplatform-autofix" and
+           user.email "autofix@nullplatform.com".
+        2. Idempotency check. If the work branch already exists on origin
+           (git ls-remote --heads origin <work branch>), look for an open PR
+           from it (gh pr list --head <work branch> --state open --json url,number
+           or GET /repos/<repository>/pulls?head=<owner>:<work branch>&state=open).
+           If a PR exists, do NOT push anything: report status "already_open"
+           with its URL and number.
+        3. Confirm each finding still applies at the base branch HEAD (the
+           scanned commit may be older): the manifest still pins the vulnerable
+           version, the code at the location still shows the pattern, the file
+           still exists. If NONE apply, push nothing and report "already_fixed".
+        4. Fix — minimal and surgical, only the findings in the brief:
+           - upgrade_package: upgrade ONLY the named package to the fixed
+             version (or the smallest release >= it) with the ecosystem's own
+             tool (npm/yarn/pnpm, pip/poetry, go get + go mod tidy, maven,
+             nuget, bundler, cargo) and regenerate the lockfile the repository
+             already uses. Never upgrade unrelated packages, never change the
+             package manager or lockfile format. For an OS package from the
+             base image (ecosystem alpine/debian/…): bump the base image to a
+             patched tag if one exists, otherwise add the package upgrade to
+             the Dockerfile's install step.
+           - code_change: edit only the files the finding points at, apply the
+             recommendation, preserve every other behavior. Add a dependency
+             only when the recommendation calls for one.
+           - secret / sensitive file: remove the file, add it to .gitignore,
+             and say in the PR that the credential must be rotated. Never
+             rewrite history.
+           - misconfiguration (Dockerfile, config): apply the recommended
+             directive.
+        5. Verify cheaply. If the repository has an install/build/test command
+           that finishes in a few minutes (package.json scripts, Makefile,
+           go test ./..., pytest, …), run it. Pre-existing failures unrelated
+           to your change are NOT yours to fix — mention them in the report.
+           Cap verification at about 15 minutes.
+        6. Commit and push: message "fix(security): <what changed>", body with
+           one "Autofix-Finding: <finding_key>" trailer per finding fixed.
+           git push -u origin <work branch>.
+        7. Open the PR against the base branch with the given title, using
+           gh pr create --base <base> --head <work branch> --title … --body-file …
+           (or POST /repos/<repository>/pulls). PR body: what changed and why;
+           a table of the findings (id, severity, title, link); how it was
+           verified; the action item ids; and the line
+           "Opened automatically by nullplatform Autofix from build <build id>."
+           Report "pr_opened" ONLY with the URL and number the API returned.
+
+        Hard rules:
+        - Never push to the base branch, never force-push, never merge, never
+          modify or close other PRs, never delete branches.
+        - Never touch CI/CD configuration, secrets, or unrelated files. Keep
+          the diff minimal.
+        - Never print, log or commit the token. Never invent a PR URL/number.
+        - If a finding cannot be fixed safely, leave it out and list it in
+          "unfixed" with a precise reason; if nothing can be fixed, report
+          "failed". A clear failure beats a wrong or partial fix.
+        - Every finding_key from the brief must appear in exactly one of
+          fixed_finding_keys or unfixed.
+      userPrompt: |
+        ${{ inputs.brief }}
+      outputSchema:
+        type: object
+        required: [status, summary, fixed_finding_keys, unfixed]
+        properties:
+          status:
+            type: string
+            enum: [pr_opened, already_open, already_fixed, no_change, failed]
+            description: "pr_opened: a PR was created now; already_open: a PR for this work branch already existed; already_fixed: nothing applies at HEAD; no_change: nothing could be changed; failed: the fix was not completed"
+          pr_url:
+            type: string
+            description: "The pull request URL exactly as returned by GitHub (pr_opened / already_open only)"
+          pr_number:
+            type: integer
+            description: "The pull request number (pr_opened / already_open only)"
+          branch:
+            type: string
+            description: "The work branch pushed"
+          summary:
+            type: string
+            description: "Short Markdown: what changed, in which files, and how it was verified (or why it failed)"
+          verification:
+            type: string
+            description: "What was run to verify and its result, or 'none'"
+          fixed_finding_keys:
+            type: array
+            items: { type: string }
+            description: "finding_key of every finding included in the PR"
+          unfixed:
+            type: array
+            items:
+              type: object
+              required: [finding_key, reason]
+              properties:
+                finding_key: { type: string }
+                reason: { type: string }
+    error_handling:
+      fallback_step: agent_failed
+
+  # ── Record the outcome on every item ─────────────────────────────────────
+  - id: record
+    type: module
+    plugin_type: code-exec
+    name: "Outcome → Item Patches + Comments"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      agent: "${{ steps.agent.outputs }}"
+      item_ids: "${{ steps.plan.outputs.item_ids }}"
+      finding_keys: "${{ steps.plan.outputs.finding_keys }}"
+      bases: "${{ steps.mark_plan.outputs.bases }}"
+      branch_name: "${{ steps.plan.outputs.branch_name }}"
+      group_key: "${{ steps.plan.outputs.group.group_key }}"
+    config:
+      code: |
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const a = inputs.agent || {};
+        const ids = inputs.item_ids || [];
+        const keys = inputs.finding_keys || [];
+        const bases = inputs.bases || [];
+        const now = new Date().toISOString();
+
+        let status = str(a.status || 'failed');
+        const prUrl = str(a.pr_url).trim();
+        const prNumber = Number(a.pr_number) || null;
+        const summary = str(a.summary || '').trim();
+        // A PR claim without a URL is a failure — the agent may not invent one.
+        if ((status === 'pr_opened' || status === 'already_open') && !/^https?:\/\//.test(prUrl)) {
+          status = 'failed';
+        }
+        const fixed = new Set((Array.isArray(a.fixed_finding_keys) ? a.fixed_finding_keys : []).map(str));
+        const unfixedReason = {};
+        for (const u of Array.isArray(a.unfixed) ? a.unfixed : []) {
+          if (u && u.finding_key) unfixedReason[str(u.finding_key)] = str(u.reason || 'not fixed');
+        }
+
+        const patchRequests = [];
+        const commentRequests = [];
+        let items_pr_opened = 0, items_failed = 0, items_already_fixed = 0, patched = 0, unpatched = 0;
+        for (let i = 0; i < ids.length; i++) {
+          const key = str(keys[i]);
+          let itemStatus, comment, error = '';
+          if (status === 'pr_opened' || status === 'already_open') {
+            if (fixed.has(key) || (fixed.size === 0 && !unfixedReason[key])) {
+              itemStatus = 'pr_opened';
+              comment = `🔧 ${status === 'already_open' ? 'A pull request for this fix was already open' : 'Pull request opened'}: ${prUrl}` +
+                (summary ? `\n\n${summary}` : '') + '\n\nThis item closes automatically once a successful build on the branch no longer reports the finding.';
+            } else {
+              itemStatus = 'failed';
+              error = unfixedReason[key] || 'not included in the pull request';
+              comment = `❌ Autofix opened ${prUrl} for other findings in this group but could not fix this one: ${error}`;
+            }
+          } else if (status === 'already_fixed') {
+            itemStatus = 'already_fixed';
+            comment = `✅ Autofix found this finding already fixed at the head of the branch${summary ? ': ' + summary : '.'}\n\nThe item closes automatically when the next successful build confirms it.`;
+          } else {
+            itemStatus = 'failed';
+            error = unfixedReason[key] || summary || str(a.status) || 'the fixer did not complete';
+            comment = `❌ Autofix could not fix this finding: ${error}\n\nIt is retried on the next successful build (up to the attempt limit).`;
+          }
+          if (itemStatus === 'pr_opened') items_pr_opened++;
+          else if (itemStatus === 'already_fixed') items_already_fixed++;
+          else items_failed++;
+
+          const base = bases[i];
+          if (base) {
+            const merged = Object.assign({}, base, {
+              fix_status: itemStatus,
+              fix_finished_at: now,
+              fix_summary: summary.slice(0, 2000),
+              fix_error: error.slice(0, 1000),
+              fix_branch: str(inputs.branch_name),
+              pr_url: itemStatus === 'pr_opened' ? prUrl : str(base.pr_url),
+              pr_number: itemStatus === 'pr_opened' ? prNumber : (base.pr_number || null),
+            });
+            patchRequests.push({ path: `/governance/action_item/${ids[i]}`, method: 'PATCH', body: { metadata: merged } });
+            patched++;
+          } else {
+            unpatched++;
+          }
+          commentRequests.push({ path: `/governance/action_item/${ids[i]}/comments`, method: 'POST', body: { author: 'agent:autofix', content: comment } });
+        }
+        const out = {
+          status, pr_url: prUrl || null, pr_number: prNumber, branch: str(a.branch || inputs.branch_name), group_key: str(inputs.group_key),
+          items: ids.length, items_pr_opened, items_failed, items_already_fixed, patched, unpatched,
+          patch_requests: patchRequests, comment_requests: commentRequests,
+        };
+        log.info('fix recorded', { status, pr_url: out.pr_url, items_pr_opened, items_failed, items_already_fixed });
+        return out;
+
+  - id: update_items
+    type: module
+    plugin_type: np-api-call
+    name: "Stamp Outcome (per item)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.record.outputs.patch_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  # No retry: a lost-ack comment retried is a duplicate comment.
+  - id: comment_items
+    type: module
+    plugin_type: np-api-call
+    name: "Comment Outcome (per item)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    forEach:
+      expression: "${{ steps.record.outputs.comment_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  - id: stash_result
+    type: module
+    plugin_type: set-variable
+    name: "Result"
+    inputs:
+      status: "${{ steps.record.outputs.status }}"
+      pr_url: "${{ steps.record.outputs.pr_url }}"
+      pr_number: "${{ steps.record.outputs.pr_number }}"
+      branch: "${{ steps.record.outputs.branch }}"
+      group_key: "${{ steps.record.outputs.group_key }}"
+      items: "${{ steps.record.outputs.items }}"
+      items_pr_opened: "${{ steps.record.outputs.items_pr_opened }}"
+      items_failed: "${{ steps.record.outputs.items_failed }}"
+    config:
+      path: result
+      value:
+        status: "${{ inputs.status }}"
+        pr_url: "${{ inputs.pr_url }}"
+        pr_number: "${{ inputs.pr_number }}"
+        branch: "${{ inputs.branch }}"
+        group_key: "${{ inputs.group_key }}"
+        items: "${{ inputs.items }}"
+        items_pr_opened: "${{ inputs.items_pr_opened }}"
+        items_failed: "${{ inputs.items_failed }}"
+
+  # ── Agent step FAILED (threw / timed out) ────────────────────────────────
+  # Reached only via `error_handling.fallback_step` on `agent`. Its single
+  # declared edge is permanently false, so it never mixes a COMPLETED and a
+  # FAILED predecessor into one join (the deadlock the gotchas guide warns
+  # about). Dedicated chain: patch → comment → stash.
+  - id: agent_failed
+    type: module
+    plugin_type: code-exec
+    name: "Agent Failed → Item Patches + Comments"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      errmsg: "${{ steps.agent.error.message }}"
+      item_ids: "${{ steps.plan.outputs.item_ids }}"
+      bases: "${{ steps.mark_plan.outputs.bases }}"
+      branch_name: "${{ steps.plan.outputs.branch_name }}"
+      group_key: "${{ steps.plan.outputs.group.group_key }}"
+    config:
+      code: |
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const ids = inputs.item_ids || [];
+        const bases = inputs.bases || [];
+        const err = str(inputs.errmsg || 'the fixer step failed').slice(0, 1000);
+        const now = new Date().toISOString();
+        const patchRequests = [];
+        const commentRequests = [];
+        for (let i = 0; i < ids.length; i++) {
+          const base = bases[i];
+          if (base) {
+            patchRequests.push({
+              path: `/governance/action_item/${ids[i]}`,
+              method: 'PATCH',
+              body: { metadata: Object.assign({}, base, { fix_status: 'failed', fix_finished_at: now, fix_error: err, fix_branch: str(inputs.branch_name) }) },
+            });
+          }
+          commentRequests.push({
+            path: `/governance/action_item/${ids[i]}/comments`,
+            method: 'POST',
+            body: { author: 'agent:autofix', content: `❌ Autofix run failed before a fix could be recorded: ${err}\n\nIt is retried on the next successful build (up to the attempt limit).` },
+          });
+        }
+        log.warn('agent failed', { error: err, items: ids.length });
+        return { status: 'failed', error: err, group_key: str(inputs.group_key), items: ids.length, patch_requests: patchRequests, comment_requests: commentRequests };
+
+  - id: fail_update_items
+    type: module
+    plugin_type: np-api-call
+    name: "Stamp failed (per item)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.agent_failed.outputs.patch_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  - id: fail_comment_items
+    type: module
+    plugin_type: np-api-call
+    name: "Comment failure (per item)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    forEach:
+      expression: "${{ steps.agent_failed.outputs.comment_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  - id: stash_failed
+    type: module
+    plugin_type: set-variable
+    name: "Result: failed"
+    inputs:
+      error: "${{ steps.agent_failed.outputs.error }}"
+      group_key: "${{ steps.agent_failed.outputs.group_key }}"
+      items: "${{ steps.agent_failed.outputs.items }}"
+    config:
+      path: result
+      value:
+        status: "failed"
+        error: "${{ inputs.error }}"
+        group_key: "${{ inputs.group_key }}"
+        items: "${{ inputs.items }}"
+        items_failed: "${{ inputs.items }}"
+
+connections:
+  - { id: c1, from: start,            to: plan }
+  - { id: c2, from: plan,             to: fetch_items }
+  - { id: c3, from: fetch_items,      to: mark_plan }
+  - { id: c4, from: mark_plan,        to: mark_in_progress }
+  - { id: c5, from: mark_in_progress, to: agent }
+  - { id: c6, from: agent,            to: record }
+  - { id: c7, from: record,           to: update_items }
+  - { id: c8, from: update_items,     to: comment_items }
+  - { id: c9, from: comment_items,    to: stash_result }
+  # Declared so the engine can route error_handling.fallback_step; the edge
+  # itself is permanently false (only ever reached via the fallback).
+  - { id: c6f, from: agent,           to: agent_failed,      condition: "false" }
+  - { id: c10, from: agent_failed,    to: fail_update_items }
+  - { id: c11, from: fail_update_items, to: fail_comment_items }
+  - { id: c12, from: fail_comment_items, to: stash_failed }
+
+outputs:
+  status: "${{ variables.result.status }}"
+  pr_url: "${{ variables.result.pr_url }}"
+  pr_number: "${{ variables.result.pr_number }}"
+  branch: "${{ variables.result.branch }}"
+  group_key: "${{ variables.result.group_key }}"
+  items: "${{ variables.result.items }}"
+  items_pr_opened: "${{ variables.result.items_pr_opened }}"
+  items_failed: "${{ variables.result.items_failed }}"
+  error: "${{ variables.result.error }}"
