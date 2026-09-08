@@ -19,7 +19,7 @@
 # Usage:
 #   ./01-config-entries.sh --env-file ../../../.env.myorg \
 #     [--branches "main,master,release/*"] \
-#     [--category-slug security] [--fix-all true|false] [--github-issues true|false] \
+#     [--category-slug security] [--fix-all true|false] \
 #     [--github-token ghp_…] [--check-repo owner/repo]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,7 +29,6 @@ source "$SCRIPT_DIR/../../cost/setup/lib.sh"
 BRANCHES="main,master"
 CATEGORY_SLUG="security"
 FIX_ALL="false"
-GITHUB_ISSUES="false"
 GH_TOKEN_ARG=""
 CHECK_REPO=""
 
@@ -39,7 +38,6 @@ while [[ $# -gt 0 ]]; do
     --branches)      BRANCHES="$2";       shift 2 ;;
     --category-slug) CATEGORY_SLUG="$2";  shift 2 ;;
     --fix-all)       FIX_ALL="$2";        shift 2 ;;
-    --github-issues) GITHUB_ISSUES="$2";  shift 2 ;;
     --github-token)  GH_TOKEN_ARG="$2";   shift 2 ;;
     --check-repo)    CHECK_REPO="$2";     shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 1 ;;
@@ -101,7 +99,6 @@ put NP_ORGANIZATION_ID    "$ORG_ID"          false "/autofix"
 put AUTOFIX_BRANCHES      "$BRANCHES"        false "/autofix"
 put AUTOFIX_CATEGORY_SLUG "$CATEGORY_SLUG"   false "/autofix"
 put AUTOFIX_FIX_ALL       "$FIX_ALL"         false "/autofix"
-put AUTOFIX_GITHUB_ISSUES "$GITHUB_ISSUES"   false "/autofix"
 put GITHUB_TOKEN          "$GH_TOKEN_VALUE"  true  "/autofix"
 
 echo "Checking root secret NP_API_KEY (path /):"

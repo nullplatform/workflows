@@ -229,7 +229,6 @@ interface OnBuildOpts {
 
 async function runOnBuild(opts: OnBuildOpts = {}) {
   const calls: ApiCall[] = [];
-  const httpCalls: ApiCall[] = [];
   const dispatched: Record<string, unknown>[] = [];
   let buildFetches = 0;
   let waited = 0;
@@ -250,14 +249,6 @@ async function runOnBuild(opts: OnBuildOpts = {}) {
         handler: () => {
           waited++;
           return ok({ timedOut: true, payload: null });
-        },
-        executeMode: 'all' as const,
-      },
-      // GitHub mirror (off here: `vars.AUTOFIX_GITHUB_ISSUES` resolves empty in the harness).
-      'http-request': {
-        handler: (ctx: { inputs: Record<string, unknown> }) => {
-          httpCalls.push({ method: String(ctx.inputs.method), path: String(ctx.inputs.url), body: ctx.inputs.body as Record<string, unknown> });
-          return ok({ statusCode: 201, body: { number: 1, html_url: 'https://github.com/x/y/issues/1' } });
         },
         executeMode: 'all' as const,
       },
@@ -316,16 +307,15 @@ async function runOnBuild(opts: OnBuildOpts = {}) {
   const closes = calls.filter((c) => c.method === 'POST' && c.path.endsWith('/close'));
   const comments = calls.filter((c) => c.method === 'POST' && c.path.endsWith('/comments'));
   const lookups = calls.filter((c) => c.method === 'GET' && c.path === '/governance/action_item');
-  return { result, calls, httpCalls, creates, patches, closes, comments, lookups, dispatched, buildFetches, waited };
+  return { result, calls, creates, patches, closes, comments, lookups, dispatched, buildFetches, waited };
 }
 
 const meta = (c: ApiCall) => (c.body?.metadata ?? {}) as Record<string, unknown>;
 
 describe('wf-a1 autofix-on-build (E2E)', () => {
   it('creates one item per raw finding with cross-build keys, and dispatches one fix group per change', async () => {
-    const { result, creates, patches, closes, lookups, dispatched, httpCalls } = await runOnBuild();
+    const { result, creates, patches, closes, lookups, dispatched } = await runOnBuild();
     expect(result.outputs.status).toBe('processed');
-    expect(httpCalls).toHaveLength(0); // GitHub mirror off unless AUTOFIX_GITHUB_ISSUES=true
 
     // One lookup for the whole repo@branch, scoped by finding_scope + label.
     expect(lookups).toHaveLength(1);
@@ -789,25 +779,18 @@ describe('wf-a2 autofix-fix (E2E)', () => {
 
 import { normalizeWorkflowDocument, parseYamlDocument } from '@nullplatform/workflow-kit/test';
 
-async function stepCode(stepId: string): Promise<string> {
+async function diffStepCode(): Promise<string> {
   const raw = await readFile(ON_BUILD, 'utf8');
   const parsed = parseYamlDocument(raw);
   const def = normalizeWorkflowDocument(parsed.document) as { steps: Record<string, { config?: { code?: string } }> | { id: string; config?: { code?: string } }[] };
   const steps = Array.isArray(def.steps) ? def.steps : Object.entries(def.steps).map(([id, s]) => ({ id, ...s }));
-  const step = steps.find((s) => s.id === stepId);
-  if (!step?.config?.code) throw new Error(`${stepId} step code not found`);
-  return step.config.code;
-}
-
-async function runStep(stepId: string, inputs: Record<string, unknown>) {
-  const code = await stepCode(stepId);
-  const fn = new Function('inputs', 'log', code) as (i: Record<string, unknown>, l: Record<string, unknown>) => Record<string, unknown>;
-  const silent = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
-  return fn(inputs, silent);
+  const diff = steps.find((s) => s.id === 'diff');
+  if (!diff?.config?.code) throw new Error('diff step code not found');
+  return diff.config.code;
 }
 
 async function runDiff(inputs: Record<string, unknown>) {
-  const code = await stepCode('diff');
+  const code = await diffStepCode();
   const fn = new Function('inputs', 'log', code) as (i: Record<string, unknown>, l: Record<string, unknown>) => Record<string, unknown>;
   const silent = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
   return fn(inputs, silent);
@@ -922,84 +905,5 @@ describe('wf-a1 — pr_opened re-check', () => {
     // seen_builds is 8 BEFORE this build → 9 after; 9 - 1 = 8 ≥ 5 (the decision reads the stored value: 8 - 1 = 7 ≥ 5)
     const stale = await runOnBuild({ existing: [liveItem(xssId, { fix_status: 'pr_opened', pr_url: 'https://x/pull/1', seen_builds: 8, pr_opened_seen_builds: 1 })] });
     expect(stale.dispatched.map((g) => g.group_key)).toContain(`code_change:${xssId}`);
-  });
-});
-
-// ── wf-a1 GitHub issue mirror (unit, step bodies) ───────────────────────────
-describe('wf-a1 — GitHub issue mirror', () => {
-  const createReq = (fid: string, title: string, sev = 'high') => ({
-    path: '/governance/action_item',
-    method: 'POST',
-    body: { title: `[${sev.toUpperCase()}] ${title}`, description: `**${title}**\n\n- **Tool**: trivy · **Category**: vulnerability · **Severity**: ${sev}\n`, metadata: { finding_id: fid, severity: sev, category: 'vulnerability', finding_key: `${SCOPE}|${fid}` } },
-  });
-
-  it('is a no-op unless AUTOFIX_GITHUB_ISSUES is "true"', async () => {
-    const out = (await runStep('plan_github', { enabled: '', context: CONTEXT, create_requests: [createReq('a', 'A')], create_plan: [{ finding_key: `${SCOPE}|a` }], creates: [{ status: 201, body: { id: 'ai_1' } }], update_requests: [], update_plan: [], close_plan: [], closes: [] })) as Record<string, unknown[]>;
-    expect(out.enabled).toBe(false);
-    expect(out.issue_create_requests).toHaveLength(0);
-  });
-
-  it('creates issues for new and unlinked items, comments + closes the mirror of closed items', async () => {
-    const out = (await runStep('plan_github', {
-      enabled: 'true',
-      context: CONTEXT,
-      create_requests: [createReq('new1', 'New finding')],
-      create_plan: [{ finding_key: `${SCOPE}|new1` }],
-      creates: [{ status: 201, body: { id: 'ai_new' } }],
-      update_requests: [
-        { body: { metadata: { finding_id: 'linked', severity: 'medium', category: 'secret', github_issue_number: 7, github_issue_url: 'https://github.com/x/y/issues/7' }, description: 'd1' } },
-        { body: { metadata: { finding_id: 'unlinked', severity: 'low', category: 'misconfiguration' }, description: '**U**\n\n- **Tool**: trivy' } },
-      ],
-      update_plan: [
-        { finding_key: `${SCOPE}|linked`, item_id: 'ai_l', finding: { id: 'linked', title: 'Linked' } },
-        { finding_key: `${SCOPE}|unlinked`, item_id: 'ai_u', finding: { id: 'unlinked', title: 'Unlinked' } },
-      ],
-      close_plan: [
-        { item_id: 'ai_c1', finding_key: 'k1', github_issue_number: 12, comment: 'gone in build 9' },
-        { item_id: 'ai_c2', finding_key: 'k2', github_issue_number: null, comment: 'gone too' },
-        { item_id: 'ai_c3', finding_key: 'k3', github_issue_number: 13, comment: 'close failed upstream' },
-      ],
-      closes: [{ status: 200 }, { status: 200 }, {}],
-    })) as { enabled: boolean; issue_create_requests: { url: string; method: string; body: { title: string; body: string; labels: string[] } }[]; issue_create_plan: { item_id: string }[]; issue_comment_requests: { url: string; body: { body: string } }[]; issue_close_requests: { url: string; method: string; body: Record<string, string> }[]; issue_by_key: Record<string, { number: number }>; to_close: number };
-    expect(out.enabled).toBe(true);
-    // new item + the unlinked known item → 2 creates; the linked one is remembered instead
-    expect(out.issue_create_requests).toHaveLength(2);
-    expect(out.issue_create_requests[0]!.url).toBe(`https://api.github.com/repos/${REPO}/issues`);
-    expect(out.issue_create_requests[0]!.method).toBe('POST');
-    expect(out.issue_create_requests[0]!.body.title).toBe('[HIGH] New finding');
-    expect(out.issue_create_requests[0]!.body.body).toContain('action item `ai_new`');
-    expect(out.issue_create_requests[0]!.body.body).toContain(`build ${BUILD_ID} on \`${REPO}@${BRANCH}\``);
-    expect(out.issue_create_requests[0]!.body.labels).toEqual(['autofix', 'severity:high', 'vulnerability']);
-    expect(out.issue_create_plan.map((p) => p.item_id)).toEqual(['ai_new', 'ai_u']);
-    expect(out.issue_by_key[`${SCOPE}|linked`]).toMatchObject({ number: 7 });
-    // closed items: only those with an issue AND a 2xx close get comment + close
-    expect(out.to_close).toBe(1);
-    expect(out.issue_comment_requests).toHaveLength(1);
-    expect(out.issue_comment_requests[0]!.url).toBe(`https://api.github.com/repos/${REPO}/issues/12/comments`);
-    expect(out.issue_comment_requests[0]!.body.body).toBe('gone in build 9');
-    expect(out.issue_close_requests[0]).toMatchObject({ url: `https://api.github.com/repos/${REPO}/issues/12`, method: 'PATCH', body: { state: 'closed', state_reason: 'completed' } });
-  });
-
-  it('zip_github links created issues on the items and hands the numbers to the fixer', async () => {
-    const plan = [
-      { item_id: 'ai_1', finding_key: `${SCOPE}|f1`, metadata: { finding_id: 'f1' }, description: '**F1**\n\n- **Tool**: trivy\n' },
-      { item_id: 'ai_2', finding_key: `${SCOPE}|f2`, metadata: { finding_id: 'f2' }, description: 'plain' },
-    ];
-    const out = (await runStep('zip_github', {
-      plan,
-      results: [{ statusCode: 201, body: { number: 41, html_url: 'https://github.com/x/y/issues/41' } }, { statusCode: 403, body: 'forbidden' }],
-      issue_by_key: { [`${SCOPE}|old`]: { number: 7, url: 'https://github.com/x/y/issues/7' } },
-      fix_dispatch: [{ fix_group: { group_key: 'g', findings: [{ finding_key: `${SCOPE}|f1` }, { finding_key: `${SCOPE}|old` }, { finding_key: `${SCOPE}|f2` }] } }],
-    })) as { issue_ref_patches: { path: string; body: { metadata: Record<string, unknown>; description: string } }[]; fix_dispatch: { fix_group: { findings: Record<string, unknown>[] } }[]; issues_created: number; issues_failed: number };
-    expect(out.issues_created).toBe(1);
-    expect(out.issues_failed).toBe(1);
-    expect(out.issue_ref_patches).toHaveLength(1);
-    expect(out.issue_ref_patches[0]!.path).toBe('/governance/action_item/ai_1');
-    expect(out.issue_ref_patches[0]!.body.metadata).toMatchObject({ finding_id: 'f1', github_issue_number: 41, github_issue_url: 'https://github.com/x/y/issues/41' });
-    expect(out.issue_ref_patches[0]!.body.description).toContain('- **GitHub issue**: [#41](https://github.com/x/y/issues/41)\n- **Tool**: trivy');
-    const findings = out.fix_dispatch[0]!.fix_group.findings;
-    expect(findings[0]).toMatchObject({ github_issue_number: 41 });
-    expect(findings[1]).toMatchObject({ github_issue_number: 7 });
-    expect(findings[2]!.github_issue_number).toBeUndefined();
   });
 });

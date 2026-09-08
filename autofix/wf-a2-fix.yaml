@@ -132,7 +132,6 @@ steps:
           lines.push(`### ${i + 1}. ${str(f.title || f.id)}`);
           lines.push(`- finding_key: \`${x.finding_key}\``);
           lines.push(`- action item: ${x.action_item_id}`);
-          if (x.github_issue_number) lines.push(`- GitHub issue: #${x.github_issue_number}${x.github_issue_url ? ' (' + x.github_issue_url + ')' : ''} — write \`Refs #${x.github_issue_number}\` in the PR body (NOT \`Fixes\`: the issue is closed by the build that proves the finding gone)`);
           lines.push(`- id: \`${f.id}\` · tool: ${str(f.tool)} · category: ${str(f.category)} · severity: ${str(f.severity)}`);
           if (r.id) lines.push(`- rule: ${r.id}${r.cwe ? ' (' + r.cwe + ')' : ''}${r.url ? ' — ' + r.url : ''}`);
           if (p.name) lines.push(`- package: ${p.name} ${str(p.version)} (${str(p.ecosystem)}${p.direct === true ? ', direct' : p.direct === false ? ', transitive' : ''})${p.fixed_version ? ' → fixed in ' + p.fixed_version : ''}${p.license ? ' · license ' + p.license : ''}`);
@@ -379,9 +378,7 @@ steps:
            gh pr create --base <base> --head <work branch> --title … --body-file …
            (or POST /repos/<repository>/pulls). PR body: what changed and why;
            a table of the findings (id, severity, title, link); how it was
-           verified; the action item ids; one "Refs #<n>" line per GitHub
-           issue named in the brief (never "Fixes"/"Closes" — the issues are
-           closed by the build that proves the finding gone); and the line
+           verified; the action item ids; and the line
            "Opened automatically by nullplatform Autofix from build <build id>."
            Report "pr_opened" ONLY with the URL and number the API returned.
 
