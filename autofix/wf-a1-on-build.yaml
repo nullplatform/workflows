@@ -127,8 +127,12 @@ steps:
             `no numeric build id in the notification (entity=${entity}) — check the notification channel filters`,
           );
         }
-        log.info(`build ${buildId} updated`, { entity, method: n.method || '' });
-        return { build_id: buildId };
+        // Logged for channel-filter tuning: NP audits several build mutations
+        // per CI run (create, asset push, metadata write, status update).
+        const method = String(n.method || body.method || '').toUpperCase();
+        const path = String(n.path || n.url || n.route || n.endpoint || '');
+        log.info(`build ${buildId} audit event`, { entity, method, path, keys: Object.keys(n) });
+        return { build_id: buildId, method, path, notification_keys: Object.keys(n) };
 
   # ── Re-read the truth from our own side ──────────────────────────────────
   # `join_strategy: any`: this is the re-entry target of the metadata wait
@@ -462,6 +466,21 @@ steps:
         // item, so closing (which needs the complete set) is blocked.
         const findPossiblyTruncated = existingRows.length >= findLimit;
 
+        // Duplicate-delivery guard. Two audit events can land on the same
+        // successful build seconds apart (the metadata write and the status
+        // update — verified live). A live item already stamped with THIS build
+        // id means another execution owns this build: write nothing.
+        const alreadyProcessed = existingRows.some((it) => it && LIVE[it.status] === 1 && it.metadata && str(it.metadata.last_build_id) === buildId);
+        if (alreadyProcessed) {
+          log.info(`build ${buildId} already processed by another execution — duplicate delivery, nothing to do`);
+          return {
+            duplicate_delivery: true,
+            create_requests: [], create_plan: [], update_requests: [], update_plan: [], close_requests: [], close_plan: [],
+            closing_blocked_reason: 'duplicate_delivery',
+            counts: { findings: findings.length, invalid: 0, duplicate_findings: 0, live_items: liveCount, duplicate_live_items: duplicateLive, manual: 0, fix_dispatch_candidates: 0, fix_skipped_pr_open: 0, fix_skipped_in_progress: 0, fix_skipped_exhausted: 0, create_truncated: 0 },
+          };
+        }
+
         // The change that fixes a finding. Same package + same fixed version →
         // same PR, whatever the CVE id. A base-image bump fixes every OS/stdlib
         // CVE of that Dockerfile at once; Dockerfile/config hardening is one PR
@@ -709,6 +728,7 @@ steps:
 
         log.info('diff', { creates: createRequests.length, updates: updateRequests.length, closes: closeRequests.length, counts });
         return {
+          duplicate_delivery: false,
           create_requests: createRequests,
           create_plan: createPlan,
           update_requests: updateRequests,
@@ -929,6 +949,7 @@ steps:
     inputs:
       context: "${{ steps.guard.outputs.context }}"
       counts: "${{ steps.diff.outputs.counts }}"
+      duplicate_delivery: "${{ steps.diff.outputs.duplicate_delivery }}"
       closing_blocked_reason: "${{ steps.diff.outputs.closing_blocked_reason }}"
       zip: "${{ steps.zip.outputs }}"
     config:
@@ -937,7 +958,7 @@ steps:
         const c = inputs.counts || {};
         const z = inputs.zip || {};
         const summary = {
-          status: 'processed',
+          status: inputs.duplicate_delivery === true ? 'duplicate_delivery' : 'processed',
           build_id: ctx.build_id,
           repository: ctx.repository,
           branch: ctx.branch,

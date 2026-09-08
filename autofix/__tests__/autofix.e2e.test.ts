@@ -874,3 +874,15 @@ describe('wf-a1 diff — fix groups by change', () => {
     expect(groups[sec.id]).toBe(`code_change:${sec.id}`);
   });
 });
+
+describe('wf-a1 — duplicate delivery', () => {
+  it('a live item already stamped with this build id means another execution owns the build: no writes, no dispatch', async () => {
+    const owned = liveItem(FINDINGS[0]!.id, { last_build_id: BUILD_ID, seen_build_ids: [BUILD_ID], fix_status: 'pending' });
+    const { result, creates, patches, closes, dispatched } = await runOnBuild({ existing: [owned] });
+    expect(creates).toHaveLength(0);
+    expect(patches).toHaveLength(0);
+    expect(closes).toHaveLength(0);
+    expect(dispatched).toHaveLength(0);
+    expect(result.outputs).toMatchObject({ status: 'duplicate_delivery', closing_blocked_reason: 'duplicate_delivery' });
+  });
+});
