@@ -855,3 +855,22 @@ describe('wf-a1 diff — AUTOFIX_FIX_ALL', () => {
     expect(out.update_requests[0]!.body.metadata).toMatchObject({ fix_status: 'pending', auto_fixable: true, ci_auto_fixable: false });
   });
 });
+
+describe('wf-a1 diff — fix groups by change', () => {
+  it('base-image and per-file config fixes share one group; secrets stay per finding', async () => {
+    const os1 = { id: 'trivy:CVE-1:libssl3@3.0.1', tool: 'trivy', category: 'vulnerability', severity: 'high', title: 'a', package: { name: 'libssl3', ecosystem: 'debian', version: '3.0.1', fixed_version: '3.0.2' }, location: { type: 'image_layer', path: 'Dockerfile', line: 19 }, fix: { available: true, auto_fixable: true, type: 'base_image_update' } };
+    const os2 = { ...os1, id: 'trivy:CVE-2:zlib1g@1.2', package: { name: 'zlib1g', ecosystem: 'debian', version: '1.2', fixed_version: '1.3' } };
+    const ds2 = { id: 'trivy:DS-0002:Dockerfile', tool: 'trivy', category: 'misconfiguration', severity: 'high', title: 'root', location: { type: 'file', path: 'Dockerfile' }, fix: { available: true, auto_fixable: true, type: 'config_change' } };
+    const ds26 = { ...ds2, id: 'trivy:DS-0026:Dockerfile', severity: 'low' };
+    const sec = { id: 'trivy:secret:private-key:config/dev.pem:2', tool: 'trivy', category: 'secret', severity: 'high', title: 'key', location: { type: 'file', path: 'config/dev.pem', line: 2 }, fix: { available: true, auto_fixable: true, type: 'code_change' } };
+    const out = (await runDiff({ context: { ...CONTEXT, findings: [os1, os2, ds2, ds26, sec] }, existing: { results: [] }, category_slug: 'security-1', fix_all: '' })) as {
+      create_plan: { finding_key: string; fix_group: string }[];
+    };
+    const groups = Object.fromEntries(out.create_plan.map((p) => [p.finding_key.split('|')[1], p.fix_group]));
+    expect(groups[os1.id]).toBe('base_image:Dockerfile');
+    expect(groups[os2.id]).toBe('base_image:Dockerfile');
+    expect(groups[ds2.id]).toBe('config_change:Dockerfile');
+    expect(groups[ds26.id]).toBe('config_change:Dockerfile');
+    expect(groups[sec.id]).toBe(`code_change:${sec.id}`);
+  });
+});

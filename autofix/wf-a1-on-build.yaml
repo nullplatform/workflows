@@ -463,12 +463,17 @@ steps:
         const findPossiblyTruncated = existingRows.length >= findLimit;
 
         // The change that fixes a finding. Same package + same fixed version →
-        // same PR, whatever the CVE id; anything else is its own PR.
+        // same PR, whatever the CVE id. A base-image bump fixes every OS/stdlib
+        // CVE of that Dockerfile at once; Dockerfile/config hardening is one PR
+        // per file. Anything else is its own PR.
         const fixGroupKey = (f, fixType) => {
           const p = f.package || {};
+          const loc = f.location || {};
           if (fixType === 'upgrade_package' && p.name) {
             return `upgrade:${str(p.ecosystem || 'unknown')}:${p.name}:${str(p.fixed_version || 'latest')}`;
           }
+          if (fixType === 'base_image_update') return `base_image:${str(loc.path || 'Dockerfile')}`;
+          if (fixType === 'config_change' && loc.path) return `config_change:${str(loc.path)}`;
           return `${fixType}:${f.id}`;
         };
 
