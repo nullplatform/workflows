@@ -54,11 +54,12 @@
 # fresh item on the next build, which is the house pattern.
 #
 # METADATA-ORDERING DEFENSE. If CI flips `status` before it writes the
-# findings, the first delivery sees a successful build with no findings. The
-# guard then parks once (`metadata_grace_seconds`, a Temporal timer — no
-# compute) and re-reads; a second miss exits `metadata_not_ready`. Any later
-# PATCH on the build re-fires the channel anyway, and the find-then-create
-# diff makes that second execution converge instead of duplicating.
+# findings, the delivery sees a successful build with no findings. The guard
+# then parks once (`metadata_grace_seconds`, a Temporal timer — no compute)
+# and re-reads; a second miss exits `metadata_not_ready`. Deliveries for a
+# build another execution already stamped (`last_build_id`) are no-ops
+# (`duplicate_delivery`) — one CI run audits four build events and the
+# channel filter is what keeps it to one.
 #
 # Per-org configuration (config entries on folder /autofix):
 #   NP_API_KEY             (secret) org credential for every NP call

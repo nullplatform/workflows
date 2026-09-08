@@ -27,8 +27,10 @@ CI-side change; the workflow never learns tool formats. The contract is a build
 so a malformed payload is rejected at `np metadata create` time rather than
 misread later. CI writes it with `np metadata create --entity build --data
 '{"quality_metrics": …}'` (the build is found from the CI environment, like
-`np build update`), **before** the final `np build update --status` — writing
-metadata does not fire the build channel (verified live), the status PATCH does. Either embedded on the
+`np build update`), **before** the final `np build update --status`. Every build
+mutation is audited (create, asset push and the metadata write are `POST`s, the
+status update is the one `PATCH`); the channel forwards only the `PATCH`, so the
+listener wakes once per build, after the findings are in place. Either embedded on the
 build entity (`build.metadata.quality_metrics`) or as a metadata instance
 (`GET /metadata/build/{id}` → `quality_metrics`):
 
@@ -200,15 +202,14 @@ per-item `fix_error`.
 - **The payload is a poke, not a source of truth.** The webhook body yields a
   build id; status, branch, findings, application and repository are re-read
   with the org credential. A forged POST costs one lookup.
-- **Every build PATCH fires the channel** — status flips and metadata writes
-  alike. The listener needs both `status=successful` and a findings array; if
-  CI flips the status before it writes the findings, the run parks once
-  (`metadata_grace_seconds`) and re-reads, and the later write re-fires the
-  channel anyway. The find-then-create diff makes concurrent deliveries
-  converge. If your CI writes `quality_metrics` through the metadata API
-  (`/metadata/build/{id}/quality_metrics`) rather than a build PATCH, confirm
-  which audit `entity` that emits and add it to the channel filter
-  (`04-build-channel.mjs`) — otherwise the grace wait is the only defense.
+- **One CI run audits four build events** (verified from the payloads:
+  `POST /build`, `POST /build/{id}/asset_url`, a `POST` for the metadata write,
+  `PATCH /build/{id}` for the status update). The channel forwards the `PATCH`
+  only, so one execution per build. If you forward everything (`--methods
+  PATCH,POST`), the listener still converges: non-successful builds skip, and a
+  live item already stamped with the build id makes a second delivery a no-op
+  (`duplicate_delivery`). If CI flips the status before it writes the findings,
+  the run parks once (`metadata_grace_seconds`) and re-reads.
 - **Metadata PATCH replaces, it does not merge.** Every write carries the full
   merged metadata: wf-a1 merges onto the item it just looked up; wf-a2
   fetches each item first and never patches an item it could not fetch.

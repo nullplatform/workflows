@@ -1,8 +1,8 @@
 # Reference CI steps that produce the `quality_metrics` build metadata the
 # autofix suite consumes, using Trivy. Drop them into a nullplatform build job
 # AFTER the asset is pushed and BEFORE `np build update --status …` — the
-# listener wakes on that status PATCH and expects the findings to be there
-# (writing metadata does not itself fire the build channel).
+# listener wakes on that status PATCH (the only PATCH the pipeline emits) and
+# expects the findings to be there.
 #
 # Live example: kwik-e-mart/autofixer-application-fixer-test/.github/workflows/ci.yml
 env:
