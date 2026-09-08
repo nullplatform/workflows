@@ -65,6 +65,9 @@
 #   NP_ORGANIZATION_ID     (var)    numeric org id — search scope for the item lookup
 #   AUTOFIX_BRANCHES       (var)    comma-separated branches to watch, `*` wildcards ok ("main,master,release/*")
 #   AUTOFIX_CATEGORY_SLUG  (var)    action item category slug (setup/02-category.sh prints it)
+#   AUTOFIX_FIX_ALL        (var)    "true" → EVERY finding is treated as auto-fixable and dispatched to
+#                                   the fixer, whatever CI said in fix.auto_fixable (rollout/testing
+#                                   switch); anything else → CI decides
 # wf-a2 additionally needs GITHUB_TOKEN; it is read there.
 
 id: autofix_on_build
@@ -410,6 +413,7 @@ steps:
       context: "${{ steps.guard.outputs.context }}"
       existing: "${{ steps.find_open_items.outputs.body }}"
       category_slug: "${{ vars.AUTOFIX_CATEGORY_SLUG }}"
+      fix_all: "${{ vars.AUTOFIX_FIX_ALL }}"
       find_limit: "${{ variables.find_limit }}"
       max_items: "${{ variables.max_items_per_build }}"
       max_fix_attempts: "${{ variables.max_fix_attempts }}"
@@ -436,6 +440,10 @@ steps:
         const nowMs = Date.parse(now);
         const buildId = str(ctx.build_id);
         const categorySlug = str(inputs.category_slug);
+        // AUTOFIX_FIX_ALL=true: CI's auto_fixable verdict is ignored and every
+        // finding goes to the fixer. The playbook is derived when CI gave none:
+        // a package with a fixed version is an upgrade, anything else a code change.
+        const fixAll = str(inputs.fix_all).trim().toLowerCase() === 'true';
 
         // Live items by finding_key. Duplicates (should never happen) are
         // counted and the first one wins; the rest are left alone.
@@ -481,7 +489,7 @@ steps:
           return 'dispatch';
         };
 
-        const describe = (f, severity, autoFixable, fixType) => {
+        const describe = (f, severity, autoFixable, fixType, forced) => {
           const rule = f.rule || {};
           const p = f.package || {};
           const loc = f.location || {};
@@ -506,7 +514,7 @@ steps:
           lines.push('');
           if (fix.recommendation) lines.push(`**Recommended fix**: ${str(fix.recommendation)}${fix.command ? ' (`' + str(fix.command) + '`)' : ''}`, '');
           if (autoFixable) {
-            lines.push(`**Autofix**: auto-fixable (${fixType}). A pull request against \`${ctx.branch}\` is opened automatically; its link is posted here as a comment when ready.`);
+            lines.push(`**Autofix**: ${forced ? 'fix attempted for every finding (AUTOFIX_FIX_ALL)' : 'auto-fixable'} (${fixType}). A pull request against \`${ctx.branch}\` is opened automatically; its link is posted here as a comment when ready.`);
           } else {
             lines.push('**Autofix**: manual — no automatic fix is attempted for this finding.');
           }
@@ -539,11 +547,14 @@ steps:
           seenKeys[key] = 1;
 
           const fix = f.fix || {};
-          const autoFixable = fix.available === true && fix.auto_fixable === true;
-          const fixType = str(fix.type || (autoFixable ? 'code_change' : 'manual'));
+          const p = f.package || {};
+          const ciFixable = fix.available === true && fix.auto_fixable === true;
+          const autoFixable = fixAll || ciFixable;
+          let fixType = str(fix.type);
+          if (autoFixable && (!fixType || fixType === 'manual')) fixType = p.fixed_version ? 'upgrade_package' : 'code_change';
+          if (!autoFixable) fixType = fixType || 'manual';
           const fixGroup = autoFixable ? fixGroupKey(f, fixType) : '';
           const severity = sev(f.severity);
-          const p = f.package || {};
           const rule = f.rule || {};
           const loc = f.location || {};
 
@@ -570,6 +581,7 @@ steps:
             application_id: str(ctx.application_id),
             report_url: str(f.url),
             auto_fixable: autoFixable,
+            ci_auto_fixable: ciFixable,
             fix_type: fixType,
             fix_group: fixGroup,
           };
@@ -597,7 +609,7 @@ steps:
             if (!autoFixable && st !== 'pr_opened') merged.fix_status = 'manual';
             if (!merged.fix_status) merged.fix_status = autoFixable ? 'pending' : 'manual';
 
-            const body = { metadata: merged, description: describe(f, severity, autoFixable, fixType) };
+            const body = { metadata: merged, description: describe(f, severity, autoFixable, fixType, autoFixable && !ciFixable) };
             if (SEV[severity] < (SEV[str(existing.priority)] !== undefined ? SEV[str(existing.priority)] : 9)) body.priority = severity;
             updateRequests.push({ path: `/governance/action_item/${existing.id}`, method: 'PATCH', body });
             const decision = decideFix(autoFixable, em);
@@ -627,7 +639,7 @@ steps:
             body: {
               nrn: str(ctx.application_nrn),
               title: `[${severity.toUpperCase()}] ${str(f.title || f.id)}`.slice(0, 140),
-              description: describe(f, severity, autoFixable, fixType),
+              description: describe(f, severity, autoFixable, fixType, autoFixable && !ciFixable),
               category_slug: categorySlug,
               priority: severity,
               created_by: 'agent:autofix',

@@ -336,6 +336,15 @@ steps:
              rewrite history.
            - misconfiguration (Dockerfile, config): apply the recommended
              directive.
+           - test_failure: make the failing test pass by fixing the code under
+             test, guided by the assertion message. Never delete, skip or
+             weaken the test unless the test itself is provably wrong — say so
+             in the PR if you do.
+           - license: replace the offending dependency ONLY with a drop-in,
+             permissively licensed alternative you can verify builds; otherwise
+             leave it in "unfixed" with the reason (needs legal approval).
+           - anything else (bug, sast, quality gate): apply the recommendation
+             as the smallest change that removes the reported condition.
         5. Verify cheaply. If the repository has an install/build/test command
            that finishes in a few minutes (package.json scripts, Makefile,
            go test ./..., pytest, …), run it. Pre-existing failures unrelated

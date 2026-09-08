@@ -759,3 +759,99 @@ describe('wf-a2 autofix-fix (E2E)', () => {
     expect(raw).toMatch(/from: agent,\s*to: agent_failed,\s*condition: "false"/);
   });
 });
+
+// ── wf-a1 diff step, fix-all mode (unit) ─────────────────────────────────────
+//
+// `AUTOFIX_FIX_ALL` arrives through `vars.*`, which the local harness cannot
+// inject (they resolve empty → CI decides). So the diff body is exercised
+// directly here with `fix_all: 'true'`, the same way lib-inventory unit-tests
+// its step bodies.
+
+import { normalizeWorkflowDocument, parseYamlDocument } from '@nullplatform/workflow-kit/test';
+
+async function diffStepCode(): Promise<string> {
+  const raw = await readFile(ON_BUILD, 'utf8');
+  const parsed = parseYamlDocument(raw);
+  const def = normalizeWorkflowDocument(parsed.document) as { steps: Record<string, { config?: { code?: string } }> | { id: string; config?: { code?: string } }[] };
+  const steps = Array.isArray(def.steps) ? def.steps : Object.entries(def.steps).map(([id, s]) => ({ id, ...s }));
+  const diff = steps.find((s) => s.id === 'diff');
+  if (!diff?.config?.code) throw new Error('diff step code not found');
+  return diff.config.code;
+}
+
+async function runDiff(inputs: Record<string, unknown>) {
+  const code = await diffStepCode();
+  const fn = new Function('inputs', 'log', code) as (i: Record<string, unknown>, l: Record<string, unknown>) => Record<string, unknown>;
+  const silent = { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
+  return fn(inputs, silent);
+}
+
+const CONTEXT = {
+  build_id: BUILD_ID,
+  application_id: APP_ID,
+  application_nrn: APPLICATION.nrn,
+  repository: REPO,
+  repository_url: `https://github.com/${REPO}`,
+  branch: BRANCH,
+  commit_sha: '3f9a2c1e7b4d5f6e8c9a0b1d2e3f4a5b6c7d8e9f',
+  finding_scope: SCOPE,
+  findings: FINDINGS,
+  findings_total: FINDINGS.length,
+  truncated: false,
+  unhealthy_gates: [],
+};
+
+describe('wf-a1 diff — AUTOFIX_FIX_ALL', () => {
+  it('CI decides by default: only auto_fixable findings are fix candidates', async () => {
+    const out = (await runDiff({ context: CONTEXT, existing: { results: [] }, category_slug: 'security-1', fix_all: '' })) as {
+      counts: Record<string, number>;
+      create_plan: { finding_key: string; fix: string; fix_group: string }[];
+    };
+    expect(out.counts.fix_dispatch_candidates).toBe(3);
+    expect(out.counts.manual).toBe(2);
+    const license = out.create_plan.find((p) => p.finding_key.endsWith(FINDINGS[3]!.id))!;
+    expect(license.fix).toBe('manual');
+    expect(license.fix_group).toBe('');
+  });
+
+  it('fix_all=true: every finding is a fix candidate, with a derived playbook and group', async () => {
+    const out = (await runDiff({ context: CONTEXT, existing: { results: [] }, category_slug: 'security-1', fix_all: 'true' })) as {
+      counts: Record<string, number>;
+      create_plan: { finding_key: string; fix: string; fix_group: string }[];
+      create_requests: { body: { metadata: Record<string, unknown>; labels: Record<string, string>; description: string } }[];
+    };
+    expect(out.counts.fix_dispatch_candidates).toBe(FINDINGS.length);
+    expect(out.counts.manual).toBe(0);
+    for (const p of out.create_plan) expect(p.fix).toBe('dispatch');
+
+    // A manual finding without a fixed version becomes its own code_change group…
+    const license = out.create_requests.find((r) => r.body.metadata.finding_id === FINDINGS[3]!.id)!;
+    expect(license.body.metadata).toMatchObject({
+      auto_fixable: true,
+      ci_auto_fixable: false,
+      fix_type: 'code_change',
+      fix_group: `code_change:${FINDINGS[3]!.id}`,
+      fix_status: 'pending',
+    });
+    expect(license.body.labels.auto_fixable).toBe('true');
+    expect(license.body.description).toContain('AUTOFIX_FIX_ALL');
+    const test = out.create_requests.find((r) => r.body.metadata.finding_id === FINDINGS[4]!.id)!;
+    expect(test.body.metadata.fix_group).toBe(`code_change:${FINDINGS[4]!.id}`);
+
+    // …while CI-fixable findings keep CI's playbook and grouping unchanged.
+    const axios = out.create_requests.find((r) => r.body.metadata.finding_id === FINDINGS[0]!.id)!;
+    expect(axios.body.metadata).toMatchObject({ ci_auto_fixable: true, fix_type: 'upgrade_package', fix_group: 'upgrade:npm:axios:1.8.2' });
+    expect(axios.body.description).not.toContain('AUTOFIX_FIX_ALL');
+  });
+
+  it('fix_all=true re-queues an existing item CI had marked manual', async () => {
+    const existing = liveItem(FINDINGS[3]!.id, { fix_status: 'manual', auto_fixable: false });
+    const out = (await runDiff({ context: CONTEXT, existing: { results: [existing] }, category_slug: 'security-1', fix_all: 'true' })) as {
+      update_plan: { finding_key: string; fix: string }[];
+      update_requests: { body: { metadata: Record<string, unknown> } }[];
+    };
+    expect(out.update_plan).toHaveLength(1);
+    expect(out.update_plan[0]!.fix).toBe('dispatch');
+    expect(out.update_requests[0]!.body.metadata).toMatchObject({ fix_status: 'pending', auto_fixable: true, ci_auto_fixable: false });
+  });
+});

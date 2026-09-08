@@ -55,7 +55,11 @@ What the workflows rely on:
 - `fix.available && fix.auto_fixable` decides whether the fixer runs. CI made
   that call; the workflow has no category rules of its own. `fix.type` selects
   the agent playbook (`upgrade_package`, `code_change`, …); anything not
-  auto-fixable still becomes an item marked `manual`.
+  auto-fixable still becomes an item marked `manual`. With `AUTOFIX_FIX_ALL=true`
+  the verdict is overridden: every finding is dispatched, and a finding CI left
+  without a playbook gets `upgrade_package` when it names a `fixed_version`,
+  else `code_change` (the agent has playbooks for `test_failure`, `license`
+  and generic findings too).
 - `findings_summary.truncated` (or `returned < total`) and any gate whose
   `result` is not `passed`/`failed` **block closing** — absence is not proven.
 - The build's `branch` (the NP entity, falling back to `source.branch`) is
@@ -126,6 +130,7 @@ PR #42 merged; build #3 successful, finding gone ──► item CLOSED, comment 
 | `NP_ORGANIZATION_ID` | var | wf-a1 | numeric org id — search scope for the item lookup |
 | `AUTOFIX_BRANCHES` | var | wf-a1 | comma-separated, `*` wildcards allowed: `main,master,release/*`. Empty → `main,master` |
 | `AUTOFIX_CATEGORY_SLUG` | var | wf-a1 | action item category slug (`02-category.sh` prints it) |
+| `AUTOFIX_FIX_ALL` | var | wf-a1 | `true` → **every** finding is dispatched to the fixer, ignoring CI's `fix.auto_fixable` (rollout/testing switch). Anything else → CI decides. Items record both verdicts (`metadata.auto_fixable`, `metadata.ci_auto_fixable`) |
 | `GITHUB_TOKEN` | secret | wf-a2 | `contents:write` + `pull_requests:write` on every repository in scope |
 
 Runtime constants live in `variables:` of wf-a1 (`metadata_grace_seconds` 120,
