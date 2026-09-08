@@ -109,6 +109,19 @@ reads it on every build:
 Items are **never reopened** (platform rule). A finding that comes back after
 its item closed gets a fresh item on the next build.
 
+## What a reviewer sees
+
+- **On the action item**: the fix PR as a banner at the very top of the
+  description (`> 🔧 Fix pull request: #42 …`), written by the fixer when the PR
+  opens and preserved by every later refresh; the GitHub issue link as the first
+  bullet; the outcome as a comment (PR link, `already_fixed`, or the reason a fix
+  failed); the close reason as the final comment.
+- **On GitHub** (when `AUTOFIX_GITHUB_ISSUES=true`): one issue per item with the
+  same description plus a footer naming the action item, finding and build; the
+  fixer's PR body says `Refs #<n>` for each (never `Fixes`, so GitHub does not
+  close the issue before the build proves the finding gone); the listener
+  comments and closes the issue when it closes the item.
+
 ## Fix groups: items are per finding, PRs are per change
 
 Auto-fixable findings are grouped by the change that fixes them:
@@ -141,7 +154,8 @@ PR #42 merged; build #3 successful, finding gone ──► item CLOSED, comment 
 | `AUTOFIX_BRANCHES` | var | wf-a1 | comma-separated, `*` wildcards allowed: `main,master,release/*`. Empty → `main,master` |
 | `AUTOFIX_CATEGORY_SLUG` | var | wf-a1 | action item category slug (`02-category.sh` prints it) |
 | `AUTOFIX_FIX_ALL` | var | wf-a1 | `true` → **every** finding is dispatched to the fixer, ignoring CI's `fix.auto_fixable` (rollout/testing switch). Anything else → CI decides. Items record both verdicts (`metadata.auto_fixable`, `metadata.ci_auto_fixable`) |
-| `GITHUB_TOKEN` | secret | wf-a2 | `contents:write` + `pull_requests:write` on every repository in scope |
+| `AUTOFIX_GITHUB_ISSUES` | var | wf-a1 | `true` → every item is mirrored as a GitHub issue in the repository (labels `autofix`, `severity:<sev>`, `<category>`), created with the item and commented + closed with it; anything else → off |
+| `GITHUB_TOKEN` | secret | both | `contents:write` + `pull_requests:write` (fixer) and `issues:write` (mirror) on every repository in scope |
 
 Runtime constants live in `variables:` of wf-a1 (`metadata_grace_seconds` 120,
 `max_metadata_waits` 1, `max_fix_groups_per_build` 10, `max_fix_attempts` 3,

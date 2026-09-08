@@ -69,6 +69,9 @@
 #   AUTOFIX_FIX_ALL        (var)    "true" → EVERY finding is treated as auto-fixable and dispatched to
 #                                   the fixer, whatever CI said in fix.auto_fixable (rollout/testing
 #                                   switch); anything else → CI decides
+#   AUTOFIX_GITHUB_ISSUES  (var)    "true" → every item is mirrored as a GitHub issue in the repository
+#                                   (created with the item, commented + closed with it); anything else → off
+#   GITHUB_TOKEN           (secret) only read when AUTOFIX_GITHUB_ISSUES is true (issues:write on the repos)
 # wf-a2 additionally needs GITHUB_TOKEN; it is read there.
 
 id: autofix_on_build
@@ -526,14 +529,20 @@ steps:
           return 'dispatch';
         };
 
-        const describe = (f, severity, autoFixable, fixType, forced) => {
+        // Same banner wf-a2 writes when it opens the PR — kept at the top of
+        // the description on every refresh while the item is pr_opened.
+        const banner = (url, number) =>
+          `> 🔧 **Fix pull request**: [${number ? '#' + number : url}](${url}) — opened automatically by autofix.\n> Merging it makes the finding disappear from the next successful build, which closes this item.\n\n`;
+        const describe = (f, severity, autoFixable, fixType, forced, pr) => {
           const rule = f.rule || {};
           const p = f.package || {};
           const loc = f.location || {};
           const fix = f.fix || {};
           const risk = f.risk || {};
           const lines = [];
+          if (pr && pr.url) lines.push(banner(pr.url, pr.number).trimEnd(), '');
           lines.push(`**${str(f.title || f.id)}**`, '');
+          if (pr && pr.issue_url) lines.push(`- **GitHub issue**: [#${str(pr.issue_number)}](${pr.issue_url})`);
           lines.push(`- **Tool**: ${str(f.tool || '—')} · **Category**: ${str(f.category || '—')} · **Severity**: ${severity}`);
           if (rule.id) lines.push(`- **Rule**: ${link(str(rule.id), rule.url)}${rule.cwe ? ' · ' + str(rule.cwe) : ''}`);
           if (p.name) {
@@ -656,7 +665,13 @@ steps:
             if (!autoFixable && st !== 'pr_opened') merged.fix_status = 'manual';
             if (!merged.fix_status) merged.fix_status = autoFixable ? 'pending' : 'manual';
 
-            const body = { metadata: merged, description: describe(f, severity, autoFixable, fixType, autoFixable && !ciFixable) };
+            const pr = {
+              url: merged.fix_status === 'pr_opened' ? str(em.pr_url) : '',
+              number: em.pr_number,
+              issue_url: str(em.github_issue_url),
+              issue_number: em.github_issue_number,
+            };
+            const body = { metadata: merged, description: describe(f, severity, autoFixable, fixType, autoFixable && !ciFixable, pr) };
             if (SEV[severity] < (SEV[str(existing.priority)] !== undefined ? SEV[str(existing.priority)] : 9)) body.priority = severity;
             updateRequests.push({ path: `/governance/action_item/${existing.id}`, method: 'PATCH', body });
             const decision = decideFix(autoFixable, em);
@@ -730,6 +745,8 @@ steps:
             closePlan.push({
               item_id: str(it.id),
               finding_key: key,
+              github_issue_number: em.github_issue_number || null,
+              title: str(it.title),
               comment: `✅ Finding \`${str(em.finding_id || key)}\` is no longer reported by build ${buildId} on \`${ctx.repository}@${ctx.branch}\`` +
                 (ctx.commit_sha ? ` (commit ${short(ctx.commit_sha)})` : '') + '. Closed automatically by autofix.' +
                 (em.pr_url ? ` Fix PR: ${str(em.pr_url)}` : ''),
@@ -918,6 +935,229 @@ steps:
           fix_findings_dispatched: fixDispatch.reduce((s, d) => s + d.fix_group.findings.length, 0),
         };
 
+  # ── GitHub issues: the optional mirror ────────────────────────────────────
+  # One GitHub issue per action item (created with it, commented + closed with
+  # it). Pure planning here; the calls are `http-request` fan-outs so tests can
+  # stub them like the NP calls. Off unless AUTOFIX_GITHUB_ISSUES is "true".
+  - id: plan_github
+    type: module
+    plugin_type: code-exec
+    name: "Plan GitHub Issues (create / comment / close)"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      enabled: "${{ vars.AUTOFIX_GITHUB_ISSUES }}"
+      context: "${{ steps.guard.outputs.context }}"
+      create_requests: "${{ steps.diff.outputs.create_requests }}"
+      create_plan: "${{ steps.diff.outputs.create_plan }}"
+      creates: "${{ steps.create_item.outputs.items }}"
+      update_requests: "${{ steps.diff.outputs.update_requests }}"
+      update_plan: "${{ steps.diff.outputs.update_plan }}"
+      close_plan: "${{ steps.diff.outputs.close_plan }}"
+      closes: "${{ steps.close_item.outputs.items }}"
+    config:
+      code: |
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const enabled = str(inputs.enabled).trim().toLowerCase() === 'true';
+        const ctx = inputs.context || {};
+        const repo = str(ctx.repository);
+        const api = `https://api.github.com/repos/${repo}`;
+        const createRequests = inputs.create_requests || [];
+        const createPlan = inputs.create_plan || [];
+        const creates = inputs.creates || [];
+        const updateRequests = inputs.update_requests || [];
+        const updatePlan = inputs.update_plan || [];
+        const closePlan = inputs.close_plan || [];
+        const closes = inputs.closes || [];
+        const ok2xx = (r) => r && r.status && Number(r.status) < 400;
+
+        const issueCreateRequests = [];
+        const issueCreatePlan = [];
+        const issueCommentRequests = [];
+        const issueCloseRequests = [];
+        const issueByKey = {};
+        if (!enabled || !repo) {
+          return { enabled: false, issue_create_requests: [], issue_create_plan: [], issue_comment_requests: [], issue_close_requests: [], issue_by_key: {}, to_close: 0 };
+        }
+
+        const footer = (itemId, meta) =>
+          `\n\n---\nTracked by **nullplatform autofix** · action item \`${itemId}\` · finding \`${str(meta.finding_id)}\` · build ${str(ctx.build_id)} on \`${repo}@${str(ctx.branch)}\`.\n` +
+          `This issue is closed automatically when a successful build on \`${str(ctx.branch)}\` no longer reports the finding.`;
+        const labels = (meta) => ['autofix', `severity:${str(meta.severity || 'unknown')}`, str(meta.category || 'finding')].filter(Boolean);
+        const planCreate = (itemId, findingKey, meta, title, description) => {
+          issueCreateRequests.push({
+            url: `${api}/issues`,
+            method: 'POST',
+            body: { title: str(title).slice(0, 250), body: str(description) + footer(itemId, meta), labels: labels(meta) },
+          });
+          issueCreatePlan.push({ item_id: itemId, finding_key: findingKey, metadata: meta, description: str(description) });
+        };
+
+        // New items (this run created them): mirror each one.
+        for (let i = 0; i < createPlan.length; i++) {
+          const id = creates[i] && creates[i].body && creates[i].body.id;
+          if (!id) continue;
+          const body = (createRequests[i] || {}).body || {};
+          planCreate(str(id), createPlan[i].finding_key, body.metadata || {}, body.title, body.description);
+        }
+        // Known items: mirror the ones that never got an issue; remember the rest.
+        for (let i = 0; i < updatePlan.length; i++) {
+          const body = (updateRequests[i] || {}).body || {};
+          const meta = body.metadata || {};
+          if (meta.github_issue_number) {
+            issueByKey[updatePlan[i].finding_key] = { number: meta.github_issue_number, url: str(meta.github_issue_url) };
+            continue;
+          }
+          const f = updatePlan[i].finding || {};
+          planCreate(str(updatePlan[i].item_id), updatePlan[i].finding_key, meta, `[${str(meta.severity || 'unknown').toUpperCase()}] ${str(f.title || f.id)}`, body.description);
+        }
+        // Items this run closed (2xx): comment, then close the mirror.
+        let toClose = 0;
+        for (let i = 0; i < closePlan.length; i++) {
+          const n = closePlan[i] && closePlan[i].github_issue_number;
+          if (!n || !ok2xx(closes[i])) continue;
+          toClose++;
+          issueCommentRequests.push({ url: `${api}/issues/${n}/comments`, method: 'POST', body: { body: str(closePlan[i].comment) } });
+          issueCloseRequests.push({ url: `${api}/issues/${n}`, method: 'PATCH', body: { state: 'closed', state_reason: 'completed' } });
+        }
+        log.info('github plan', { create: issueCreateRequests.length, close: toClose, already_linked: Object.keys(issueByKey).length });
+        return {
+          enabled: true,
+          issue_create_requests: issueCreateRequests,
+          issue_create_plan: issueCreatePlan,
+          issue_comment_requests: issueCommentRequests,
+          issue_close_requests: issueCloseRequests,
+          issue_by_key: issueByKey,
+          to_close: toClose,
+        };
+
+  # POST is not retried (a lost-ack retry would open a duplicate issue). A
+  # failed iteration is an absorbed slot; zip_github counts it and the item
+  # simply stays unlinked — the next build tries again.
+  - id: github_create_issue
+    type: module
+    plugin_type: http-request
+    name: "Create GitHub Issue (per new item)"
+    config:
+      method: POST
+      url: "https://api.github.com/"
+      headers:
+        Authorization: "Bearer ${{ secrets.GITHUB_TOKEN }}"
+        Accept: "application/vnd.github+json"
+        Content-Type: "application/json"
+        User-Agent: "nullplatform-autofix"
+    forEach:
+      expression: "${{ steps.plan_github.outputs.issue_create_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 3
+
+  - id: zip_github
+    type: module
+    plugin_type: code-exec
+    name: "Zip Issues → Item Refs, Enrich Fix Groups"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      plan: "${{ steps.plan_github.outputs.issue_create_plan }}"
+      results: "${{ steps.github_create_issue.outputs.items }}"
+      issue_by_key: "${{ steps.plan_github.outputs.issue_by_key }}"
+      fix_dispatch: "${{ steps.zip.outputs.fix_dispatch }}"
+    config:
+      code: |
+        const str = (v) => (v === undefined || v === null ? '' : String(v));
+        const plan = inputs.plan || [];
+        const results = inputs.results || [];
+        const byKey = Object.assign({}, inputs.issue_by_key || {});
+        const patches = [];
+        let created = 0, failed = 0;
+        for (let i = 0; i < plan.length; i++) {
+          const r = results[i] || {};
+          const body = typeof r.body === 'string' ? (() => { try { return JSON.parse(r.body); } catch (e) { return {}; } })() : (r.body || {});
+          const code = Number(r.statusCode || r.status || 0);
+          if (!(code >= 200 && code < 300) || !body.number) { failed++; continue; }
+          created++;
+          const ref = { number: body.number, url: str(body.html_url) };
+          byKey[plan[i].finding_key] = ref;
+          const meta = Object.assign({}, plan[i].metadata, { github_issue_number: ref.number, github_issue_url: ref.url });
+          // Surface the issue right under the title bullet list head.
+          const line = `- **GitHub issue**: [#${ref.number}](${ref.url})\n`;
+          const desc = str(plan[i].description);
+          const description = desc.includes('- **Tool**') ? desc.replace('- **Tool**', line + '- **Tool**') : line + desc;
+          patches.push({ path: `/governance/action_item/${plan[i].item_id}`, method: 'PATCH', body: { metadata: meta, description } });
+        }
+        // The fixer gets the issue numbers so its PR can say "Refs #N".
+        const dispatch = (inputs.fix_dispatch || []).map((d) => {
+          const g = d.fix_group || {};
+          return { fix_group: Object.assign({}, g, { findings: (g.findings || []).map((x) => Object.assign({}, x, byKey[x.finding_key] ? { github_issue_number: byKey[x.finding_key].number, github_issue_url: byKey[x.finding_key].url } : {})) }) };
+        });
+        return { issue_ref_patches: patches, fix_dispatch: dispatch, issues_created: created, issues_failed: failed };
+
+  - id: patch_issue_refs
+    type: module
+    plugin_type: np-api-call
+    name: "Link Issue on Item (per created issue)"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      failOnHttpError: true
+      path: "/governance/action_item"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.zip_github.outputs.issue_ref_patches }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+
+  - id: github_issue_comment
+    type: module
+    plugin_type: http-request
+    name: "Comment on GitHub Issue (per closed item)"
+    config:
+      method: POST
+      url: "https://api.github.com/"
+      headers:
+        Authorization: "Bearer ${{ secrets.GITHUB_TOKEN }}"
+        Accept: "application/vnd.github+json"
+        Content-Type: "application/json"
+        User-Agent: "nullplatform-autofix"
+    forEach:
+      expression: "${{ steps.plan_github.outputs.issue_comment_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 3
+
+  # PATCH is idempotent → retried.
+  - id: github_close_issue
+    type: module
+    plugin_type: http-request
+    name: "Close GitHub Issue (per closed item)"
+    config:
+      method: PATCH
+      url: "https://api.github.com/"
+      headers:
+        Authorization: "Bearer ${{ secrets.GITHUB_TOKEN }}"
+        Accept: "application/vnd.github+json"
+        Content-Type: "application/json"
+        User-Agent: "nullplatform-autofix"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    forEach:
+      expression: "${{ steps.plan_github.outputs.issue_close_requests }}"
+      itemVariable: item
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 3
+
   - id: close_comment
     type: module
     plugin_type: np-api-call
@@ -942,7 +1182,7 @@ steps:
     plugin_type: sub-workflow
     name: "Dispatch Fixer (per fix group)"
     forEach:
-      expression: "${{ steps.zip.outputs.fix_dispatch }}"
+      expression: "${{ steps.zip_github.outputs.fix_dispatch }}"
       itemVariable: item
       spreadItem: true
       parallel: true
@@ -965,6 +1205,11 @@ steps:
       duplicate_delivery: "${{ steps.diff.outputs.duplicate_delivery }}"
       closing_blocked_reason: "${{ steps.diff.outputs.closing_blocked_reason }}"
       zip: "${{ steps.zip.outputs }}"
+      github_enabled: "${{ steps.plan_github.outputs.enabled }}"
+      github_to_close: "${{ steps.plan_github.outputs.to_close }}"
+      github_created: "${{ steps.zip_github.outputs.issues_created }}"
+      github_failed: "${{ steps.zip_github.outputs.issues_failed }}"
+      github_closes: "${{ steps.github_close_issue.outputs.items }}"
     config:
       code: |
         const ctx = inputs.context || {};
@@ -993,6 +1238,11 @@ steps:
           fix_skipped_in_progress: c.fix_skipped_in_progress || 0,
           fix_skipped_exhausted: c.fix_skipped_exhausted || 0,
           create_truncated: c.create_truncated || 0,
+          github_issues: inputs.github_enabled === true,
+          github_issues_created: inputs.github_created || 0,
+          github_issues_create_failed: inputs.github_failed || 0,
+          github_issues_closed: (inputs.github_closes || []).filter((r) => r && Number(r.statusCode || r.status || 0) >= 200 && Number(r.statusCode || r.status || 0) < 300).length,
+          github_issues_close_failed: Math.max(0, (Number(inputs.github_to_close) || 0) - (inputs.github_closes || []).filter((r) => r && Number(r.statusCode || r.status || 0) >= 200 && Number(r.statusCode || r.status || 0) < 300).length),
         };
         log.info('build processed', summary);
         return summary;
@@ -1027,7 +1277,14 @@ connections:
   - { id: c14, from: create_item,       to: update_item }
   - { id: c15, from: update_item,       to: close_item }
   - { id: c16, from: close_item,        to: zip }
-  - { id: c17, from: zip,               to: close_comment }
+  # GitHub mirror (no-ops when AUTOFIX_GITHUB_ISSUES is not "true")
+  - { id: c16a, from: zip,              to: plan_github }
+  - { id: c16b, from: plan_github,      to: github_create_issue }
+  - { id: c16c, from: github_create_issue, to: zip_github }
+  - { id: c16d, from: zip_github,       to: patch_issue_refs }
+  - { id: c16e, from: patch_issue_refs, to: github_issue_comment }
+  - { id: c16f, from: github_issue_comment, to: github_close_issue }
+  - { id: c17, from: github_close_issue, to: close_comment }
   - { id: c18, from: close_comment,     to: dispatch_fix }
   - { id: c19, from: dispatch_fix,      to: summary }
   - { id: c20, from: summary,           to: stash_summary }
@@ -1045,3 +1302,5 @@ outputs:
   closing_blocked_reason: "${{ variables.result.closing_blocked_reason }}"
   fix_groups_dispatched: "${{ variables.result.fix_groups_dispatched }}"
   fix_findings_dispatched: "${{ variables.result.fix_findings_dispatched }}"
+  github_issues_created: "${{ variables.result.github_issues_created }}"
+  github_issues_closed: "${{ variables.result.github_issues_closed }}"

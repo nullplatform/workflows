@@ -132,6 +132,7 @@ steps:
           lines.push(`### ${i + 1}. ${str(f.title || f.id)}`);
           lines.push(`- finding_key: \`${x.finding_key}\``);
           lines.push(`- action item: ${x.action_item_id}`);
+          if (x.github_issue_number) lines.push(`- GitHub issue: #${x.github_issue_number}${x.github_issue_url ? ' (' + x.github_issue_url + ')' : ''} — write \`Refs #${x.github_issue_number}\` in the PR body (NOT \`Fixes\`: the issue is closed by the build that proves the finding gone)`);
           lines.push(`- id: \`${f.id}\` · tool: ${str(f.tool)} · category: ${str(f.category)} · severity: ${str(f.severity)}`);
           if (r.id) lines.push(`- rule: ${r.id}${r.cwe ? ' (' + r.cwe + ')' : ''}${r.url ? ' — ' + r.url : ''}`);
           if (p.name) lines.push(`- package: ${p.name} ${str(p.version)} (${str(p.ecosystem)}${p.direct === true ? ', direct' : p.direct === false ? ', transitive' : ''})${p.fixed_version ? ' → fixed in ' + p.fixed_version : ''}${p.license ? ' · license ' + p.license : ''}`);
@@ -204,12 +205,14 @@ steps:
         const fetches = inputs.fetches || [];
         const now = new Date().toISOString();
         const bases = [];
+        const descriptions = [];
         const patchRequests = [];
         let fetch_failed = 0;
         for (let i = 0; i < ids.length; i++) {
           const r = fetches[i];
           const item = r && r.status && Number(r.status) < 400 && r.body;
-          if (!item) { bases.push(null); fetch_failed++; continue; }
+          if (!item) { bases.push(null); descriptions.push(null); fetch_failed++; continue; }
+          descriptions.push(str(item.description));
           const merged = Object.assign({}, item.metadata || {}, {
             fix_status: 'in_progress',
             fix_started_at: now,
@@ -222,7 +225,7 @@ steps:
           patchRequests.push({ path: `/governance/action_item/${ids[i]}`, method: 'PATCH', body: { metadata: merged } });
         }
         if (fetch_failed) log.warn(`mark_plan: ${fetch_failed} item(s) could not be fetched — they will be commented but not patched`);
-        return { bases, patch_requests: patchRequests, fetch_failed };
+        return { bases, descriptions, patch_requests: patchRequests, fetch_failed };
 
   - id: mark_in_progress
     type: module
@@ -376,7 +379,9 @@ steps:
            gh pr create --base <base> --head <work branch> --title … --body-file …
            (or POST /repos/<repository>/pulls). PR body: what changed and why;
            a table of the findings (id, severity, title, link); how it was
-           verified; the action item ids; and the line
+           verified; the action item ids; one "Refs #<n>" line per GitHub
+           issue named in the brief (never "Fixes"/"Closes" — the issues are
+           closed by the build that proves the finding gone); and the line
            "Opened automatically by nullplatform Autofix from build <build id>."
            Report "pr_opened" ONLY with the URL and number the API returned.
 
@@ -442,12 +447,20 @@ steps:
       item_ids: "${{ steps.plan.outputs.item_ids }}"
       finding_keys: "${{ steps.plan.outputs.finding_keys }}"
       bases: "${{ steps.mark_plan.outputs.bases }}"
+      descriptions: "${{ steps.mark_plan.outputs.descriptions }}"
       branch_name: "${{ steps.plan.outputs.branch_name }}"
       group_key: "${{ steps.plan.outputs.group.group_key }}"
     config:
       code: |
         const str = (v) => (v === undefined || v === null ? '' : String(v));
         const a = inputs.agent || {};
+        const descriptions = inputs.descriptions || [];
+        // The PR link goes at the TOP of the item description (always visible),
+        // not only in metadata and the comment. The listener keeps this banner
+        // on every later refresh (it rebuilds descriptions from the finding).
+        const BANNER_RE = /^> 🔧 \*\*Fix pull request\*\*:[^\n]*\n(?:>[^\n]*\n)*\n?/;
+        const banner = (url, number) =>
+          `> 🔧 **Fix pull request**: [${number ? '#' + number : url}](${url}) — opened automatically by autofix.\n> Merging it makes the finding disappear from the next successful build, which closes this item.\n\n`;
         const ids = inputs.item_ids || [];
         const keys = inputs.finding_keys || [];
         const bases = inputs.bases || [];
@@ -508,7 +521,11 @@ steps:
               // Lets the listener re-check a PR that is still open N builds later.
               pr_opened_seen_builds: itemStatus === 'pr_opened' ? (Number(base.seen_builds) || 0) : (base.pr_opened_seen_builds ?? null),
             });
-            patchRequests.push({ path: `/governance/action_item/${ids[i]}`, method: 'PATCH', body: { metadata: merged } });
+            const body = { metadata: merged };
+            if (itemStatus === 'pr_opened' && descriptions[i] !== null && descriptions[i] !== undefined) {
+              body.description = banner(prUrl, prNumber) + str(descriptions[i]).replace(BANNER_RE, '');
+            }
+            patchRequests.push({ path: `/governance/action_item/${ids[i]}`, method: 'PATCH', body });
             patched++;
           } else {
             unpatched++;
