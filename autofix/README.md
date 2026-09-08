@@ -102,7 +102,7 @@ reads it on every build:
 | `manual` | not auto-fixable | refreshed, never dispatched |
 | `pending` | fixable, not attempted yet | dispatched |
 | `in_progress` | a fixer run owns it (`fix_started_at`) | skipped while younger than `stale_fix_hours` (2h); retried after |
-| `pr_opened` | PR open (`pr_url`) | skipped — the PR merge makes the finding vanish, which closes the item |
+| `pr_opened` | PR open (`pr_url`) | skipped — the PR merge makes the finding vanish, which closes the item. Still reported `pr_recheck_builds` (5) builds later → re-dispatched: the fixer reports `already_open`, or opens a fresh PR if the old one was closed without merging |
 | `already_fixed` | agent found HEAD already fixed | retried below `max_fix_attempts` (3) |
 | `failed` | fix did not complete (`fix_error`) | retried below `max_fix_attempts` (3), then left alone |
 

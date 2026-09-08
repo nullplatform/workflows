@@ -329,8 +329,10 @@ steps:
            (git ls-remote --heads origin <work branch>), look for an open PR
            from it (gh pr list --head <work branch> --state open --json url,number
            or GET /repos/<repository>/pulls?head=<owner>:<work branch>&state=open).
-           If a PR exists, do NOT push anything: report status "already_open"
-           with its URL and number.
+           If an OPEN PR exists, do NOT push anything: report status
+           "already_open" with its URL and number. If the branch exists but its
+           PR was closed WITHOUT merging, delete the remote branch and start
+           over from the base branch (a fresh PR is wanted).
         3. Confirm each finding still applies at the base branch HEAD (the
            scanned commit may be older): the manifest still pins the vulnerable
            version, the code at the location still shows the pattern, the file
@@ -503,6 +505,8 @@ steps:
               fix_branch: str(inputs.branch_name),
               pr_url: itemStatus === 'pr_opened' ? prUrl : str(base.pr_url),
               pr_number: itemStatus === 'pr_opened' ? prNumber : (base.pr_number || null),
+              // Lets the listener re-check a PR that is still open N builds later.
+              pr_opened_seen_builds: itemStatus === 'pr_opened' ? (Number(base.seen_builds) || 0) : (base.pr_opened_seen_builds ?? null),
             });
             patchRequests.push({ path: `/governance/action_item/${ids[i]}`, method: 'PATCH', body: { metadata: merged } });
             patched++;

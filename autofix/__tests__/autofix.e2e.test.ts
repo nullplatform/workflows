@@ -886,3 +886,14 @@ describe('wf-a1 — duplicate delivery', () => {
     expect(result.outputs).toMatchObject({ status: 'duplicate_delivery', closing_blocked_reason: 'duplicate_delivery' });
   });
 });
+
+describe('wf-a1 — pr_opened re-check', () => {
+  it('re-dispatches a pr_opened item still reported 5 builds after the PR opened, not before', async () => {
+    const xssId = FINDINGS[2]!.id;
+    const fresh = await runOnBuild({ existing: [liveItem(xssId, { fix_status: 'pr_opened', pr_url: 'https://x/pull/1', seen_builds: 4, pr_opened_seen_builds: 1 })] });
+    expect(fresh.dispatched.map((g) => g.group_key)).not.toContain(`code_change:${xssId}`);
+    // seen_builds is 8 BEFORE this build → 9 after; 9 - 1 = 8 ≥ 5 (the decision reads the stored value: 8 - 1 = 7 ≥ 5)
+    const stale = await runOnBuild({ existing: [liveItem(xssId, { fix_status: 'pr_opened', pr_url: 'https://x/pull/1', seen_builds: 8, pr_opened_seen_builds: 1 })] });
+    expect(stale.dispatched.map((g) => g.group_key)).toContain(`code_change:${xssId}`);
+  });
+});

@@ -93,6 +93,10 @@ variables:
   max_fix_groups_per_build: { initialValue: 10 }
   max_fix_attempts: { initialValue: 3 }
   stale_fix_hours: { initialValue: 2 }
+  # A pr_opened item whose finding is STILL reported this many builds later is
+  # re-dispatched: the fixer finds the PR open (cheap `already_open`) or, if it
+  # was closed without merging, opens a fresh one — no item stays stuck.
+  pr_recheck_builds: { initialValue: 5 }
   result: { initialValue: { status: "unknown" } }
 
 steps:
@@ -423,6 +427,7 @@ steps:
       max_items: "${{ variables.max_items_per_build }}"
       max_fix_attempts: "${{ variables.max_fix_attempts }}"
       stale_fix_hours: "${{ variables.stale_fix_hours }}"
+      pr_recheck_builds: "${{ variables.pr_recheck_builds }}"
     config:
       code: |
         // "Live" = every ActionItemStatus that is not resolved/rejected/closed.
@@ -441,6 +446,7 @@ steps:
         const maxItems = Number(inputs.max_items) || 200;
         const maxAttempts = Number(inputs.max_fix_attempts) || 3;
         const staleMs = (Number(inputs.stale_fix_hours) || 2) * 3600000;
+        const prRecheckBuilds = Number(inputs.pr_recheck_builds) || 5;
         const now = new Date().toISOString();
         const nowMs = Date.parse(now);
         const buildId = str(ctx.build_id);
@@ -502,7 +508,11 @@ steps:
           if (!autoFixable) return 'manual';
           const st = str(em.fix_status || 'pending');
           const attempts = Number(em.fix_attempts) || 0;
-          if (st === 'pr_opened') return 'skip_pr_open';
+          if (st === 'pr_opened') {
+            // Still reported N builds after the PR was opened → re-check it.
+            const since = (Number(em.seen_builds) || 0) - (Number(em.pr_opened_seen_builds) || Number(em.seen_builds) || 0);
+            return since >= prRecheckBuilds ? 'dispatch' : 'skip_pr_open';
+          }
           if (st === 'in_progress' || st === 'queued') {
             const started = Date.parse(str(em.fix_started_at)) || 0;
             if (nowMs - started < staleMs) return 'skip_in_progress';
