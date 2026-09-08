@@ -8,7 +8,7 @@
  *   …/04-build-channel.mjs --dry-run              # show what would be created
  *   …/04-build-channel.mjs --delete               # remove the channel (stops autofix)
  *   …/04-build-channel.mjs --workflow-id wf_…     # bypass setup/.uploaded.json
- *   …/04-build-channel.mjs --methods PATCH,POST   # forward only these audit methods (default: all)
+ *   …/04-build-channel.mjs --methods PATCH,POST   # audit methods to forward (default: PATCH = the status update)
  *   …/04-build-channel.mjs --nrn organization=X   # channel NRN (default: the org)
  *
  * SCOPE THE CHANNEL TO THE ORGANIZATION. Build audit events are NOT matched by
@@ -53,11 +53,13 @@ const argValue = (flag) => {
 };
 const WORKFLOW_ID_ARG = argValue('--workflow-id');
 const NRN_ARG = argValue('--nrn');
-// Default: every audited build mutation (create, status flips, patches) —
-// the listener discards what is not a successful build anyway. Narrow with
-// --methods only once you have confirmed which HTTP method your CI's status
-// update is audited as.
-const METHODS = (argValue('--methods') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+// Default PATCH: one CI run audits POST /build (create), POST /build/{id}/asset_url
+// (asset push), a POST for the metadata write and exactly ONE PATCH /build/{id}
+// for the status update (verified live 2026-09-08 from the audit payloads).
+// Forwarding only PATCH gives one listener execution per build. Pass
+// --methods PATCH,POST to forward everything (the listener skips non-successful
+// builds and has a duplicate-delivery guard, so it is safe, just noisier).
+const METHODS = (argValue('--methods') ?? 'PATCH').split(',').map((s) => s.trim()).filter(Boolean);
 
 /** The workflow whose webhook the channel targets, by client key. */
 const WORKFLOW_KEY = 'autofix-on-build';
