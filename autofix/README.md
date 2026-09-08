@@ -14,13 +14,21 @@ Two workflows, no approval loop by design (the PR *is* the review gate):
 |---|---|
 | `wf-a1-on-build.yaml` | **The listener and the closer.** Webhook fed by an NP audit notification channel (`entity=build`). Re-reads the build, keeps only `status=successful` on watched branches, waits once if the findings have not landed yet, then diffs `quality_metrics.findings[]` against the live autofix items of that repo@branch: creates new items, refreshes known ones, closes vanished ones, and dispatches the fixer once per **fix group**. |
 | `wf-a2-fix.yaml` | **The fixer.** One execution per fix group. Stamps the items `in_progress`, runs the agent (clone → verify the finding still applies → minimal fix → cheap verification → push a deterministic branch → open the PR), then stamps every item with the outcome (`pr_opened` + PR link, `already_fixed`, or `failed` + reason) and comments. |
-| `setup/*` | Bring-up runbook (below). |
+| `setup/*` | Bring-up runbook (below): the `quality_metrics` metadata specification, category, config entries, upload, build channel. |
+| `ci/*` | **What CI has to produce.** `quality-metrics.mjs` normalizes Trivy reports into the contract (stable ids, go.mod line numbers, per-package highest fixed version, spec-clipped fields); `github-actions.example.yml` shows where the steps go. Live in `kwik-e-mart/autofixer-application-fixer-test`. |
 | `__tests__/autofix.e2e.test.ts` | Every branch of both graphs, on the real engine with stubbed I/O. |
 
 ## The contract: what CI writes on the build
 
 The suite reads **normalized findings**, not tool reports. Adding a scanner is a
-CI-side change; the workflow never learns tool formats. Either embedded on the
+CI-side change; the workflow never learns tool formats. The contract is a build
+**metadata specification** (`setup/00-metadata-spec.json`, created by
+`setup/00-metadata-spec.sh`): the platform validates every CI write against it,
+so a malformed payload is rejected at `np metadata create` time rather than
+misread later. CI writes it with `np metadata create --entity build --data
+'{"quality_metrics": …}'` (the build is found from the CI environment, like
+`np build update`), **before** the final `np build update --status` — writing
+metadata does not fire the build channel (verified live), the status PATCH does. Either embedded on the
 build entity (`build.metadata.quality_metrics`) or as a metadata instance
 (`GET /metadata/build/{id}` → `quality_metrics`):
 
@@ -144,6 +152,9 @@ applied at runtime, `initialValue` is.
 # 0. local check — same engine + validator the platform runs
 npx vitest autofix && npx np-workflow validate autofix/*.yaml
 
+# 0b. the build metadata specification CI writes and the listener reads
+NP_API_KEY=… autofix/setup/00-metadata-spec.sh
+
 # 1. category (prints the slug to use)
 NP_API_KEY=… autofix/setup/02-category.sh --name Security --slug security
 
@@ -166,6 +177,14 @@ an alias is CREATED with `POST …/aliases {name, revision}` (PUT only repoints
 an existing one, 404 otherwise); a live trigger row reports `status: "live"`;
 a category named "Security" got the slug `security-1` because the name was
 taken — always read the slug back.
+
+**CI side.** Copy `ci/quality-metrics.mjs` into the repository and add the steps
+from `ci/github-actions.example.yml` between the asset push and the final status
+update. Trivy stands in for Aqua/Checkmarx; any scanner works as long as the
+normalizer emits the contract. The image scan is OS packages only (`--pkg-types
+os`): the repository scan already covers language packages with manifest line
+numbers, and a Go binary's stdlib CVEs would add ~140 findings that all share
+one fix.
 
 **Verify before widening.** Trigger a real build on a watched branch, or replay
 one: `POST <webhookUrl>` with

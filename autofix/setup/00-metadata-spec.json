@@ -1,0 +1,166 @@
+{
+  "name": "Quality Metrics",
+  "description": "CI quality gates plus normalized security/quality findings (Aqua, Checkmarx, SonarQube, Trivy, lint, tests) with location and fix data for automated remediation",
+  "nrn": "organization=<ORG_ID>",
+  "entity": "build",
+  "metadata": "quality_metrics",
+  "schema": {
+    "type": "object",
+    "merge": "replace",
+    "visibleOn": ["read"],
+    "properties": {
+      "overall_result": { "type": "string", "enum": ["passed","failed","warning","skipped","error"], "title": "Overall", "description": "Aggregate result of all quality gates", "visibleOn": ["read","list"], "tag": true },
+      "unit_test_result": { "type": "string", "enum": ["passed","failed","warning","skipped","error"], "title": "Unit Tests", "description": "Result of the unit test stage", "visibleOn": ["read","list"] },
+      "lint_result": { "type": "string", "enum": ["passed","failed","warning","skipped","error"], "title": "Lint", "description": "Result of the lint stage", "visibleOn": ["read","list"] },
+      "sonarqube_quality_gate_result": { "type": "string", "enum": ["passed","failed","warning","skipped","error"], "title": "SonarQube Quality Gate", "description": "Result of the SonarQube quality gate", "visibleOn": ["read","list"] },
+      "security_scan_result": { "type": "string", "enum": ["passed","failed","warning","skipped","error"], "title": "Security Scan", "description": "Aggregate result of security scans (Aqua, Checkmarx)", "visibleOn": ["read","list"], "tag": true },
+      "security_vulnerabilities_critical": { "type": "integer", "minimum": 0, "title": "Critical Vulnerabilities", "description": "Number of critical severity vulnerabilities", "visibleOn": ["read","list"] },
+      "security_vulnerabilities_high": { "type": "integer", "minimum": 0, "title": "High Vulnerabilities", "description": "Number of high severity vulnerabilities", "visibleOn": ["read","list"] },
+      "security_vulnerabilities_medium": { "type": "integer", "minimum": 0, "title": "Medium Vulnerabilities", "description": "Number of medium severity vulnerabilities", "visibleOn": ["read","list"] },
+      "security_vulnerabilities_low": { "type": "integer", "minimum": 0, "title": "Low Vulnerabilities", "description": "Number of low severity vulnerabilities", "visibleOn": ["read","list"] },
+      "security_vulnerabilities_fixable": { "type": "integer", "minimum": 0, "title": "Fixable Vulnerabilities", "description": "Number of vulnerabilities with a fix available", "visibleOn": ["read","list"] },
+      "source": {
+        "type": "object", "title": "Source", "description": "Repository revision the findings apply to", "additionalProperties": false,
+        "properties": {
+          "repository": { "type": "string", "title": "Repository", "description": "owner/name" },
+          "repository_url": { "type": "string", "title": "Repository URL", "format": "uri" },
+          "branch": { "type": "string", "title": "Branch" },
+          "commit_sha": { "type": "string", "title": "Commit SHA", "pattern": "^[0-9a-f]{7,64}$" },
+          "dockerfile": { "type": "string", "title": "Dockerfile", "description": "Repository-relative path to the Dockerfile" },
+          "manifests": { "type": "array", "title": "Manifests", "maxItems": 20, "items": { "type": "string" }, "description": "Dependency manifests scanned" }
+        }
+      },
+      "gates": {
+        "type": "array", "title": "Gates", "maxItems": 20, "description": "One entry per tool run / pipeline stage",
+        "items": {
+          "type": "object", "title": "Gate", "additionalProperties": false, "required": ["name","tool","result"],
+          "properties": {
+            "name": { "type": "string", "title": "Name", "description": "Stage identifier (e.g., 'unit_tests', 'lint', 'quality_gate', 'sast', 'sca', 'container_scan')" },
+            "tool": { "type": "string", "title": "Tool" },
+            "result": { "type": "string", "enum": ["passed","failed","warning","skipped","error"], "title": "Result" },
+            "report_url": { "type": "string", "title": "Report URL", "format": "uri" },
+            "target": { "type": "string", "title": "Target", "description": "What was scanned (image reference, project key, path)" },
+            "counts": { "type": "object", "title": "Counts", "description": "Free-form counters (passed/failed, critical/high/..., errors/warnings)", "additionalProperties": { "type": "integer", "minimum": 0 } },
+            "failed_conditions": {
+              "type": "array", "title": "Failed Conditions", "maxItems": 20,
+              "items": { "type": "object", "title": "Failed Condition", "additionalProperties": false, "required": ["metric"],
+                "properties": {
+                  "metric": { "type": "string", "title": "Metric" },
+                  "operator": { "type": "string", "enum": ["less_than","greater_than"], "title": "Operator" },
+                  "threshold": { "type": ["number","string"], "title": "Threshold" },
+                  "actual": { "type": ["number","string"], "title": "Actual" }
+                } }
+            },
+            "policy": {
+              "type": "object", "title": "Policy", "additionalProperties": false, "required": ["name","result"],
+              "properties": {
+                "name": { "type": "string", "title": "Name" },
+                "result": { "type": "string", "enum": ["passed","failed"], "title": "Result" },
+                "failed_controls": { "type": "array", "title": "Failed Controls", "maxItems": 50, "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      },
+      "findings_summary": {
+        "type": "object", "title": "Findings Summary", "additionalProperties": false,
+        "properties": {
+          "total": { "type": "integer", "minimum": 0, "title": "Total", "description": "Total findings produced by all tools" },
+          "returned": { "type": "integer", "minimum": 0, "title": "Returned", "description": "Findings included in the findings array" },
+          "truncated": { "type": "boolean", "title": "Truncated", "description": "True when findings were cut to fit the cap" },
+          "by_severity": { "type": "object", "title": "By Severity", "additionalProperties": false,
+            "properties": {
+              "critical": { "type": "integer", "minimum": 0, "title": "Critical" },
+              "high": { "type": "integer", "minimum": 0, "title": "High" },
+              "medium": { "type": "integer", "minimum": 0, "title": "Medium" },
+              "low": { "type": "integer", "minimum": 0, "title": "Low" },
+              "negligible": { "type": "integer", "minimum": 0, "title": "Negligible" },
+              "unknown": { "type": "integer", "minimum": 0, "title": "Unknown" }
+            } },
+          "by_category": { "type": "object", "title": "By Category", "additionalProperties": { "type": "integer", "minimum": 0 } },
+          "auto_fixable": { "type": "integer", "minimum": 0, "title": "Auto-fixable" }
+        }
+      },
+      "findings": {
+        "type": "array", "title": "Findings", "maxItems": 200, "description": "Normalized findings across all tools, sorted by severity",
+        "items": {
+          "type": "object", "title": "Finding", "additionalProperties": false, "required": ["id","tool","category","severity","title"],
+          "properties": {
+            "id": { "type": "string", "title": "ID", "description": "Stable fingerprint: tool + rule + target. Used to dedupe across builds", "maxLength": 300 },
+            "tool": { "type": "string", "title": "Tool", "description": "Producer of the finding (e.g., 'aqua', 'checkmarx', 'sonarqube', 'eslint', 'jest')" },
+            "category": { "type": "string", "enum": ["vulnerability","sast","sca","license","secret","misconfiguration","malware","bug","code_smell","lint","test_failure"], "title": "Category" },
+            "severity": { "type": "string", "enum": ["critical","high","medium","low","negligible","unknown"], "title": "Severity" },
+            "status": { "type": "string", "enum": ["open","acknowledged","fixed"], "title": "Status" },
+            "status_reason": { "type": "string", "title": "Status Reason", "description": "Why the finding was acknowledged/suppressed", "maxLength": 500 },
+            "status_until": { "type": "string", "title": "Status Until", "description": "Expiry of an acknowledgement", "format": "date-time" },
+            "confidence": { "type": "string", "enum": ["high","medium","low"], "title": "Confidence", "description": "Tool confidence, mainly for SAST triage" },
+            "title": { "type": "string", "title": "Title", "maxLength": 300 },
+            "message": { "type": "string", "title": "Message", "description": "Raw tool message (assertion text, lint message)", "maxLength": 2000 },
+            "description": { "type": "string", "title": "Description", "maxLength": 1000 },
+            "rule": { "type": "object", "title": "Rule", "additionalProperties": false, "required": ["id"],
+              "properties": {
+                "id": { "type": "string", "title": "Rule ID", "description": "CVE/GHSA id, Checkmarx query name, Sonar rule key, lint rule" },
+                "name": { "type": "string", "title": "Rule Name" },
+                "cwe": { "type": "string", "title": "CWE", "pattern": "^CWE-[0-9]+$" },
+                "url": { "type": "string", "title": "Rule URL", "format": "uri" }
+              } },
+            "package": { "type": "object", "title": "Package", "additionalProperties": false, "required": ["name"],
+              "properties": {
+                "name": { "type": "string", "title": "Name" },
+                "ecosystem": { "type": "string", "title": "Ecosystem", "description": "e.g., 'npm', 'pip', 'maven', 'nuget', 'go', 'alpine', 'debian'" },
+                "version": { "type": "string", "title": "Installed Version" },
+                "fixed_version": { "type": "string", "title": "Fixed Version", "description": "Empty when no fix exists" },
+                "direct": { "type": "boolean", "title": "Direct Dependency" },
+                "via": { "type": "array", "title": "Via", "maxItems": 20, "items": { "type": "string" }, "description": "Dependency chain for transitive packages" },
+                "license": { "type": "string", "title": "License", "description": "SPDX identifier" }
+              } },
+            "location": { "type": "object", "title": "Location", "additionalProperties": false, "required": ["type"],
+              "properties": {
+                "type": { "type": "string", "enum": ["file","code_flow","manifest","image_layer","package"], "title": "Type", "description": "Tells the agent what kind of edit is implied" },
+                "path": { "type": "string", "title": "Path", "description": "Repository-relative path (Dockerfile, manifest or source file)" },
+                "line": { "type": "integer", "minimum": 1, "title": "Line" },
+                "column": { "type": "integer", "minimum": 1, "title": "Column" },
+                "end_line": { "type": "integer", "minimum": 1, "title": "End Line" },
+                "snippet": { "type": "string", "title": "Snippet", "description": "Single line of code or instruction", "maxLength": 500 },
+                "source": { "type": "object", "title": "Taint Source", "additionalProperties": false, "required": ["path"],
+                  "properties": {
+                    "path": { "type": "string", "title": "Path", "description": "Repository-relative file path" },
+                    "line": { "type": "integer", "minimum": 1, "title": "Line" },
+                    "column": { "type": "integer", "minimum": 1, "title": "Column" },
+                    "snippet": { "type": "string", "title": "Snippet", "description": "Single line of code at this point", "maxLength": 500 }
+                  } },
+                "sink": { "type": "object", "title": "Taint Sink", "additionalProperties": false, "required": ["path"],
+                  "properties": {
+                    "path": { "type": "string", "title": "Path", "description": "Repository-relative file path" },
+                    "line": { "type": "integer", "minimum": 1, "title": "Line" },
+                    "column": { "type": "integer", "minimum": 1, "title": "Column" },
+                    "snippet": { "type": "string", "title": "Snippet", "description": "Single line of code at this point", "maxLength": 500 }
+                  } },
+                "node_count": { "type": "integer", "minimum": 0, "title": "Data Flow Nodes", "description": "Number of nodes in the full data flow" }
+              } },
+            "fix": { "type": "object", "title": "Fix", "additionalProperties": false,
+              "properties": {
+                "available": { "type": "boolean", "title": "Fix Available" },
+                "auto_fixable": { "type": "boolean", "title": "Auto-fixable", "description": "True when an agent may apply the fix without human input" },
+                "type": { "type": "string", "enum": ["upgrade_package","base_image_update","code_change","config_change","manual"], "title": "Fix Type" },
+                "recommendation": { "type": "string", "title": "Recommendation", "description": "Human/agent-readable remediation", "maxLength": 1000 },
+                "command": { "type": "string", "title": "Command", "description": "Single shell command that applies the fix", "maxLength": 500 },
+                "effort_minutes": { "type": "integer", "minimum": 0, "title": "Effort (min)" }
+              } },
+            "risk": { "type": "object", "title": "Risk", "additionalProperties": false,
+              "properties": {
+                "cvss_score": { "type": "number", "title": "CVSS Score", "minimum": 0, "maximum": 10 },
+                "cvss_vector": { "type": "string", "title": "CVSS Vector" },
+                "epss_score": { "type": "number", "title": "EPSS Score", "description": "Probability of exploitation in the next 30 days", "minimum": 0, "maximum": 1 },
+                "exploit_available": { "type": "boolean", "title": "Exploit Available" }
+              } },
+            "url": { "type": "string", "title": "URL", "description": "Deep link to the finding in the tool", "format": "uri" },
+            "first_seen": { "type": "string", "title": "First Seen", "format": "date-time" },
+            "last_seen": { "type": "string", "title": "Last Seen", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "additionalProperties": false
+  }
+}

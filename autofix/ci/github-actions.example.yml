@@ -1,0 +1,37 @@
+# Reference CI steps that produce the `quality_metrics` build metadata the
+# autofix suite consumes, using Trivy. Drop them into a nullplatform build job
+# AFTER the asset is pushed and BEFORE `np build update --status …` — the
+# listener wakes on that status PATCH and expects the findings to be there
+# (writing metadata does not itself fire the build channel).
+#
+# Live example: kwik-e-mart/autofixer-application-fixer-test/.github/workflows/ci.yml
+env:
+  TRIVY_VERSION: v0.69.3
+steps:
+  - name: Install Trivy
+    continue-on-error: true
+    run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin "$TRIVY_VERSION"
+  - name: Scan repository (dependencies, Dockerfile, secrets)
+    continue-on-error: true
+    run: trivy fs --scanners vuln,misconfig,secret --format json --output trivy-fs.json --exit-code 0 .
+  - name: Scan image (OS packages)
+    continue-on-error: true
+    run: trivy image --pkg-types os --scanners vuln --format json --output trivy-image.json --exit-code 0 main
+  - name: Normalize findings → quality_metrics
+    continue-on-error: true
+    # quality-metrics.mjs from this directory, committed to the repository.
+    run: node .github/scripts/quality-metrics.mjs --fs=trivy-fs.json --image=trivy-image.json --image-ref=main --dockerfile=Dockerfile --out=quality_metrics.json
+  - name: Attach quality_metrics to the build
+    continue-on-error: true
+    run: |
+      test -f quality_metrics.payload.json || { echo "no quality_metrics payload — scans did not run"; exit 1; }
+      np metadata create --entity build \
+        --repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+        --commit-sha "${GITHUB_SHA}" \
+        --branch "${GITHUB_REF_NAME}" \
+        --current-build-status in_progress \
+        --data "$(cat quality_metrics.payload.json)" --no-output
+  # … then the existing:
+  # - name: End nullplatform CI
+  #   if: ${{ always() }}
+  #   run: np build update --status ${{ contains(fromJSON('["failure", "cancelled"]'), job.status) && 'failed' || 'successful' }}
