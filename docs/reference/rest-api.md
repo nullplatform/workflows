@@ -202,7 +202,7 @@ curl -sf "$NP_WORKFLOW_URL/workflows/executions/$EID/state" \
   | jq '{status, steps: [.steps[] | {id, status, items}]}'
 ```
 
-For a workflow that pauses on `waitForSignal`, `GET /workflows/executions/:id/pending-signals` returns the signal envelopes the engine is waiting on. Resume by `POST /workflows/signals`.
+For a workflow that pauses on `waitForSignal`, `GET /workflows/executions/:id/pending_signals` returns the signal envelopes the engine is waiting on. Resume by `POST /workflows/signals`.
 
 ## Common errors
 
@@ -483,7 +483,7 @@ curl http://localhost:3000/workflows/executions/exec_abc123/state
 ### Get Pending Signals
 
 ```bash
-curl http://localhost:3000/workflows/executions/exec_abc123/pending-signals
+curl http://localhost:3000/workflows/executions/exec_abc123/pending_signals
 ```
 
 ### Get Step Records
