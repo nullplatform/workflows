@@ -222,6 +222,15 @@ steps:
     network:
       allowedHosts:
       - api.nullplatform.com
+  # code-exec with `network` runs in an E2B microVM; the provider fails intermittently
+  # (SANDBOX_NOT_AVAILABLE) and without a retry that single hiccup kills the run.
+  error_handling:
+    retry_policy:
+      max_attempts: 3
+      initial_interval: "30s"
+      backoff_strategy: exponential
+      jitter: 0.3
+      non_retryable_errors: [SANDBOX_RUNTIME, VALIDATION_FAILED]
   join_strategy: any
 - id: summarize
   type: module
@@ -450,6 +459,15 @@ steps:
     network:
       allowedHosts:
       - api.nullplatform.com
+  # code-exec with `network` runs in an E2B microVM; the provider fails intermittently
+  # (SANDBOX_NOT_AVAILABLE) and without a retry that single hiccup kills the run.
+  error_handling:
+    retry_policy:
+      max_attempts: 3
+      initial_interval: "30s"
+      backoff_strategy: exponential
+      jitter: 0.3
+      non_retryable_errors: [SANDBOX_RUNTIME, VALIDATION_FAILED]
 connections:
 - id: c1
   from: start
