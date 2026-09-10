@@ -11,7 +11,7 @@ the raw responses. It carries no cost semantics.
 |---|---|---|
 | `provider` | `"aws"` | only AWS for now |
 | `region` | string | default `AWS_REGION` of the worker, else `us-east-1` |
-| `assumeRole` | `{ roleArn, sessionName?, externalId? }` | optional STS AssumeRole before the calls |
+| `assumeRole` | `{ roleArn, sessionName?, externalId? }` | optional STS AssumeRole before the calls — the per-customer/per-account role; the worker's base identity (pod service account) must be trusted by it. See `docs/mapping-playbook.md` §4b |
 | `calls[]` | `{ id, service, operation, params?, paginate?, maxPages? }` | `service` in `ce`, `cost-explorer`, `cloudwatch`, `ec2`, `sts`, `tagging` (Resource Groups Tagging API), `elbv2`, `rds`; `operation` PascalCase SDK command |
 | `maxResultBytes` | number | per-call cap, default 307200 |
 | `callback` | `{ url, token? }` | POST the response here (engine callback); `token` is echoed. The host MUST be in `NP_CALLBACK_ALLOWED_HOSTS` (worker env, comma separated, default `api.nullplatform.com`) — SSRF guard, the worker runs inside the customer network |

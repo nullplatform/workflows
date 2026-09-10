@@ -94,6 +94,56 @@ of the cluster's consumption and get allocated in phase 3 by namespace/pod
   `cloud-query` worker needs `ce:*Get*`, `ec2:Describe*`, `elasticloadbalancing:Describe*`,
   `rds:Describe*`, `tag:GetResources`, `cloudwatch:GetMetricData`, `sts:GetCallerIdentity`.
 
+## 4b. The role the worker runs with — configured per customer
+
+Two layers, both without registering the package on the platform:
+
+**Layer 1 — identity of the worker pod (per cluster, in the agent Helm values).**
+The agent patches the worker pod for the `cloud-query` package with a service
+account; that service account carries the IAM role (IRSA or EKS Pod Identity):
+
+```yaml
+worker:
+  allowedRegistries: ["public.ecr.aws/nullplatform/*"]
+  patches:
+    - target: { package: cloud-query }
+      merge:
+        spec:
+          serviceAccountName: np-cloud-query      # annotated eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/np-finops-worker
+```
+
+The role's policy is the read-only set below. Trust: the cluster's OIDC
+provider with `sub = system:serviceaccount:<ns>:np-cloud-query` (IRSA) or
+`pods.eks.amazonaws.com` (Pod Identity).
+
+**Layer 2 — AssumeRole per account (per customer, in the workflow config).**
+When the customer wants its own role, or bills several accounts, the worker
+assumes a role before every call. `wf1-aws-billing-daily` takes
+`assume_role_arn` + `assume_role_external_id` (inputs or the workflow
+variables `assume_role_arn` / `assume_role_external_id`; set them on the
+customer's revision or from config entries). Trust policy of that role:
+
+```json
+{ "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<worker-account>:role/np-finops-worker" },
+  "Action": "sts:AssumeRole",
+  "Condition": { "StringEquals": { "sts:ExternalId": "<customer-specific external id>" } } }
+```
+
+The worker's base role then only needs `sts:AssumeRole` on the customer roles;
+the read-only policy lives on the customer role. One collector run per account
+(the `cloud_account` dimension separates the facts).
+
+Read-only policy for whichever role does the reading:
+
+```json
+{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Resource": "*", "Action": [
+  "ce:GetCostAndUsage", "ce:GetCostAndUsageWithResources", "ce:GetDimensionValues", "ce:GetTags",
+  "ec2:DescribeInstances", "ec2:DescribeVolumes", "ec2:DescribeInstanceTypes", "ec2:DescribeTags",
+  "elasticloadbalancing:DescribeLoadBalancers", "rds:DescribeDBClusters", "rds:DescribeDBInstances",
+  "tag:GetResources", "cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "sts:GetCallerIdentity" ] }] }
+```
+
 ## 5. Direct-cost recommendation
 
 1. Every resource null provisions must carry `application_id`, `scope_id` or

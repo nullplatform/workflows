@@ -30,7 +30,11 @@ inputs:
   assume_role_arn:
     type: string
     required: false
-    description: "Optional role the worker assumes before the calls"
+    description: "Optional role the worker assumes before the calls (per customer/account; the worker's base identity must be trusted by it)"
+  assume_role_external_id:
+    type: string
+    required: false
+    description: "ExternalId for the AssumeRole trust policy (recommended for cross-account roles)"
   mode:
     type: string
     required: false
@@ -86,6 +90,10 @@ steps:
           type: string
           required: false
           description: "Role ARN to assume"
+        assume_role_external_id:
+          type: string
+          required: false
+          description: "AssumeRole ExternalId"
         mode:
           type: string
           required: false
@@ -107,6 +115,7 @@ steps:
       calls: "${{ workflow.inputs.calls }}"
       region: "${{ workflow.inputs.region }}"
       assume_role_arn: "${{ workflow.inputs.assume_role_arn }}"
+      assume_role_external_id: "${{ workflow.inputs.assume_role_external_id }}"
       mode: "${{ workflow.inputs.mode }}"
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
       callback_default: "${{ variables.callback_base_url }}"
@@ -120,7 +129,10 @@ steps:
         if (calls.length === 0) throw new Error("calls must be a non-empty array");
         var cq = { provider: "aws", calls: calls };
         if (inputs.region) cq.region = String(inputs.region);
-        if (inputs.assume_role_arn) cq.assumeRole = { roleArn: String(inputs.assume_role_arn), sessionName: "np-finops" };
+        if (inputs.assume_role_arn) {
+          cq.assumeRole = { roleArn: String(inputs.assume_role_arn), sessionName: "np-finops" };
+          if (inputs.assume_role_external_id) cq.assumeRole.externalId = String(inputs.assume_role_external_id);
+        }
         var cb = String(inputs.callback_base_url || inputs.callback_default || "https://api.nullplatform.com").trim();
         // Strict shape: scheme://host[:port] with no credentials, path or query.
         var m = /^(https?):\/\/([a-z0-9.-]+)(:\d{1,5})?$/i.exec(cb);

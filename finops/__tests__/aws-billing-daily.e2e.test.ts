@@ -152,7 +152,7 @@ describe('finops/wf1-aws-billing-daily', () => {
     const written: Array<Record<string, unknown>> = [];
     const result = await runWorkflowE2E({
       yamlPath: COLLECTOR,
-      inputs: { date: '2026-09-09', agent_tags: { package: 'cloud-query', local: 'x' } },
+      inputs: { date: '2026-09-09', agent_tags: { package: 'cloud-query', local: 'x' }, assume_role_arn: 'arn:aws:iam::111122223333:role/np-finops', assume_role_external_id: 'kwik-ext' },
       pluginStubs: {
         manual: passthroughTrigger,
         cron: passthroughTrigger,
@@ -176,6 +176,10 @@ describe('finops/wf1-aws-billing-daily', () => {
     expect(calls.map((c) => c.id)).toEqual(['identity', 'by_service', 'by_usage_type', 'ec2_by_resource', 'instances', 'volumes', 'tagged', 'lbs', 'db_clusters', 'db_instances']);
     expect(calls[1]?.params?.TimePeriod).toEqual({ Start: '2026-09-09', End: '2026-09-10' });
     expect(queries[0]?.agent_tags).toEqual({ package: 'cloud-query', local: 'x' });
+    for (const q of queries) {
+      expect(q.assume_role_arn).toBe('arn:aws:iam::111122223333:role/np-finops');
+      expect(q.assume_role_external_id).toBe('kwik-ext');
+    }
     const typeCalls = queries[1]?.calls as Array<{ id: string; params: { InstanceTypes: string[] } }>;
     expect(typeCalls[0]?.params.InstanceTypes).toEqual(['c5a.xlarge', 't3.micro']);
 

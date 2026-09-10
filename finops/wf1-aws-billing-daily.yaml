@@ -51,10 +51,25 @@ inputs:
     type: boolean
     required: false
     description: "When true, build the facts but do not write them"
+  assume_role_arn:
+    type: string
+    required: false
+    description: "Per-customer/account role the worker assumes for the AWS calls (default: variables.assume_role_arn). Empty = the pod's own identity."
+  assume_role_external_id:
+    type: string
+    required: false
+    description: "ExternalId for that role's trust policy (default: variables.assume_role_external_id)"
 
 variables:
   agent_tags:
     initialValue: { package: "cloud-query" }
+  # Per-customer role configuration. Set these on the customer's revision (or
+  # pass the inputs): with an ARN the worker runs STS AssumeRole before every
+  # call; empty means the pod's own IAM identity (IRSA / Pod Identity).
+  assume_role_arn:
+    initialValue: ""
+  assume_role_external_id:
+    initialValue: ""
   # AWS region for regional SDK calls (EC2, ELB, RDS). Cost Explorer is global.
   aws_region:
     initialValue: "us-east-1"
@@ -104,6 +119,14 @@ steps:
           type: boolean
           required: false
           description: "Build facts without writing"
+        assume_role_arn:
+          type: string
+          required: false
+          description: "Role ARN the worker assumes"
+        assume_role_external_id:
+          type: string
+          required: false
+          description: "AssumeRole ExternalId"
 
   - id: daily_cron
     type: trigger
@@ -124,6 +147,10 @@ steps:
       default_tags: "${{ variables.agent_tags }}"
       region: "${{ variables.aws_region }}"
       ec2_service: "${{ variables.ec2_service_name }}"
+      role_arn: "${{ workflow.inputs.assume_role_arn }}"
+      role_arn_default: "${{ variables.assume_role_arn }}"
+      role_ext: "${{ workflow.inputs.assume_role_external_id }}"
+      role_ext_default: "${{ variables.assume_role_external_id }}"
     config:
       language: javascript
       code: |
@@ -153,7 +180,10 @@ steps:
           { id: "db_clusters", service: "rds", operation: "DescribeDBClusters", params: {} },
           { id: "db_instances", service: "rds", operation: "DescribeDBInstances", params: {} }
         ];
-        return { day: day, calls: calls, agent_tags: tags, region: String(inputs.region) };
+        var roleArn = String(inputs.role_arn || inputs.role_arn_default || "").trim();
+        if (roleArn && !/^arn:aws:iam::\d{12}:role\/[\w+=,.@\/-]+$/.test(roleArn)) throw new Error("assume_role_arn is not an IAM role ARN: " + roleArn);
+        var roleExt = String(inputs.role_ext || inputs.role_ext_default || "").trim();
+        return { day: day, calls: calls, agent_tags: tags, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null };
 
   - id: query
     type: module
@@ -164,6 +194,8 @@ steps:
       calls: "${{ steps.prep.outputs.calls }}"
       region: "${{ steps.prep.outputs.region }}"
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
+      assume_role_arn: "${{ steps.prep.outputs.assume_role_arn }}"
+      assume_role_external_id: "${{ steps.prep.outputs.assume_role_external_id }}"
     config:
       # Definition id of finops/tool-cloud-query.yaml (patched at publish time).
       workflowId: FINOPS_CLOUD_QUERY_ID
@@ -199,6 +231,8 @@ steps:
       calls: "${{ steps.prep_types.outputs.calls }}"
       region: "${{ steps.prep.outputs.region }}"
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
+      assume_role_arn: "${{ steps.prep.outputs.assume_role_arn }}"
+      assume_role_external_id: "${{ steps.prep.outputs.assume_role_external_id }}"
     config:
       workflowId: FINOPS_CLOUD_QUERY_ID
       alias: live
