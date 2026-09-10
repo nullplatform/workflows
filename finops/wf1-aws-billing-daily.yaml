@@ -1,0 +1,487 @@
+# finops/wf1-aws-billing-daily.yaml
+#
+# Daily collector (phase 1): one day of AWS billing → cost_daily facts.
+#
+#   cloud-query (agent, IAM role)             build_facts (code-exec)            write_facts (fan-out)
+#   ─────────────────────────────             ───────────────────────            ───────────────────────
+#   CE by SERVICE                         →   cloud_service facts (Σ = day)  →   finops_cost_fact_upsert
+#   CE by SERVICE + USAGE_TYPE            →   bucket facts (parent = service)    one child per fact
+#   CE per EC2 resource (+ hours)         →   scope / resource facts
+#   EC2 DescribeInstances / Volumes       →   cluster facts + components
+#   Tagging API (LBs, RDS, cache…)        →   cluster LB share, DB facts
+#   EC2 DescribeInstanceTypes (2nd call)  →   capacity → blended rates
+#
+# Cost basis: AMORTIZED (cost_usd), unblended kept in unblended_usd.
+# Sum rule: Σ cost_usd over subject_type=cloud_service for a day equals the
+# AWS daily amortized total. Every other subject is an ATTRIBUTION of part of
+# that total (bucket / resource / scope / cluster carry `parent_id` or are
+# derived) and must not be added to it.
+#
+# Cluster = nodes + control plane + load balancers tagged to it + VPC-level
+# networking (NAT, endpoints, public IPv4, data transfer) + EBS attached to
+# its nodes + other EC2 charges (CPU credits) by instance share. The cluster is
+# NOT split per scope here: it carries a BLENDED RATE per core-hour and per
+# GB-hour over its reserved capacity (cpu_share configurable) so the allocator
+# can charge consumers by consumption; idle capacity stays on the cluster.
+# `dry_run: true` builds everything and writes nothing.
+id: finops_aws_billing_daily
+name: "FinOps — AWS billing daily"
+description: >
+  Collects one day of AWS cost through the cloud-query package (Cost Explorer
+  by service, by usage type, per EC2 resource; EC2, volumes, tags, instance
+  types) and upserts dimensioned cost_daily facts: cloud services, buckets,
+  tagged scopes, EKS clusters with components and blended rates, databases.
+path: "/finops"
+semantic_version: 0.2.0
+
+inputs:
+  date:
+    type: string
+    required: false
+    description: "Day to collect, YYYY-MM-DD (UTC). Default: yesterday."
+  agent_tags:
+    type: object
+    required: false
+    description: "Agent selector tags. Default: variables.agent_tags"
+  callback_base_url:
+    type: string
+    required: false
+    description: "Engine URL the worker can reach (local dev: http://host.docker.internal:<port>)"
+  dry_run:
+    type: boolean
+    required: false
+    description: "When true, build the facts but do not write them"
+
+variables:
+  agent_tags:
+    initialValue: { package: "cloud-query" }
+  # AWS region for regional SDK calls (EC2, ELB, RDS). Cost Explorer is global.
+  aws_region:
+    initialValue: "us-east-1"
+  ec2_service_name:
+    initialValue: "Amazon Elastic Compute Cloud - Compute"
+  ec2_other_service_name:
+    initialValue: "EC2 - Other"
+  eks_service_name:
+    initialValue: "Amazon Elastic Container Service for Kubernetes"
+  vpc_service_name:
+    initialValue: "Amazon Virtual Private Cloud"
+  elb_service_name:
+    initialValue: "Amazon Elastic Load Balancing"
+  rds_service_name:
+    initialValue: "Amazon Relational Database Service"
+  # Share of the cluster cost attributed to CPU (the rest to memory) when
+  # deriving the blended rates. 0.5 = Kubecost-style even split; tune per org.
+  cpu_share:
+    initialValue: 0.5
+  # Root NRN for listing null services (mapping cloud databases/caches → null service by host).
+  org_nrn:
+    initialValue: "organization=1255165411"
+  collector:
+    initialValue: "finops_aws_billing_daily@0.2.0"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Collect"
+    config:
+      description: "Collect one day of AWS billing into cost_daily facts."
+      inputs:
+        date:
+          type: string
+          required: false
+          description: "YYYY-MM-DD (UTC), default yesterday"
+        agent_tags:
+          type: object
+          required: false
+          description: "Agent selector tags"
+        callback_base_url:
+          type: string
+          required: false
+          description: "Engine URL for the worker callback"
+        dry_run:
+          type: boolean
+          required: false
+          description: "Build facts without writing"
+
+  - id: daily_cron
+    type: trigger
+    plugin_type: cron
+    name: "Daily 04:30 UTC"
+    config:
+      schedule: "30 4 * * *"
+      timezone: "UTC"
+
+  - id: prep
+    type: module
+    plugin_type: code-exec
+    name: "Day window + cloud-query calls"
+    join_strategy: any
+    inputs:
+      date: "${{ workflow.inputs.date }}"
+      agent_tags: "${{ workflow.inputs.agent_tags }}"
+      default_tags: "${{ variables.agent_tags }}"
+      region: "${{ variables.aws_region }}"
+      ec2_service: "${{ variables.ec2_service_name }}"
+    config:
+      language: javascript
+      code: |
+        function iso(d) { return d.toISOString().slice(0, 10); }
+        var day = inputs.date && /^\d{4}-\d{2}-\d{2}$/.test(String(inputs.date)) ? String(inputs.date) : iso(new Date(Date.now() - 86400000));
+        var next = iso(new Date(new Date(day + "T00:00:00Z").getTime() + 86400000));
+        var period = { Start: day, End: next };
+        var tags = (inputs.agent_tags && Object.keys(inputs.agent_tags).length) ? inputs.agent_tags : inputs.default_tags;
+        var calls = [
+          { id: "identity", service: "sts", operation: "GetCallerIdentity" },
+          { id: "by_service", service: "ce", operation: "GetCostAndUsage",
+            params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost"], GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }] } },
+          { id: "by_usage_type", service: "ce", operation: "GetCostAndUsage",
+            params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost", "UsageQuantity"], GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }, { Type: "DIMENSION", Key: "USAGE_TYPE" }] } },
+          { id: "ec2_by_resource", service: "ce", operation: "GetCostAndUsageWithResources",
+            params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost", "UsageQuantity"], GroupBy: [{ Type: "DIMENSION", Key: "RESOURCE_ID" }],
+                      Filter: { Dimensions: { Key: "SERVICE", Values: [String(inputs.ec2_service)] } } } },
+          { id: "instances", service: "ec2", operation: "DescribeInstances", params: {} },
+          { id: "volumes", service: "ec2", operation: "DescribeVolumes", params: {} },
+          // Tags for the resources we attribute beyond EC2: load balancers (cluster
+          // ownership), databases, caches. Scoped by type to stay under the cap.
+          { id: "tagged", service: "tagging", operation: "GetResources",
+            params: { ResourceTypeFilters: ["elasticloadbalancing:loadbalancer", "rds:cluster", "rds:db", "elasticache:cluster", "elasticache:replicationgroup"], ResourcesPerPage: 100 }, maxPages: 20 },
+          // All load balancers (the tagging API omits never-tagged resources, so it
+          // cannot be the denominator of the cluster's LB share).
+          { id: "lbs", service: "elbv2", operation: "DescribeLoadBalancers", params: {} },
+          { id: "db_clusters", service: "rds", operation: "DescribeDBClusters", params: {} },
+          { id: "db_instances", service: "rds", operation: "DescribeDBInstances", params: {} }
+        ];
+        return { day: day, calls: calls, agent_tags: tags, region: String(inputs.region) };
+
+  - id: query
+    type: module
+    plugin_type: sub-workflow
+    name: "cloud-query (agent)"
+    inputs:
+      agent_tags: "${{ steps.prep.outputs.agent_tags }}"
+      calls: "${{ steps.prep.outputs.calls }}"
+      region: "${{ steps.prep.outputs.region }}"
+      callback_base_url: "${{ workflow.inputs.callback_base_url }}"
+    config:
+      # Definition id of finops/tool-cloud-query.yaml (patched at publish time).
+      workflowId: FINOPS_CLOUD_QUERY_ID
+      alias: live
+      waitForCompletion: true
+      iterateItems: false
+
+  - id: prep_types
+    type: module
+    plugin_type: code-exec
+    name: "Instance types in use"
+    inputs:
+      results: "${{ steps.query.outputs.results }}"
+      failed: "${{ steps.query.outputs.failed }}"
+    config:
+      language: javascript
+      code: |
+        var failed = inputs.failed || [];
+        if (failed.length) throw new Error("cloud-query calls failed: " + failed.join(", "));
+        var types = {};
+        (((inputs.results || {}).instances || {}).Reservations || []).forEach(function (res) {
+          (res.Instances || []).forEach(function (i) { if (i.InstanceType) types[i.InstanceType] = true; });
+        });
+        var list = Object.keys(types).sort();
+        return { types: list, calls: [{ id: "instance_types", service: "ec2", operation: "DescribeInstanceTypes", params: { InstanceTypes: list.length ? list : ["t3.micro"] } }] };
+
+  - id: query_types
+    type: module
+    plugin_type: sub-workflow
+    name: "cloud-query: instance types"
+    inputs:
+      agent_tags: "${{ steps.prep.outputs.agent_tags }}"
+      calls: "${{ steps.prep_types.outputs.calls }}"
+      region: "${{ steps.prep.outputs.region }}"
+      callback_base_url: "${{ workflow.inputs.callback_base_url }}"
+    config:
+      workflowId: FINOPS_CLOUD_QUERY_ID
+      alias: live
+      waitForCompletion: true
+      iterateItems: false
+
+  # null services (dependencies) with their attributes: a cloud database maps to
+  # the service whose `attributes.host` is its endpoint. No tags needed.
+  - id: np_services
+    type: module
+    plugin_type: np-api-call
+    name: "null services (descendants)"
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/service"
+      query:
+        nrn: "${{ variables.org_nrn }}"
+        show_descendants: "true"
+        limit: "500"
+      failOnHttpError: false
+
+  - id: build_facts
+    type: module
+    plugin_type: code-exec
+    name: "Build cost_daily facts"
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      np_services: "${{ steps.np_services.outputs.body }}"
+      results: "${{ steps.query.outputs.results }}"
+      types_results: "${{ steps.query_types.outputs.results }}"
+      identity: "${{ steps.query.outputs.identity }}"
+      failed: "${{ steps.query_types.outputs.failed }}"
+      region: "${{ steps.prep.outputs.region }}"
+      ec2_service: "${{ variables.ec2_service_name }}"
+      ec2_other_service: "${{ variables.ec2_other_service_name }}"
+      eks_service: "${{ variables.eks_service_name }}"
+      vpc_service: "${{ variables.vpc_service_name }}"
+      elb_service: "${{ variables.elb_service_name }}"
+      rds_service: "${{ variables.rds_service_name }}"
+      cpu_share: "${{ variables.cpu_share }}"
+      collector: "${{ variables.collector }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day);
+        var r = inputs.results || {};
+        var failed = inputs.failed || [];
+        if (failed.length) throw new Error("cloud-query calls failed: " + failed.join(", "));
+        function slug(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""); }
+        var acct = (inputs.identity && inputs.identity.account) ? String(inputs.identity.account) : null;
+        var region = String(inputs.region);
+        var now = new Date().toISOString();
+        var cpuShare = Number(inputs.cpu_share); if (!(cpuShare >= 0 && cpuShare <= 1)) cpuShare = 0.5;
+        function num(x) { var n = Number(x); return isFinite(n) ? Math.round(n * 1e6) / 1e6 : 0; }
+        // Cost basis: AMORTIZED (Savings Plans / RIs spread over the usage they cover).
+        // Unblended shows on-demand equivalents per resource plus a negation line
+        // without resource (seen in kwik: -22.85/day on NoResourceId), useless for
+        // attribution. Unblended is kept alongside for transparency.
+        function amort(g) { return num((g.Metrics.AmortizedCost || g.Metrics.UnblendedCost || {}).Amount); }
+        function unbl(g) { return num((g.Metrics.UnblendedCost || {}).Amount); }
+        function qty(g) { return num((g.Metrics.UsageQuantity || {}).Amount); }
+        function base(stage, type, id) {
+          // Logical id: every part is also a field. Dashes only — the catalog path rejects ':' and '/'.
+          return { id: stage + "-" + type + "-" + slug(id) + "-" + d, date: d, stage: stage, subject_type: type, subject_id: id,
+                   cloud: "aws", cloud_account: acct, source: "aws_ce", collected_at: now, collector: String(inputs.collector),
+                   allocation_method: "unallocated" };
+        }
+        // Tag conventions seen in the wild: plain (EC2/Lambda/ECR) and `nullplatform:`-prefixed (API Gateway).
+        function tagMap(list) { var t = {}; (list || []).forEach(function (kv) { t[kv.Key] = kv.Value; }); return t; }
+        function npDims(t) {
+          function pick() { for (var i = 0; i < arguments.length; i++) { var v = t[arguments[i]]; if (v !== undefined && v !== null && v !== "") return String(v); } return null; }
+          return { scope_id: pick("scope_id", "nullplatform:scope-id", "np:scope_id"), scope_name: pick("scope", "nullplatform:scope", "np:scope"),
+                   application_id: pick("application_id", "nullplatform:application-id"), application_name: pick("application", "nullplatform:application"),
+                   namespace_id: pick("namespace_id", "nullplatform:namespace-id"), namespace_name: pick("namespace", "nullplatform:namespace"),
+                   account_id: pick("account_id", "nullplatform:account-id"), account_name: pick("account", "nullplatform:account"),
+                   environment: pick("environment", "nullplatform:environment", "env") };
+        }
+        function clusterOf(t) {
+          var c = t["eks:cluster-name"] || t["aws:eks:cluster-name"] || t["elbv2.k8s.aws/cluster"] || null;
+          if (!c) Object.keys(t).forEach(function (k) { var m = /^kubernetes\.io\/cluster\/(.+)$/.exec(k); if (m) c = m[1]; });
+          return c;
+        }
+        var facts = [];
+        // ── 1) cloud_service: the org-level truth, one per AWS service. Σ = daily total.
+        var svcTotal = {}, svcUnbl = {};
+        ((r.by_service || {}).ResultsByTime || []).forEach(function (rt) {
+          (rt.Groups || []).forEach(function (g) { var svc = g.Keys[0]; svcTotal[svc] = (svcTotal[svc] || 0) + amort(g); svcUnbl[svc] = (svcUnbl[svc] || 0) + unbl(g); });
+        });
+        var svcFactId = {};
+        Object.keys(svcTotal).forEach(function (svc) {
+          var f = base("raw", "cloud_service", slug(svc));
+          f.subject_name = svc; f.cloud_service = svc; f.cost_usd = num(svcTotal[svc]); f.unblended_usd = num(svcUnbl[svc]);
+          svcFactId[svc] = f.id; facts.push(f);
+        });
+        // ── 2) bucket per (service, usage_type): breakdown of the service fact (parent_id).
+        var usage = []; // [{svc, ut, cost, qty, unit}]
+        ((r.by_usage_type || {}).ResultsByTime || []).forEach(function (rt) {
+          (rt.Groups || []).forEach(function (g) {
+            var svc = g.Keys[0], ut = g.Keys[1]; var c = amort(g);
+            if (c === 0 && unbl(g) === 0) return;
+            usage.push({ svc: svc, ut: ut, cost: c, qty: qty(g), unit: g.Metrics.UsageQuantity ? g.Metrics.UsageQuantity.Unit : null });
+            var f = base("raw", "bucket", slug(svc) + "|" + slug(ut));
+            f.subject_name = svc + " / " + ut; f.cloud_service = svc; f.usage_type = ut; f.cost_usd = c; f.unblended_usd = unbl(g);
+            f.quantity = qty(g); f.units = f.quantity ? (g.Metrics.UsageQuantity ? g.Metrics.UsageQuantity.Unit : null) : null;
+            f.parent_id = svcFactId[svc] || null; facts.push(f);
+          });
+        });
+        function sumUsage(svc, re) { return num(usage.filter(function (u) { return u.svc === svc && (!re || re.test(u.ut)); }).reduce(function (a, u) { return a + u.cost; }, 0)); }
+        // ── 3) inventory: instances (tags, type), volumes (attachments), instance types (capacity), tagged resources.
+        var inst = {}; // id -> {type, tags, cluster}
+        ((r.instances || {}).Reservations || []).forEach(function (res) {
+          (res.Instances || []).forEach(function (i) { var t = tagMap(i.Tags); inst[i.InstanceId] = { type: i.InstanceType, tags: t, cluster: clusterOf(t) }; });
+        });
+        var typeCap = {}; // type -> {vcpu, gib}
+        (((inputs.types_results || {}).instance_types || {}).InstanceTypes || []).forEach(function (it) {
+          typeCap[it.InstanceType] = { vcpu: Number((it.VCpuInfo || {}).DefaultVCpus || 0), gib: Number((it.MemoryInfo || {}).SizeInMiB || 0) / 1024 };
+        });
+        var volGbByInstance = {}, volGbTotal = 0;
+        ((r.volumes || {}).Volumes || []).forEach(function (v) {
+          var gb = Number(v.Size || 0); volGbTotal += gb;
+          (v.Attachments || []).forEach(function (a) { if (a.InstanceId) volGbByInstance[a.InstanceId] = (volGbByInstance[a.InstanceId] || 0) + gb; });
+        });
+        var tagged = ((r.tagged || {}).ResourceTagMappingList || []).map(function (x) { return { arn: x.ResourceARN, tags: tagMap(x.Tags) }; });
+        var lbsTagged = tagged.filter(function (x) { return /:elasticloadbalancing:.*:loadbalancer\//.test(x.arn); });
+        var lbsByCluster = {}; lbsTagged.forEach(function (x) { var c = clusterOf(x.tags); if (c) lbsByCluster[c] = (lbsByCluster[c] || 0) + 1; });
+        var lbsAll = ((r.lbs || {}).LoadBalancers || []).length || lbsTagged.length;
+        // ── 4) EC2 instances: cost + hours per instance (CE resource-level) × tags → scope / resource facts.
+        var ec2ParentId = svcFactId[String(inputs.ec2_service)] || null;
+        var cl = {}; // cluster -> {nodes, nodeIds[], coreH, gbH, volGb, instCount}
+        function clusterAcc(name) { return cl[name] || (cl[name] = { nodes: 0, nodeIds: [], coreH: 0, gbH: 0, volGb: 0, instCount: 0 }); }
+        var totalInstances = Object.keys(inst).length;
+        ((r.ec2_by_resource || {}).ResultsByTime || []).forEach(function (rt) {
+          (rt.Groups || []).forEach(function (g) {
+            var rid = g.Keys[0]; var c = amort(g); var hours = qty(g);
+            if (!rid || rid === "NoResourceId" || (c === 0 && hours === 0)) return;
+            var i = inst[rid] || { type: null, tags: {}, cluster: null };
+            var t = i.tags; var dims = npDims(t); var f;
+            if (dims.scope_id) {
+              f = base("raw", "scope", dims.scope_id); f.allocation_method = "direct_tag";
+              Object.keys(dims).forEach(function (k) { f[k] = dims[k]; });
+              f.subject_name = t.Name || dims.scope_name || rid;
+            } else {
+              f = base("raw", "resource", rid); f.subject_name = t.Name || rid;
+              if (i.cluster) { f.allocation_method = "cluster_split_cpu_mem"; }
+            }
+            var rtype = /^i-[0-9a-z]+$/i.test(rid) ? "ec2:instance" : (function () { var m = /^arn:aws:([^:]+):[^:]*:[^:]*:([^\/:]+)/.exec(rid); return m ? (m[1] + ":" + m[2]) : "ec2:other"; })();
+            f.cloud_service = String(inputs.ec2_service); f.resource_id = rid; f.resource_type = rtype; f.usage_type = i.type || null;
+            f.region = region; f.cluster = i.cluster; f.cost_usd = c; f.unblended_usd = unbl(g); f.quantity = hours; f.units = hours ? "Hrs" : null;
+            f.parent_id = ec2ParentId; facts.push(f);
+            if (i.cluster) {
+              var a = clusterAcc(i.cluster); var cap = typeCap[i.type] || { vcpu: 0, gib: 0 };
+              a.nodes += c; a.nodeIds.push(rid); a.instCount += 1; a.coreH += cap.vcpu * hours; a.gbH += cap.gib * hours; a.volGb += (volGbByInstance[rid] || 0);
+            }
+          });
+        });
+        // ── 5) clusters: nodes + control plane + LBs + networking + storage + other, and blended rates.
+        var clusters = Object.keys(cl);
+        var nClusters = clusters.length || 1;
+        var eks = num(svcTotal[String(inputs.eks_service)] || 0);
+        var elbTotal = num(svcTotal[String(inputs.elb_service)] || 0);
+        var vpcTotal = num(svcTotal[String(inputs.vpc_service)] || 0);
+        var ec2OtherSvc = String(inputs.ec2_other_service);
+        var netRe = /NatGateway|DataTransfer|PublicIPv4|VpcEndpoint|In-Bytes|Out-Bytes/i, ebsRe = /EBS:/i;
+        var ec2OtherNet = sumUsage(ec2OtherSvc, netRe), ec2OtherEbs = sumUsage(ec2OtherSvc, ebsRe);
+        var ec2OtherRest = num((svcTotal[ec2OtherSvc] || 0) - ec2OtherNet - ec2OtherEbs);
+        var clusterFacts = [];
+        clusters.forEach(function (name) {
+          var a = cl[name];
+          var comp = {
+            nodes: num(a.nodes),
+            control_plane: num(eks / nClusters),
+            load_balancers: num(lbsAll ? elbTotal * ((lbsByCluster[name] || 0) / lbsAll) : 0),
+            networking: num((vpcTotal + ec2OtherNet) / nClusters),
+            storage: num(volGbTotal ? ec2OtherEbs * (a.volGb / volGbTotal) : 0),
+            other: num(totalInstances ? ec2OtherRest * (a.instCount / totalInstances) : 0)
+          };
+          var total = num(Object.keys(comp).reduce(function (s, k) { return s + comp[k]; }, 0));
+          var f = base("raw", "cluster", name);
+          f.subject_name = name; f.cluster = name; f.region = region; f.cost_usd = total; f.parent_id = null;
+          f.cpu_capacity_core_h = num(a.coreH); f.mem_capacity_gb_h = num(a.gbH); f.cpu_share = cpuShare;
+          f.rate_cpu_usd_core_h = a.coreH ? num(total * cpuShare / a.coreH) : null;
+          f.rate_mem_usd_gb_h = a.gbH ? num(total * (1 - cpuShare) / a.gbH) : null;
+          f.quantity = a.instCount; f.units = "nodes";
+          facts.push(f);
+          Object.keys(comp).forEach(function (k) {
+            var b = base("raw", "bucket", name + "|" + k);
+            b.subject_name = name + " / " + k; b.cluster = name; b.region = region; b.component = k; b.cost_usd = comp[k]; b.parent_id = f.id; facts.push(b);
+          });
+          clusterFacts.push({ cluster: name, cost_usd: total, components: comp, nodes: a.instCount, core_h: num(a.coreH), gb_h: num(a.gbH),
+                              rate_cpu_usd_core_h: f.rate_cpu_usd_core_h, rate_mem_usd_gb_h: f.rate_mem_usd_gb_h, lbs: lbsByCluster[name] || 0, ebs_gb: a.volGb });
+        });
+        // ── 6) databases (RDS clusters + instances): the RDS service cost split evenly across DB subjects, tags → null dims.
+        var dbs = [];
+        (((r.db_clusters || {}).DBClusters) || []).forEach(function (c) { dbs.push({ id: c.DBClusterIdentifier, arn: c.DBClusterArn, kind: "rds:cluster", engine: c.Engine, tags: tagMap(c.TagList), hosts: [c.Endpoint, c.ReaderEndpoint] }); });
+        (((r.db_instances || {}).DBInstances) || []).forEach(function (i) { if (!i.DBClusterIdentifier) dbs.push({ id: i.DBInstanceIdentifier, arn: i.DBInstanceArn, kind: "rds:db", engine: i.Engine, tags: tagMap(i.TagList), hosts: [(i.Endpoint || {}).Address] }); });
+        // null services indexed by host (attributes.host / attributes.hostname), lower-cased.
+        var svcList = inputs.np_services; svcList = Array.isArray(svcList) ? svcList : ((svcList && (svcList.results || svcList.data)) || []);
+        var svcByHost = {};
+        svcList.forEach(function (sv) {
+          var at = sv.attributes || {}; [at.host, at.hostname, at.endpoint].forEach(function (h) { if (h) svcByHost[String(h).toLowerCase()] = sv; });
+        });
+        function nrnParts(nrn) { var o = {}; String(nrn || "").split(":").forEach(function (kv) { var p = kv.split("="); if (p.length === 2) o[p[0]] = p[1]; }); return o; }
+        var rdsTotal = num(svcTotal[String(inputs.rds_service)] || 0);
+        dbs.forEach(function (db) {
+          var tg = db.tags; tagged.forEach(function (x) { if (x.arn === db.arn) Object.keys(x.tags).forEach(function (k) { tg[k] = x.tags[k]; }); });
+          var dims = npDims(tg);
+          var f = base("raw", "service", db.id); f.subject_name = db.id; f.resource_id = db.arn || db.id; f.resource_type = db.kind; f.usage_type = db.engine || null;
+          f.cloud_service = String(inputs.rds_service); f.region = region; f.cost_usd = num(dbs.length ? rdsTotal / dbs.length : 0); f.parent_id = svcFactId[String(inputs.rds_service)] || null;
+          Object.keys(dims).forEach(function (k) { f[k] = dims[k]; });
+          f.allocation_method = dims.application_id ? "direct_tag" : "unallocated";
+          // null service whose host is this database's endpoint → owner application (service_owner).
+          var sv = null; (db.hosts || []).forEach(function (h) { if (!sv && h && svcByHost[String(h).toLowerCase()]) sv = svcByHost[String(h).toLowerCase()]; });
+          if (sv) {
+            var np = nrnParts(sv.entity_nrn || sv.nrn);
+            f.service_id = String(sv.id); f.service_name = sv.name || sv.slug || null; f.subject_name = sv.name || db.id; f.nrn = sv.entity_nrn || null;
+            if (np.application) f.application_id = np.application; if (np.namespace) f.namespace_id = np.namespace; if (np.account) f.account_id = np.account;
+            var dm = sv.dimensions || {}; if (dm.environment) f.environment = dm.environment;
+            f.allocation_method = "service_owner";
+          }
+          facts.push(f);
+        });
+        var total = num(Object.keys(svcTotal).reduce(function (a, k) { return a + svcTotal[k]; }, 0));
+        var count = function (t) { return facts.filter(function (f) { return f.subject_type === t; }).length; };
+        var summary = { day: d, account: acct, services: Object.keys(svcTotal).length, daily_total_usd: total,
+                        buckets: count("bucket"), scopes: count("scope"), resources: count("resource"), databases: count("service"),
+                        clusters: clusterFacts, facts: facts.length, dry_run: !!inputs.dry_run };
+        return { facts: facts, to_write: inputs.dry_run ? [] : facts, summary: summary };
+
+  - id: write_facts
+    type: module
+    plugin_type: sub-workflow
+    name: "Upsert facts (fan-out)"
+    forEach:
+      expression: "${{ steps.build_facts.outputs.to_write }}"
+      itemVariable: fact
+      parallel: true
+      maxConcurrency: 5
+    inputs:
+      fact: "${{ fact }}"
+    config:
+      # Definition id of finops/wf-cost-fact-upsert.yaml (patched at publish time).
+      workflowId: FINOPS_COST_FACT_UPSERT_ID
+      alias: live
+      waitForCompletion: true
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Summary"
+    # Aggregate step: never dispatch per upstream fan-out item.
+    metadata: { fanOutPerItem: false }
+    inputs:
+      summary: "${{ steps.build_facts.outputs.summary }}"
+      # After a forEach fan-out, `outputs.items` carries one entry per child run
+      # (live engine wraps each as {outputs, _childExecutionId}; the E2E stub flat).
+      written: "${{ steps.write_facts.outputs.items }}"
+    config:
+      language: javascript
+      code: |
+        // inputs are frozen in the sandbox: build a new object instead of mutating.
+        var s = inputs.summary || {};
+        var w = inputs.written;
+        var n = Array.isArray(w) ? w.length : 0;
+        var out = {};
+        Object.keys(s).forEach(function (k) { out[k] = s[k]; });
+        out.written = s.dry_run ? 0 : n;
+        return out;
+
+connections:
+  - { from: start, to: prep }
+  - { from: daily_cron, to: prep }
+  - { from: prep, to: query }
+  - { from: query, to: prep_types }
+  - { from: prep_types, to: query_types }
+  - { from: query_types, to: np_services }
+  - { from: np_services, to: build_facts }
+  - { from: build_facts, to: write_facts }
+  - { from: write_facts, to: summary }
+
+outputs:
+  summary: "${{ steps.summary.outputs }}"
+  facts: "${{ steps.build_facts.outputs.facts }}"

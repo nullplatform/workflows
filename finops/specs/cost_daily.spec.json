@@ -1,0 +1,433 @@
+{
+  "name": "Cost Daily",
+  "slug": "cost_daily",
+  "description": "One cost fact per subject and day. stage=raw from collectors (cloud billing, k8s), stage=allocated from the allocator. Every fact declares its allocation_method.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "primaryKey": true,
+        "autoGenerate": false,
+        "description": "<stage>-<subject_type>-<slug(subject_id)>-<date>; every part is also a field (logical id, not a UUID; no ':' or '/')"
+      },
+      "date": {
+        "type": "string",
+        "description": "Day, YYYY-MM-DD (UTC)",
+        "index": [
+          "filter"
+        ]
+      },
+      "stage": {
+        "type": "string",
+        "enum": [
+          "raw",
+          "allocated"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "subject_type": {
+        "type": "string",
+        "enum": [
+          "cloud_service",
+          "resource",
+          "cluster",
+          "scope",
+          "service",
+          "application",
+          "bucket"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "subject_id": {
+        "type": "string"
+      },
+      "subject_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "nrn": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "application_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "application_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "namespace_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "namespace_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "environment": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "scope_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "scope_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "service_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "service_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cloud": {
+        "type": "string",
+        "enum": [
+          "aws",
+          "azure",
+          "gcp",
+          "other"
+        ]
+      },
+      "cloud_account": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "region": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cloud_service": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "usage_type": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "resource_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "resource_type": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cluster": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "component": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Cluster component for cluster breakdown buckets: nodes | control_plane | load_balancers | networking | storage | other"
+      },
+      "cost_usd": {
+        "type": "number",
+        "description": "Amortized cost (Savings Plans / RIs spread over covered usage) \u2014 the chargeback basis"
+      },
+      "unblended_usd": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Unblended cost as billed on the day (on-demand equivalents + SP/RI negations)"
+      },
+      "usage_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "waste_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_req_core_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_used_core_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_req_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_used_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "storage_gb": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "requests_total": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "quantity": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "units": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cpu_capacity_core_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: reserved vCPU-hours of its nodes on the day"
+      },
+      "mem_capacity_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: reserved GiB-hours of its nodes on the day"
+      },
+      "cpu_share": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: share of cost_usd attributed to CPU when deriving rates (rest \u2192 memory)"
+      },
+      "rate_cpu_usd_core_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster blended rate: USD per vCPU-hour (\u00f71000 for millicore-hour)"
+      },
+      "rate_mem_usd_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster blended rate: USD per GiB-hour"
+      },
+      "source": {
+        "type": "string",
+        "enum": [
+          "aws_ce",
+          "aws_cur",
+          "k8s",
+          "manual"
+        ]
+      },
+      "allocation_method": {
+        "type": "string",
+        "enum": [
+          "direct_tag",
+          "direct_resource",
+          "cluster_split_cpu_mem",
+          "service_owner",
+          "rule",
+          "unallocated"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "rule_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "parent_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "share": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "collected_at": {
+        "type": "string"
+      },
+      "collector": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "id",
+      "date",
+      "stage",
+      "subject_type",
+      "subject_id",
+      "cloud",
+      "cost_usd",
+      "source",
+      "allocation_method",
+      "collected_at"
+    ],
+    "additionalProperties": false,
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

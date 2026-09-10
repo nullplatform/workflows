@@ -1,0 +1,32 @@
+{
+  "name": "@nullplatform/plugin-cloud-query",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "test": "bun test",
+    "build": "bun build --compile ./src/index.ts --outfile dist/cloud-query",
+    "describe": "bun src/index.ts --describe",
+    "publish:image": "bash scripts/publish-image.sh"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1129.0",
+    "@aws-sdk/client-cost-explorer": "^3.1129.0",
+    "@aws-sdk/client-ec2": "^3.1129.0",
+    "@aws-sdk/client-elastic-load-balancing-v2": "^3.1129.0",
+    "@aws-sdk/client-rds": "^3.1129.0",
+    "@aws-sdk/client-resource-groups-tagging-api": "^3.1129.0",
+    "@aws-sdk/client-sts": "^3.1129.0",
+    "@nullplatform/plugin": "0.0.4",
+    "@nullplatform/workflow": "^0.0.5",
+    "@nullplatform/workflow-engine-in-memory": "^0.0.5",
+    "config": "^4.4.2"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0"
+  },
+  "trustedDependencies": [
+    "@grpc/grpc-js"
+  ]
+}

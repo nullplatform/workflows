@@ -1,0 +1,164 @@
+# finops/tool-cloud-query.yaml
+#
+# Reusable child: run a list of cloud SDK calls through the `cloud-query`
+# package on an agent selected by tags, and return results keyed by call id.
+# Async by default (np-package-call two-phase wait + engine callback); sync
+# only for small, fast calls (<60 s, <300 KB — platform limits measured
+# 2026-09-10, see docs/superpowers/specs/2026-09-10-finops-cost-allocation-design.md §2).
+id: finops_cloud_query
+name: "FinOps — Cloud Query (tool)"
+description: >
+  Runs cloud SDK calls (Cost Explorer, CloudWatch, EC2, STS) on a customer
+  agent through the cloud-query package and returns the raw responses keyed
+  by call id. Called by the FinOps collectors and usable as an agent tool.
+path: "/finops"
+semantic_version: 0.1.0
+
+inputs:
+  agent_tags:
+    type: object
+    required: true
+    description: "Agent selector tags, e.g. {\"package\":\"cloud-query\"}"
+  calls:
+    type: array
+    required: true
+    description: "cloud-query calls: [{id, service, operation, params?, paginate?, maxPages?}]"
+  region:
+    type: string
+    required: false
+    description: "AWS region for regional services (Cost Explorer is global)"
+  assume_role_arn:
+    type: string
+    required: false
+    description: "Optional role the worker assumes before the calls"
+  mode:
+    type: string
+    required: false
+    description: "async (default) or sync"
+  # Security note: this input only CHOOSES where the worker posts its result;
+  # the WORKER enforces the destination against NP_CALLBACK_ALLOWED_HOSTS
+  # (default api.nullplatform.com; host.docker.internal only in `mise run run`).
+  # A caller cannot redirect billing data or reach internal hosts through it.
+  callback_base_url:
+    type: string
+    required: false
+    description: "Engine base URL the WORKER can reach for the async callback (default: variables.callback_base_url). Must be on the worker's NP_CALLBACK_ALLOWED_HOSTS. Local dev with a docker worker: http://host.docker.internal:<port>"
+
+variables:
+  # The engine base URL the WORKER must reach to deliver the callback.
+  # Locally (docker worker → dev-server on the laptop): http://host.docker.internal:3000
+  callback_base_url:
+    initialValue: "https://api.nullplatform.com"
+  # Hosts a caller may point the callback to (comma separated). First layer of
+  # the SSRF guard; the worker enforces its own NP_CALLBACK_ALLOWED_HOSTS too.
+  callback_allowed_hosts:
+    initialValue: "api.nullplatform.com,host.docker.internal"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Query"
+    config:
+      description: "Run cloud SDK calls through the cloud-query package."
+      inputs:
+        agent_tags:
+          type: object
+          required: true
+          description: "Agent selector tags"
+        calls:
+          type: array
+          required: true
+          description: "cloud-query calls"
+        region:
+          type: string
+          required: false
+          description: "AWS region"
+        assume_role_arn:
+          type: string
+          required: false
+          description: "Role ARN to assume"
+        mode:
+          type: string
+          required: false
+          description: "async | sync"
+        callback_base_url:
+          type: string
+          required: false
+          description: "Engine base URL for the worker callback"
+
+  - id: build_request
+    type: module
+    plugin_type: code-exec
+    name: "Build cloud-query request"
+    inputs:
+      calls: "${{ workflow.inputs.calls }}"
+      region: "${{ workflow.inputs.region }}"
+      assume_role_arn: "${{ workflow.inputs.assume_role_arn }}"
+      mode: "${{ workflow.inputs.mode }}"
+      callback_base_url: "${{ workflow.inputs.callback_base_url }}"
+      callback_default: "${{ variables.callback_base_url }}"
+      callback_allowed_hosts: "${{ variables.callback_allowed_hosts }}"
+    config:
+      language: javascript
+      code: |
+        var calls = Array.isArray(inputs.calls) ? inputs.calls : [];
+        if (calls.length === 0) throw new Error("calls must be a non-empty array");
+        var cq = { provider: "aws", calls: calls };
+        if (inputs.region) cq.region = String(inputs.region);
+        if (inputs.assume_role_arn) cq.assumeRole = { roleArn: String(inputs.assume_role_arn), sessionName: "np-finops" };
+        var cb = String(inputs.callback_base_url || inputs.callback_default || "https://api.nullplatform.com").trim();
+        // Strict shape: scheme://host[:port] with no credentials, path or query.
+        var m = /^(https?):\/\/([a-z0-9.-]+)(:\d{1,5})?$/i.exec(cb);
+        if (!m) throw new Error("callback_base_url must be http(s)://host[:port] (got " + cb + ")");
+        var allowed = String(inputs.callback_allowed_hosts || "").toLowerCase().split(",").map(function (h) { return h.trim(); }).filter(Boolean);
+        if (allowed.indexOf(m[2].toLowerCase()) === -1) throw new Error("callback host not allowed: " + m[2] + " (allowed: " + allowed.join(", ") + ")");
+        return { action_context: { cloud_query: cq }, mode: inputs.mode === "sync" ? "sync" : "async", callback_base_url: cb };
+
+  - id: call_package
+    type: module
+    plugin_type: np-package-call
+    name: "cloud-query (package-exec)"
+    inputs:
+      action_context: "${{ steps.build_request.outputs.action_context }}"
+      agent_selector: "${{ workflow.inputs.agent_tags }}"
+      mode: "${{ steps.build_request.outputs.mode }}"
+      # Step INPUT, not config: `${{ steps.X.outputs.* }}` is not reliably
+      # resolved inside `config:` (see feedback in the repo's authoring notes).
+      callback_base_url: "${{ steps.build_request.outputs.callback_base_url }}"
+    config:
+      apikey: "${{ secrets.NP_API_KEY }}"
+      package: cloud-query
+      # Placeholders so validateConfig() passes; the inputs above replace them at run time.
+      agent_selector:
+        tags:
+          package: cloud-query
+      action_context: {}
+      callback_base_url: "https://api.nullplatform.com"
+      timeout: "30m"
+      retry_max_attempts: 1
+
+  - id: shape_results
+    type: module
+    plugin_type: code-exec
+    name: "Results by call id"
+    inputs:
+      response: "${{ steps.call_package.outputs.response }}"
+      failed: "${{ steps.call_package.outputs.failed }}"
+    config:
+      language: javascript
+      code: |
+        var r = inputs.response || {};
+        var out = {};
+        (r.calls || []).forEach(function (c) { out[c.id] = c.ok ? c.result : { error: c.error, errorCode: c.errorCode }; });
+        return { results: out, identity: r.identity || null, failed: inputs.failed || [] };
+
+connections:
+  - { from: start, to: build_request }
+  - { from: build_request, to: call_package }
+  - { from: call_package, to: shape_results }
+
+outputs:
+  results: "${{ steps.shape_results.outputs.results }}"
+  identity: "${{ steps.shape_results.outputs.identity }}"
+  failed: "${{ steps.shape_results.outputs.failed }}"

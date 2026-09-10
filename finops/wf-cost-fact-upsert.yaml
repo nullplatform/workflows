@@ -1,0 +1,81 @@
+# finops/wf-cost-fact-upsert.yaml
+#
+# Child: upsert ONE cost_daily fact into the catalog. Called by the collectors
+# through `sub-workflow` + `forEach` (one child per fact, bounded parallelism).
+# `PATCH /catalog/instances/cost_daily/{id}?upsert=true` merges at top level,
+# so each writer owns its fields (cost-finout lesson).
+id: finops_cost_fact_upsert
+name: "FinOps — Upsert cost_daily fact"
+description: >
+  Upserts one cost_daily catalog instance (PATCH ?upsert=true, top-level merge).
+path: "/finops"
+semantic_version: 0.1.0
+
+inputs:
+  fact:
+    type: object
+    required: true
+    description: "A cost_daily fact (must carry id, date, stage, subject_type, subject_id, cloud, cost_usd, source, allocation_method, collected_at)"
+
+variables:
+  # Catalog specification slug the facts are written to.
+  catalog_slug:
+    initialValue: "cost_daily"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Upsert"
+    config:
+      description: "Upsert one cost_daily fact."
+      inputs:
+        fact:
+          type: object
+          required: true
+          description: "cost_daily fact"
+
+  - id: check
+    type: module
+    plugin_type: code-exec
+    name: "Validate fact"
+    inputs:
+      fact: "${{ workflow.inputs.fact }}"
+    config:
+      language: javascript
+      code: |
+        var f = inputs.fact || {};
+        var req = ["id","date","stage","subject_type","subject_id","cloud","cost_usd","source","allocation_method","collected_at"];
+        var missing = req.filter(function (k) { return f[k] === undefined || f[k] === null || f[k] === ""; });
+        if (missing.length) throw new Error("fact is missing " + missing.join(", ") + " (id=" + f.id + ")");
+        if (typeof f.cost_usd !== "number") throw new Error("cost_usd must be a number (id=" + f.id + ")");
+        return { id: String(f.id), fact: f };
+
+  - id: upsert
+    type: module
+    plugin_type: np-api-call
+    name: "PATCH catalog instance (upsert)"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "2s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      path: "/catalog/instances/${{ variables.catalog_slug }}/${{ steps.check.outputs.id }}"
+      body: "${{ steps.check.outputs.fact }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: PATCH
+      path: "/catalog/instances/placeholder/placeholder"
+      query:
+        upsert: "true"
+      body: {}
+
+connections:
+  - { from: start, to: check }
+  - { from: check, to: upsert }
+
+outputs:
+  id: "${{ steps.check.outputs.id }}"
+  status: "${{ steps.upsert.outputs.status }}"

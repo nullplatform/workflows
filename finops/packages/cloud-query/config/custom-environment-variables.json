@@ -1,0 +1,11 @@
+{
+  "api": {
+    "url": "NP_API_URL",
+    "key": "NP_API_KEY",
+    "executionsUrl": "NP_EXECUTIONS_API_URL"
+  },
+  "agent": {
+    "mode": "NP_AGENT_PLUGIN",
+    "actionContext": "NP_ACTION_CONTEXT"
+  }
+}
