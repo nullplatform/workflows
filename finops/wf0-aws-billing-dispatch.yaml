@@ -85,8 +85,9 @@ steps:
           var name = String(t.name || ("target-" + i));
           if (seen[name]) throw new Error("duplicate target name " + name); seen[name] = true;
           if (!t.agent_tags || typeof t.agent_tags !== "object" || !Object.keys(t.agent_tags).length) throw new Error("targets[" + i + "] (" + name + ") needs agent_tags");
-          return { name: name, agent_tags: t.agent_tags, assume_role_arn: t.assume_role_arn || null, assume_role_external_id: t.assume_role_external_id || null,
-                   region: t.region || null, expected_account: t.expected_account ? String(t.expected_account) : null,
+          // Keys match wf1's inputs: the forEach spreads each target into the child's inputs.
+          return { target_name: name, agent_tags: t.agent_tags, assume_role_arn: t.assume_role_arn || null, assume_role_external_id: t.assume_role_external_id || null,
+                   package_version: t.package_version || null, region: t.region || null, expected_account: t.expected_account ? String(t.expected_account) : null,
                    date: inputs.date || null, callback_base_url: inputs.callback_base_url || null, dry_run: !!inputs.dry_run };
         });
         return { runs: runs, count: runs.length };
@@ -98,17 +99,10 @@ steps:
     forEach:
       expression: "${{ steps.prep.outputs.runs }}"
       itemVariable: target
+      # Spread each target object into the child's inputs (its keys are wf1's input names).
+      spreadItem: true
       parallel: true
       maxConcurrency: 3
-    inputs:
-      date: "${{ target.date }}"
-      agent_tags: "${{ target.agent_tags }}"
-      assume_role_arn: "${{ target.assume_role_arn }}"
-      assume_role_external_id: "${{ target.assume_role_external_id }}"
-      callback_base_url: "${{ target.callback_base_url }}"
-      dry_run: "${{ target.dry_run }}"
-      target_name: "${{ target.name }}"
-      expected_account: "${{ target.expected_account }}"
     config:
       # Definition id of finops/wf1-aws-billing-daily.yaml (patched at publish time).
       workflowId: FINOPS_AWS_BILLING_DAILY_ID
@@ -130,7 +124,7 @@ steps:
         var accounts = results.map(function (r, i) {
           // live engine wraps each fan-out item as {outputs, _childExecutionId}; the E2E stub returns outputs flat
           var o = (r || {}).outputs || r || {}; var s = o.summary || {};
-          return { target: (runs[i] || {}).name || null, account: s.account || null, day: s.day || null,
+          return { target: (runs[i] || {}).target_name || null, account: s.account || null, day: s.day || null,
                    daily_total_usd: s.daily_total_usd || 0, facts: s.facts || 0, written: s.written || 0, clusters: (s.clusters || []).length };
         });
         var total = accounts.reduce(function (a, x) { return a + (Number(x.daily_total_usd) || 0); }, 0);
