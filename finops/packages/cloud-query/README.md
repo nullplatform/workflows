@@ -47,6 +47,30 @@ curl -s -X POST https://api.nullplatform.com/controlplane/agent_command \
 From a workflow, use the `np-package-call` plugin (async with callback) or the
 `finops/tool-cloud-query.yaml` child.
 
+## Release (registry owner only)
+
+The worker image lives in nullplatform's public ECR:
+`public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer`.
+Pushing needs AWS credentials with write access to that repository, which most
+people do not have; `scripts/release.sh` does the login, a multi-arch
+(amd64 + arm64) buildx build from the Dockerfile, the push, and writes
+`scripts/release.json` with the immutable `@sha256` reference:
+
+```bash
+export AWS_PROFILE=<profile-that-can-push>     # or AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+scripts/release.sh            # version from package.json
+scripts/release.sh 0.0.2      # explicit version
+scripts/release.sh --dry-run  # local build only, no login/push
+```
+
+Then register the version on the platform and pin it on the customer agent:
+
+```bash
+np-preview package publish --nrn "$NRN" --image "$(jq -r .image scripts/release.json)"
+# agent Helm values: worker.allowedRegistries: ["public.ecr.aws/nullplatform/*"]
+#                    worker.pins: [{package: cloud-query, version: 0.0.1, image: <that ref>, serviceAccount: np-cloud-query}]
+```
+
 ## Tests
 
 `mise run test` (bun). No live AWS in tests.
