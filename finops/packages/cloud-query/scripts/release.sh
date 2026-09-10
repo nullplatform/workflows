@@ -16,6 +16,7 @@
 #   scripts/release.sh 0.0.2           # explicit version tag
 #   NP_PUSH_REGISTRY=<other registry/repo> scripts/release.sh   # override the target
 #   scripts/release.sh --dry-run       # build for the local arch only, no login, no push
+#   scripts/release.sh 0.0.2 --latest  # also move the :latest tag to this version
 #
 # Then register the version on the platform (needs NP_API_KEY with publish grants):
 #   np-preview package publish --nrn "$NRN" --image "$(jq -r .image scripts/release.json)"
@@ -27,10 +28,12 @@ REGISTRY_HOST="public.ecr.aws"
 DEFAULT_REPO="public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer"
 NP_PUSH_REGISTRY="${NP_PUSH_REGISTRY:-$DEFAULT_REPO}"
 DRY_RUN=0
+LATEST=0
 VERSION=""
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
+    --latest) LATEST=1 ;;
     -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
     *) VERSION="$arg" ;;
   esac
@@ -62,9 +65,11 @@ aws ecr-public get-login-password --region us-east-1 | docker login --username A
 BUILDER="cloud-query-release"
 docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create --name "$BUILDER" --driver docker-container --bootstrap >/dev/null
 META="$(mktemp)"
+TAGS=(-t "${NP_PUSH_REGISTRY}:${VERSION}")
+[[ "$LATEST" == "1" ]] && TAGS+=(-t "${NP_PUSH_REGISTRY}:latest")
 docker buildx build --builder "$BUILDER" \
   --platform linux/amd64,linux/arm64 \
-  -t "${NP_PUSH_REGISTRY}:${VERSION}" \
+  "${TAGS[@]}" \
   --push --metadata-file "$META" . >&2
 
 # 3) immutable reference
@@ -73,5 +78,5 @@ DIGEST=$(sed -nE 's/.*"containerimage.digest"[[:space:]]*:[[:space:]]*"([^"]+)".
 IMAGE="${NP_PUSH_REGISTRY}@${DIGEST}"
 printf '{\n  "package": "cloud-query",\n  "version": "%s",\n  "tag": "%s:%s",\n  "image": "%s",\n  "platforms": ["linux/amd64", "linux/arm64"],\n  "released_at": "%s"\n}\n' \
   "$VERSION" "$NP_PUSH_REGISTRY" "$VERSION" "$IMAGE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > scripts/release.json
-echo "release: pushed ${NP_PUSH_REGISTRY}:${VERSION}" >&2
+echo "release: pushed ${NP_PUSH_REGISTRY}:${VERSION}$([[ "$LATEST" == "1" ]] && echo ' (+ :latest)')" >&2
 echo "$IMAGE"

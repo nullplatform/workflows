@@ -1,0 +1,8 @@
+{
+  "package": "cloud-query",
+  "version": "0.0.1",
+  "tag": "public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer:0.0.1",
+  "image": "public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer@sha256:29e8c1578c028a192965e64e778349252f7efedb7b375bbb3daedcb2f8f6cf79",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "released_at": "2026-09-10T17:05:47Z"
+}
