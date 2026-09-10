@@ -1,0 +1,12 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AssumedByTheFinopsWorkerRole",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<worker-account>:role/np-finops-worker" },
+      "Action": "sts:AssumeRole",
+      "Condition": { "StringEquals": { "sts:ExternalId": "<customer-specific-external-id>" } }
+    }
+  ]
+}

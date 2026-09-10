@@ -1,0 +1,55 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BillingRead",
+      "Effect": "Allow",
+      "Action": [
+        "ce:GetCostAndUsage",
+        "ce:GetCostAndUsageWithResources",
+        "ce:GetDimensionValues",
+        "ce:GetTags",
+        "ce:GetCostCategories"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InventoryRead",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeTags",
+        "ec2:DescribeNatGateways",
+        "ec2:DescribeVpcEndpoints",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeTags",
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBInstances",
+        "rds:ListTagsForResource",
+        "elasticache:DescribeReplicationGroups",
+        "elasticache:DescribeCacheClusters",
+        "eks:ListClusters",
+        "eks:DescribeCluster",
+        "tag:GetResources"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "UsageMetricsRead",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricData",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Identity",
+      "Effect": "Allow",
+      "Action": ["sts:GetCallerIdentity"],
+      "Resource": "*"
+    }
+  ]
+}

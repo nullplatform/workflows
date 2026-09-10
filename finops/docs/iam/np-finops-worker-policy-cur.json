@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CurViaAthena",
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:GetQueryResults",
+        "athena:GetWorkGroup",
+        "glue:GetDatabase",
+        "glue:GetTable",
+        "glue:GetPartitions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CurBuckets",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": [
+        "arn:aws:s3:::<cur-bucket>",
+        "arn:aws:s3:::<cur-bucket>/*",
+        "arn:aws:s3:::<athena-results-bucket>",
+        "arn:aws:s3:::<athena-results-bucket>/*"
+      ]
+    },
+    {
+      "Sid": "AthenaResultsWrite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::<athena-results-bucket>/*"
+    }
+  ]
+}
