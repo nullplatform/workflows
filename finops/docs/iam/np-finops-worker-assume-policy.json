@@ -5,7 +5,11 @@
       "Sid": "AssumeCustomerAccountRoles",
       "Effect": "Allow",
       "Action": "sts:AssumeRole",
-      "Resource": "arn:aws:iam::*:role/np-finops"
+      "Resource": [
+        "arn:aws:iam::<account-1>:role/np-finops",
+        "arn:aws:iam::<account-2>:role/np-finops"
+      ],
+      "Condition": { "StringEquals": { "sts:ExternalId": "<customer-specific-external-id>" } }
     }
   ]
 }

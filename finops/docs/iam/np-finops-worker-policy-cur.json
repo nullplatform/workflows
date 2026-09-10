@@ -2,18 +2,25 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "CurViaAthena",
+      "Sid": "AthenaQueriesInTheFinopsWorkgroup",
       "Effect": "Allow",
       "Action": [
         "athena:StartQueryExecution",
         "athena:GetQueryExecution",
         "athena:GetQueryResults",
-        "athena:GetWorkGroup",
-        "glue:GetDatabase",
-        "glue:GetTable",
-        "glue:GetPartitions"
+        "athena:GetWorkGroup"
       ],
-      "Resource": "*"
+      "Resource": "arn:aws:athena:<region>:<account>:workgroup/<np-finops-workgroup>"
+    },
+    {
+      "Sid": "CurCatalogRead",
+      "Effect": "Allow",
+      "Action": ["glue:GetDatabase", "glue:GetTable", "glue:GetPartitions"],
+      "Resource": [
+        "arn:aws:glue:<region>:<account>:catalog",
+        "arn:aws:glue:<region>:<account>:database/<cur-database>",
+        "arn:aws:glue:<region>:<account>:table/<cur-database>/<cur-table>"
+      ]
     },
     {
       "Sid": "CurBuckets",
