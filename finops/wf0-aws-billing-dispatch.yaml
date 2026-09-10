@@ -1,0 +1,146 @@
+# finops/wf0-aws-billing-dispatch.yaml
+#
+# Multi-account dispatcher: one `target` per AWS account to collect, each with
+# ITS OWN agent (tags), role (AssumeRole ARN + ExternalId) and region. Fans out
+# `wf1-aws-billing-daily` once per target and summarizes. The association of
+# facts → account is NOT taken from this config: every fact carries
+# `cloud_account` from the STS identity the worker actually ran with.
+#
+# targets (variable `targets`, JSON array — set it on the customer's revision or
+# from a config entry): [{ "name": "prod", "agent_tags": {"package":"cloud-query","account":"prod"},
+#   "assume_role_arn": "arn:aws:iam::111122223333:role/np-finops", "assume_role_external_id": "…",
+#   "region": "us-east-1", "expected_account": "111122223333" }]
+# `expected_account` (optional) makes the run fail if the worker's identity is a
+# different account — catches a wrong role/agent pairing.
+id: finops_aws_billing_dispatch
+name: "FinOps — AWS billing dispatch (multi-account)"
+description: >
+  Runs the daily AWS billing collector once per configured target (account ×
+  agent × role) and summarizes facts written per account.
+path: "/finops"
+semantic_version: 0.1.0
+
+inputs:
+  date:
+    type: string
+    required: false
+    description: "Day to collect, YYYY-MM-DD (UTC). Default: yesterday."
+  targets:
+    type: array
+    required: false
+    description: "Override of variables.targets: [{name, agent_tags, assume_role_arn?, assume_role_external_id?, region?, expected_account?}]"
+  callback_base_url:
+    type: string
+    required: false
+    description: "Engine URL the workers can reach (local dev only)"
+  dry_run:
+    type: boolean
+    required: false
+    description: "Build facts without writing"
+
+variables:
+  targets:
+    initialValue: []
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Dispatch"
+    config:
+      description: "Collect one day of AWS billing for every configured account."
+      inputs:
+        date: { type: string, required: false, description: "YYYY-MM-DD (UTC)" }
+        targets: { type: array, required: false, description: "Targets override" }
+        callback_base_url: { type: string, required: false, description: "Engine URL for the worker callback" }
+        dry_run: { type: boolean, required: false, description: "Build facts without writing" }
+
+  - id: daily_cron
+    type: trigger
+    plugin_type: cron
+    name: "Daily 04:15 UTC"
+    config:
+      schedule: "15 4 * * *"
+      timezone: "UTC"
+
+  - id: prep
+    type: module
+    plugin_type: code-exec
+    name: "Resolve targets"
+    join_strategy: any
+    inputs:
+      targets: "${{ workflow.inputs.targets }}"
+      default_targets: "${{ variables.targets }}"
+      date: "${{ workflow.inputs.date }}"
+      callback_base_url: "${{ workflow.inputs.callback_base_url }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var list = Array.isArray(inputs.targets) && inputs.targets.length ? inputs.targets : (Array.isArray(inputs.default_targets) ? inputs.default_targets : []);
+        if (!list.length) throw new Error("no targets configured (variables.targets or inputs.targets)");
+        var seen = {};
+        var runs = list.map(function (t, i) {
+          if (!t || typeof t !== "object") throw new Error("targets[" + i + "] must be an object");
+          var name = String(t.name || ("target-" + i));
+          if (seen[name]) throw new Error("duplicate target name " + name); seen[name] = true;
+          if (!t.agent_tags || typeof t.agent_tags !== "object" || !Object.keys(t.agent_tags).length) throw new Error("targets[" + i + "] (" + name + ") needs agent_tags");
+          return { name: name, agent_tags: t.agent_tags, assume_role_arn: t.assume_role_arn || null, assume_role_external_id: t.assume_role_external_id || null,
+                   region: t.region || null, expected_account: t.expected_account ? String(t.expected_account) : null,
+                   date: inputs.date || null, callback_base_url: inputs.callback_base_url || null, dry_run: !!inputs.dry_run };
+        });
+        return { runs: runs, count: runs.length };
+
+  - id: collect
+    type: module
+    plugin_type: sub-workflow
+    name: "Collect per account (fan-out)"
+    forEach:
+      expression: "${{ steps.prep.outputs.runs }}"
+      itemVariable: target
+      parallel: true
+      maxConcurrency: 3
+    inputs:
+      date: "${{ target.date }}"
+      agent_tags: "${{ target.agent_tags }}"
+      assume_role_arn: "${{ target.assume_role_arn }}"
+      assume_role_external_id: "${{ target.assume_role_external_id }}"
+      callback_base_url: "${{ target.callback_base_url }}"
+      dry_run: "${{ target.dry_run }}"
+      target_name: "${{ target.name }}"
+      expected_account: "${{ target.expected_account }}"
+    config:
+      # Definition id of finops/wf1-aws-billing-daily.yaml (patched at publish time).
+      workflowId: FINOPS_AWS_BILLING_DAILY_ID
+      alias: live
+      waitForCompletion: true
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Summary per account"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      runs: "${{ steps.prep.outputs.runs }}"
+      results: "${{ steps.collect.outputs.items }}"
+    config:
+      language: javascript
+      code: |
+        var runs = inputs.runs || []; var results = inputs.results || [];
+        var accounts = results.map(function (r, i) {
+          // live engine wraps each fan-out item as {outputs, _childExecutionId}; the E2E stub returns outputs flat
+          var o = (r || {}).outputs || r || {}; var s = o.summary || {};
+          return { target: (runs[i] || {}).name || null, account: s.account || null, day: s.day || null,
+                   daily_total_usd: s.daily_total_usd || 0, facts: s.facts || 0, written: s.written || 0, clusters: (s.clusters || []).length };
+        });
+        var total = accounts.reduce(function (a, x) { return a + (Number(x.daily_total_usd) || 0); }, 0);
+        return { targets: runs.length, accounts: accounts, total_usd: Math.round(total * 1e6) / 1e6 };
+
+connections:
+  - { from: start, to: prep }
+  - { from: daily_cron, to: prep }
+  - { from: prep, to: collect }
+  - { from: collect, to: summary }
+
+outputs:
+  summary: "${{ steps.summary.outputs }}"

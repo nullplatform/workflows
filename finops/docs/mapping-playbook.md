@@ -96,7 +96,27 @@ of the cluster's consumption and get allocated in phase 3 by namespace/pod
 
 ## 4b. The role the worker runs with — configured per customer
 
-Two layers, both without registering the package on the platform:
+Three knobs, all per target and all without registering the package on the
+platform. `wf0-aws-billing-dispatch` holds one **target per account**:
+
+```json
+{ "name": "prod", "agent_tags": { "package": "cloud-query", "account": "prod" },
+  "package_version": "0.0.1",
+  "assume_role_arn": "arn:aws:iam::111122223333:role/np-finops", "assume_role_external_id": "…",
+  "region": "us-east-1", "expected_account": "111122223333" }
+```
+
+| Knob | Chooses | Where it is set |
+|---|---|---|
+| `agent_tags` | **which agent** (cluster / environment) runs the worker | target |
+| `package_version` | **which worker pin** on that agent — and the pin declares the pod **service account** → IAM role (pins are keyed by package + version; different SAs = different pinned versions/patch targets) | target + agent Helm values |
+| `assume_role_arn` (+ `assume_role_external_id`) | the **AWS role** assumed before the calls, per account | target (or config entry) |
+
+`expected_account` makes the run fail when the STS identity the worker ended up
+with is another account — the facts always carry `cloud_account` from that
+identity, never from config.
+
+Two layers underneath:
 
 **Layer 1 — identity of the worker pod (per cluster, in the agent Helm values).**
 The agent patches the worker pod for the `cloud-query` package with a service

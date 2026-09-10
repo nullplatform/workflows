@@ -39,6 +39,10 @@ inputs:
     type: string
     required: false
     description: "async (default) or sync"
+  package_version:
+    type: string
+    required: false
+    description: "Package version to run. Selects the agent's worker pin (package, version) — and with it the pod SERVICE ACCOUNT / IAM role that pin declares. Empty = default."
   image:
     type: string
     required: false
@@ -106,6 +110,10 @@ steps:
           type: string
           required: false
           description: "Worker image (immutable reference)"
+        package_version:
+          type: string
+          required: false
+          description: "Package version → agent pin → service account"
 
   - id: build_request
     type: module
@@ -122,6 +130,7 @@ steps:
       callback_allowed_hosts: "${{ variables.callback_allowed_hosts }}"
       image: "${{ workflow.inputs.image }}"
       image_default: "${{ variables.image }}"
+      package_version: "${{ workflow.inputs.package_version }}"
     config:
       language: javascript
       code: |
@@ -141,7 +150,9 @@ steps:
         if (allowed.indexOf(m[2].toLowerCase()) === -1) throw new Error("callback host not allowed: " + m[2] + " (allowed: " + allowed.join(", ") + ")");
         var img = String(inputs.image || inputs.image_default || "").trim();
         if (img && !/^[a-z0-9.-]+(:\d+)?\/[a-z0-9._\/-]+@sha256:[a-f0-9]{64}$/i.test(img)) throw new Error("image must be registry/repository@sha256:<digest> (got " + img + ")");
-        return { action_context: { cloud_query: cq }, mode: inputs.mode === "sync" ? "sync" : "async", callback_base_url: cb, image: img || null };
+        var ver = String(inputs.package_version || "").trim();
+        if (ver && !/^\d+\.\d+\.\d+([-.][A-Za-z0-9.]+)?$/.test(ver)) throw new Error("package_version must be semver (got " + ver + ")");
+        return { action_context: { cloud_query: cq }, mode: inputs.mode === "sync" ? "sync" : "async", callback_base_url: cb, image: img || null, version: ver || null };
 
   - id: call_package
     type: module
@@ -155,6 +166,7 @@ steps:
       # resolved inside `config:` (see feedback in the repo's authoring notes).
       callback_base_url: "${{ steps.build_request.outputs.callback_base_url }}"
       image: "${{ steps.build_request.outputs.image }}"
+      version: "${{ steps.build_request.outputs.version }}"
     config:
       apikey: "${{ secrets.NP_API_KEY }}"
       package: cloud-query

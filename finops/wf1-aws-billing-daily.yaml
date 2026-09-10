@@ -59,6 +59,18 @@ inputs:
     type: string
     required: false
     description: "ExternalId for that role's trust policy (default: variables.assume_role_external_id)"
+  package_version:
+    type: string
+    required: false
+    description: "cloud-query version to run → selects the agent's worker pin and its SERVICE ACCOUNT (default: variables.package_version)"
+  target_name:
+    type: string
+    required: false
+    description: "Label of the dispatcher target (informational)"
+  expected_account:
+    type: string
+    required: false
+    description: "If set, the run FAILS when the worker's STS identity is another AWS account (wrong agent/role pairing)"
 
 variables:
   agent_tags:
@@ -69,6 +81,8 @@ variables:
   assume_role_arn:
     initialValue: ""
   assume_role_external_id:
+    initialValue: ""
+  package_version:
     initialValue: ""
   # AWS region for regional SDK calls (EC2, ELB, RDS). Cost Explorer is global.
   aws_region:
@@ -127,6 +141,18 @@ steps:
           type: string
           required: false
           description: "AssumeRole ExternalId"
+        package_version:
+          type: string
+          required: false
+          description: "cloud-query version (→ pin → service account)"
+        target_name:
+          type: string
+          required: false
+          description: "Dispatcher target label"
+        expected_account:
+          type: string
+          required: false
+          description: "Expected AWS account id"
 
   - id: daily_cron
     type: trigger
@@ -151,6 +177,8 @@ steps:
       role_arn_default: "${{ variables.assume_role_arn }}"
       role_ext: "${{ workflow.inputs.assume_role_external_id }}"
       role_ext_default: "${{ variables.assume_role_external_id }}"
+      package_version: "${{ workflow.inputs.package_version }}"
+      package_version_default: "${{ variables.package_version }}"
     config:
       language: javascript
       code: |
@@ -183,7 +211,8 @@ steps:
         var roleArn = String(inputs.role_arn || inputs.role_arn_default || "").trim();
         if (roleArn && !/^arn:aws:iam::\d{12}:role\/[\w+=,.@\/-]+$/.test(roleArn)) throw new Error("assume_role_arn is not an IAM role ARN: " + roleArn);
         var roleExt = String(inputs.role_ext || inputs.role_ext_default || "").trim();
-        return { day: day, calls: calls, agent_tags: tags, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null };
+        var ver = String(inputs.package_version || inputs.package_version_default || "").trim();
+        return { day: day, calls: calls, agent_tags: tags, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null, package_version: ver || null };
 
   - id: query
     type: module
@@ -196,6 +225,7 @@ steps:
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
       assume_role_arn: "${{ steps.prep.outputs.assume_role_arn }}"
       assume_role_external_id: "${{ steps.prep.outputs.assume_role_external_id }}"
+      package_version: "${{ steps.prep.outputs.package_version }}"
     config:
       # Definition id of finops/tool-cloud-query.yaml (patched at publish time).
       workflowId: FINOPS_CLOUD_QUERY_ID
@@ -233,6 +263,7 @@ steps:
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
       assume_role_arn: "${{ steps.prep.outputs.assume_role_arn }}"
       assume_role_external_id: "${{ steps.prep.outputs.assume_role_external_id }}"
+      package_version: "${{ steps.prep.outputs.package_version }}"
     config:
       workflowId: FINOPS_CLOUD_QUERY_ID
       alias: live
@@ -278,6 +309,8 @@ steps:
       cpu_share: "${{ variables.cpu_share }}"
       collector: "${{ variables.collector }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
+      expected_account: "${{ workflow.inputs.expected_account }}"
+      target_name: "${{ workflow.inputs.target_name }}"
     config:
       language: javascript
       code: |
@@ -287,6 +320,9 @@ steps:
         if (failed.length) throw new Error("cloud-query calls failed: " + failed.join(", "));
         function slug(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""); }
         var acct = (inputs.identity && inputs.identity.account) ? String(inputs.identity.account) : null;
+        // The account comes from the STS identity the worker ACTUALLY ran with (after AssumeRole),
+        // never from config. `expected_account` guards against a wrong agent/role pairing.
+        if (inputs.expected_account && String(inputs.expected_account) !== String(acct)) throw new Error("worker identity is account " + acct + " but target " + (inputs.target_name || "?") + " expects " + inputs.expected_account);
         var region = String(inputs.region);
         var now = new Date().toISOString();
         var cpuShare = Number(inputs.cpu_share); if (!(cpuShare >= 0 && cpuShare <= 1)) cpuShare = 0.5;
@@ -460,7 +496,7 @@ steps:
         });
         var total = num(Object.keys(svcTotal).reduce(function (a, k) { return a + svcTotal[k]; }, 0));
         var count = function (t) { return facts.filter(function (f) { return f.subject_type === t; }).length; };
-        var summary = { day: d, account: acct, services: Object.keys(svcTotal).length, daily_total_usd: total,
+        var summary = { day: d, account: acct, target: inputs.target_name || null, services: Object.keys(svcTotal).length, daily_total_usd: total,
                         buckets: count("bucket"), scopes: count("scope"), resources: count("resource"), databases: count("service"),
                         clusters: clusterFacts, facts: facts.length, dry_run: !!inputs.dry_run };
         return { facts: facts, to_write: inputs.dry_run ? [] : facts, summary: summary };

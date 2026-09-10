@@ -14,6 +14,7 @@ Read first:
 |---|---|
 | `packages/cloud-query/` | The runner package: generic AWS SDK call executor (Cost Explorer, EC2, ELB, RDS, tagging API, CloudWatch, STS), pagination, 300 KB cap, callback with host allow-list. See its README. |
 | `tool-cloud-query.yaml` | Reusable child: agent tags + calls → results by call id (async with engine callback by default, sync for small calls) |
+| `wf0-aws-billing-dispatch.yaml` | Multi-account dispatcher: one target per account (agent tags × package version/pin × AssumeRole × region), fan-out of wf1, summary per account. `expected_account` guards the pairing. |
 | `wf1-aws-billing-daily.yaml` | Daily collector: one day of AWS billing → `cost_daily` facts (cloud services, usage-type buckets, EC2 scopes/resources, EKS clusters with components + blended rates, databases mapped to null services by host). `dry_run` input. |
 | `wf-cost-fact-upsert.yaml` | Child: `PATCH /catalog/instances/<slug>/<id>?upsert=true` for one fact (fan-out target) |
 | `specs/cost_daily.spec.json` | Catalog spec (51 fields): subject, null dimensions, cloud dimensions, amortized `cost_usd` + `unblended_usd`, capacity/rates, provenance. Logical id `<stage>-<subject_type>-<slug>-<date>`. |

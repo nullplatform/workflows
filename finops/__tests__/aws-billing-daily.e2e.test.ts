@@ -152,7 +152,7 @@ describe('finops/wf1-aws-billing-daily', () => {
     const written: Array<Record<string, unknown>> = [];
     const result = await runWorkflowE2E({
       yamlPath: COLLECTOR,
-      inputs: { date: '2026-09-09', agent_tags: { package: 'cloud-query', local: 'x' }, assume_role_arn: 'arn:aws:iam::111122223333:role/np-finops', assume_role_external_id: 'kwik-ext' },
+      inputs: { date: '2026-09-09', agent_tags: { package: 'cloud-query', local: 'x' }, assume_role_arn: 'arn:aws:iam::111122223333:role/np-finops', assume_role_external_id: 'kwik-ext', package_version: '0.0.1', expected_account: '688720756067', target_name: 'kwik' },
       pluginStubs: {
         manual: passthroughTrigger,
         cron: passthroughTrigger,
@@ -179,7 +179,9 @@ describe('finops/wf1-aws-billing-daily', () => {
     for (const q of queries) {
       expect(q.assume_role_arn).toBe('arn:aws:iam::111122223333:role/np-finops');
       expect(q.assume_role_external_id).toBe('kwik-ext');
+      expect(q.package_version).toBe('0.0.1');
     }
+    expect(summary.target).toBe('kwik');
     const typeCalls = queries[1]?.calls as Array<{ id: string; params: { InstanceTypes: string[] } }>;
     expect(typeCalls[0]?.params.InstanceTypes).toEqual(['c5a.xlarge', 't3.micro']);
 
@@ -286,6 +288,24 @@ describe('finops/wf1-aws-billing-daily', () => {
     expect(written).toHaveLength(0);
     expect((result.outputs?.summary as { written: number; dry_run: boolean }).written).toBe(0);
     expect((result.outputs?.summary as { dry_run: boolean }).dry_run).toBe(true);
+  });
+
+  it('fails when the worker identity is not the expected account (wrong agent/role pairing)', async () => {
+    await expect(
+      runWorkflowE2E({
+        yamlPath: COLLECTOR,
+        inputs: { date: '2026-09-09', expected_account: '999999999999', target_name: 'other' },
+        pluginStubs: {
+          manual: passthroughTrigger,
+          cron: passthroughTrigger,
+          'np-api-call': npApiStub,
+          'sub-workflow': {
+            handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => cloudQueryStub().handler(ctx),
+            executeMode: 'all' as const,
+          },
+        },
+      }),
+    ).rejects.toThrow(/worker identity is account 688720756067 but target other expects 999999999999/);
   });
 
   it('fails when a cloud-query call failed instead of writing partial facts', async () => {

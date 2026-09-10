@@ -27,7 +27,8 @@ const { parseYamlWorkflow } = dsl;
 const ORDER: Array<{ file: string; placeholder?: string }> = [
   { file: 'tool-cloud-query.yaml', placeholder: 'FINOPS_CLOUD_QUERY_ID' },
   { file: 'wf-cost-fact-upsert.yaml', placeholder: 'FINOPS_COST_FACT_UPSERT_ID' },
-  { file: 'wf1-aws-billing-daily.yaml' },
+  { file: 'wf1-aws-billing-daily.yaml', placeholder: 'FINOPS_AWS_BILLING_DAILY_ID' },
+  { file: 'wf0-aws-billing-dispatch.yaml' },
 ];
 
 async function api(method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
