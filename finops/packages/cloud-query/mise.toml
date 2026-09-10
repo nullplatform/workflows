@@ -72,10 +72,17 @@ region="${NP_WORKER_AWS_REGION:-us-east-1}"
 # NP_AGENT_EXTRA_TAGS (optional, e.g. run:1757520000): extra agent tags. A
 # restarted agent registers a NEW id and the old one lingers "active" until its
 # TTL, so a per-start tag keeps workflow selectors deterministic.
+# NP_ALLOWED_REGISTRIES (optional, e.g. public.ecr.aws/nullplatform/*): run WITHOUT
+# the local image pin — the agent pulls the image the workflow references
+# (tool-cloud-query `image` input, the released digest). With it unset the
+# agent is pinned to the locally built cloud-query-worker:dev.
 # NP_CALLBACK_ALLOWED_HOSTS: the worker may only POST results to these hosts
 # (SSRF guard). Locally the engine runs on the laptop → host.docker.internal.
 cb_hosts="${NP_CALLBACK_ALLOWED_HOSTS:-host.docker.internal,api.nullplatform.com}"
 patches=$(printf '[{"target":{"package":"cloud-query"},"merge":{"spec":{"containers":[{"name":"worker","env":[{"name":"AWS_ACCESS_KEY_ID","value":"%s"},{"name":"AWS_SECRET_ACCESS_KEY","value":"%s"},{"name":"AWS_REGION","value":"%s"},{"name":"NP_CALLBACK_ALLOWED_HOSTS","value":"%s"}]}]}}}]' "$NP_WORKER_AWS_ACCESS_KEY_ID" "$NP_WORKER_AWS_SECRET_ACCESS_KEY" "$region" "$cb_hosts")
+# Pin the locally built image, or let the agent pull what the workflow references.
+set -f  # no globbing: the registry pattern carries a '*'
+if [ -n "${NP_ALLOWED_REGISTRIES:-}" ]; then worker_env="-e NP_ALLOWED_REGISTRIES=$NP_ALLOWED_REGISTRIES"; else worker_env="-e NP_WORKER_IMAGE=cloud-query-worker:dev"; fi
 docker rm -f np-cloud-query-agent >/dev/null 2>&1 || true
 # The agent reuses a warm worker; remove it so a rebuilt image is picked up.
 for w in $(docker ps -a -q --filter "name=^np-worker-.*cloud-query$"); do docker rm -f "$w" >/dev/null 2>&1 || true; done
@@ -83,7 +90,7 @@ docker run -d --name np-cloud-query-agent --network host \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e NP_API_KEY -e NP_LOG_LEVEL="${NP_LOG_LEVEL:-INFO}" \
   -e NP_WORKER_BACKEND=docker \
-  -e NP_WORKER_IMAGE=cloud-query-worker:dev \
+  $worker_env \
   -e NP_WORKER_PATCHES="$patches" \
   "${NP_AGENT_IMAGE:-public.ecr.aws/nullplatform/controlplane-agent:latest}" \
   -runtime=host -tags=package:cloud-query,local:"${NP_LOCAL_USER:-$USER}",env:local"${NP_AGENT_EXTRA_TAGS:+,$NP_AGENT_EXTRA_TAGS}" >/dev/null

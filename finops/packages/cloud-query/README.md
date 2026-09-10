@@ -63,7 +63,11 @@ scripts/release.sh 0.0.2      # explicit version
 scripts/release.sh --dry-run  # local build only, no login/push
 ```
 
-Then register the version on the platform and pin it on the customer agent:
+Registering the version on the platform (`np package publish`) is **optional**:
+`tool-cloud-query.yaml` sends the image as an immutable reference in the action
+context and the agent pulls it directly, as long as the agent allows the
+registry (`worker.allowedRegistries: ["public.ecr.aws/nullplatform/*"]`). Register
+it when you want the version visible in the console or an operator pin:
 
 ```bash
 np-preview package publish --nrn "$NRN" --image "$(jq -r .image scripts/release.json)"

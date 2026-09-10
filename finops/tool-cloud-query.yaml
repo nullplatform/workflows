@@ -35,6 +35,10 @@ inputs:
     type: string
     required: false
     description: "async (default) or sync"
+  image:
+    type: string
+    required: false
+    description: "Worker image as an immutable reference registry/repository@sha256:<digest> (default: variables.image). The agent pulls it directly when its NP_ALLOWED_REGISTRIES allows the registry — no platform package registration needed."
   # Security note: this input only CHOOSES where the worker posts its result;
   # the WORKER enforces the destination against NP_CALLBACK_ALLOWED_HOSTS
   # (default api.nullplatform.com; host.docker.internal only in `mise run run`).
@@ -45,6 +49,10 @@ inputs:
     description: "Engine base URL the WORKER can reach for the async callback (default: variables.callback_base_url). Must be on the worker's NP_CALLBACK_ALLOWED_HOSTS. Local dev with a docker worker: http://host.docker.internal:<port>"
 
 variables:
+  # Released worker image (see packages/cloud-query/scripts/release.json). Operator
+  # pins in the agent (NP_WORKERS) win over this when present.
+  image:
+    initialValue: "public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer@sha256:29e8c1578c028a192965e64e778349252f7efedb7b375bbb3daedcb2f8f6cf79"
   # The engine base URL the WORKER must reach to deliver the callback.
   # Locally (docker worker → dev-server on the laptop): http://host.docker.internal:3000
   callback_base_url:
@@ -86,6 +94,10 @@ steps:
           type: string
           required: false
           description: "Engine base URL for the worker callback"
+        image:
+          type: string
+          required: false
+          description: "Worker image (immutable reference)"
 
   - id: build_request
     type: module
@@ -99,6 +111,8 @@ steps:
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
       callback_default: "${{ variables.callback_base_url }}"
       callback_allowed_hosts: "${{ variables.callback_allowed_hosts }}"
+      image: "${{ workflow.inputs.image }}"
+      image_default: "${{ variables.image }}"
     config:
       language: javascript
       code: |
@@ -113,7 +127,9 @@ steps:
         if (!m) throw new Error("callback_base_url must be http(s)://host[:port] (got " + cb + ")");
         var allowed = String(inputs.callback_allowed_hosts || "").toLowerCase().split(",").map(function (h) { return h.trim(); }).filter(Boolean);
         if (allowed.indexOf(m[2].toLowerCase()) === -1) throw new Error("callback host not allowed: " + m[2] + " (allowed: " + allowed.join(", ") + ")");
-        return { action_context: { cloud_query: cq }, mode: inputs.mode === "sync" ? "sync" : "async", callback_base_url: cb };
+        var img = String(inputs.image || inputs.image_default || "").trim();
+        if (img && !/^[a-z0-9.-]+(:\d+)?\/[a-z0-9._\/-]+@sha256:[a-f0-9]{64}$/i.test(img)) throw new Error("image must be registry/repository@sha256:<digest> (got " + img + ")");
+        return { action_context: { cloud_query: cq }, mode: inputs.mode === "sync" ? "sync" : "async", callback_base_url: cb, image: img || null };
 
   - id: call_package
     type: module
@@ -126,6 +142,7 @@ steps:
       # Step INPUT, not config: `${{ steps.X.outputs.* }}` is not reliably
       # resolved inside `config:` (see feedback in the repo's authoring notes).
       callback_base_url: "${{ steps.build_request.outputs.callback_base_url }}"
+      image: "${{ steps.build_request.outputs.image }}"
     config:
       apikey: "${{ secrets.NP_API_KEY }}"
       package: cloud-query

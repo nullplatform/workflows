@@ -87,6 +87,8 @@ describe('finops/tool-cloud-query', () => {
     expect(ac.cloud_query.calls).toHaveLength(2);
     expect(seen[0]?.agent_selector).toEqual({ package: 'cloud-query' });
     expect(seen[0]?.mode).toBe('async');
+    // the released image travels as an immutable reference (default from variables.image)
+    expect(String(seen[0]?.image)).toMatch(/^public\.ecr\.aws\/nullplatform\/agent-plugins\/workflows\/aws-cost-explorer@sha256:[a-f0-9]{64}$/);
   });
 
   it('surfaces failed calls in outputs when the plugin reports them', async () => {
