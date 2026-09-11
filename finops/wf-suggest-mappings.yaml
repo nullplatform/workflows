@@ -1,0 +1,262 @@
+# finops/wf-suggest-mappings.yaml
+#
+# Inference: for the cost the allocator could not attribute, look for evidence of
+# who owns it and write cost_mapping_suggestion rows (status=proposed) a human
+# accepts into cost_mapping_rule. Evidence sources (design: docs/mapping-rules-design.md):
+#   1. null services whose attributes.host/hostname/endpoint equals the leaf's host  (confidence 0.95)
+#   2. application PARAMETERS whose value contains the leaf's host or resource name  (confidence 0.6;
+#      several consumers → an equal `split`, to be refined by a metric)
+# Secrets are not readable: a consumer that only has a secret DATABASE_URL is missed.
+# Called by wf2 (sub-workflow) with its `unallocated_leaves`, or manually with a day.
+id: finops_suggest_mappings
+name: "FinOps — suggest mapping rules from evidence"
+description: >
+  Turns unallocated cost into proposed mapping rules using null services and
+  application parameters as evidence.
+path: "/finops"
+semantic_version: 0.1.0
+
+inputs:
+  date:
+    type: string
+    required: true
+    description: "Day the evidence was observed on (YYYY-MM-DD)"
+  unallocated_leaves:
+    type: array
+    required: true
+    description: "wf2 output: [{id, cloud_service, subject_type, subject_id, resource_type, host, tags, cost_usd}]"
+  org_nrn:
+    type: string
+    required: false
+    description: "Root NRN of the organization (default: variables.org_nrn)"
+  account_id:
+    type: string
+    required: false
+    description: "Account id used to build application NRNs for the parameter scan (default: variables.account_id)"
+  dry_run:
+    type: boolean
+    required: false
+
+variables:
+  org_nrn:
+    initialValue: "organization=1255165411"
+  account_id:
+    initialValue: ""
+  min_usd:
+    initialValue: 0.05
+  suggester:
+    initialValue: "finops_suggest_mappings@0.1.0"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Suggest"
+    config:
+      description: "Propose mapping rules for unallocated cost."
+      inputs:
+        date: { type: string, required: true, description: "YYYY-MM-DD" }
+        unallocated_leaves: { type: array, required: true, description: "wf2 unallocated_leaves" }
+        org_nrn: { type: string, required: false, description: "Organization NRN" }
+        account_id: { type: string, required: false, description: "Account id for application NRNs" }
+        dry_run: { type: boolean, required: false, description: "Compute without writing" }
+
+  - id: prep
+    type: module
+    plugin_type: code-exec
+    name: "Candidates"
+    inputs:
+      leaves: "${{ workflow.inputs.unallocated_leaves }}"
+      org_nrn: "${{ workflow.inputs.org_nrn }}"
+      org_nrn_default: "${{ variables.org_nrn }}"
+      account_id: "${{ workflow.inputs.account_id }}"
+      account_id_default: "${{ variables.account_id }}"
+      min_usd: "${{ variables.min_usd }}"
+    config:
+      language: javascript
+      code: |
+        var org = String(inputs.org_nrn || inputs.org_nrn_default || "").trim();
+        if (!/^organization=\d+$/.test(org)) throw new Error("org_nrn must be organization=<id> (got " + org + ")");
+        var acct = String(inputs.account_id || inputs.account_id_default || "").trim();
+        var min = Number(inputs.min_usd) || 0;
+        // Only leaves with something to match on: a host or a resource name/id.
+        var cands = (inputs.leaves || []).filter(function (l) { return l && (Number(l.cost_usd) || 0) >= min && (l.host || l.resource_id || l.subject_id); });
+        return { org_nrn: org, account_id: acct, candidates: cands, app_filters: { nrn: org, status: "active" }, service_query: { nrn: org, show_descendants: "true", limit: "500" } };
+
+  - id: np_services
+    type: module
+    plugin_type: np-api-call
+    name: "null services"
+    inputs:
+      query: "${{ steps.prep.outputs.service_query }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/service"
+      query: { show_descendants: "true", limit: "500" }
+      failOnHttpError: false
+
+  - id: apps
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "Active applications"
+    inputs:
+      filters: "${{ steps.prep.outputs.app_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "application"
+      filters: { status: "active" }
+      limit: 100
+      maxPages: 20
+
+  - id: app_nrns
+    type: module
+    plugin_type: code-exec
+    name: "Application NRNs"
+    inputs:
+      apps: "${{ steps.apps.outputs.items }}"
+      org_nrn: "${{ steps.prep.outputs.org_nrn }}"
+      account_id: "${{ steps.prep.outputs.account_id }}"
+    config:
+      language: javascript
+      code: |
+        var acct = String(inputs.account_id || "");
+        var list = (inputs.apps || []).filter(function (a) { return a && a.id; }).map(function (a) {
+          var nrn = a.nrn || (acct && a.namespace_id ? inputs.org_nrn + ":account=" + acct + ":namespace=" + a.namespace_id + ":application=" + a.id : null);
+          // `query` is pre-built per item: nested `${{ app.nrn }}` inside an object input does not resolve in fan-out.
+          return { id: String(a.id), slug: a.slug || String(a.id), namespace_id: a.namespace_id != null ? String(a.namespace_id) : null, nrn: nrn, query: { nrn: nrn } };
+        }).filter(function (a) { return a.nrn; });
+        // Fan-out items are spread into the np-api-call inputs (spreadItem): keep them to the `query` key only.
+        return { apps: list, queries: list.map(function (a) { return { query: a.query }; }), count: list.length };
+
+  - id: params
+    type: module
+    plugin_type: np-api-call
+    name: "Parameters per application (fan-out)"
+    forEach:
+      expression: "${{ steps.app_nrns.outputs.queries }}"
+      itemVariable: app
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 6
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/parameter"
+      query: { nrn: "placeholder" }
+      failOnHttpError: false
+
+  - id: suggest
+    type: module
+    plugin_type: code-exec
+    name: "Evidence → suggestions"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      day: "${{ workflow.inputs.date }}"
+      candidates: "${{ steps.prep.outputs.candidates }}"
+      services: "${{ steps.np_services.outputs.body }}"
+      apps: "${{ steps.app_nrns.outputs.apps }}"
+      params: "${{ steps.params.outputs.items }}"
+      suggester: "${{ variables.suggester }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day); var now = new Date().toISOString();
+        function num(x) { return Math.round((Number(x) || 0) * 1e6) / 1e6; }
+        function slug(x) { return String(x).toLowerCase().replace(/[^a-z0-9_]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100); }
+        function nrnDims(nrn) { var o = {}; String(nrn || "").split(":").forEach(function (p) { var kv = p.split("="); if (kv.length === 2) o[kv[0]] = kv[1]; }); return o; }
+        // 1) null services by host
+        var svcs = ((inputs.services || {}).results) || (Array.isArray(inputs.services) ? inputs.services : []);
+        var byHost = {};
+        svcs.forEach(function (s) {
+          var at = s.attributes || {}; [at.host, at.hostname, at.endpoint, at.url].forEach(function (h) {
+            if (!h) return; var m = /^(?:[a-z]+:\/\/)?([^\/:]+)/i.exec(String(h)); if (m) byHost[m[1].toLowerCase()] = s;
+          });
+        });
+        // 2) parameters: app → set of values (hosts / names)
+        var apps = inputs.apps || []; var paramsByApp = inputs.params || [];
+        var consumers = {}; // key (host or name) → [{app, param}]
+        function addConsumer(key, app, pname) { key = String(key).toLowerCase(); (consumers[key] = consumers[key] || []).push({ app: app, param: pname }); }
+        paramsByApp.forEach(function (res, i) {
+          var app = apps[i]; if (!app) return;
+          var body = (res || {}).body || res || {}; var list = body.results || [];
+          list.forEach(function (p) { (p.values || []).forEach(function (v) {
+            var val = String((v || {}).value || ""); if (!val) return;
+            var hosts = val.match(/[a-z0-9.-]+\.(?:rds|cache|es|amazonaws)\.[a-z0-9.-]*amazonaws\.com/ig) || val.match(/[a-z0-9.-]+\.amazonaws\.com/ig) || [];
+            hosts.forEach(function (h) { addConsumer(h, app, p.name); });
+          }); });
+        });
+        var out = [];
+        (inputs.candidates || []).forEach(function (L) {
+          var host = String(L.host || "").toLowerCase(); var cost = num(L.cost_usd);
+          var evidence = []; var owners = [];
+          if (host && byHost[host]) {
+            var s = byHost[host]; var dims = nrnDims(s.entity_nrn || s.nrn);
+            evidence.push({ kind: "null_service", detail: "attributes.host of service " + (s.name || s.slug) + " equals " + host, service_id: String(s.id), application_id: dims.application || null });
+            if (dims.application) owners.push({ application_id: dims.application, namespace_id: dims.namespace || null, service_id: String(s.id) });
+          }
+          var seen = {};
+          [host, String(L.resource_id || "").toLowerCase(), String(L.subject_id || "").toLowerCase()].forEach(function (k) {
+            if (!k || !consumers[k]) return;
+            consumers[k].forEach(function (c) { if (seen[c.app.id]) return; seen[c.app.id] = true;
+              evidence.push({ kind: "parameter", detail: c.app.slug + " parameter " + c.param + " references " + k, application_id: c.app.id, application_slug: c.app.slug, namespace_id: c.app.namespace_id });
+              if (!owners.some(function (o) { return o.application_id === c.app.id; })) owners.push({ application_id: c.app.id, namespace_id: c.app.namespace_id, application_slug: c.app.slug });
+            });
+          });
+          if (!owners.length) return;
+          var conf = evidence.some(function (e) { return e.kind === "null_service"; }) ? 0.95 : (owners.length === 1 ? 0.7 : 0.6);
+          var match = host ? [{ field: "host", equals: host }] : [{ field: "resource_id", equals: String(L.resource_id || L.subject_id) }];
+          var rule = { scope: { cloud_service: L.cloud_service }, match: match, method: owners.length === 1 ? "direct" : "split",
+                       target: owners.length === 1 ? owners[0] : { split: owners.map(function (o) { return { weight: 1, target: o }; }) } };
+          var id = "sugg-" + slug(L.subject_id) + "-" + d;
+          out.push({ id: id, name: (owners.length === 1 ? "→ " + (owners[0].application_slug || "application " + owners[0].application_id) : "split among " + owners.length + " consumers") + ": " + (L.subject_name || L.subject_id),
+                     status: "proposed", day: d, cloud_service: L.cloud_service, resource_type: L.resource_type || null, subject_id: String(L.subject_id), recovers_usd: cost, confidence: conf,
+                     rule: rule, evidence: evidence, created_at: now, updated_at: now, source: String(inputs.suggester) });
+        });
+        out.sort(function (a, b) { return b.recovers_usd - a.recovers_usd; });
+        return { suggestions: out, to_write: inputs.dry_run ? [] : out.map(function (s) { return { fact: s, catalog_slug: "cost_mapping_suggestion" }; }),
+                 summary: { day: d, candidates: (inputs.candidates || []).length, suggestions: out.length, recovers_usd: num(out.reduce(function (s, x) { return s + x.recovers_usd; }, 0)), apps_scanned: apps.length, services: svcs.length } };
+
+  - id: write
+    type: module
+    plugin_type: sub-workflow
+    name: "Upsert suggestions (fan-out)"
+    forEach:
+      expression: "${{ steps.suggest.outputs.to_write }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+    config:
+      workflowId: FINOPS_COST_FACT_UPSERT_ID
+      alias: live
+      waitForCompletion: true
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Summary"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      summary: "${{ steps.suggest.outputs.summary }}"
+      results: "${{ steps.write.outputs.items }}"
+    config:
+      language: javascript
+      code: |
+        var s = Object.assign({}, inputs.summary || {}); s.written = (inputs.results || []).length; return s;
+
+connections:
+  - { from: start, to: prep }
+  - { from: prep, to: np_services }
+  - { from: prep, to: apps }
+  - { from: apps, to: app_nrns }
+  - { from: app_nrns, to: params }
+  - { from: params, to: suggest }
+  - { from: np_services, to: suggest }
+  - { from: suggest, to: write }
+  - { from: write, to: summary }
+
+outputs:
+  summary: "${{ steps.summary.outputs }}"
+  suggestions: "${{ steps.suggest.outputs.suggestions }}"

@@ -1,0 +1,152 @@
+/**
+ * E2E for finops/wf2-allocate-daily.yaml: raw facts + mapping rules → allocated facts.
+ * Catalog reads are stubbed at the `np-entity-paginated-fetch` level, the upsert child at
+ * the `sub-workflow` level.
+ */
+import { resolve } from 'node:path';
+import { runWorkflowE2E } from '@nullplatform/workflow-kit/test';
+import { describe, expect, it } from 'vitest';
+
+const YAML = resolve(__dirname, '..', 'wf2-allocate-daily.yaml');
+const D = '2026-09-09';
+
+const passthroughTrigger = {
+  handler: () => ({ status: 'success' as const, outputs: {}, activePorts: ['default'] }),
+  registryType: 'trigger' as const,
+};
+
+const svc = (name: string, id: string, cost: number) => ({
+  id: `raw-cloud_service-${id}-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cloud_service', subject_id: id, subject_name: name,
+  cloud: 'aws', cloud_account: '111122223333', cloud_service: name, cost_usd: cost,
+});
+const EC2 = 'Amazon Elastic Compute Cloud - Compute';
+const RDS = 'Amazon Relational Database Service';
+const VPC = 'Amazon Virtual Private Cloud';
+const GD = 'Amazon GuardDuty';
+const CW = 'AmazonCloudWatch';
+
+const RAW = [
+  svc(EC2, 'ec2', 10), svc(RDS, 'rds', 20), svc(VPC, 'vpc', 3), svc(GD, 'guardduty', 1), svc(CW, 'cloudwatch', 4),
+  // EC2: a null scope (tags → dims from wf1), a cluster nodes component, the unattributed bucket → remainder 2
+  { id: `raw-scope-777-${D}`, date: D, day: D, stage: 'raw', subject_type: 'scope', subject_id: '777', subject_name: 'ns.app.prod', cloud: 'aws', cloud_service: EC2, parent_id: `raw-cloud_service-ec2-${D}`,
+    cost_usd: 2, scope_id: '777', application_id: '100', namespace_id: '5', account_id: '1', tags: { scope_id: '777', application_id: '100' }, resource_id: 'i-1', resource_type: 'ec2:instance' },
+  { id: `raw-bucket-runtime-nodes-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'runtime|nodes', subject_name: 'runtime / nodes', cloud: 'aws', cloud_service: EC2, cluster: 'runtime', component: 'nodes', parent_id: `raw-cluster-runtime-${D}`, cost_usd: 5 },
+  { id: `raw-bucket-ec2-instances-unattributed-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'ec2-instances-unattributed', subject_name: 'EC2 instances not attributable', cloud: 'aws', cloud_service: EC2, parent_id: `raw-cloud_service-ec2-${D}`, cost_usd: 1, resource_type: 'ec2:instance' },
+  { id: `raw-cluster-runtime-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cluster', subject_id: 'runtime', cloud: 'aws', cluster: 'runtime', cost_usd: 8 },
+  { id: `raw-bucket-runtime-networking-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'runtime|networking', subject_name: 'runtime / networking', cloud: 'aws', cloud_service: VPC, cluster: 'runtime', component: 'networking', parent_id: `raw-cluster-runtime-${D}`, cost_usd: 3 },
+  // RDS: one cluster mapped by wf1 (host = null service), one shared cluster with no owner
+  { id: `raw-service-orders-db-${D}`, date: D, day: D, stage: 'raw', subject_type: 'service', subject_id: 'orders-db', subject_name: 'Orders DB', cloud: 'aws', cloud_service: RDS, parent_id: `raw-cloud_service-rds-${D}`,
+    cost_usd: 12, service_id: 'svc-1', application_id: '100', namespace_id: '5', account_id: '1', host: 'orders-db.cluster-abc.us-east-1.rds.amazonaws.com', resource_type: 'rds:cluster', tags: { application: 'orders' } },
+  { id: `raw-service-shared-db-${D}`, date: D, day: D, stage: 'raw', subject_type: 'service', subject_id: 'shared-db', subject_name: 'shared-db', cloud: 'aws', cloud_service: RDS, parent_id: `raw-cloud_service-rds-${D}`,
+    cost_usd: 8, host: 'shared-db.cluster-abc.us-east-1.rds.amazonaws.com', resource_type: 'rds:cluster', tags: { application: 'shared' } },
+  // usage-type buckets are informational — must not be allocated (they overlap the leaves)
+  { id: `raw-bucket-rds-aurora-storageio-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'rds|Aurora:StorageIOUsage', cloud: 'aws', cloud_service: RDS, parent_id: `raw-cloud_service-rds-${D}`, usage_type: 'Aurora:StorageIOUsage', cost_usd: 7 },
+  // CloudWatch: a log-group resource named <namespace>.<application>
+  { id: `raw-resource-loggroup-catalog-entities-api-${D}`, date: D, day: D, stage: 'raw', subject_type: 'resource', subject_id: 'catalog.entities-api', subject_name: 'catalog.entities-api', cloud: 'aws', cloud_service: CW, parent_id: `raw-cloud_service-cloudwatch-${D}`, resource_type: 'logs:log-group', cost_usd: 1.5 },
+  // yesterday's row must be ignored
+  { id: 'raw-cloud_service-ec2-2026-09-08', date: '2026-09-08', day: '2026-09-08', stage: 'raw', subject_type: 'cloud_service', subject_id: 'ec2', subject_name: EC2, cloud: 'aws', cloud_service: EC2, cost_usd: 99 },
+];
+
+const RULES = [
+  { id: 'security-is-platform', name: 'security → platform', enabled: true, status: 'active', priority: 10, scope: { cloud_service: { regex: 'GuardDuty|Security Hub' } }, target: { bucket: 'shared-platform' }, category: 'security' },
+  { id: 'shared-db-by-database', name: 'shared Aurora split', enabled: true, status: 'active', priority: 20, scope: { resource_type: 'rds:cluster' },
+    match: [{ field: 'host', equals: 'shared-db.cluster-abc.us-east-1.rds.amazonaws.com' }],
+    method: 'split', target: { split: [{ weight: 3, target: { application_id: '100', namespace_id: '5' } }, { weight: 1, target: { application_id: '200', namespace_id: '6' } }] } },
+  { id: 'log-groups-by-name', name: 'log groups <ns>.<app>', enabled: true, status: 'active', priority: 30, scope: { resource_type: 'logs:log-group' },
+    match: [{ field: 'subject_name', regex: '^(?<ns>[a-z0-9-]+)\\.(?<app>[a-z0-9-]+)$' }], target: { capture: { application_slug: '$app' } } },
+  { id: 'disabled-rule', name: 'would steal everything', enabled: false, status: 'active', priority: 1, target: { bucket: 'nope' } },
+  { id: 'proposed-rule', name: 'not active yet', enabled: true, status: 'proposed', priority: 1, target: { bucket: 'nope' } },
+];
+
+function fetchStub(raw = RAW, rules = RULES) {
+  return {
+    handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
+      const items = ctx.stepId === 'read_rules' ? rules : raw;
+      return { status: 'success' as const, outputs: { items, totalFetched: items.length, pages: 1 }, activePorts: ['default'] };
+    },
+    executeMode: 'all' as const,
+  };
+}
+
+describe('finops/wf2-allocate-daily', () => {
+  it('allocates every leaf, reconciles with the service totals, and rolls up per application', async () => {
+    const written: Array<Record<string, unknown>> = [];
+    const result = await runWorkflowE2E({
+      yamlPath: YAML,
+      inputs: { date: D },
+      pluginStubs: {
+        manual: passthroughTrigger,
+        'np-entity-paginated-fetch': fetchStub(),
+        'sub-workflow': {
+          handler: (ctx: { inputs: Record<string, unknown> }) => {
+            written.push(ctx.inputs.fact as Record<string, unknown>);
+            return { status: 'success' as const, outputs: { id: (ctx.inputs.fact as { id: string }).id, status: 200 }, activePorts: ['default'] };
+          },
+          executeMode: 'all' as const,
+        },
+      },
+    });
+    const facts = result.outputs?.facts as Array<Record<string, unknown>>;
+    const summary = result.outputs?.summary as Record<string, unknown>;
+    const byId = Object.fromEntries(facts.map((f) => [f.id, f]));
+
+    // leaves: scope, nodes, unattributed, EC2 remainder 2, orders-db, shared-db, networking, GuardDuty remainder, log group, CloudWatch remainder 2.5
+    expect(summary.leaves).toBe(10);
+    expect(summary.total_usd).toBe(38);
+    expect(summary.rules_active).toBe(3);
+
+    // default:null-dims — the scope row already carries the owner
+    expect(byId[`alloc-scope-777-${D}-app-100`]).toMatchObject({ stage: 'allocated', application_id: '100', scope_id: '777', cost_usd: 2, share: 1, rule_id: 'default:null-dims', category: 'compute', source_fact_id: `raw-scope-777-${D}` });
+    // default:null-service — host mapped by wf1
+    expect(byId[`alloc-service-orders-db-${D}-app-100`]).toMatchObject({ application_id: '100', service_id: 'svc-1', cost_usd: 12, rule_id: 'default:null-service', category: 'database' });
+    // split rule 3:1 on the shared cluster
+    expect(byId[`alloc-service-shared-db-${D}-app-100`]).toMatchObject({ application_id: '100', cost_usd: 6, share: 0.75, allocation_method: 'split', rule_id: 'shared-db-by-database' });
+    expect(byId[`alloc-service-shared-db-${D}-app-200`]).toMatchObject({ application_id: '200', cost_usd: 2, share: 0.25 });
+    // regex capture → application_slug
+    expect(byId[`alloc-resource-loggroup-catalog-entities-api-${D}-app-entities-api`]).toMatchObject({ application_slug: 'entities-api', cost_usd: 1.5, rule_id: 'log-groups-by-name', category: 'observability' });
+    // cluster components wait for phase 3
+    expect(byId[`alloc-bucket-runtime-nodes-${D}-cluster-runtime`]).toMatchObject({ cluster: 'runtime', cost_usd: 5, allocation_method: 'cluster_pending_consumption', rule_id: 'default:cluster' });
+    expect(byId[`alloc-bucket-runtime-networking-${D}-cluster-runtime`]).toMatchObject({ cost_usd: 3, category: 'network' });
+    // security → shared bucket with the rule's category
+    expect(byId[`alloc-cloud_service-guardduty-${D}-remainder-bucket-shared-platform`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1, category: 'security', rule_id: 'security-is-platform' });
+    // what nobody claims
+    expect(byId[`alloc-bucket-ec2-instances-unattributed-${D}-unallocated`]).toMatchObject({ cost_usd: 1, allocation_method: 'unallocated' });
+    expect(byId[`alloc-cloud_service-ec2-${D}-remainder-unallocated`]).toMatchObject({ cost_usd: 2 });
+    expect(byId[`alloc-cloud_service-cloudwatch-${D}-remainder-unallocated`]).toMatchObject({ cost_usd: 2.5 });
+    // usage-type buckets and the cluster row are not allocation leaves
+    expect(facts.some((f) => String(f.source_fact_id ?? '').includes('storageio'))).toBe(false);
+    expect(facts.some((f) => f.source_fact_id === `raw-cluster-runtime-${D}`)).toBe(false);
+
+    // rollups
+    expect(byId[`alloc-app-100-${D}`]).toMatchObject({ subject_type: 'application', application_id: '100', cost_usd: 20, by_category: { compute: 2, database: 18 }, quantity: 3 });
+    expect(byId[`alloc-app-200-${D}`]).toMatchObject({ cost_usd: 2 });
+    expect(byId[`alloc-bucket-shared-platform-${D}`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1 });
+    expect(byId[`alloc-unallocated-${D}`]).toMatchObject({ subject_type: 'unallocated', cost_usd: 5.5, by_cloud_service: { [EC2]: 3, [CW]: 2.5 } });
+
+    // Σ leaves = Σ services = allocated + cluster + unallocated
+    const leafRows = facts.filter((f) => f.allocation_method !== 'rollup' && f.subject_type !== 'unallocated');
+    expect(leafRows.reduce((s, f) => s + Number(f.cost_usd), 0)).toBeCloseTo(38, 6);
+    expect(summary.unallocated_usd).toBe(5.5);
+    expect(summary.cluster_pending_usd).toEqual({ runtime: 8 });
+    expect(summary.allocated_usd).toBeCloseTo(24.5, 6);
+    expect((summary.applications as Array<{ owner: string; cost_usd: number }>)[0]).toMatchObject({ owner: 'app-100', cost_usd: 20 });
+
+    // everything was written, every row carries the required keys
+    expect(written).toHaveLength(facts.length);
+    expect(summary.written).toBe(facts.length);
+    for (const f of facts) for (const k of ['id', 'date', 'day', 'stage', 'subject_type', 'subject_id', 'cloud', 'cost_usd', 'source', 'allocation_method', 'collected_at']) expect(f[k], `${f.id}.${k}`).toBeDefined();
+    const unl = result.outputs?.unallocated_leaves as Array<Record<string, unknown>>;
+    expect(unl.map((u) => u.id)).toEqual([`raw-cloud_service-cloudwatch-${D}-remainder`, `raw-cloud_service-ec2-${D}-remainder`, `raw-bucket-ec2-instances-unattributed-${D}`]);
+  });
+
+  it('dry_run computes everything and writes nothing; no raw facts is an error', async () => {
+    const written: unknown[] = [];
+    const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { written.push(ctx.inputs.fact); return { status: 'success' as const, outputs: {}, activePorts: ['default'] }; }, executeMode: 'all' as const };
+    const r = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'sub-workflow': stub } });
+    expect(written).toHaveLength(0);
+    expect((r.outputs?.summary as { written: number; dry_run: boolean })).toMatchObject({ written: 0, dry_run: true });
+    await expect(
+      runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub([], []), 'sub-workflow': stub } }),
+    ).rejects.toThrow(/no raw facts for 2026-01-01/);
+  });
+});

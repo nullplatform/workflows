@@ -15,7 +15,11 @@ inputs:
   fact:
     type: object
     required: true
-    description: "A cost_daily fact (must carry id, date, stage, subject_type, subject_id, cloud, cost_usd, source, allocation_method, collected_at)"
+    description: "A cost_daily fact (must carry id, date, stage, subject_type, subject_id, cloud, cost_usd, source, allocation_method, collected_at); for other slugs only `id` is required"
+  catalog_slug:
+    type: string
+    required: false
+    description: "Catalog spec slug (default: variables.catalog_slug)"
 
 variables:
   # Catalog specification slug the facts are written to.
@@ -34,6 +38,10 @@ steps:
           type: object
           required: true
           description: "cost_daily fact"
+        catalog_slug:
+          type: string
+          required: false
+          description: "Catalog spec slug (default: variables.catalog_slug)"
 
   - id: check
     type: module
@@ -41,15 +49,20 @@ steps:
     name: "Validate fact"
     inputs:
       fact: "${{ workflow.inputs.fact }}"
+      catalog_slug: "${{ workflow.inputs.catalog_slug }}"
+      default_slug: "${{ variables.catalog_slug }}"
     config:
       language: javascript
       code: |
         var f = inputs.fact || {};
-        var req = ["id","date","stage","subject_type","subject_id","cloud","cost_usd","source","allocation_method","collected_at"];
+        var slug = String(inputs.catalog_slug || inputs.default_slug || "cost_daily");
+        if (!/^[a-z0-9_]+$/.test(slug)) throw new Error("catalog_slug must be a spec slug (got " + slug + ")");
+        var req = slug === "cost_daily" ? ["id","date","stage","subject_type","subject_id","cloud","cost_usd","source","allocation_method","collected_at"] : ["id"];
         var missing = req.filter(function (k) { return f[k] === undefined || f[k] === null || f[k] === ""; });
         if (missing.length) throw new Error("fact is missing " + missing.join(", ") + " (id=" + f.id + ")");
-        if (typeof f.cost_usd !== "number") throw new Error("cost_usd must be a number (id=" + f.id + ")");
-        return { id: String(f.id), fact: f };
+        if (slug === "cost_daily" && typeof f.cost_usd !== "number") throw new Error("cost_usd must be a number (id=" + f.id + ")");
+        if (!/^[A-Za-z0-9_.-]+$/.test(String(f.id))) throw new Error("id must be a catalog-safe slug (got " + f.id + ")");
+        return { id: String(f.id), fact: f, slug: slug, path: "/catalog/instances/" + slug + "/" + String(f.id) };
 
   - id: upsert
     type: module
@@ -62,7 +75,7 @@ steps:
         backoff_strategy: exponential
         jitter: 0.3
     inputs:
-      path: "/catalog/instances/${{ variables.catalog_slug }}/${{ steps.check.outputs.id }}"
+      path: "${{ steps.check.outputs.path }}"
       body: "${{ steps.check.outputs.fact }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"

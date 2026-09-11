@@ -361,7 +361,7 @@ steps:
         function qty(g) { return num((g.Metrics.UsageQuantity || {}).Amount); }
         function base(stage, type, id) {
           // Logical id: every part is also a field. Dashes only — the catalog path rejects ':' and '/'.
-          return { id: stage + "-" + type + "-" + slug(id) + "-" + d, date: d, stage: stage, subject_type: type, subject_id: id,
+          return { id: stage + "-" + type + "-" + slug(id) + "-" + d, date: d, day: d, stage: stage, subject_type: type, subject_id: id,
                    cloud: "aws", cloud_account: acct, source: "aws_ce", collected_at: now, collector: String(inputs.collector),
                    allocation_method: "unallocated" };
         }
@@ -461,7 +461,7 @@ steps:
             var rtype = isInstance ? "ec2:instance" : (function () { var m = /^arn:aws:([^:]+):[^:]*:[^:]*:([^\/:]+)/.exec(rid); return m ? (m[1] + ":" + m[2]) : "ec2:other"; })();
             f.cloud_service = String(inputs.ec2_service); f.resource_id = rid; f.resource_type = rtype; f.usage_type = i.type || null;
             f.region = region; f.cluster = i.cluster; f.cost_usd = c; f.unblended_usd = unbl(g); f.quantity = hours; f.units = hours ? "Hrs" : null;
-            f.parent_id = ec2ParentId; facts.push(f);
+            f.tags = Object.keys(t).length ? t : null; f.parent_id = ec2ParentId; facts.push(f);
           });
         });
         if (unattr.ids > 0) {
@@ -484,14 +484,18 @@ steps:
         var clusterFacts = [];
         clusters.forEach(function (name) {
           var a = cl[name];
-          var comp = {
-            nodes: num(a.nodes),
-            control_plane: num(eks / nClusters),
-            load_balancers: num(lbsAll ? elbTotal * ((lbsByCluster[name] || 0) / lbsAll) : 0),
-            networking: num((vpcTotal + ec2OtherNet) / nClusters),
-            storage: num(volGbTotal ? ec2OtherEbs * (a.volGb / volGbTotal) : 0),
-            other: num(totalInstances ? ec2OtherRest * (a.instCount / totalInstances) : 0)
+          // component → [cost, cloud service it comes from]; one row each so the allocator can
+          // reconcile every cloud service: total = Σ resource rows + Σ cluster components + remainder.
+          var compSvc = {
+            nodes: [num(a.nodes), String(inputs.ec2_service)],
+            control_plane: [num(eks / nClusters), String(inputs.eks_service)],
+            load_balancers: [num(lbsAll ? elbTotal * ((lbsByCluster[name] || 0) / lbsAll) : 0), String(inputs.elb_service)],
+            networking: [num(vpcTotal / nClusters), String(inputs.vpc_service)],
+            networking_ec2: [num(ec2OtherNet / nClusters), ec2OtherSvc],
+            storage: [num(volGbTotal ? ec2OtherEbs * (a.volGb / volGbTotal) : 0), ec2OtherSvc],
+            other: [num(totalInstances ? ec2OtherRest * (a.instCount / totalInstances) : 0), ec2OtherSvc]
           };
+          var comp = {}; Object.keys(compSvc).forEach(function (k) { comp[k] = compSvc[k][0]; });
           var total = num(Object.keys(comp).reduce(function (s, k) { return s + comp[k]; }, 0));
           var f = base("raw", "cluster", name);
           f.subject_name = name; f.cluster = name; f.region = region; f.cost_usd = total; f.parent_id = null;
@@ -502,7 +506,7 @@ steps:
           facts.push(f);
           Object.keys(comp).forEach(function (k) {
             var b = base("raw", "bucket", name + "|" + k);
-            b.subject_name = name + " / " + k; b.cluster = name; b.region = region; b.component = k; b.cost_usd = comp[k]; b.parent_id = f.id; facts.push(b);
+            b.subject_name = name + " / " + k; b.cluster = name; b.region = region; b.component = k; b.cost_usd = comp[k]; b.cloud_service = compSvc[k][1]; b.parent_id = f.id; facts.push(b);
           });
           clusterFacts.push({ cluster: name, cost_usd: total, components: comp, nodes: a.instCount, core_h: num(a.coreH), gb_h: num(a.gbH),
                               rate_cpu_usd_core_h: f.rate_cpu_usd_core_h, rate_mem_usd_gb_h: f.rate_mem_usd_gb_h, lbs: lbsByCluster[name] || 0, ebs_gb: a.volGb });
@@ -523,6 +527,8 @@ steps:
           var tg = db.tags; tagged.forEach(function (x) { if (x.arn === db.arn) Object.keys(x.tags).forEach(function (k) { tg[k] = x.tags[k]; }); });
           var dims = npDims(tg);
           var f = base("raw", "service", db.id); f.subject_name = db.id; f.resource_id = db.arn || db.id; f.resource_type = db.kind; f.usage_type = db.engine || null;
+          f.host = (db.hosts || []).filter(Boolean)[0] || null;
+          f.tags = Object.keys(tg).length ? tg : null;
           f.cloud_service = String(inputs.rds_service); f.region = region; f.cost_usd = num(dbs.length ? rdsTotal / dbs.length : 0); f.parent_id = svcFactId[String(inputs.rds_service)] || null;
           Object.keys(dims).forEach(function (k) { f[k] = dims[k]; });
           f.allocation_method = dims.application_id ? "direct_tag" : "unallocated";

@@ -1,0 +1,246 @@
+[
+  {
+    "id": "security-compliance-platform",
+    "name": "Security & compliance services \u2192 shared platform bucket",
+    "enabled": true,
+    "status": "active",
+    "priority": 10,
+    "source": "manual",
+    "scope": {
+      "cloud_service": {
+        "regex": "GuardDuty|Security Hub|Inspector|AWS Config|WAF|Cognito|Secrets Manager|Key Management"
+      }
+    },
+    "match": [],
+    "target": {
+      "bucket": "shared-platform"
+    },
+    "category": "security",
+    "description": "Account-wide security tooling is platform cost, not attributable to an application."
+  },
+  {
+    "id": "observability-platform-remainder",
+    "name": "CloudWatch remainder \u2192 shared platform (until log-group collection lands)",
+    "enabled": true,
+    "status": "active",
+    "priority": 20,
+    "source": "manual",
+    "scope": {
+      "cloud_service": "AmazonCloudWatch",
+      "subject_type": "cloud_service"
+    },
+    "match": [],
+    "target": {
+      "bucket": "shared-platform"
+    },
+    "category": "observability"
+  },
+  {
+    "id": "rds-approvals-shared-by-consumers",
+    "name": "postgres-approvals-api-db split among its consumers (parameters)",
+    "description": "Equal split among the applications whose parameters reference the cluster host; refine with Performance Insights db.load by db.name (by_metric) when 0.0.3 lands.",
+    "enabled": true,
+    "status": "active",
+    "priority": 100,
+    "source": "inferred",
+    "confidence": 0.6,
+    "scope": {
+      "cloud_service": "Amazon Relational Database Service",
+      "resource_type": "rds:cluster"
+    },
+    "match": [
+      {
+        "field": "host",
+        "equals": "postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
+      }
+    ],
+    "method": "split",
+    "target": {
+      "split": [
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "518811741",
+            "application_slug": "tracing-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1182532716",
+            "application_slug": "core-entities-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1302811219",
+            "application_slug": "parameters-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1311001341",
+            "application_slug": "users-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1449966796",
+            "application_slug": "ui-plugins"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1556752344",
+            "application_slug": "entities-ingestor"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "2044993572",
+            "application_slug": "entities-api"
+          }
+        }
+      ]
+    },
+    "evidence": [
+      {
+        "kind": "parameter",
+        "detail": "frontend.ui-plugins parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1449966796"
+      },
+      {
+        "kind": "parameter",
+        "detail": "catalog.tracing-api parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "518811741"
+      },
+      {
+        "kind": "parameter",
+        "detail": "catalog.tracing-api parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "518811741"
+      },
+      {
+        "kind": "parameter",
+        "detail": "catalog.entities-ingestor parameter CORE_ENTITIES_DB_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1556752344"
+      },
+      {
+        "kind": "parameter",
+        "detail": "catalog.entities-api parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "2044993572"
+      },
+      {
+        "kind": "parameter",
+        "detail": "main.users-api parameter DB_HOSTNAME references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1311001341"
+      },
+      {
+        "kind": "parameter",
+        "detail": "main.core-entities-api parameter DB_HOSTNAME references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1182532716"
+      },
+      {
+        "kind": "parameter",
+        "detail": "main.parameters-api parameter DB_HOSTNAME references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1302811219"
+      }
+    ]
+  },
+  {
+    "id": "rds-shared-apis-by-consumers",
+    "name": "postgres-shared-apis split among its consumers (parameters)",
+    "description": "Equal split among the applications whose parameters reference the instance host.",
+    "enabled": true,
+    "status": "active",
+    "priority": 100,
+    "source": "inferred",
+    "confidence": 0.6,
+    "scope": {
+      "cloud_service": "Amazon Relational Database Service",
+      "resource_type": "rds:cluster"
+    },
+    "match": [
+      {
+        "field": "host",
+        "equals": "postgres-shared-apis.cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
+      }
+    ],
+    "method": "split",
+    "target": {
+      "split": [
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "897065762",
+            "application_slug": "migrations-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1302811219",
+            "application_slug": "parameters-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1593752815",
+            "application_slug": "notifications-center-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1939881900",
+            "application_slug": "auth-z-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "2132349945",
+            "application_slug": "github-dumper"
+          }
+        }
+      ]
+    },
+    "evidence": [
+      {
+        "kind": "parameter",
+        "detail": "main.notifications-center-api parameter DB_HOSTNAME references postgres-shared-apis.cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1593752815"
+      },
+      {
+        "kind": "parameter",
+        "detail": "main.migrations-api parameter DATABASE_HOST references postgres-shared-apis.cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "897065762"
+      },
+      {
+        "kind": "parameter",
+        "detail": "finance.github-dumper parameter DB_HOST references postgres-shared-apis.cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "2132349945"
+      },
+      {
+        "kind": "parameter",
+        "detail": "main.auth-z-api parameter DB_HOSTNAME references postgres-shared-apis.cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1939881900"
+      },
+      {
+        "kind": "parameter",
+        "detail": "main.auth-z-api parameter DB_HOSTNAME references postgres-shared-apis.cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1939881900"
+      },
+      {
+        "kind": "parameter",
+        "detail": "main.parameters-api parameter DB_HOSTNAME references postgres-shared-apis.cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
+        "application_id": "1302811219"
+      }
+    ]
+  }
+]

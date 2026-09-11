@@ -55,6 +55,8 @@ const ORDER: Array<{ file: string; placeholder?: string }> = [
   { file: 'wf-cost-fact-upsert.yaml', placeholder: 'FINOPS_COST_FACT_UPSERT_ID' },
   { file: 'wf1-aws-billing-daily.yaml', placeholder: 'FINOPS_AWS_BILLING_DAILY_ID' },
   { file: 'wf0-aws-billing-dispatch.yaml' },
+  { file: 'wf-suggest-mappings.yaml', placeholder: 'FINOPS_SUGGEST_MAPPINGS_ID' },
+  { file: 'wf2-allocate-daily.yaml' },
 ];
 
 async function api(method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {

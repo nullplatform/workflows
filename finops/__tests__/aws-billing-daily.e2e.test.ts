@@ -227,8 +227,16 @@ describe('finops/wf1-aws-billing-daily', () => {
     expect(cluster).toMatchObject({ id: 'raw-cluster-developent-2026-09-09', cluster: 'developent', allocation_method: 'unallocated', quantity: 2, units: 'nodes' });
     expect(cluster?.cost_usd).toBeCloseTo(16.55, 6);
     const comps = Object.fromEntries(facts.filter((f) => f.subject_type === 'bucket' && f.component).map((b) => [b.component, b.cost_usd]));
-    expect(comps).toEqual({ nodes: 7.4, control_plane: 2.4, load_balancers: 1.0, networking: 4.5, storage: 1.0, other: 0.25 });
-    for (const b of facts.filter((f) => f.subject_type === 'bucket' && f.component)) expect(b.parent_id).toBe(cluster?.id);
+    // networking is split by the cloud service it comes from (VPC 3.0 vs EC2-Other NAT 1.5) so the allocator can reconcile per service
+    expect(comps).toEqual({ nodes: 7.4, control_plane: 2.4, load_balancers: 1.0, networking: 3.0, networking_ec2: 1.5, storage: 1.0, other: 0.25 });
+    for (const b of facts.filter((f) => f.subject_type === 'bucket' && f.component)) {
+      expect(b.parent_id).toBe(cluster?.id);
+      expect(typeof b.cloud_service).toBe('string');
+    }
+    // every fact carries `day` (a filterable copy of `date`) and evidence for mapping rules where it exists
+    for (const f of facts) expect(f.day).toBe('2026-09-09');
+    expect(facts.find((f) => f.subject_type === 'scope')?.tags).toMatchObject({ scope_id: expect.any(String) });
+    expect(facts.find((f) => f.subject_type === 'service' && f.subject_id === 'transactions')?.host).toMatch(/rds\.amazonaws\.com$/);
 
     // blended rates over reserved capacity: 2 × c5a.xlarge × 24 h = 192 core-h, 384 GiB-h; cpu_share 0.5
     expect(cluster?.cpu_capacity_core_h).toBe(192);

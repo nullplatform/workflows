@@ -47,7 +47,7 @@ api() { # method path [body-file]
   fi
 }
 
-for slug in cost_daily; do
+for slug in cost_daily cost_mapping_rule cost_mapping_suggestion; do
   f="$SPECS_DIR/$slug.spec.json"
   body=$(mktemp)
   jq --arg nrn "organization=$ORG_ID" '. + {nrn: $nrn}' "$f" > "$body"
@@ -57,7 +57,7 @@ for slug in cost_daily; do
   if [[ "$st" =~ ^2 ]]; then
     echo "created $slug: $(jq -r '.id // "ok"' <<<"$res")"
   elif [[ "$st" == "409" || ( "$st" == "400" && "$res" == *exist* ) ]]; then
-    sid=$(api GET "/catalog/specifications?nrn=organization=$ORG_ID&limit=200" | sed '$d' \
+    sid=$(api GET "/catalog/specifications?nrn=organization=$ORG_ID&limit=100" | sed '$d' \
       | jq -r --arg s "$slug" '[.. | objects | select(.slug? == $s)] | .[0].id // empty')
     [[ -n "$sid" ]] || { echo "FAILED: $slug exists but id not resolvable: $res"; exit 1; }
     # NOTA: el PATCH rechaza la key `relations` dentro de schema (400) — se quita

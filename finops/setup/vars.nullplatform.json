@@ -1,6 +1,8 @@
 {
   "finops_aws_billing_daily": {
-    "agent_tags": { "cluster": "runtime" },
+    "agent_tags": {
+      "cluster": "runtime"
+    },
     "agent_nrn": "organization=4:account=17",
     "org_nrn": "organization=4"
   },
@@ -8,12 +10,18 @@
     "targets": [
       {
         "name": "nullplatform",
-        "agent_tags": { "cluster": "runtime" },
+        "agent_tags": {
+          "cluster": "runtime"
+        },
         "agent_nrn": "organization=4:account=17",
         "org_nrn": "organization=4",
         "region": "us-east-1",
         "expected_account": "283477532906"
       }
     ]
+  },
+  "finops_suggest_mappings": {
+    "org_nrn": "organization=4",
+    "account_id": "17"
   }
 }
