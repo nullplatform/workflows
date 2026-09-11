@@ -79,4 +79,40 @@ describe('finops/wf3-k8s-consumption-daily', () => {
       'sub-workflow': { handler: () => ({ status: 'success' as const, outputs: {}, activePorts: ['default'] }), executeMode: 'all' as const },
     } })).rejects.toThrow(/raw cluster row not found/);
   });
+
+  it('newrelic mode: one NerdGraph query per cluster-day (scope × hour) replaces the agent collector', async () => {
+    const posts: Array<Record<string, unknown>> = []; const cmds: string[] = [];
+    // NR rows: average per pod-sample × distinct pods = the scope's hourly consumption. 777: two hours, 999: one.
+    const rows = [
+      { facet: ['777', '0:00'], 'label.scope_id': '777', 'Hour of timestamp': '0:00', cpu: 0.5, mem: 512 * 1048576, cpuReq: 1.0, memReq: 1024 * 1048576, pods: 2, samples: 240 }, // 1000 mc / 1024 MB used, 2000 mc / 2048 MB req
+      { facet: ['777', '1:00'], 'label.scope_id': '777', 'Hour of timestamp': '1:00', cpu: 1.0, mem: 1024 * 1048576, cpuReq: 0.5, memReq: 1024 * 1048576, pods: 2, samples: 240 }, // 2000 / 2048 used, 1000 / 2048 req
+      { facet: ['999', '5:00'], 'label.scope_id': '999', 'Hour of timestamp': '5:00', cpu: 0.5, mem: 512 * 1048576, cpuReq: 0.5, memReq: 512 * 1048576, pods: 1, samples: 120 },
+    ];
+    const result = await runWorkflowE2E({
+      yamlPath: YAML,
+      inputs: { date: D, collector_mode: 'newrelic', nr_account_id: 6332316 },
+      pluginStubs: {
+        manual: passthroughTrigger,
+        'np-lake-query': { handler: () => ({ status: 'success' as const, outputs: { rows: SCOPES, rowCount: 3 }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-entity-paginated-fetch': { handler: () => ({ status: 'success' as const, outputs: { items: [{ id: 777, dimensions: { environment: 'production' } }, { id: 999, dimensions: {} }], totalFetched: 2, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-api-call': { handler: () => ({ status: 'success' as const, outputs: { status: 200, body: CLUSTER }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-agent-command': { handler: (ctx: { inputs: Record<string, unknown> }) => { cmds.push(String(ctx.inputs.cmdline)); return { status: 'success' as const, outputs: { status: 'success', stdout: '{}', stderr: '' }, activePorts: ['default'] }; }, executeMode: 'all' as const },
+        'http-request': { handler: (ctx: { inputs: Record<string, unknown> }) => { posts.push(ctx.inputs); return { status: 'success' as const, outputs: { status: 200, body: { data: { actor: { account: { usage: { results: rows } } } } } }, activePorts: ['default'] }; }, executeMode: 'all' as const },
+        'sub-workflow': { handler: () => ({ status: 'success' as const, outputs: { written: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
+      },
+    });
+    expect(cmds).toEqual([]); // the agent path is not taken
+    expect(posts).toHaveLength(1);
+    const q = String((posts[0]?.body as { query: string }).query);
+    expect(q).toContain('account(id: 6332316)');
+    expect(q).toContain("clusterName = 'runtime' AND containerName = 'application'");
+    expect(q).toContain("SINCE '2026-09-09 00:00:00 UTC' UNTIL '2026-09-10 00:00:00 UTC'");
+    const facts = result.outputs?.facts as Array<Record<string, unknown>>;
+    expect(facts.map((f) => f.id)).toEqual([`raw-k8s-scope-777-${D}`, `raw-k8s-scope-999-${D}`]);
+    // 777: hour 0 request wins (2 core-h, 2 GiB-h), hour 1 usage wins (2 core-h, 2 GiB-h) → 4 core-h × 0.05 + 4 GiB-h × 0.01 = 0.24; used 3 core-h + 3 GiB-h = 0.18
+    expect(facts[0]).toMatchObject({ scope_id: '777', application_id: '100', cost_usd: 0.24, usage_usd: 0.18, core_h_chargeable: 4, gb_h_chargeable: 4, core_h_used: 3, gb_h_used: 3, pods_avg: 2, quantity: 480 });
+    expect(facts[1]).toMatchObject({ scope_id: '999', cost_usd: 0.03, core_h_chargeable: 0.5, gb_h_chargeable: 0.5 });
+    const summary = result.outputs?.summary as Record<string, unknown>;
+    expect(summary.scopes_with_data ?? summary.with_data ?? 2).toBeTruthy();
+  });
 });

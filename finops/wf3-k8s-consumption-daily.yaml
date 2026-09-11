@@ -45,8 +45,21 @@ inputs:
   dry_run:
     type: boolean
     required: false
+  collector_mode:
+    type: string
+    required: false
+    description: "Override of variables.collector_mode: agent | newrelic"
+  nr_account_id:
+    type: number
+    required: false
+    description: "Override of the NR_ACCOUNT_ID config entry (newrelic mode)"
 
 variables:
+  # Where the per-scope consumption comes from: `agent` (collector script on the customer's agent →
+  # Prometheus in the cluster) or `newrelic` (NerdGraph K8sContainerSample, labels scope_id/application_id
+  # ingested by the NR Kubernetes integration; needs config entries NR_USER_KEY, NR_ACCOUNT_ID [, NR_GRAPHQL_URL]).
+  collector_mode:
+    initialValue: "agent"
   cluster:
     initialValue: "runtime"
   # Organization NRN for the scopes listing (dimensions live in the API, not in the lake).
@@ -86,6 +99,8 @@ steps:
       date: "${{ workflow.inputs.date }}"
       cluster: "${{ workflow.inputs.cluster }}"
       cluster_default: "${{ variables.cluster }}"
+      collector_mode: "${{ workflow.inputs.collector_mode }}"
+      collector_mode_default: "${{ variables.collector_mode }}"
       agent_tags: "${{ variables.agent_tags }}"
       agent_nrn: "${{ variables.agent_nrn }}"
       org_nrn: "${{ variables.org_nrn }}"
@@ -96,9 +111,10 @@ steps:
         var day = inputs.date && /^\d{4}-\d{2}-\d{2}$/.test(String(inputs.date)) ? String(inputs.date) : iso(new Date(Date.now() - 86400000));
         var cluster = String(inputs.cluster || inputs.cluster_default || "").trim();
         if (!cluster) throw new Error("cluster is required");
+        var mode = String(inputs.collector_mode || inputs.collector_mode_default || "agent").trim().toLowerCase(); if (mode !== "agent" && mode !== "newrelic") throw new Error("collector_mode must be agent or newrelic (got " + mode + ")");
         var sel = { tags: inputs.agent_tags || { cluster: cluster } };
         if (inputs.agent_nrn) sel.nrn = String(inputs.agent_nrn);
-        return { day: day, cluster: cluster, agent_selector: sel, scope_filters: { nrn: String(inputs.org_nrn || ""), status: "active" }, cluster_row_path: "/catalog/instances/cost_daily/raw-cluster-" + cluster.toLowerCase().replace(/[^a-z0-9_]+/g, "-") + "-" + day };
+        return { day: day, cluster: cluster, collector_mode: mode, agent_selector: sel, scope_filters: { nrn: String(inputs.org_nrn || ""), status: "active" }, cluster_row_path: "/catalog/instances/cost_daily/raw-cluster-" + cluster.toLowerCase().replace(/[^a-z0-9_]+/g, "-") + "-" + day };
 
   - id: lake_scopes
     type: module
@@ -176,6 +192,89 @@ steps:
         var cmds = scopes.map(function (s) { return { cmdline: String(inputs.base) + " --mode day --date " + String(inputs.day) + " --scope " + s.scope_id }; });
         return { scopes: scopes, commands: cmds, count: scopes.length, cluster: { id: c.id, cost_usd: Number(c.cost_usd) || 0, rate_cpu: Number(c.rate_cpu_usd_core_h), rate_mem: Number(c.rate_mem_usd_gb_h), cpu_share: Number(c.cpu_share) || 0.5, core_h: Number(c.cpu_capacity_core_h) || 0, gb_h: Number(c.mem_capacity_gb_h) || 0 }, cluster_body: c };
 
+  - id: route
+    type: decider
+    plugin_type: conditional
+    name: "Collector: New Relic or agent?"
+    config:
+      expression: "steps.prep.outputs.collector_mode == 'newrelic'"
+
+  # ── New Relic path: one NRQL for the whole cluster-day, FACET scope_id × hour ─────────────
+  - id: nr_build
+    type: module
+    plugin_type: code-exec
+    name: "Build NerdGraph query (cluster-day by scope × hour)"
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      cluster: "${{ steps.prep.outputs.cluster }}"
+      account_id: "${{ workflow.inputs.nr_account_id || vars.NR_ACCOUNT_ID }}"
+      scopes: "${{ steps.prep_run.outputs.scopes }}"
+    config:
+      language: javascript
+      code: |
+        var accountId = Number(inputs.account_id); if (!(accountId > 0)) throw new Error("NR_ACCOUNT_ID config entry must be a positive number");
+        var day = String(inputs.day); var next = new Date(new Date(day + "T00:00:00Z").getTime() + 86400000).toISOString().slice(0, 10);
+        var cluster = String(inputs.cluster).replace(/'/g, "");
+        // Per (scope, hour): average per pod-sample × distinct pods ≈ the scope's hourly consumption; same
+        // pod-hour semantics as the agent collector (cost-nr wf1b, FACET podName+hour, summed here per hour).
+        var nrql = "SELECT average(cpuUsedCores) AS cpu, average(memoryWorkingSetBytes) AS mem, average(cpuRequestedCores) AS cpuReq, average(memoryRequestedBytes) AS memReq, uniqueCount(podName) AS pods, count(*) AS samples " +
+          "FROM K8sContainerSample WHERE clusterName = '" + cluster + "' AND containerName = 'application' AND `label.scope_id` IS NOT NULL " +
+          "FACET `label.scope_id`, hourOf(timestamp) SINCE '" + day + " 00:00:00 UTC' UNTIL '" + next + " 00:00:00 UTC' LIMIT MAX";
+        function esc(q) { return q.split("\\").join("\\\\").split('"').join('\\"'); }
+        var gql = "{ actor { account(id: " + accountId + ") { usage: nrql(query: \"" + esc(nrql) + "\", timeout: 120) { results } } } }";
+        return { payload: { query: gql }, nrql: nrql, scopes: (inputs.scopes || []).length };
+
+  # inputs shield: http-request merges ctx.inputs OVER config — the declared body keeps inherited
+  # passthrough from touching url/method.
+  - id: nr_query
+    type: module
+    plugin_type: http-request
+    name: "Query New Relic"
+    error_handling:
+      retry_policy:
+        max_attempts: 3
+        initial_interval: "5s"
+        backoff_strategy: exponential
+        jitter: 0.3
+    inputs:
+      body: "${{ steps.nr_build.outputs.payload }}"
+    config:
+      url: "${{ vars.NR_GRAPHQL_URL || 'https://api.newrelic.com/graphql' }}"
+      method: POST
+      timeout: "150s"
+      headers:
+        Api-Key: "${{ secrets.NR_USER_KEY }}"
+        Content-Type: "application/json"
+
+  - id: nr_shape
+    type: module
+    plugin_type: code-exec
+    name: "NR rows → per-scope collector shape"
+    inputs:
+      scopes: "${{ steps.prep_run.outputs.scopes }}"
+      status: "${{ steps.nr_query.outputs.status }}"
+      body: "${{ steps.nr_query.outputs.body }}"
+    config:
+      language: javascript
+      code: |
+        var body = inputs.body; if (typeof body === "string") { try { body = JSON.parse(body); } catch (e) { body = null; } }
+        if (Number(inputs.status) !== 200 || !body) throw new Error("NerdGraph HTTP " + inputs.status + ": " + String(JSON.stringify(inputs.body) || "").slice(0, 200));
+        if (body.errors && body.errors.length) throw new Error("NerdGraph error: " + JSON.stringify(body.errors).slice(0, 300));
+        var rows = ((((body.data || {}).actor || {}).account || {}).usage || {}).results || [];
+        // Same shape the agent collector prints per scope (hours[] + totals), keyed by scope id.
+        var per = {};
+        rows.forEach(function (r) {
+          var sid = String(r["label.scope_id"] || (r.facet && r.facet[0]) || ""); if (!sid) return;
+          var hourLabel = String(r["Hour of timestamp"] || (r.facet && r.facet[1]) || ""); var h = parseInt(hourLabel, 10); if (isNaN(h)) return;
+          var pods = Number(r.pods) || 0; if (!(pods > 0)) return;
+          var o = per[sid] || (per[sid] = { samples: 0, hours: [], cpu_mc_hours: 0, mem_mb_hours: 0 });
+          var cpuMc = (Number(r.cpu) || 0) * 1000 * pods, memMb = (Number(r.mem) || 0) / 1048576 * pods;
+          o.hours.push({ hour: h, cpu_mc: cpuMc, mem_mb: memMb, cpu_req_mc: (Number(r.cpuReq) || 0) * 1000 * pods, mem_req_mb: (Number(r.memReq) || 0) / 1048576 * pods, pods: pods });
+          o.cpu_mc_hours += cpuMc; o.mem_mb_hours += memMb; o.samples += Number(r.samples) || pods;
+        });
+        var items = (inputs.scopes || []).map(function (s) { var o = per[String(s.scope_id)]; return { stdout: JSON.stringify(o || { samples: 0, hours: [] }) }; });
+        return { items: items, scopes_with_data: Object.keys(per).length, rows: rows.length };
+
   - id: collect
     type: module
     plugin_type: np-agent-command
@@ -207,7 +306,9 @@ steps:
     plugin_type: code-exec
     name: "Price scopes + cluster shares"
     metadata: { fanOutPerItem: false }
+    join_strategy: any
     inputs:
+      results_nr: "${{ steps.nr_shape.outputs.items }}"
       day: "${{ steps.prep.outputs.day }}"
       cluster_name: "${{ steps.prep.outputs.cluster }}"
       scopes: "${{ steps.prep_run.outputs.scopes }}"
@@ -215,13 +316,14 @@ steps:
       cluster_body: "${{ steps.prep_run.outputs.cluster_body }}"
       results: "${{ steps.collect.outputs.items }}"
       collector: "${{ variables.collector }}"
+      collector_mode: "${{ steps.prep.outputs.collector_mode }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
     config:
       language: javascript
       code: |
         var d = String(inputs.day); var now = new Date().toISOString(); var C = inputs.cluster || {}; var cname = String(inputs.cluster_name);
         function num(x) { return Math.round((Number(x) || 0) * 1e6) / 1e6; }
-        var scopes = inputs.scopes || []; var results = inputs.results || [];
+        var scopes = inputs.scopes || []; var results = String(inputs.collector_mode) === "newrelic" ? (inputs.results_nr || []) : (inputs.results || []);
         var facts = []; var shares = {}; var owners = {}; var sum = 0; var withData = 0; var errors = [];
         scopes.forEach(function (s, i) {
           var r = results[i] || {}; var o = r.outputs || r; var parsed = null;
@@ -295,7 +397,12 @@ connections:
   - { from: lake_scopes, to: prep_run }
   - { from: scope_dims, to: prep_run }
   - { from: cluster_row, to: prep_run }
-  - { from: prep_run, to: collect }
+  - { from: prep_run, to: route }
+  - { id: r_agent, from: route, to: collect, source_port: "false" }
+  - { id: r_nr, from: route, to: nr_build, source_port: "true" }
+  - { from: nr_build, to: nr_query }
+  - { from: nr_query, to: nr_shape }
+  - { from: nr_shape, to: build }
   - { from: collect, to: build }
   - { from: build, to: write }
   - { from: write, to: summary }

@@ -36,7 +36,8 @@
     },
     "agent_nrn": "organization=4:account=17",
     "collector_cmd": "nullplatform/platform-scopes-override/cost/collect_metrics --prom http://prometheus-server.default.svc.cluster.local",
-    "org_nrn": "organization=4"
+    "org_nrn": "organization=4",
+    "collector_mode": "agent"
   },
   "finops_allocate_daily": {
     "org_nrn": "organization=4"

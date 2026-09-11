@@ -573,10 +573,23 @@ steps:
         // node type of a cluster, it was a node (Karpenter churn). Component `nodes_terminated`, kept apart.
         var nodeTypeClusters = {}; Object.keys(inst).forEach(function (id) { var x = inst[id]; if (x.cluster && x.type) { nodeTypeClusters[x.type] = nodeTypeClusters[x.type] || {}; nodeTypeClusters[x.type][x.cluster] = (nodeTypeClusters[x.type][x.cluster] || 0) + 1; } });
         function inferCluster(type) { var m = nodeTypeClusters[type]; if (!m) return null; return Object.keys(m).sort(function (a, b) { return m[b] - m[a]; })[0]; }
+        // Accounts without Cost Explorer resource-level data return one row per INSTANCE_TYPE with
+        // RESOURCE_ID = NoResourceId. Those instance-hours still belong to a cluster when the running
+        // nodes of that type do (or when the account has a single cluster): price them into the
+        // cluster row (cost + capacity by type) instead of leaving the whole of EC2 as a bucket.
+        var clusterSet = {}; Object.keys(inst).forEach(function (id) { if (inst[id].cluster) clusterSet[inst[id].cluster] = true; });
+        var soleCluster = Object.keys(clusterSet).length === 1 ? Object.keys(clusterSet)[0] : null;
         ((r.ec2_by_resource || {}).ResultsByTime || []).forEach(function (rt) {
           (rt.Groups || []).forEach(function (g) {
             var rid = g.Keys[0]; var c = amort(g); var hours = qty(g);
-            if (!rid || rid === "NoResourceId" || (c === 0 && hours === 0)) return;
+            if (!rid || (c === 0 && hours === 0)) return;
+            if (rid === "NoResourceId") {
+              var nt = g.Keys[1] && g.Keys[1] !== "NoInstanceType" ? String(g.Keys[1]) : null; if (!nt) return;
+              var ncl = inferCluster(nt) || soleCluster; if (!ncl) return;
+              var na = clusterAcc(ncl); var ncap = typeCap[nt] || { vcpu: 0, gib: 0 };
+              na.nodes = num(na.nodes + c); na.instCount += 1; na.coreH += ncap.vcpu * hours; na.gbH += ncap.gib * hours; na.byType = na.byType || {}; na.byType[nt] = num((na.byType[nt] || 0) + c);
+              return;
+            }
             var isInstance = /^i-[0-9a-z]+$/i.test(rid);
             var ceType = g.Keys[1] && g.Keys[1] !== "NoInstanceType" ? String(g.Keys[1]) : null;
             var i = inst[rid] || { type: ceType, tags: {}, cluster: null, gone: true };
@@ -668,6 +681,7 @@ steps:
           var at = sv.attributes || {}; [at.host, at.hostname, at.endpoint].forEach(function (h) { if (h) svcByHost[String(h).toLowerCase()] = sv; });
         });
         function nrnParts(nrn) { var o = {}; String(nrn || "").split(":").forEach(function (kv) { var p = kv.split("="); if (p.length === 2) o[p[0]] = p[1]; }); return o; }
+        var rdsDbs = dbs.filter(function (db) { return !/docdb/i.test(String(db.engine || "")); });
         var rdsTotal = num(svcTotal[String(inputs.rds_service)] || 0);
         // Cost per RDS subject: Cost Explorer by owner tag (exact per tag value; clusters sharing a value split
         // it evenly) + untagged usage types placed by instance class (an untagged instance of a tagged cluster)
@@ -693,14 +707,20 @@ steps:
           });
           var placed = num(Object.keys(dbCost).reduce(function (a, k) { return a + dbCost[k]; }, 0));
           if (rest > 0) { if (placed > 0) Object.keys(dbCost).forEach(function (k) { dbCost[k] = num(dbCost[k] + rest * (dbCost[k] / placed)); }); else dbs.forEach(function (db) { dbCost[db.id] = num(rest / dbs.length); }); }
-        } else { dbs.forEach(function (db) { dbCost[db.id] = num(dbs.length ? rdsTotal / dbs.length : 0); dbMethod[db.id] = "unallocated"; }); }
+        } else { dbs.forEach(function (db) { if (!/docdb/i.test(String(db.engine || ""))) { dbCost[db.id] = num(rdsDbs.length ? rdsTotal / rdsDbs.length : 0); dbMethod[db.id] = "unallocated"; } }); }
+        // DocumentDB is billed as its own service: split its total evenly among the docdb subjects (Performance
+        // Insights shares on each of them do the real attribution downstream).
+        var docdbTotal = num(svcTotal[String(inputs.docdb_service || "Amazon DocumentDB (with MongoDB compatibility)")] || 0);
+        var docDbs = dbs.filter(function (db) { return /docdb/i.test(String(db.engine || "")); });
+        docDbs.forEach(function (db) { dbCost[db.id] = num(docDbs.length ? docdbTotal / docDbs.length : 0); dbMethod[db.id] = "unallocated"; });
         dbs.forEach(function (db) {
           var tg = db.tags;
           var dims = npDims(tg);
           var f = base("raw", "service", db.id); f.subject_name = db.id; f.resource_id = db.arn || db.id; f.resource_type = db.kind; f.usage_type = db.engine || null;
           f.host = (db.hosts || []).filter(Boolean)[0] || null;
           f.tags = Object.keys(tg).length ? tg : null;
-          f.cloud_service = String(inputs.rds_service); f.region = region; f.cost_usd = num(dbCost[db.id] || 0); f.parent_id = svcFactId[String(inputs.rds_service)] || null;
+          var dbSvc = /docdb/i.test(String(db.engine || "")) ? String(inputs.docdb_service || "Amazon DocumentDB (with MongoDB compatibility)") : String(inputs.rds_service);
+          f.cloud_service = dbSvc; f.region = region; f.cost_usd = num(dbCost[db.id] || 0); f.parent_id = svcFactId[dbSvc] || null;
           f.cost_method = dbMethod[db.id] || "unallocated";
           Object.keys(dims).forEach(function (k) { f[k] = dims[k]; });
           f.allocation_method = dims.application_id ? "direct_tag" : "unallocated";
