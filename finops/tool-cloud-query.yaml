@@ -64,7 +64,7 @@ variables:
   # Released worker image (see packages/cloud-query/scripts/release.json). Operator
   # pins in the agent (NP_WORKERS) win over this when present.
   image:
-    initialValue: "public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer@sha256:0d3a30ece8344096bd4686913e7fda0fa76020b6dacf2eb5b31309fadaa1d3af"
+    initialValue: "public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer@sha256:24fcd9b320880c549c910a43c32c91c8c7024d1e57aedfbc2c3ff3bd85447368"
   # The engine base URL the WORKER must reach to deliver the callback.
   # Locally (docker worker → dev-server on the laptop): http://host.docker.internal:3000
   callback_base_url:
