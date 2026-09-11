@@ -1,0 +1,105 @@
+[tools]
+bun = "latest"
+oras = "latest"
+
+# Install runs on demand and is the root of the task dependency graph.
+# Every other task declares `depends = ["install"]` so a fresh clone
+# just works — no need to remember `mise install` before `mise run dev`.
+[tasks.install]
+description = "Install dependencies"
+run = "bun install"
+sources = ["package.json", "bun.lock"]
+
+[tasks.test]
+description = "Run tests"
+depends = ["install"]
+run = "bun run test"
+
+[tasks.describe]
+description = "Print plugin manifest"
+depends = ["install"]
+run = "bun run describe"
+
+[tasks.build]
+description = "Compile the plugin to a standalone executable"
+depends = ["install"]
+run = "bun run build"
+sources = ["src/**/*.ts", "package.json", "bun.lock"]
+outputs = ["dist/cloud-query"]
+
+[tasks."build:all"]
+description = "Cross-compile all release targets"
+depends = ["install"]
+run = """
+bun build --compile --target=bun-linux-x64   ./src/index.ts --outfile dist/cloud-query-linux-x64
+bun build --compile --target=bun-linux-arm64 ./src/index.ts --outfile dist/cloud-query-linux-arm64
+bun build --compile --target=bun-darwin-arm64 ./src/index.ts --outfile dist/cloud-query-darwin-arm64
+"""
+
+# `np plugin dev` → this task. Everyday dev workflow with hot reload.
+# Uses `bun --hot` (not `--watch`) so module changes reload inside the
+# same process — keeps the plugin SDK's idempotent startGrpcServer() in effect.
+[tasks.dev]
+description = "Run the plugin in dev mode"
+depends = ["install"]
+run = "bun run dev"
+
+
+# Build the LEAN gRPC worker image (the image the agent spawns and dials over
+# gRPC/mTLS). Just the compiled package binary on a minimal base — the agent
+# injects the port + TLS + API key at runtime.
+[tasks."build:image"]
+description = "Build the lean gRPC worker image"
+run = "docker build -t cloud-query-worker:dev ."
+
+# `np package run` → run this package locally the way production does: a
+# controlplane-agent with the worker orchestrator (docker backend) that SPAWNS
+# the lean worker container and talks to it over gRPC/mTLS. Needs NP_API_KEY.
+# --network host so the agent can reach the worker it publishes on the host
+# (Linux; on Docker Desktop enable host networking). Override the agent image
+# with NP_AGENT_IMAGE until the orchestrator agent is the default tag.
+[tasks.run]
+description = "Run locally: an agent (docker backend, :latest) that spawns the lean worker"
+depends = ["build:image"]
+run = """
+set -eu
+: "${NP_API_KEY:?set NP_API_KEY}"
+: "${NP_WORKER_AWS_ACCESS_KEY_ID:?set NP_WORKER_AWS_ACCESS_KEY_ID (dev only; in a cluster the worker uses the pod IAM role)}"
+: "${NP_WORKER_AWS_SECRET_ACCESS_KEY:?set NP_WORKER_AWS_SECRET_ACCESS_KEY}"
+region="${NP_WORKER_AWS_REGION:-us-east-1}"
+# AWS creds reach the worker through a standard pod patch (NP_WORKER_PATCHES);
+# the template's alpha-packages-2.2.0 image ignores NP_WORKER_ENV on docker.
+# NP_AGENT_EXTRA_TAGS (optional, e.g. run:1757520000): extra agent tags. A
+# restarted agent registers a NEW id and the old one lingers "active" until its
+# TTL, so a per-start tag keeps workflow selectors deterministic.
+# NP_ALLOWED_REGISTRIES (optional, e.g. public.ecr.aws/nullplatform/*): run WITHOUT
+# the local image pin — the agent pulls the image the workflow references
+# (tool-cloud-query `image` input, the released digest). With it unset the
+# agent is pinned to the locally built cloud-query-worker:dev.
+# NP_CALLBACK_ALLOWED_HOSTS: the worker may only POST results to these hosts
+# (SSRF guard). Locally the engine runs on the laptop → host.docker.internal.
+cb_hosts="${NP_CALLBACK_ALLOWED_HOSTS:-host.docker.internal,api.nullplatform.com}"
+patches=$(printf '[{"target":{"package":"cloud-query"},"merge":{"spec":{"containers":[{"name":"worker","env":[{"name":"AWS_ACCESS_KEY_ID","value":"%s"},{"name":"AWS_SECRET_ACCESS_KEY","value":"%s"},{"name":"AWS_REGION","value":"%s"},{"name":"NP_CALLBACK_ALLOWED_HOSTS","value":"%s"}]}]}}}]' "$NP_WORKER_AWS_ACCESS_KEY_ID" "$NP_WORKER_AWS_SECRET_ACCESS_KEY" "$region" "$cb_hosts")
+# Pin the locally built image, or let the agent pull what the workflow references.
+set -f  # no globbing: the registry pattern carries a '*'
+if [ -n "${NP_ALLOWED_REGISTRIES:-}" ]; then worker_env="-e NP_ALLOWED_REGISTRIES=$NP_ALLOWED_REGISTRIES"; else worker_env="-e NP_WORKER_IMAGE=cloud-query-worker:dev"; fi
+docker rm -f np-cloud-query-agent >/dev/null 2>&1 || true
+# The agent reuses a warm worker; remove it so a rebuilt image is picked up.
+for w in $(docker ps -a -q --filter "name=^np-worker-.*cloud-query$"); do docker rm -f "$w" >/dev/null 2>&1 || true; done
+docker run -d --name np-cloud-query-agent --network host \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e NP_API_KEY -e NP_LOG_LEVEL="${NP_LOG_LEVEL:-INFO}" \
+  -e NP_WORKER_BACKEND=docker \
+  $worker_env \
+  -e NP_WORKER_PATCHES="$patches" \
+  "${NP_AGENT_IMAGE:-public.ecr.aws/nullplatform/controlplane-agent:latest}" \
+  -runtime=host -tags=package:cloud-query,local:"${NP_LOCAL_USER:-$USER}",env:local"${NP_AGENT_EXTRA_TAGS:+,$NP_AGENT_EXTRA_TAGS}" >/dev/null
+echo "agent started; follow with: docker logs -f np-cloud-query-agent" >&2
+"""
+
+# `np package publish` runs this (when --image is omitted): build the lean worker
+# image, push it to $NP_PUSH_REGISTRY (any registry you're `docker login`ed to),
+# and print registry/repo@sha256:<digest> on stdout for the CLI to register.
+[tasks."publish:image"]
+description = "Build + push the lean worker image; prints its digest ref"
+run = "bash scripts/publish-image.sh"

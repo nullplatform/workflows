@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WorkerPodViaEksPodIdentity",
+      "Effect": "Allow",
+      "Principal": { "Service": "pods.eks.amazonaws.com" },
+      "Action": ["sts:AssumeRole", "sts:TagSession"],
+      "Condition": {
+        "StringEquals": { "aws:SourceAccount": "<account>" },
+        "ArnEquals": { "aws:SourceArn": "arn:aws:eks:<region>:<account>:cluster/<cluster-name>" }
+      }
+    }
+  ]
+}

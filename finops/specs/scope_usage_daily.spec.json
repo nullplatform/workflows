@@ -1,0 +1,306 @@
+{
+  "name": "Scope Usage Daily",
+  "slug": "scope_usage_daily",
+  "description": "Kubernetes consumption of one null scope for one day: CPU/memory used vs requested per hour (agent collector or New Relic), pods, utilization. Priced into cost_daily by the FinOps allocator; the right-sizing source.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "primaryKey": true,
+        "autoGenerate": false,
+        "description": "usage-<scope_id>-<day>"
+      },
+      "date": {
+        "type": "string",
+        "description": "YYYY-MM-DD (UTC)",
+        "index": [
+          "filter"
+        ]
+      },
+      "day": {
+        "type": "string",
+        "description": "Same as date; filterable copy",
+        "index": [
+          "filter"
+        ]
+      },
+      "scope_id": {
+        "type": "string",
+        "index": [
+          "filter"
+        ]
+      },
+      "scope_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "scope_slug": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "scope_type": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "application_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "application_slug": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "namespace_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "nrn": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cluster": {
+        "type": "string",
+        "index": [
+          "filter"
+        ]
+      },
+      "cloud": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cloud_account": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "region": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "dimensions": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": true
+      },
+      "environment": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "source": {
+        "type": "string",
+        "enum": [
+          "agent",
+          "newrelic"
+        ],
+        "description": "where the pod metrics came from",
+        "index": [
+          "filter"
+        ]
+      },
+      "collector": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "collected_at": {
+        "type": "string"
+      },
+      "samples": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "metric samples of the day (0 = the scope had no pods in this cluster)"
+      },
+      "pods_avg": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "hours_with_data": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "core_h_used": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "core_h_requested": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "core_h_chargeable": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "\u03a3_hours max(used, requested) \u2014 what the scope binds on the nodes"
+      },
+      "gb_h_used": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "gb_h_requested": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "gb_h_chargeable": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_utilization_pct": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "100 \u00d7 used / requested (core-hours)"
+      },
+      "mem_utilization_pct": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_waste_core_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "requested \u2212 used when positive"
+      },
+      "mem_waste_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "hours": {
+        "type": [
+          "array",
+          "null"
+        ],
+        "description": "per-hour detail [{hour, cpu_mc, mem_mb, cpu_req_mc, mem_req_mb, pods}]",
+        "items": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "required": [
+      "id",
+      "date",
+      "day",
+      "scope_id",
+      "cluster",
+      "source",
+      "collected_at"
+    ],
+    "additionalProperties": true,
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

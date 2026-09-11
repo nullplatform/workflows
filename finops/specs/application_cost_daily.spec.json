@@ -1,0 +1,170 @@
+{
+  "slug": "application_cost_daily",
+  "name": "Application Cost Daily",
+  "description": "One invoice per application per day: total USD, charge items (each charged through a null scope, a null service, or the application itself, with category, cloud service and the attributing rule) and totals. Written by the allocator.",
+  "schema": {
+    "type": "object",
+    "required": [
+      "id",
+      "date",
+      "day",
+      "application_id",
+      "total_usd",
+      "charge_items",
+      "computed_at"
+    ],
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "<application_id>-<day>",
+        "alias": "id",
+        "primaryKey": true,
+        "autoGenerate": false
+      },
+      "day": {
+        "type": "string",
+        "description": "Same as date; filterable copy",
+        "index": [
+          "filter"
+        ]
+      },
+      "date": {
+        "type": "string",
+        "description": "Invoice day, YYYY-MM-DD (UTC)"
+      },
+      "application_id": {
+        "type": "string",
+        "description": "null application id",
+        "index": [
+          "filter"
+        ]
+      },
+      "application_slug": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null application slug",
+        "index": [
+          "filter"
+        ]
+      },
+      "namespace_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null namespace id",
+        "index": [
+          "filter"
+        ]
+      },
+      "account_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null account id",
+        "index": [
+          "filter"
+        ]
+      },
+      "total_usd": {
+        "type": "number",
+        "description": "Total attributed to the application on the day (amortized)"
+      },
+      "cloud_accounts": {
+        "type": "array",
+        "description": "Cloud accounts the cost came from",
+        "items": {
+          "type": "string"
+        }
+      },
+      "currency": {
+        "type": "string",
+        "description": "USD"
+      },
+      "allocator": {
+        "type": "string",
+        "description": "finops_allocate_daily@<version>"
+      },
+      "computed_at": {
+        "type": "string",
+        "description": "ISO timestamp"
+      },
+      "charge_items": {
+        "type": "array",
+        "description": "Invoice lines: [{charge_type: scope|service|application, scope_id, scope_name, scope_type, service_id, service_name, dimensions, environment, category, cloud_service, subject_type, subject_id, subject_name, cluster, component, cost_usd, share, allocation_method, rule_id, source_fact_id}] \u2014 every key present (null when it does not apply)",
+        "items": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "totals": {
+        "type": "object",
+        "description": "{by_charge_type: {scope, service, application}, by_environment: {production, stage, \u2026, none}, by_category: {\u2026}, by_cloud_service: {\u2026}}",
+        "additionalProperties": true
+      },
+      "charge_items_count": {
+        "type": "integer",
+        "description": "Number of charge items"
+      }
+    },
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "slug": "cost_mapping_rule",
+  "name": "Cost Mapping Rule",
+  "description": "Maps cloud cost to a null owner (application/scope/service), a cluster or a shared bucket. The allocator evaluates active rules by priority per raw fact; first match wins. See docs/mapping-rules-design.md.",
+  "schema": {
+    "type": "object",
+    "required": [
+      "id",
+      "name",
+      "enabled",
+      "status",
+      "priority",
+      "target"
+    ],
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Logical id (slug)",
+        "alias": "id",
+        "primaryKey": true,
+        "autoGenerate": false
+      },
+      "name": {
+        "type": "string",
+        "description": "Human name"
+      },
+      "description": {
+        "type": "string",
+        "description": "Why this rule exists"
+      },
+      "enabled": {
+        "type": "boolean",
+        "description": "Disabled rules are ignored",
+        "index": [
+          "filter"
+        ]
+      },
+      "status": {
+        "type": "string",
+        "description": "active | proposed | rejected \u2014 only active rules allocate",
+        "index": [
+          "filter"
+        ]
+      },
+      "priority": {
+        "type": "integer",
+        "description": "Ascending; first matching rule wins (defaults ship with priority 1000+)"
+      },
+      "source": {
+        "type": "string",
+        "description": "manual | inferred | default",
+        "index": [
+          "filter"
+        ]
+      },
+      "confidence": {
+        "type": "number",
+        "description": "0..1 for inferred rules"
+      },
+      "scope": {
+        "type": "object",
+        "description": "Field \u2192 expected value or {regex} on the raw fact: cloud, cloud_service, subject_type, resource_type, cluster, region",
+        "additionalProperties": true
+      },
+      "match": {
+        "type": "array",
+        "description": "Predicates, all must hold: {field, equals|regex|in|exists}. field is a dotted path on the raw fact (tags.application_id, host, subject_name, resource_id, usage_type, component). Regex named groups become $captures.",
+        "items": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "target": {
+        "type": "object",
+        "description": "{application_id|scope_id|service_id|namespace_id|cluster|bucket} literal, or capture:{application_id:'tags.application_id', ...}, or split:[{weight,target}], or map:{key:'tags.db_name'|'$group', entries:{key:{target}}}",
+        "additionalProperties": true
+      },
+      "method": {
+        "type": "string",
+        "description": "direct | split | map | by_metric (by_metric not implemented yet: falls back to unallocated)"
+      },
+      "category": {
+        "type": "string",
+        "description": "Optional category override for the allocated cost (compute, kubernetes, database, storage, network, observability, messaging, security, cdn, other)"
+      },
+      "evidence": {
+        "type": "array",
+        "description": "What produced the rule (for inferred rules)",
+        "items": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "created_by": {
+        "type": "string",
+        "description": "user or workflow"
+      },
+      "created_at": {
+        "type": "string",
+        "description": "ISO timestamp"
+      },
+      "updated_at": {
+        "type": "string",
+        "description": "ISO timestamp"
+      }
+    },
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

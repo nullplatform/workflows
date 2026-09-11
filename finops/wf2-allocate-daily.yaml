@@ -1,0 +1,574 @@
+# finops/wf2-allocate-daily.yaml
+#
+# The allocator: one day of `raw` cost_daily facts + the organization's active
+# cost_mapping_rules → `allocated` facts (per source fact × owner, categorized)
+# and one rollup row per application (+ one for what stays unallocated).
+#
+# Allocation leaves, per cloud service S (total T):
+#   - resource-evidence rows with parent_id = S: subject_type scope / resource / service,
+#     plus the `ec2-instances-unattributed` bucket;
+#   - cluster component buckets whose cloud_service = S (nodes, LBs, networking, …);
+#   - remainder = T − Σ(the above) → a synthetic leaf "S / remainder".
+# Usage-type buckets are informational (they overlap the leaves) and are NOT allocated.
+#
+# Rules (finops/docs/mapping-rules-design.md, spec cost_mapping_rule): enabled +
+# status=active, ascending priority, first match. Built-in defaults (lowest priority):
+#   default:null-dims     the raw fact already carries application_id/scope_id (null tags, wf1)
+#   default:null-service  the raw fact already carries service_id + nrn (host = null service)
+#   default:cluster       cluster components → the cluster bucket (phase 3 splits it by consumption)
+# Everything else → unallocated (kept per cloud service, so the gap is visible).
+#
+# Invariant: Σ allocated (owners + cluster + unallocated) = Σ cloud_service totals.
+id: finops_allocate_daily
+name: "FinOps — allocate one day to applications"
+description: >
+  Applies the organization's cost mapping rules to one day of raw cost facts and
+  writes allocated facts per application (resource by resource, categorized) plus
+  a per-application rollup.
+path: "/finops"
+semantic_version: 0.1.0
+
+inputs:
+  date:
+    type: string
+    required: false
+    description: "Day to allocate, YYYY-MM-DD (UTC). Default: yesterday."
+  dry_run:
+    type: boolean
+    required: false
+    description: "Compute without writing"
+  cloud_account:
+    type: string
+    required: false
+    description: "Only raw facts of this cloud account (default: all)"
+
+variables:
+  # cloud_service regex → category. First match wins; anything else → "other".
+  categories:
+    initialValue:
+      - { regex: "Elastic Compute Cloud - Compute|Lambda|Elastic Container Service|Fargate", category: "compute" }
+      - { regex: "Kubernetes", category: "kubernetes" }
+      - { regex: "Relational Database|DynamoDB|ElastiCache|OpenSearch|DocumentDB|Neptune|Redshift|Database Migration", category: "database" }
+      - { regex: "Simple Storage Service|EC2 - Other|Elastic File System|Backup|Glacier|Container Registry", category: "storage" }
+      - { regex: "Virtual Private Cloud|Load Balancing|Route 53|Direct Connect|Transit|Global Accelerator", category: "network" }
+      - { regex: "CloudWatch|X-Ray|Managed Grafana|Managed Service for Prometheus", category: "observability" }
+      - { regex: "Simple Queue Service|Simple Notification Service|EventBridge|Kinesis|MSK|MQ", category: "messaging" }
+      - { regex: "GuardDuty|Security Hub|Inspector|WAF|Config|Secrets Manager|Key Management|Cognito|Shield|Macie", category: "security" }
+      - { regex: "CloudFront", category: "cdn" }
+  # Organization NRN: scopes (dimensions) and services listings.
+  org_nrn:
+    initialValue: "organization=1255165411"
+  allocator:
+    initialValue: "finops_allocate_daily@0.1.0"
+
+steps:
+  - id: start
+    type: trigger
+    plugin_type: manual
+    name: "Allocate"
+    config:
+      description: "Allocate one day of raw cost facts to applications."
+      inputs:
+        date: { type: string, required: false, description: "YYYY-MM-DD (UTC)" }
+        dry_run: { type: boolean, required: false, description: "Compute without writing" }
+        cloud_account: { type: string, required: false, description: "Restrict to one cloud account" }
+
+  # Daily allocation of yesterday, 45 minutes after the dispatcher's 04:15 UTC collection (see wf0
+  # variables.allocate_in_chain: with it false, this cron is the daily allocation).
+  - id: daily_cron
+    type: trigger
+    plugin_type: cron
+    name: "Daily 05:00 UTC"
+    config:
+      schedule: "0 5 * * *"
+      timezone: "UTC"
+
+  - id: prep
+    type: module
+    plugin_type: code-exec
+    join_strategy: any
+    name: "Day + filters"
+    inputs:
+      date: "${{ workflow.inputs.date }}"
+      cloud_account: "${{ workflow.inputs.cloud_account }}"
+      org_nrn: "${{ variables.org_nrn }}"
+    config:
+      language: javascript
+      code: |
+        function iso(dt) { return dt.toISOString().slice(0, 10); }
+        var day = inputs.date && /^\d{4}-\d{2}-\d{2}$/.test(String(inputs.date)) ? String(inputs.date) : iso(new Date(Date.now() - 86400000));
+        // Catalog list filters only work on fields indexed when the spec was CREATED (stage, subject_type,
+        // cloud_service, cluster, …); `day` was added later and `date` is ignored → read all raw rows and
+        // filter by day here. TODO: switch to the lake (customers_lake.catalog_entities) once volume grows.
+        var org = String(inputs.org_nrn || "");
+        var rawSql = "SELECT data FROM (SELECT id, argMax(data, _version) AS data, argMax(_deleted, _version) AS del FROM catalog_entities WHERE entity_specification_id IN (SELECT id FROM catalog_entity_specifications FINAL WHERE slug = 'cost_daily' AND _deleted = 0) GROUP BY id HAVING del = 0) WHERE JSONExtractString(data, 'stage') = 'raw' AND JSONExtractString(data, 'day') = '" + day + "' QUALIFY parseDateTimeBestEffortOrNull(JSONExtractString(data, 'collected_at')) >= max(parseDateTimeBestEffortOrNull(JSONExtractString(data, 'collected_at'))) OVER (PARTITION BY JSONExtractString(data, 'source')) - INTERVAL 30 MINUTE";
+        return { raw_sql: rawSql, day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, allocated_filters: { stage: "allocated" }, rule_filters: { status: "active" }, scope_filters: { nrn: org, status: "active" }, service_query: { nrn: org, show_descendants: "true", limit: "500" } };
+
+  # The catalog list cannot filter by day (only the fields indexed at spec creation), so it returned
+  # EVERY day's raw facts: 5 days of itti = 2.3 MB, over the 2 MB step budget. The Lake filters by day;
+  # the latest run per source (30-minute window: wf3 patches the cluster row minutes after wf1) is what
+  # the catalog holds after the collectors' stale sweeps.
+  - id: read_raw
+    type: module
+    plugin_type: np-lake-query
+    name: "Raw facts of the day (Lake)"
+    inputs:
+      sql: "${{ steps.prep.outputs.raw_sql }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      sql: "SELECT 1"
+      maxRows: 20000
+
+  - id: read_rules
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "Active mapping rules"
+    inputs:
+      filters: "${{ steps.prep.outputs.rule_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "catalog/instances/cost_mapping_rule"
+      filters: { status: "active" }
+      limit: 100
+      maxPages: 20
+
+  - id: scopes
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    # The parent's Temporal history carries every step result: keep only what the allocator reads.
+    output_projection: ["items[].id", "items[].name", "items[].type", "items[].dimensions", "totalFetched", "pages"]
+    name: "Scopes (dimensions)"
+    inputs:
+      filters: "${{ steps.prep.outputs.scope_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "scope"
+      filters: { status: "active" }
+      limit: 100
+      maxPages: 100
+
+  - id: services
+    type: module
+    plugin_type: np-api-call
+    output_projection: ["status", "body.results[].id", "body.results[].name", "body.results[].slug", "body.results[].dimensions", "body.data[].id", "body.data[].name", "body.data[].slug", "body.data[].dimensions"]
+    name: "Services (dimensions)"
+    inputs:
+      query: "${{ steps.prep.outputs.service_query }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/service"
+      query: { show_descendants: "true", limit: "500" }
+      failOnHttpError: false
+
+  - id: allocate
+    type: module
+    plugin_type: code-exec
+    name: "Evaluate rules → allocated facts"
+    join_strategy: all
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      raw: "${{ steps.read_raw.outputs.rows }}"
+      rules: "${{ steps.read_rules.outputs.items }}"
+      cloud_account: "${{ steps.prep.outputs.cloud_account }}"
+      scopes: "${{ steps.scopes.outputs.items }}"
+      services: "${{ steps.services.outputs.body }}"
+      categories: "${{ variables.categories }}"
+      allocator: "${{ variables.allocator }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day); var now = new Date().toISOString();
+        var rawIn = (inputs.raw || []).map(function (r) { if (r && typeof r.data === "string") { try { return JSON.parse(r.data); } catch (e) { return null; } } return r && r.data && typeof r.data === "object" ? r.data : r; });
+        var raw = rawIn.filter(function (f) { return f && f.stage === "raw" && (f.date === d || f.day === d) && (!inputs.cloud_account || String(f.cloud_account) === String(inputs.cloud_account)); });
+        if (!raw.length) throw new Error("no raw facts for " + d + " (run finops_aws_billing_daily first)");
+        var rules = (inputs.rules || []).filter(function (r) { return r && r.enabled !== false && r.status === "active" && r.target; })
+          .map(function (r) { return JSON.parse(JSON.stringify(r)); })
+          .sort(function (a, b) { return (Number(a.priority) || 1000) - (Number(b.priority) || 1000); });
+        function num(x) { return Math.round((Number(x) || 0) * 1e6) / 1e6; }
+        function slug(x) { return String(x).toLowerCase().replace(/[^a-z0-9_]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100); }
+        function get(obj, path) { if (path == null) return undefined; if (String(path).charAt(0) === "$") return undefined; return String(path).split(".").reduce(function (o, k) { return o == null ? undefined : o[k]; }, obj); }
+        // null dimensions by scope / service id (the API has them; the lake scope table does not)
+        var scopeInfo = {}; (inputs.scopes || []).forEach(function (sc) { if (sc && sc.id) scopeInfo[String(sc.id)] = { dimensions: sc.dimensions && Object.keys(sc.dimensions).length ? sc.dimensions : null, type: sc.type || null, name: sc.name || null }; });
+        var svcList = inputs.services; svcList = Array.isArray(svcList) ? svcList : ((svcList && (svcList.results || svcList.data)) || []);
+        var serviceInfo = {}; svcList.forEach(function (sv) { if (sv && sv.id) serviceInfo[String(sv.id)] = { dimensions: sv.dimensions && Object.keys(sv.dimensions).length ? sv.dimensions : null, name: sv.name || sv.slug || null }; });
+        function dimsFor(scopeId, serviceId, fact) { var d = scopeId && scopeInfo[scopeId] ? scopeInfo[scopeId].dimensions : (serviceId && serviceInfo[serviceId] ? serviceInfo[serviceId].dimensions : null); return d || fact.dimensions || null; }
+        function categoryOf(svc) { var cats = inputs.categories || []; for (var i = 0; i < cats.length; i++) { if (new RegExp(cats[i].regex, "i").test(String(svc || ""))) return cats[i].category; } return "other"; }
+
+        // ── 1) leaves per cloud service
+        var byId = {}; raw.forEach(function (f) { byId[f.id] = f; });
+        var services = raw.filter(function (f) { return f.subject_type === "cloud_service"; });
+        var leaves = [];
+        services.forEach(function (s) {
+          var name = s.cloud_service || s.subject_name; var covered = 0;
+          raw.forEach(function (f) {
+            var isRes = f.parent_id === s.id && (f.subject_type === "scope" || f.subject_type === "resource" || f.subject_type === "service" || (f.subject_type === "bucket" && f.subject_id === "ec2-instances-unattributed"));
+            var isComp = f.subject_type === "bucket" && f.component && f.cloud_service === name;
+            // usage-type buckets are informational EXCEPT when the collector attached consumption shares to them
+            // (CloudWatch Logs ingestion/storage by log group, EMF metrics by application): those are leaves.
+            var isMetricBucket = f.subject_type === "bucket" && f.usage_type && f.parent_id === s.id && f.metric_shares && typeof f.metric_shares === "object";
+            if (isRes || isComp || isMetricBucket) { leaves.push({ fact: f, service: name, kind: isComp ? "cluster_component" : isMetricBucket ? "usage_type" : f.subject_type }); covered += Number(f.cost_usd) || 0; }
+          });
+          var rem = num((Number(s.cost_usd) || 0) - covered);
+          if (Math.abs(rem) >= 0.000001) {
+            leaves.push({ fact: { id: s.id + "-remainder", date: d, subject_type: "cloud_service", subject_id: s.subject_id, subject_name: name + " / remainder", cloud_service: name,
+                                  cloud: s.cloud, cloud_account: s.cloud_account, region: s.region || null, cost_usd: rem, parent_id: s.id, synthetic: true,
+                                  dimensions: s.dimensions || null, environment: s.environment || null }, service: name, kind: "remainder" });
+          }
+        });
+
+        // ── 2) rule evaluation
+        function test(pred, fact, caps) {
+          var v = get(fact, pred.field);
+          if (pred.exists !== undefined) return pred.exists ? (v !== undefined && v !== null && v !== "") : (v === undefined || v === null || v === "");
+          if (v === undefined || v === null) return false;
+          var sv = String(v);
+          if (pred.equals !== undefined) return sv === String(pred.equals);
+          if (pred.in) return pred.in.map(String).indexOf(sv) >= 0;
+          if (pred.regex) { var m = new RegExp(pred.regex, pred.flags || "i").exec(sv); if (!m) return false; if (m.groups) Object.keys(m.groups).forEach(function (g) { caps["$" + g] = m.groups[g]; }); for (var i = 1; i < m.length; i++) caps["$" + i] = m[i]; return true; }
+          return false;
+        }
+        function scopeOk(rule, fact) {
+          var sc = rule.scope || {};
+          return Object.keys(sc).every(function (k) {
+            var want = sc[k], v = get(fact, k);
+            if (want && typeof want === "object" && want.regex) return v != null && new RegExp(want.regex, "i").test(String(v));
+            if (Array.isArray(want)) return v != null && want.map(String).indexOf(String(v)) >= 0;
+            return v != null && String(v) === String(want);
+          });
+        }
+        var OWNER = ["application_id", "namespace_id", "scope_id", "service_id", "account_id", "cluster", "bucket", "application_slug"];
+        function resolveTarget(t, fact, caps) {
+          if (!t || typeof t !== "object") return null;
+          var out = {};
+          OWNER.forEach(function (k) { if (t[k] !== undefined && t[k] !== null && t[k] !== "") out[k] = String(t[k]); });
+          if (t.capture) Object.keys(t.capture).forEach(function (k) {
+            var src = String(t.capture[k]); var v = src.charAt(0) === "$" ? caps[src] : get(fact, src);
+            if (v !== undefined && v !== null && v !== "") out[k] = String(v);
+          });
+          return Object.keys(out).length ? out : null;
+        }
+        function apply(rule, fact, caps) {
+          var t = rule.target || {}; var method = rule.method || (t.split ? "split" : t.map ? "map" : "direct");
+          if (method === "split" && Array.isArray(t.split)) {
+            var tot = t.split.reduce(function (s, p) { return s + (Number(p.weight) || 0); }, 0) || 1;
+            return t.split.map(function (p) { return { share: (Number(p.weight) || 0) / tot, owner: resolveTarget(p.target, fact, caps) }; }).filter(function (x) { return x.owner && x.share > 0; });
+          }
+          if (method === "map" && t.map && t.map.entries) {
+            var key = String(t.map.key || ""); var kv = key.charAt(0) === "$" ? caps[key] : get(fact, key);
+            var e = kv != null ? t.map.entries[String(kv)] : undefined;
+            if (!e) return [];
+            return [{ share: 1, owner: resolveTarget(e, fact, caps) }].filter(function (x) { return x.owner; });
+          }
+          if (method === "spread") return [{ share: 1, owner: null, spread: true }]; // resolved in §3b once every application of the day is known
+          if (method === "by_metric_parent") {
+            // Cluster components: the consumption metric lives on the PARENT cluster row (wf3 attaches
+            // metric_shares {scope_id → share} + metric_owners {scope_id → dims}). Shares sum to < 1: the
+            // rest (system namespaces, idle headroom) stays with the cluster as k8s overhead.
+            var parent = byId[fact.parent_id]; if (!parent || !parent.metric_shares) return [];
+            var ps = parent.metric_shares; var po = parent.metric_owners || {}; var out = []; var covered = 0;
+            Object.keys(ps).forEach(function (k) { var sh = Number(ps[k]) || 0; if (sh <= 0) return; covered += sh; var o = po[k] ? resolveTarget(po[k], fact, caps) : null; out.push(o ? { share: sh, owner: o, key: k } : { share: sh, owner: null, key: k }); });
+            if (covered < 1) out.push({ share: num(1 - covered), owner: { cluster: String(fact.cluster) }, key: "kubernetes-overhead", overhead: true });
+            return out;
+          }
+          if (method === "by_metric") {
+            // The fact carries `metric_shares` {key → share} (e.g. Performance Insights db.load by db.name,
+            // attached by the collector). `target.map.entries` maps each key to an owner; keys without an
+            // owner stay unallocated (returned as an explicit `unallocated` part so the gap is visible).
+            var shares = fact.metric_shares; if (!shares || typeof shares !== "object") return [];
+            var entries = (t.map && t.map.entries) || {}; var parts = [];
+            Object.keys(shares).forEach(function (k) {
+              var s = Number(shares[k]) || 0; if (s <= 0) return;
+              // owner: the rule's map first, else the owner the collector resolved for the key (fact.metric_owners)
+              var e = entries[k] || ((fact.metric_owners || {})[k]); var o = e ? resolveTarget(e, fact, caps) : null;
+              parts.push(o ? { share: s, owner: o, key: k } : { share: s, owner: null, key: k });
+            });
+            return parts;
+          }
+          var o = resolveTarget(t, fact, caps); return o ? [{ share: 1, owner: o }] : [];
+        }
+        var defaults = [
+          { id: "default:null-service", match: [{ field: "service_id", exists: true }, { field: "application_id", exists: true }], target: { capture: { application_id: "application_id", namespace_id: "namespace_id", service_id: "service_id", account_id: "account_id" } } },
+          { id: "default:null-dims", match: [{ field: "application_id", exists: true }], target: { capture: { application_id: "application_id", namespace_id: "namespace_id", scope_id: "scope_id", account_id: "account_id" } } },
+          { id: "default:cluster-consumption", match: [{ field: "component", exists: true }, { field: "cluster", exists: true }], method: "by_metric_parent", target: {}, category: "kubernetes" },
+          { id: "default:cluster", match: [{ field: "component", exists: true }, { field: "cluster", exists: true }], target: { capture: { cluster: "cluster" } }, cluster_pending: true }
+        ];
+        function evaluate(fact) {
+          var all = rules.concat(defaults);
+          for (var i = 0; i < all.length; i++) {
+            var r = all[i]; var caps = {};
+            if (!scopeOk(r, fact)) continue;
+            var preds = Array.isArray(r.match) ? r.match : [];
+            var ok = true; for (var j = 0; j < preds.length; j++) { if (!test(preds[j], fact, caps)) { ok = false; break; } }
+            if (!ok) continue;
+            var parts = apply(r, fact, caps);
+            if (parts.length) return { rule: r, parts: parts };
+          }
+          return null;
+        }
+
+        // ── 3) allocated facts
+        var allocated = []; var perApp = {}; var unalloc = {}; var perCluster = {}; var overhead = {}; var sumLeaves = 0, sumAlloc = 0;
+        var spreadLeaves = []; var spreadTotal = 0; // rules with method "spread": shared by every application of the day (§3b)
+        function ownerKey(o) { return o.application_id ? "app-" + o.application_id : o.scope_id ? "scope-" + o.scope_id : o.service_id ? "svc-" + o.service_id : o.namespace_id ? "ns-" + o.namespace_id : o.cluster ? "cluster-" + o.cluster : o.bucket ? "bucket-" + o.bucket : o.application_slug ? "app-" + o.application_slug : "unknown"; }
+        leaves.forEach(function (L) {
+          var f = L.fact; var cost = num(f.cost_usd); sumLeaves += cost;
+          var cat = categoryOf(L.service); var hit = evaluate(f);
+          var base = { date: d, day: d, stage: "allocated", subject_type: f.subject_type, subject_id: f.subject_id, subject_name: f.subject_name || f.subject_id,
+                       cloud: f.cloud || "aws", cloud_account: f.cloud_account || null, cloud_service: L.service, region: f.region || null, cluster: f.cluster || null,
+                       resource_id: f.resource_id || null, resource_type: f.resource_type || null, component: f.component || null, usage_type: f.usage_type || null,
+                       source: "finops_allocator", source_fact_id: f.id, parent_id: f.id, collected_at: now, collector: String(inputs.allocator), category: cat,
+                       scope_name: f.scope_name || null, scope_type: f.scope_type || null, service_name: f.service_name || null };
+          if (!hit) {
+            var u = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-unallocated", cost_usd: cost, share: 1, allocation_method: "unallocated", rule_id: null });
+            allocated.push(u); unalloc[L.service] = num((unalloc[L.service] || 0) + cost); sumAlloc += cost; return;
+          }
+          if (hit.rule.method === "spread") { spreadLeaves.push({ L: L, base: base, hit: hit, cost: cost }); return; }
+          var rcat = hit.rule.category || cat;
+          hit.parts.forEach(function (p) {
+            var amt = num(cost * p.share);
+            if (!p.owner) { // by_metric key without an owner in the map → unallocated portion, key kept for the suggestion pass
+              var un = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(p.key) + "-unallocated", cost_usd: amt, share: num(p.share), allocation_method: "unallocated", rule_id: String(hit.rule.id), metric_key: String(p.key) });
+              allocated.push(un); unalloc[L.service] = num((unalloc[L.service] || 0) + amt); sumAlloc += amt; return;
+            }
+            var o = p.owner; var key = ownerKey(o);
+            var method = hit.rule.cluster_pending ? "cluster_pending_consumption" : p.overhead ? "kubernetes_overhead" : (hit.rule.method === "by_metric_parent" ? "by_metric" : (hit.rule.method || (hit.rule.target && hit.rule.target.split ? "split" : hit.rule.target && hit.rule.target.map ? "map" : "direct")));
+            var a = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(key) + (p.key ? "-" + slug(p.key) : ""), cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), category: rcat });
+            OWNER.forEach(function (k) { if (o[k] !== undefined) a[k] = o[k]; });
+            allocated.push(a); sumAlloc += amt;
+            if (o.cluster && !o.application_id) { var pc = p.overhead ? overhead : perCluster; pc[o.cluster] = num((pc[o.cluster] || 0) + amt); return; }
+            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, by_category: {}, by_cloud_service: {}, facts: 0 });
+            app.cost_usd = num(app.cost_usd + amt); app.by_category[rcat] = num((app.by_category[rcat] || 0) + amt); app.by_cloud_service[L.service] = num((app.by_cloud_service[L.service] || 0) + amt); app.facts += 1;
+            // The null OBJECT the cost came through (a scope of any type, a service, or the application) + its dimensions.
+            var scopeId = o.scope_id || f.scope_id || (p.key && hit.rule.method === "by_metric_parent" ? String(p.key) : null);
+            var serviceId = !scopeId && (o.service_id || f.service_id) ? String(o.service_id || f.service_id) : null;
+            // A cloud resource that acts as a service (a database, a cache) without a null service registered
+            // for it is still charged as a SERVICE — flagged service_kind "cloud" (vs "null") so the invoice
+            // and the dashboard can tell them apart.
+            var cloudSvc = !scopeId && !serviceId && f.subject_type === "service" && f.subject_id ? String(f.subject_id) : null;
+            a.charge_type = scopeId ? "scope" : (serviceId || cloudSvc) ? "service" : "application";
+            if (scopeId) { a.scope_id = String(scopeId); a.scope_name = a.scope_name || (scopeInfo[String(scopeId)] || {}).name || null; a.scope_type = a.scope_type || (scopeInfo[String(scopeId)] || {}).type || null; }
+            if (serviceId) { a.service_id = serviceId; a.service_name = a.service_name || (serviceInfo[serviceId] || {}).name || f.subject_name || null; a.service_kind = "null"; }
+            if (cloudSvc) { a.service_id = "cloud:" + slug(cloudSvc); a.service_name = f.subject_name || cloudSvc; a.service_kind = "cloud"; }
+            var dims = dimsFor(scopeId ? String(scopeId) : null, serviceId, f); var env = dims && dims.environment ? String(dims.environment) : null;
+            a.dimensions = dims; if (env) a.environment = env;
+            a.cloud_account = a.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null;
+          });
+        });
+        // ── 3b) spread: platform cost every application of the account shares. Weights = each application's
+        // cost attributed so far (default) or equal. Decided AFTER the main pass so the weights are the day's
+        // attribution, never the spread itself. No application yet → the leaf stays visibly unallocated.
+        var spreadWeights = {}; Object.keys(perApp).forEach(function (k) { if (perApp[k].owner.application_id) spreadWeights[k] = num(perApp[k].cost_usd); });
+        spreadLeaves.forEach(function (S) {
+          var f = S.L.fact; var mode = String(((S.hit.rule.target || {}).spread || {}).weights || "attributed"); var rcat = S.hit.rule.category || "platform";
+          var keys = Object.keys(spreadWeights); var w = {}; var tot = 0;
+          keys.forEach(function (k) { var v = mode === "equal" ? 1 : spreadWeights[k]; if (v > 0) { w[k] = v; tot += v; } });
+          if (tot <= 0) { keys.forEach(function (k) { w[k] = 1; }); tot = keys.length; }
+          if (!tot) {
+            var un = Object.assign({}, S.base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-unallocated", cost_usd: S.cost, share: 1, allocation_method: "unallocated", rule_id: String(S.hit.rule.id) });
+            allocated.push(un); unalloc[S.L.service] = num((unalloc[S.L.service] || 0) + S.cost); sumAlloc += S.cost; return;
+          }
+          var wk = Object.keys(w); var acc = 0;
+          wk.forEach(function (k, i) {
+            var share = w[k] / tot; var amt = i === wk.length - 1 ? num(S.cost - acc) : num(S.cost * share); acc = num(acc + amt); var o = perApp[k].owner;
+            var a = Object.assign({}, S.base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(k) + "-spread", cost_usd: amt, share: num(share), allocation_method: "spread", rule_id: String(S.hit.rule.id), category: rcat, charge_type: "application" });
+            OWNER.forEach(function (kk) { if (o[kk] !== undefined) a[kk] = o[kk]; });
+            var dims = dimsFor(null, null, f); a.dimensions = dims; if (dims && dims.environment) a.environment = String(dims.environment);
+            allocated.push(a); sumAlloc += amt; spreadTotal = num(spreadTotal + amt);
+            var app = perApp[k]; app.cost_usd = num(app.cost_usd + amt); app.by_category[rcat] = num((app.by_category[rcat] || 0) + amt); app.by_cloud_service[S.L.service] = num((app.by_cloud_service[S.L.service] || 0) + amt); app.facts += 1;
+          });
+        });
+        // ── 4) rollups: one per owner, one for unallocated
+        Object.keys(perApp).forEach(function (k) {
+          var a = perApp[k]; var o = a.owner;
+          var r = { id: "alloc-" + slug(k) + "-" + d, date: d, day: d, stage: "allocated", subject_type: "application", subject_id: k, subject_name: o.application_slug || k,
+                    cloud: "aws", source: "finops_allocator", collected_at: now, collector: String(inputs.allocator), allocation_method: "rollup", cost_usd: a.cost_usd,
+                    by_category: a.by_category, by_cloud_service: a.by_cloud_service, quantity: a.facts, units: "facts" };
+          OWNER.forEach(function (kk) { if (o[kk] !== undefined) r[kk] = o[kk]; });
+          allocated.push(r);
+        });
+        var unTotal = num(Object.keys(unalloc).reduce(function (s, k) { return s + unalloc[k]; }, 0));
+        allocated.push({ id: "alloc-unallocated-" + d, date: d, day: d, stage: "allocated", subject_type: "unallocated", subject_id: "unallocated", subject_name: "Not attributable yet",
+                         cloud: "aws", source: "finops_allocator", collected_at: now, collector: String(inputs.allocator), allocation_method: "unallocated", cost_usd: unTotal, by_cloud_service: unalloc });
+        var svcTotal = num(services.reduce(function (s, f) { return s + (Number(f.cost_usd) || 0); }, 0));
+        if (Math.abs(sumAlloc - sumLeaves) > 0.01 || Math.abs(sumLeaves - svcTotal) > 0.01) throw new Error("allocation does not reconcile: services " + svcTotal + " leaves " + sumLeaves + " allocated " + sumAlloc);
+        var apps = Object.keys(perApp).map(function (k) { var a = perApp[k]; return { owner: k, application_id: a.owner.application_id || null, cost_usd: a.cost_usd, by_category: a.by_category }; }).sort(function (x, y) { return y.cost_usd - x.cost_usd; });
+        var unLeaves = leaves.filter(function (L) { return !evaluate(L.fact); }).map(function (L) { return { id: L.fact.id, cloud_service: L.service, subject_type: L.fact.subject_type, subject_id: L.fact.subject_id, resource_type: L.fact.resource_type || null, host: L.fact.host || null, tags: L.fact.tags || null, cost_usd: num(L.fact.cost_usd), kind: L.kind }; });
+        // by_metric keys nobody owns (a new database on a shared cluster, …) are candidates too: the
+        // suggestion pass proposes a map entry from the key name, the DB users and the DB_NAME parameters.
+        allocated.forEach(function (a) {
+          if (a.metric_key && a.allocation_method === "unallocated") unLeaves.push({ id: a.source_fact_id + "#" + a.metric_key, cloud_service: a.cloud_service, subject_type: a.subject_type, subject_id: a.subject_id, resource_type: a.resource_type || null, host: byId[a.source_fact_id] ? (byId[a.source_fact_id].host || null) : null, tags: null, cost_usd: a.cost_usd, kind: "metric_key", metric_key: a.metric_key, rule_id: a.rule_id });
+        });
+        unLeaves.sort(function (x, y) { return y.cost_usd - x.cost_usd; });
+        var seen = {}; allocated.forEach(function (a) { if (seen[a.id]) throw new Error("duplicate allocated id " + a.id); seen[a.id] = true; });
+        // Batches of 40 → ~20 upsert children per day instead of one per fact (the per-fact fan-out
+        // re-ran in a loop in prod once the parent state grew). The facts live ONCE, here.
+        var batches = []; for (var bi = 0; bi < allocated.length; bi += 40) batches.push({ facts: allocated.slice(bi, bi + 40), catalog_slug: "cost_daily", dry_run: !!inputs.dry_run });
+        // batches_out: the workflow output. Only a DRY RUN returns the batches (a real day is ~1 MB and a parent
+        // waiting on this child gets the whole output into its history; the summary step must not receive them either).
+        return { day: d, batches: batches, batches_out: inputs.dry_run ? batches : [], ids: Object.keys(seen), count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0) - Object.keys(overhead).reduce(function (s, k) { return s + overhead[k]; }, 0)),
+                 cluster_pending_usd: perCluster, kubernetes_overhead_usd: overhead, platform_spread_usd: spreadTotal, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
+                 unallocated_leaves: unLeaves.slice(0, 200) };
+
+  - id: write_facts
+    type: module
+    plugin_type: sub-workflow
+    name: "Upsert allocated facts (fan-out)"
+    forEach:
+      expression: "${{ steps.allocate.outputs.batches }}"
+      itemVariable: batch
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 4
+    config:
+      # Definition id of finops/wf-cost-fact-upsert.yaml (patched at publish time).
+      workflowId: FINOPS_COST_FACT_UPSERT_ID
+      alias: live
+      waitForCompletion: true
+
+  # ── invoices: one application_cost_daily row per application, built from the allocated facts.
+  - id: invoices
+    type: module
+    plugin_type: code-exec
+    name: "Invoices per application"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      batches: "${{ steps.allocate.outputs.batches }}"
+      allocator: "${{ variables.allocator }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day); var now = new Date().toISOString();
+        function num(x) { return Math.round((Number(x) || 0) * 1e6) / 1e6; }
+        var apps = {}; var facts = []; (inputs.batches || []).forEach(function (b) { (b.facts || []).forEach(function (f) { facts.push(f); }); });
+        facts.forEach(function (a) {
+          if (!a || a.stage !== "allocated" || !a.application_id || a.allocation_method === "rollup" || a.subject_type === "unallocated" || a.subject_type === "application") return;
+          var id = String(a.application_id);
+          var app = apps[id] || (apps[id] = { application_id: id, application_slug: a.application_slug || null, namespace_id: a.namespace_id || null, account_id: a.account_id || null, total: 0, by_charge_type: {}, by_environment: {}, by_category: {}, by_cloud_service: {}, accounts: {}, items: [] });
+          if (!app.application_slug && a.application_slug) app.application_slug = a.application_slug;
+          var amt = num(a.cost_usd); var ctype = a.charge_type || (a.scope_id ? "scope" : a.service_id ? "service" : "application"); var env = a.environment || "none"; var cat = a.category || "other"; var svc = a.cloud_service || "other";
+          app.total = num(app.total + amt); app.by_charge_type[ctype] = num((app.by_charge_type[ctype] || 0) + amt); app.by_environment[env] = num((app.by_environment[env] || 0) + amt);
+          app.by_category[cat] = num((app.by_category[cat] || 0) + amt); app.by_cloud_service[svc] = num((app.by_cloud_service[svc] || 0) + amt); if (a.cloud_account) app.accounts[String(a.cloud_account)] = true;
+          app.items.push({ charge_type: ctype, scope_id: a.scope_id || null, scope_name: a.scope_name || null, scope_type: a.scope_type || null, service_id: a.service_id || null, service_name: a.service_name || null, service_kind: a.service_kind || null,
+                           dimensions: a.dimensions || null, environment: a.environment || null, category: cat, cloud_service: a.cloud_service || null, subject_type: a.subject_type, subject_id: a.subject_id, subject_name: a.subject_name || a.subject_id,
+                           cluster: a.cluster || null, component: a.component || null, cost_usd: amt, share: num(a.share), allocation_method: a.allocation_method, rule_id: a.rule_id || null, source_fact_id: a.source_fact_id || null });
+        });
+        var rows = Object.keys(apps).map(function (id) {
+          var a = apps[id]; a.items.sort(function (x, y) { return y.cost_usd - x.cost_usd; });
+          return { id: id + "-" + d, date: d, day: d, application_id: id, application_slug: a.application_slug, namespace_id: a.namespace_id, account_id: a.account_id, total_usd: a.total, currency: "USD",
+                   charge_items: a.items, charge_items_count: a.items.length, totals: { by_charge_type: a.by_charge_type, by_environment: a.by_environment, by_category: a.by_category, by_cloud_service: a.by_cloud_service },
+                   cloud_accounts: Object.keys(a.accounts), allocator: String(inputs.allocator), computed_at: now };
+        }).sort(function (x, y) { return y.total_usd - x.total_usd; });
+        var batches = []; for (var bi = 0; bi < rows.length; bi += 25) batches.push({ facts: rows.slice(bi, bi + 25), catalog_slug: "application_cost_daily", dry_run: !!inputs.dry_run });
+        return { count: rows.length, batches: batches, batches_out: inputs.dry_run ? batches : [] };
+
+  - id: write_invoices
+    type: module
+    plugin_type: sub-workflow
+    name: "Upsert invoices (fan-out)"
+    forEach:
+      expression: "${{ steps.invoices.outputs.batches }}"
+      itemVariable: batch
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 2
+    config:
+      workflowId: FINOPS_COST_FACT_UPSERT_ID
+      alias: live
+      waitForCompletion: true
+
+  # ── stale sweep: re-allocating a day must not leave rows from a previous allocation behind.
+  - id: read_allocated
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    output_projection: ["items[].id", "items[].day", "items[].date", "items[].stage", "items[].cost_usd", "totalFetched", "pages"]
+    name: "Allocated rows already in the catalog"
+    inputs:
+      filters: "${{ steps.prep.outputs.allocated_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "catalog/instances/cost_daily"
+      filters: { stage: "allocated" }
+      limit: 100
+      maxPages: 500
+
+  - id: stale
+    type: module
+    plugin_type: code-exec
+    name: "Rows of the day this run did not produce"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      ids: "${{ steps.allocate.outputs.ids }}"
+      existing: "${{ steps.read_allocated.outputs.items }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day); var mine = {}; (inputs.ids || []).forEach(function (id) { mine[id] = true; });
+        var stale = (inputs.existing || []).filter(function (r) { return r && r.stage === "allocated" && (r.day === d || r.date === d) && !mine[r.id]; });
+        var usd = Math.round(stale.reduce(function (s, r) { return s + (Number(r.cost_usd) || 0); }, 0) * 1e6) / 1e6;
+        return { count: stale.length, stale_usd: usd, ids: stale.map(function (r) { return r.id; }).slice(0, 50),
+                 list: inputs.dry_run ? [] : stale.map(function (r) { return { path: "/catalog/instances/cost_daily/" + encodeURIComponent(r.id) }; }) };
+
+  - id: delete_stale
+    type: module
+    plugin_type: np-api-call
+    name: "Delete stale allocated rows (fan-out)"
+    forEach:
+      expression: "${{ steps.stale.outputs.list }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: DELETE
+      path: "/catalog/instances/cost_daily/placeholder"
+
+  - id: summary
+    type: module
+    plugin_type: code-exec
+    name: "Summary"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      summary: "${{ steps.allocate.outputs.summary }}"
+      results: "${{ steps.write_facts.outputs.items }}"
+      invoices: "${{ steps.write_invoices.outputs.items }}"
+      stale: "${{ steps.stale.outputs }}"
+      invoice_count: "${{ steps.invoices.outputs.count }}"
+    config:
+      language: javascript
+      code: |
+        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0; function wr(list) { return (list || []).reduce(function (n, r) { var o = (r || {}).outputs || r || {}; return n + (Number(o.written) || 0); }, 0); }
+        s.invoices_written = s.dry_run ? 0 : wr(inputs.invoices); s.written = s.dry_run ? 0 : wr(inputs.results) + s.invoices_written; s.stale_rows = (inputs.stale || {}).count || 0; s.stale_usd = (inputs.stale || {}).stale_usd || 0; s.stale_deleted = s.dry_run ? 0 : s.stale_rows; return s;
+
+connections:
+  - { from: start, to: prep }
+  - { from: daily_cron, to: prep }
+  - { from: prep, to: read_raw }
+  - { from: prep, to: read_rules }
+  - { from: prep, to: scopes }
+  - { from: prep, to: services }
+  - { from: read_raw, to: allocate }
+  - { from: read_rules, to: allocate }
+  - { from: scopes, to: allocate }
+  - { from: services, to: allocate }
+  - { from: allocate, to: write_facts }
+  - { from: allocate, to: invoices }
+  - { from: invoices, to: write_invoices }
+  - { from: write_facts, to: read_allocated }
+  - { from: read_allocated, to: stale }
+  - { from: stale, to: delete_stale }
+  - { from: delete_stale, to: summary }
+  - { from: write_invoices, to: summary }
+
+outputs:
+  summary: "${{ steps.summary.outputs }}"
+  # dry_run only (see summary): a real day returns [] so the dispatcher's history stays small
+  batches: "${{ steps.allocate.outputs.batches_out }}"
+  invoice_batches: "${{ steps.invoices.outputs.batches_out }}"
+  unallocated_leaves: "${{ steps.allocate.outputs.unallocated_leaves }}"

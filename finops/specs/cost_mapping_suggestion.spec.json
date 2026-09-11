@@ -1,0 +1,144 @@
+{
+  "slug": "cost_mapping_suggestion",
+  "name": "Cost Mapping Suggestion",
+  "description": "A rule proposed by the inference workflow from evidence (null services, application parameters, naming). A human accepts it into cost_mapping_rule or rejects it.",
+  "schema": {
+    "type": "object",
+    "required": [
+      "id",
+      "name",
+      "status",
+      "rule"
+    ],
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Logical id (slug)",
+        "alias": "id",
+        "primaryKey": true,
+        "autoGenerate": false
+      },
+      "name": {
+        "type": "string",
+        "description": "Human name"
+      },
+      "status": {
+        "type": "string",
+        "description": "proposed | accepted | rejected",
+        "index": [
+          "filter"
+        ]
+      },
+      "day": {
+        "type": "string",
+        "description": "Day (YYYY-MM-DD) the evidence was observed on",
+        "index": [
+          "filter"
+        ]
+      },
+      "cloud_service": {
+        "type": "string",
+        "description": "Cloud service of the unallocated cost",
+        "index": [
+          "filter"
+        ]
+      },
+      "resource_type": {
+        "type": "string",
+        "description": "Resource type of the subject",
+        "index": [
+          "filter"
+        ]
+      },
+      "subject_id": {
+        "type": "string",
+        "description": "Raw subject the suggestion is about (resource id, cluster, host\u2026)"
+      },
+      "recovers_usd": {
+        "type": "number",
+        "description": "Unallocated USD/day this rule would attribute"
+      },
+      "confidence": {
+        "type": "number",
+        "description": "0..1"
+      },
+      "rule": {
+        "type": "object",
+        "description": "The proposed cost_mapping_rule body (scope, match, target, method)",
+        "additionalProperties": true
+      },
+      "evidence": {
+        "type": "array",
+        "description": "[{kind: tag|null_service|parameter|naming, detail, application_id?, application_slug?, ...}]",
+        "items": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "created_at": {
+        "type": "string",
+        "description": "ISO timestamp"
+      },
+      "updated_at": {
+        "type": "string",
+        "description": "ISO timestamp"
+      }
+    },
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

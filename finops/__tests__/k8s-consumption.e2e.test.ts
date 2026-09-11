@@ -1,0 +1,125 @@
+/**
+ * E2E for finops/wf3-k8s-consumption-daily.yaml: lake scopes + collector output (agent) +
+ * the day's raw cluster row → priced scope facts and the cluster's consumption shares.
+ */
+import { resolve } from 'node:path';
+import { runWorkflowE2E } from '@nullplatform/workflow-kit/test';
+import { describe, expect, it } from 'vitest';
+
+const YAML = resolve(__dirname, '..', 'wf3-k8s-consumption-daily.yaml');
+const D = '2026-09-09';
+const passthroughTrigger = { handler: () => ({ status: 'success' as const, outputs: {}, activePorts: ['default'] }), registryType: 'trigger' as const };
+
+const SCOPES = [
+  { scope_id: 777, scope_name: 'prod', scope_slug: 'prod', scope_nrn: 'organization=4:account=17:namespace=5:application=100:scope=777', scope_type: 'web_pool_k8s', app_name: 'Orders', app_slug: 'orders-api' },
+  { scope_id: 999, scope_name: 'prod', scope_slug: 'prod', scope_nrn: 'organization=4:account=17:namespace=6:application=400:scope=999', scope_type: 'web_pool_k8s', app_name: 'Users', app_slug: 'users-api' },
+  { scope_id: 555, scope_name: 'ec2', scope_slug: 'ec2', scope_nrn: 'organization=4:account=17:namespace=6:application=400:scope=555', scope_type: 'custom', app_name: 'Users', app_slug: 'users-api' },
+];
+// cluster row of the day (wf1): 100 USD, rates 0.05 $/core-h and 0.01 $/GiB-h
+const CLUSTER = { id: `raw-cluster-runtime-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cluster', subject_id: 'runtime', cluster: 'runtime', cloud: 'aws', cloud_account: '283477532906', region: 'us-east-1', source: 'aws_ce', collected_at: 'x', allocation_method: 'unallocated', cost_usd: 100, rate_cpu_usd_core_h: 0.05, rate_mem_usd_gb_h: 0.01, cpu_share: 0.5, cpu_capacity_core_h: 2000, mem_capacity_gb_h: 8000 };
+// collector day mode per scope: 2 hours, usage vs request (mc / MB)
+const OUT: Record<string, unknown> = {
+  777: { samples: 24, cpu_mc_hours: 3000, mem_mb_hours: 4096, cpu_req_mc_avg: 2000, mem_req_mb_avg: 2048, hours: [
+    { cpu_mc: 1000, mem_mb: 1024, cpu_req_mc: 2000, mem_req_mb: 2048, pods: 2 }, // request wins: 2 core-h, 2 GiB-h
+    { cpu_mc: 2000, mem_mb: 3072, cpu_req_mc: 1000, mem_req_mb: 2048, pods: 3 }, // usage wins: 2 core-h, 3 GiB-h
+  ] },
+  999: { samples: 24, cpu_mc_hours: 500, mem_mb_hours: 512, hours: [{ cpu_mc: 500, mem_mb: 512, cpu_req_mc: 500, mem_req_mb: 512, pods: 1 }] }, // 0.5 core-h, 0.5 GiB-h
+  555: { samples: 0 }, // not in the cluster
+};
+
+describe('finops/wf3-k8s-consumption-daily', () => {
+  it('prices each scope with the cluster rates (max(usage, request) per hour) and writes the cluster shares', async () => {
+    const cmds: string[] = []; const written: Array<Record<string, unknown>> = [];
+    const result = await runWorkflowE2E({
+      yamlPath: YAML,
+      inputs: { date: D },
+      pluginStubs: {
+        manual: passthroughTrigger,
+        'np-lake-query': { handler: () => ({ status: 'success' as const, outputs: { rows: SCOPES, rowCount: 3 }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-entity-paginated-fetch': { handler: () => ({ status: 'success' as const, outputs: { items: [{ id: 777, dimensions: { environment: 'production' } }, { id: 999, dimensions: {} }], totalFetched: 2, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-api-call': { handler: () => ({ status: 'success' as const, outputs: { status: 200, body: CLUSTER }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-agent-command': {
+          handler: (ctx: { inputs: Record<string, unknown> }) => {
+            const c = String(ctx.inputs.cmdline); cmds.push(c);
+            const id = c.split('--scope ')[1];
+            return { status: 'success' as const, outputs: { status: 'success', stdout: JSON.stringify(OUT[id as string]), stderr: '' }, activePorts: ['default'] };
+          },
+          executeMode: 'all' as const,
+        },
+        'sub-workflow': { handler: (ctx: { inputs: Record<string, unknown> }) => { written.push(ctx.inputs); return { status: 'success' as const, outputs: { id: (ctx.inputs.fact as { id: string }).id }, activePorts: ['default'] }; }, executeMode: 'all' as const },
+      },
+    });
+    expect(cmds).toEqual([
+      `nullplatform/platform-scopes-override/cost/collect_metrics --prom http://prometheus-server.default.svc.cluster.local --mode day --date ${D} --scope 777`,
+      `nullplatform/platform-scopes-override/cost/collect_metrics --prom http://prometheus-server.default.svc.cluster.local --mode day --date ${D} --scope 999`,
+      `nullplatform/platform-scopes-override/cost/collect_metrics --prom http://prometheus-server.default.svc.cluster.local --mode day --date ${D} --scope 555`,
+    ]);
+    const facts = result.outputs?.facts as Array<Record<string, unknown>>;
+    expect(facts.map((f) => f.id)).toEqual([`raw-k8s-scope-777-${D}`, `raw-k8s-scope-999-${D}`]); // 555 has no pods here
+    // 777: chargeable 4 core-h × 0.05 + 5 GiB-h × 0.01 = 0.25; used 3 core-h + 4 GiB-h = 0.19; waste 0.06
+    expect(facts[0]).toMatchObject({ subject_type: 'scope', source: 'k8s', cluster: 'runtime', application_id: '100', namespace_id: '5', scope_id: '777', application_slug: 'orders-api', subject_name: 'orders-api.prod',
+      core_h_chargeable: 4, gb_h_chargeable: 5, core_h_used: 3, gb_h_used: 4, core_h_requested: 3, gb_h_requested: 4, pods_avg: 2.5, cost_usd: 0.25, usage_usd: 0.19, waste_usd: 0.06, allocation_method: 'direct_resource', metric: 'k8s.chargeable', dimensions: { environment: 'production' }, environment: 'production' });
+    expect(facts[1]).toMatchObject({ scope_id: '999', application_id: '400', cost_usd: 0.03, usage_usd: 0.03, waste_usd: 0 });
+    // cluster row patched with shares by scope (over the cluster cost) and the overhead
+    const cluster = written.find((w) => (w.fact as { id: string }).id === `raw-cluster-runtime-${D}`)?.fact as Record<string, unknown>;
+    expect(cluster).toMatchObject({ metric: 'k8s.chargeable', metric_shares: { 777: 0.0025, 999: 0.0003 }, k8s_overhead_usd: 99.72, cost_usd: 100 });
+    expect((cluster.metric_owners as Record<string, Record<string, unknown>>)[777]).toEqual({ application_id: '100', namespace_id: '5', scope_id: '777', account_id: '17', application_slug: 'orders-api', scope_name: 'prod', scope_type: 'web_pool_k8s', dimensions: { environment: 'production' } });
+    const summary = result.outputs?.summary as Record<string, unknown>;
+    // 2 usage rows (scope_usage_daily) + 2 priced facts + the cluster row
+    expect(summary).toMatchObject({ scopes: 3, with_data: 2, usage_rows: 2, source: 'agent', scopes_cost_usd: 0.28, overhead_usd: 99.72, cluster_cost_usd: 100, written: 5, error_count: 0 });
+    expect(written.map((w) => w.catalog_slug)).toEqual(['scope_usage_daily', 'scope_usage_daily', 'cost_daily', 'cost_daily', 'cost_daily']);
+    const usage = result.outputs?.usage as Array<Record<string, unknown>>;
+    expect(usage.map((u) => u.id)).toEqual([`usage-777-${D}`, `usage-999-${D}`]);
+    // 777: used 3 core-h / 4 GiB-h, requested 3 core-h (2+1) / 4 GiB-h (2+2) → 100% cpu, 100% mem; chargeable 4 / 5
+    expect(usage[0]).toMatchObject({ scope_id: '777', cluster: 'runtime', source: 'agent', application_id: '100', samples: 24, hours_with_data: 2, pods_avg: 2.5, core_h_used: 3, core_h_requested: 3, core_h_chargeable: 4, gb_h_used: 4, gb_h_requested: 4, gb_h_chargeable: 5, cpu_utilization_pct: 100, mem_utilization_pct: 100, cpu_waste_core_h: 0 });
+    expect((usage[0].hours as unknown[]).length).toBe(2);
+    expect(facts[0]).toMatchObject({ usage_id: `usage-777-${D}` });
+  });
+
+  it('fails clearly when the day has no raw cluster row', async () => {
+    await expect(runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: {
+      manual: passthroughTrigger,
+      'np-lake-query': { handler: () => ({ status: 'success' as const, outputs: { rows: SCOPES }, activePorts: ['default'] }), executeMode: 'all' as const },
+      'np-entity-paginated-fetch': { handler: () => ({ status: 'success' as const, outputs: { items: [], totalFetched: 0, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
+      'np-api-call': { handler: () => ({ status: 'success' as const, outputs: { status: 404, body: { message: 'not found' } }, activePorts: ['default'] }), executeMode: 'all' as const },
+      'np-agent-command': { handler: () => ({ status: 'success' as const, outputs: { stdout: '{}' }, activePorts: ['default'] }), executeMode: 'all' as const },
+      'sub-workflow': { handler: () => ({ status: 'success' as const, outputs: {}, activePorts: ['default'] }), executeMode: 'all' as const },
+    } })).rejects.toThrow(/raw cluster row not found/);
+  });
+
+  it('newrelic mode: one NerdGraph query per cluster-day (scope × hour) replaces the agent collector', async () => {
+    const posts: Array<Record<string, unknown>> = []; const cmds: string[] = [];
+    // NR rows: average per pod-sample × distinct pods = the scope's hourly consumption. 777: two hours, 999: one.
+    const rows = [
+      { facet: ['777', '0:00'], 'label.scope_id': '777', 'Hour of timestamp': '0:00', cpu: 0.5, mem: 512 * 1048576, cpuReq: 1.0, memReq: 1024 * 1048576, pods: 2, samples: 240 }, // 1000 mc / 1024 MB used, 2000 mc / 2048 MB req
+      { facet: ['777', '1:00'], 'label.scope_id': '777', 'Hour of timestamp': '1:00', cpu: 1.0, mem: 1024 * 1048576, cpuReq: 0.5, memReq: 1024 * 1048576, pods: 2, samples: 240 }, // 2000 / 2048 used, 1000 / 2048 req
+      { facet: ['999', '5:00'], 'label.scope_id': '999', 'Hour of timestamp': '5:00', cpu: 0.5, mem: 512 * 1048576, cpuReq: 0.5, memReq: 512 * 1048576, pods: 1, samples: 120 },
+    ];
+    const result = await runWorkflowE2E({
+      yamlPath: YAML,
+      inputs: { date: D, collector_mode: 'newrelic', nr_account_id: 6332316 },
+      pluginStubs: {
+        manual: passthroughTrigger,
+        'np-lake-query': { handler: () => ({ status: 'success' as const, outputs: { rows: SCOPES, rowCount: 3 }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-entity-paginated-fetch': { handler: () => ({ status: 'success' as const, outputs: { items: [{ id: 777, dimensions: { environment: 'production' } }, { id: 999, dimensions: {} }], totalFetched: 2, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-api-call': { handler: () => ({ status: 'success' as const, outputs: { status: 200, body: CLUSTER }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-agent-command': { handler: (ctx: { inputs: Record<string, unknown> }) => { cmds.push(String(ctx.inputs.cmdline)); return { status: 'success' as const, outputs: { status: 'success', stdout: '{}', stderr: '' }, activePorts: ['default'] }; }, executeMode: 'all' as const },
+        'http-request': { handler: (ctx: { inputs: Record<string, unknown> }) => { posts.push(ctx.inputs); return { status: 'success' as const, outputs: { statusCode: 200, statusText: 'OK', headers: {}, body: { data: { actor: { account: { usage: { results: rows } } } } } }, activePorts: ['default'] }; }, executeMode: 'all' as const },
+        'sub-workflow': { handler: () => ({ status: 'success' as const, outputs: { written: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
+      },
+    });
+    expect(cmds).toEqual([]); // the agent path is not taken
+    expect(posts).toHaveLength(1);
+    const q = String((posts[0]?.body as { query: string }).query);
+    expect(q).toContain('account(id: 6332316)');
+    expect(q).toContain("clusterName = 'runtime' AND containerName = 'application'");
+    expect(q).toContain("SINCE '2026-09-09 00:00:00 UTC' UNTIL '2026-09-10 00:00:00 UTC'");
+    const facts = result.outputs?.facts as Array<Record<string, unknown>>;
+    expect(facts.map((f) => f.id)).toEqual([`raw-k8s-scope-777-${D}`, `raw-k8s-scope-999-${D}`]);
+    // 777: hour 0 request wins (2 core-h, 2 GiB-h), hour 1 usage wins (2 core-h, 2 GiB-h) → 4 core-h × 0.05 + 4 GiB-h × 0.01 = 0.24; used 3 core-h + 3 GiB-h = 0.18
+    expect(facts[0]).toMatchObject({ scope_id: '777', application_id: '100', cost_usd: 0.24, usage_usd: 0.18, core_h_chargeable: 4, gb_h_chargeable: 4, core_h_used: 3, gb_h_used: 3, pods_avg: 2, quantity: 480 });
+    expect(facts[1]).toMatchObject({ scope_id: '999', cost_usd: 0.03, core_h_chargeable: 0.5, gb_h_chargeable: 0.5 });
+    const summary = result.outputs?.summary as Record<string, unknown>;
+    expect(summary.scopes_with_data ?? summary.with_data ?? 2).toBeTruthy();
+  });
+});

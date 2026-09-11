@@ -1,0 +1,699 @@
+{
+  "name": "Cost Daily",
+  "slug": "cost_daily",
+  "description": "One cost fact per subject and day. stage=raw from collectors (cloud billing, k8s), stage=allocated from the allocator. Every fact declares its allocation_method.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "id": {
+        "type": "string",
+        "primaryKey": true,
+        "autoGenerate": false,
+        "description": "<stage>-<subject_type>-<slug(subject_id)>-<date>; every part is also a field (logical id, not a UUID; no ':' or '/')"
+      },
+      "date": {
+        "type": "string",
+        "description": "Day, YYYY-MM-DD (UTC)",
+        "index": [
+          "filter"
+        ]
+      },
+      "stage": {
+        "type": "string",
+        "enum": [
+          "raw",
+          "allocated"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "subject_type": {
+        "type": "string",
+        "enum": [
+          "cloud_service",
+          "resource",
+          "cluster",
+          "scope",
+          "service",
+          "application",
+          "bucket",
+          "unallocated"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "subject_id": {
+        "type": "string"
+      },
+      "subject_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "nrn": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "application_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "application_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "namespace_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "namespace_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "account_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "environment": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "scope_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "scope_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "service_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "service_name": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cloud": {
+        "type": "string",
+        "enum": [
+          "aws",
+          "azure",
+          "gcp",
+          "other"
+        ]
+      },
+      "cloud_account": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "region": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cloud_service": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "usage_type": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "resource_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "resource_type": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cluster": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "component": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Cluster component for cluster breakdown buckets: nodes | control_plane | load_balancers | networking | storage | other"
+      },
+      "cost_usd": {
+        "type": "number",
+        "description": "Amortized cost (Savings Plans / RIs spread over covered usage) — the chargeback basis"
+      },
+      "unblended_usd": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Unblended cost as billed on the day (on-demand equivalents + SP/RI negations)"
+      },
+      "usage_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "waste_usd": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_req_core_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "cpu_used_core_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_req_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "mem_used_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "storage_gb": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "requests_total": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "quantity": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "units": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "cpu_capacity_core_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: reserved vCPU-hours of its nodes on the day"
+      },
+      "mem_capacity_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: reserved GiB-hours of its nodes on the day"
+      },
+      "cpu_share": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: share of cost_usd attributed to CPU when deriving rates (rest → memory)"
+      },
+      "rate_cpu_usd_core_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster blended rate: USD per vCPU-hour (÷1000 for millicore-hour)"
+      },
+      "rate_mem_usd_gb_h": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster blended rate: USD per GiB-hour"
+      },
+      "source": {
+        "type": "string",
+        "enum": [
+          "aws_ce",
+          "aws_cur",
+          "k8s",
+          "manual",
+          "finops_allocator"
+        ]
+      },
+      "allocation_method": {
+        "type": "string",
+        "enum": [
+          "by_metric",
+          "cluster_pending_consumption",
+          "cluster_split_cpu_mem",
+          "direct",
+          "direct_resource",
+          "direct_tag",
+          "kubernetes_overhead",
+          "map",
+          "rollup",
+          "rule",
+          "spread",
+          "service_owner",
+          "split",
+          "unallocated"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "rule_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "cost_mapping_rule that produced an allocated fact (or 'default:<name>')",
+        "index": [
+          "filter"
+        ]
+      },
+      "parent_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "index": [
+          "filter"
+        ]
+      },
+      "share": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Fraction (0..1) of the source fact allocated to this target"
+      },
+      "collected_at": {
+        "type": "string"
+      },
+      "collector": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "usage_hours": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Instance-hours summed into an aggregated bucket (e.g. ec2-instances-unattributed)"
+      },
+      "instances_seen": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "description": "How many of the aggregated instances still existed at collection time (the rest terminated during the day)"
+      },
+      "instance_types": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "Instance type → count for aggregated buckets (only for instances still present at collection)",
+        "additionalProperties": {
+          "type": "integer"
+        }
+      },
+      "day": {
+        "type": "string",
+        "description": "Same value as date; filterable copy (the catalog list API ignores a `date` query param)",
+        "index": [
+          "filter"
+        ]
+      },
+      "tags": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "Cloud tags of the subject (evidence for mapping rules)",
+        "additionalProperties": true
+      },
+      "host": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Primary endpoint/host of the subject (databases, caches) — evidence for mapping rules"
+      },
+      "category": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Cost category of an allocated fact: compute, kubernetes, database, storage, network, observability, messaging, security, cdn, other",
+        "index": [
+          "filter"
+        ]
+      },
+      "source_fact_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Raw fact an allocated fact was derived from"
+      },
+      "application_slug": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Application slug when the target was resolved by name"
+      },
+      "by_category": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "Rollup rows: category → USD",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "by_cloud_service": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "Rollup rows: cloud service → USD",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "metric": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Consumption metric attached to the fact (e.g. pi.db.load) whose shares split it under a by_metric rule"
+      },
+      "metric_shares": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "metric key (database name, log group, namespace…) → share 0..1 of the metric on the day",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "metric_key": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "For by_metric allocations: the metric key this portion corresponds to"
+      },
+      "cost_method": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "How the subject's cost_usd was derived by the collector: direct_tag (Cost Explorer by owner tag), unallocated (even split / fallback)"
+      },
+      "metric_owners": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "metric key → owner dims {application_id, namespace_id, scope_id, account_id, application_slug} when the collector knows the owner (k8s scopes by label)",
+        "additionalProperties": true
+      },
+      "core_h_chargeable": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: Σ hours max(usage, request) CPU cores"
+      },
+      "gb_h_chargeable": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: Σ hours max(usage, request) memory GiB"
+      },
+      "core_h_used": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: CPU core-hours used"
+      },
+      "gb_h_used": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: memory GiB-hours used"
+      },
+      "core_h_requested": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: CPU core-hours requested"
+      },
+      "gb_h_requested": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: memory GiB-hours requested"
+      },
+      "pods_avg": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: average pods over the day"
+      },
+      "k8s_overhead_usd": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: cost not covered by any scope (system namespaces, idle headroom)"
+      },
+      "scope_type": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null scope type (web_pool_k8s, custom, lambda, …) when known"
+      },
+      "dimensions": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "null dimensions of the scope/service the fact belongs to (e.g. {environment: production})",
+        "additionalProperties": true
+      },
+      "charge_type": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "scope",
+          "service",
+          "application",
+          null
+        ],
+        "description": "Invoice line type: through a null scope, a null service, or the application itself (unmapped resource attributed by rule)",
+        "index": [
+          "filter"
+        ]
+      },
+      "usage_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "scope_usage_daily row this k8s scope fact was priced from (usage-<scope_id>-<day>)"
+      },
+      "service_kind": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "null",
+          "cloud",
+          null
+        ],
+        "description": "service charges: null = a registered null service; cloud = a cloud resource acting as a service (database, cache) with no null service registered",
+        "index": [
+          "filter"
+        ]
+      },
+      "bucket": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "owner bucket when the cost goes to a shared pool instead of an application (e.g. shared-platform)",
+        "index": [
+          "filter"
+        ]
+      }
+    },
+    "required": [
+      "id",
+      "date",
+      "stage",
+      "subject_type",
+      "subject_id",
+      "cloud",
+      "cost_usd",
+      "source",
+      "allocation_method",
+      "collected_at"
+    ],
+    "additionalProperties": false,
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

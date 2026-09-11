@@ -1,0 +1,49 @@
+{
+  "finops_aws_billing_daily": {
+    "agent_tags": {
+      "stage": "sdlc"
+    },
+    "agent_nrn": "organization=1049493649:account=1041301647",
+    "org_nrn": "organization=1049493649"
+  },
+  "finops_aws_billing_dispatch": {
+    "targets": [
+      {
+        "name": "itti-tuti-development",
+        "agent_tags": {
+          "stage": "sdlc"
+        },
+        "agent_nrn": "organization=1049493649:account=1041301647",
+        "org_nrn": "organization=1049493649",
+        "region": "us-east-1",
+        "expected_account": "985539773184",
+        "dimensions": {
+          "environment": "development"
+        }
+      }
+    ],
+    "k8s_clusters": [
+      {
+        "cluster": "eks-1-tuti-null-use1-dev"
+      }
+    ],
+    "allocate_in_chain": false
+  },
+  "finops_suggest_mappings": {
+    "org_nrn": "organization=1049493649",
+    "account_id": "1041301647"
+  },
+  "finops_k8s_consumption_daily": {
+    "cluster": "eks-1-tuti-null-use1-dev",
+    "agent_tags": {
+      "stage": "sdlc"
+    },
+    "agent_nrn": "organization=1049493649:account=1041301647",
+    "collector_cmd": "nullplatform/platform-scopes-override/cost/collect_metrics --prom http://prometheus-server.default.svc.cluster.local",
+    "org_nrn": "organization=1049493649:account=1041301647",
+    "collector_mode": "newrelic"
+  },
+  "finops_allocate_daily": {
+    "org_nrn": "organization=1049493649"
+  }
+}

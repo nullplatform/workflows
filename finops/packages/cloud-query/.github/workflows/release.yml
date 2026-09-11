@@ -1,0 +1,57 @@
+name: release
+
+# Publish this scope package to nullplatform when you cut a GitHub Release.
+# `np package publish` builds + pushes the lean worker image tagged with the
+# release version (mise `publish:image`) and registers the scope type, actions,
+# channel, and the package revision pinning that image.
+#
+# Works out of the box: the image goes to this repo's GitHub Container Registry
+# (ghcr.io/<owner>/<repo>) using the built-in GITHUB_TOKEN — no extra secrets.
+# To push elsewhere, set the NP_PUSH_REGISTRY variable and REGISTRY_USERNAME /
+# REGISTRY_PASSWORD secrets.
+#
+# Configure: secret NULLPLATFORM_API_KEY, variable NP_NRN.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  NP_API_KEY: ${{ secrets.NULLPLATFORM_API_KEY }}
+  NP_PUSH_REGISTRY: ${{ vars.NP_PUSH_REGISTRY || format('ghcr.io/{0}', github.repository) }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # mise provides bun/oras and runs the package's own tasks.
+      - uses: jdx/mise-action@v2
+      # buildx + QEMU so publish:image can build the multi-arch (amd64+arm64) worker.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Install np CLI
+        run: |
+          curl https://cli.nullplatform.com/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Log in to the container registry
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          user="${REGISTRY_USERNAME:-$GHCR_USER}"
+          pass="${REGISTRY_PASSWORD:-$GHCR_TOKEN}"
+          echo "$pass" | docker login "${NP_PUSH_REGISTRY%%/*}" -u "$user" --password-stdin
+      # The release tag is the version: the worker image is pushed as
+      # registry/repo:<version> and the package revision is pinned to it.
+      - name: Publish package
+        env:
+          NP_VERSION: ${{ github.event.release.tag_name }}
+        run: np package publish --nrn "${{ vars.NP_NRN }}" --version "${NP_VERSION#v}"

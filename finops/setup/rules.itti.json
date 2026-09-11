@@ -1,0 +1,395 @@
+[
+  {
+    "id": "itti-cloudwatch-logs-by-log-group",
+    "name": "CloudWatch Logs ingestion/storage → application of the log group",
+    "enabled": true,
+    "status": "active",
+    "priority": 100,
+    "source": "seed",
+    "confidence": 0.95,
+    "description": "Log groups follow <namespace>.<application>[.http_agg|.sys_agg]; wf1 attaches IncomingBytes (ingestion) / storedBytes (storage) shares per group and the owner it resolved from the null applications (metric_owners). Groups nobody owns (/aws/eks/…, /aws/lambda/…, RDSOSMetrics) stay visibly unallocated with their metric_key.",
+    "scope": {
+      "cloud_service": {
+        "regex": "CloudWatch"
+      },
+      "usage_type": {
+        "regex": "DataProcessing-Bytes|VendedLog-Bytes|TimedStorage-ByteHrs"
+      }
+    },
+    "match": [
+      {
+        "field": "metric_shares",
+        "exists": true
+      }
+    ],
+    "method": "by_metric",
+    "category": "observability",
+    "target": {
+      "map": {
+        "key": "log_group",
+        "entries": {}
+      }
+    }
+  },
+  {
+    "id": "itti-cloudwatch-emf-metrics-by-app",
+    "name": "CloudWatch custom metrics (EMF) → application by *_agg log bytes",
+    "enabled": true,
+    "status": "active",
+    "priority": 110,
+    "source": "seed",
+    "confidence": 0.8,
+    "description": "MetricStorage:AWS/Logs-EMF is the custom metrics the platform derives from the <namespace>.<application>.http_agg / .sys_agg log groups; each application's share is its *_agg IncomingBytes. Metric stream usage (USE1-CW:MetricStreamUsage) is left to the platform spread until the stream's filter is confirmed to carry only application metrics — flip its usage_type into this rule's scope to attribute it the same way.",
+    "scope": {
+      "cloud_service": {
+        "regex": "CloudWatch"
+      },
+      "usage_type": {
+        "regex": "MetricMonitorUsage"
+      }
+    },
+    "match": [
+      {
+        "field": "metric",
+        "equals": "cloudwatch.EmfBytes"
+      }
+    ],
+    "method": "by_metric",
+    "category": "observability",
+    "target": {
+      "map": {
+        "key": "application",
+        "entries": {}
+      }
+    }
+  },
+  {
+    "id": "itti-security-compliance-platform-spread",
+    "name": "Security & compliance services → every application (platform cost)",
+    "enabled": true,
+    "status": "active",
+    "priority": 900,
+    "source": "seed",
+    "confidence": 1,
+    "description": "AWS Config, GuardDuty, KMS, Inspector, Secrets Manager, Macie: nobody owns them, every application of the account shares them in proportion to the cost it already carries.",
+    "scope": {
+      "cloud_service": {
+        "regex": "AWS Config|GuardDuty|Key Management|Inspector|Secrets Manager|Macie"
+      }
+    },
+    "method": "spread",
+    "category": "platform",
+    "target": {
+      "spread": {
+        "weights": "attributed"
+      }
+    }
+  },
+  {
+    "id": "itti-cloudwatch-remainder-platform-spread",
+    "name": "CloudWatch not attributable by log group → every application (platform cost)",
+    "enabled": true,
+    "status": "active",
+    "priority": 910,
+    "source": "seed",
+    "confidence": 1,
+    "description": "Metrics, alarms, dashboards and the log groups nobody owns. Log ingestion/storage buckets carry metric_shares by log group and are handled by the by_metric rule first (lower priority number wins).",
+    "scope": {
+      "cloud_service": {
+        "regex": "CloudWatch"
+      }
+    },
+    "method": "spread",
+    "category": "observability",
+    "target": {
+      "spread": {
+        "weights": "attributed"
+      }
+    }
+  },
+  {
+    "id": "itti-network-platform-spread",
+    "name": "VPC / networking → every application (platform cost)",
+    "enabled": true,
+    "status": "active",
+    "priority": 920,
+    "source": "seed",
+    "confidence": 1,
+    "description": "VPC endpoints, public IPs, NAT: shared network plumbing of the account.",
+    "scope": {
+      "cloud_service": {
+        "regex": "Virtual Private Cloud"
+      }
+    },
+    "method": "spread",
+    "category": "network",
+    "target": {
+      "spread": {
+        "weights": "attributed"
+      }
+    }
+  },
+  {
+    "id": "itti-aurora-sdlc-by-database-load",
+    "name": "Aurora sdlc-tuti by Performance Insights load per database",
+    "enabled": true,
+    "status": "active",
+    "priority": 90,
+    "source": "inferred",
+    "confidence": 0.95,
+    "description": "Each application's DB_HOST parameter points at this cluster and its DB_NAME says which database is its own; wf1 attaches the PI db.load share per database. rdsadmin (maintenance) → shared-platform.",
+    "scope": {
+      "cloud_service": "Amazon Relational Database Service"
+    },
+    "match": [
+      {
+        "field": "host",
+        "equals": "sdlc-tuti-aurora-pgsql-use1-cluster.cluster-chq6geios9rh.us-east-1.rds.amazonaws.com"
+      },
+      {
+        "field": "metric",
+        "equals": "pi.db.load"
+      }
+    ],
+    "method": "by_metric",
+    "category": "database",
+    "target": {
+      "map": {
+        "key": "db.name",
+        "entries": {
+          "conmebol_service_dev": {
+            "application_id": "1185887166",
+            "namespace_id": "221971421",
+            "application_slug": "conmebol-service"
+          },
+          "report_service_dev": {
+            "application_id": "2083727971",
+            "namespace_id": "221971421",
+            "application_slug": "report-service"
+          },
+          "access_ctrl_service_dev": {
+            "application_id": "1299653508",
+            "namespace_id": "221971421",
+            "application_slug": "access-ctrl-service"
+          },
+          "ticket_service_dev": {
+            "application_id": "1415257472",
+            "namespace_id": "221971421",
+            "application_slug": "ticket-service"
+          },
+          "pricing_service_dev": {
+            "application_id": "1390615930",
+            "namespace_id": "221971421",
+            "application_slug": "pricing-service"
+          },
+          "smart_pass_service_dev": {
+            "application_id": "778444005",
+            "namespace_id": "221971421",
+            "application_slug": "smart-pass-service"
+          },
+          "rdsadmin": {
+            "bucket": "shared-platform"
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "itti-docdb-dev-by-database-load",
+    "name": "DocumentDB dev-tuti by Performance Insights load per database",
+    "enabled": true,
+    "status": "active",
+    "priority": 90,
+    "source": "inferred",
+    "confidence": 0.9,
+    "description": "Every consumer has DBM_HOST = this cluster; database names follow <app>db (cartdb → cart-service). admin → shared-platform.",
+    "scope": {
+      "cloud_service": "Amazon DocumentDB (with MongoDB compatibility)"
+    },
+    "match": [
+      {
+        "field": "host",
+        "equals": "dev-tuti-null-docdb-main.cluster-chq6geios9rh.us-east-1.docdb.amazonaws.com"
+      },
+      {
+        "field": "metric",
+        "equals": "pi.db.load"
+      }
+    ],
+    "method": "by_metric",
+    "category": "database",
+    "target": {
+      "map": {
+        "key": "db.name",
+        "entries": {
+          "cartdb": {
+            "application_id": "1460411787",
+            "namespace_id": "221971421",
+            "application_slug": "cart-service"
+          },
+          "ticketdb": {
+            "application_id": "1415257472",
+            "namespace_id": "221971421",
+            "application_slug": "ticket-service"
+          },
+          "accountdb": {
+            "application_id": "1423449474",
+            "namespace_id": "221971421",
+            "application_slug": "account-service"
+          },
+          "catalogdb": {
+            "application_id": "1435770245",
+            "namespace_id": "221971421",
+            "application_slug": "catalog-service"
+          },
+          "paymentdb": {
+            "application_id": "54170274",
+            "namespace_id": "221971421",
+            "application_slug": "payment-service"
+          },
+          "financialdb": {
+            "application_id": "1452219785",
+            "namespace_id": "221971421",
+            "application_slug": "financial-service"
+          },
+          "accessctrldb": {
+            "application_id": "1299653508",
+            "namespace_id": "221971421",
+            "application_slug": "access-ctrl-service"
+          },
+          "notificationdb": {
+            "application_id": "1444027783",
+            "namespace_id": "221971421",
+            "application_slug": "notification-service"
+          },
+          "subscriptiondb": {
+            "application_id": "1883577842",
+            "namespace_id": "221971421",
+            "application_slug": "user-subscriptions-service"
+          },
+          "businessrulesdb": {
+            "application_id": "521168424",
+            "namespace_id": "221971421",
+            "application_slug": "business-rules-service"
+          },
+          "bulkoperationsdb": {
+            "application_id": "1444169832",
+            "namespace_id": "221971421",
+            "application_slug": "bulk-operations-service"
+          },
+          "admin": {
+            "bucket": "shared-platform"
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "itti-elasticache-dev-split-consumers",
+    "name": "ElastiCache dev-tuti split equally among its consumers (REDIS_HOST)",
+    "enabled": true,
+    "status": "active",
+    "priority": 95,
+    "source": "inferred",
+    "confidence": 0.7,
+    "description": "Applications whose REDIS_HOST parameter points at dev-tuti-null-elasticache-main; equal split until a per-client metric exists.",
+    "scope": {
+      "cloud_service": "Amazon ElastiCache"
+    },
+    "match": [],
+    "method": "split",
+    "category": "database",
+    "target": {
+      "split": [
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1444169832",
+            "namespace_id": "221971421",
+            "application_slug": "bulk-operations-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1299653508",
+            "namespace_id": "221971421",
+            "application_slug": "access-ctrl-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1450568",
+            "namespace_id": "221971421",
+            "application_slug": "render-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1472732558",
+            "namespace_id": "221971421",
+            "application_slug": "composite-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1460411787",
+            "namespace_id": "221971421",
+            "application_slug": "cart-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1452219785",
+            "namespace_id": "221971421",
+            "application_slug": "financial-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1431707012",
+            "namespace_id": "221971421",
+            "application_slug": "checkout-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1419320705",
+            "namespace_id": "221971421",
+            "application_slug": "partner-membership-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1415257472",
+            "namespace_id": "221971421",
+            "application_slug": "ticket-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1386487161",
+            "namespace_id": "221971421",
+            "application_slug": "bff-service"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "778444005",
+            "namespace_id": "221971421",
+            "application_slug": "smart-pass-service"
+          }
+        }
+      ]
+    }
+  }
+]
