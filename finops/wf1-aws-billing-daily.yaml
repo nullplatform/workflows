@@ -110,6 +110,13 @@ variables:
   # Cost allocation tag that names the owner of RDS resources (nullplatform: `application`).
   rds_owner_tag:
     initialValue: "application"
+  # Cloud services whose resources carry the null tags (Lambda functions today): their cost is
+  # grouped by the active cost allocation tags `scope` × `application` and mapped to the scope id
+  # through the resource tags (tagging API). One CE call per service (CE groups by 2 keys max).
+  tagged_services:
+    initialValue: ["AWS Lambda"]
+  tagged_resource_types:
+    initialValue: ["lambda:function"]
   # Share of the cluster cost attributed to CPU (the rest to memory) when
   # deriving the blended rates. 0.5 = Kubecost-style even split; tune per org.
   cpu_share:
@@ -193,6 +200,8 @@ steps:
       ec2_service: "${{ variables.ec2_service_name }}"
       rds_service: "${{ variables.rds_service_name }}"
       rds_owner_tag: "${{ variables.rds_owner_tag }}"
+      tagged_services: "${{ variables.tagged_services }}"
+      tagged_resource_types: "${{ variables.tagged_resource_types }}"
       role_arn: "${{ workflow.inputs.assume_role_arn }}"
       role_arn_default: "${{ variables.assume_role_arn }}"
       role_ext: "${{ workflow.inputs.assume_role_external_id }}"
@@ -236,6 +245,16 @@ steps:
           { id: "db_clusters", service: "rds", operation: "DescribeDBClusters", params: {} },
           { id: "db_instances", service: "rds", operation: "DescribeDBInstances", params: {} }
         ];
+        // Tagged services (Lambda…): cost by the null tags `scope` × `application`, plus the resources' full tag
+        // sets so the (application, scope) pair resolves to scope_id / application_id / namespace_id.
+        var tagged = Array.isArray(inputs.tagged_services) ? inputs.tagged_services.map(String).filter(Boolean) : [];
+        tagged.forEach(function (svc) {
+          calls.push({ id: "svc_by_tag_" + svc.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""), service: "ce", operation: "GetCostAndUsage",
+            params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost"], GroupBy: [{ Type: "TAG", Key: "scope" }, { Type: "TAG", Key: "application" }],
+                      Filter: { Dimensions: { Key: "SERVICE", Values: [svc] } } } });
+        });
+        var taggedTypes = Array.isArray(inputs.tagged_resource_types) ? inputs.tagged_resource_types.map(String).filter(Boolean) : [];
+        if (tagged.length && taggedTypes.length) calls.push({ id: "fn_tags", service: "tagging", operation: "GetResources", params: { ResourceTypeFilters: taggedTypes, ResourcesPerPage: 100 }, maxPages: 20 });
         var roleArn = String(inputs.role_arn || inputs.role_arn_default || "").trim();
         if (roleArn && !/^arn:aws:iam::\d{12}:role\/[\w+=,.@\/-]+$/.test(roleArn)) throw new Error("assume_role_arn is not an IAM role ARN: " + roleArn);
         var roleExt = String(inputs.role_ext || inputs.role_ext_default || "").trim();
@@ -361,6 +380,8 @@ steps:
       elb_service: "${{ variables.elb_service_name }}"
       rds_service: "${{ variables.rds_service_name }}"
       rds_owner_tag: "${{ variables.rds_owner_tag }}"
+      tagged_services: "${{ variables.tagged_services }}"
+      tagged_resource_types: "${{ variables.tagged_resource_types }}"
       cpu_share: "${{ variables.cpu_share }}"
       collector: "${{ variables.collector }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
@@ -623,6 +644,25 @@ steps:
             if (tot > 0) { Object.keys(shares).forEach(function (k) { shares[k] = num(shares[k] / tot); }); f.metric = "pi.db.load"; f.metric_shares = shares; }
           }
           facts.push(f);
+        });
+        // §7 Tagged services (Lambda functions today): CE by (scope, application) tag → the resource tags give the
+        // null ids → one scope row per (service, scope). Untagged usage stays in the service remainder (unallocated).
+        var fnDims = {};
+        (((r.fn_tags || {}).ResourceTagMappingList) || []).forEach(function (m) { var dm = npDims(tagMap(m.Tags)); if (dm.scope_id && dm.application_name && dm.scope_name) fnDims[dm.application_name + "|" + dm.scope_name] = dm; });
+        (Array.isArray(inputs.tagged_services) ? inputs.tagged_services.map(String) : []).forEach(function (svc) {
+          var res = r["svc_by_tag_" + svc.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")] || {};
+          var perScope = {};
+          (res.ResultsByTime || []).forEach(function (rt) { (rt.Groups || []).forEach(function (g) {
+            var sc = String((g.Keys || [])[0] || "").replace(/^scope\$/, ""); var ap = String((g.Keys || [])[1] || "").replace(/^application\$/, ""); var c = amort(g);
+            if (!(c > 0) || !sc || !ap) return; var dm = fnDims[ap + "|" + sc]; if (!dm) return;
+            var acc = perScope[dm.scope_id] || (perScope[dm.scope_id] = { dims: dm, sc: sc, ap: ap, cost: 0, unbl: 0 }); acc.cost += c; acc.unbl += unbl(g);
+          }); });
+          Object.keys(perScope).forEach(function (sid) {
+            var e = perScope[sid]; var f = base("raw", "scope", sid); f.allocation_method = "direct_tag";
+            Object.keys(e.dims).forEach(function (k) { f[k] = e.dims[k]; });
+            f.cloud_service = svc; f.subject_name = e.ap + "." + e.sc; f.tags = { scope: e.sc, application: e.ap }; f.cost_usd = num(e.cost); f.unblended_usd = num(e.unbl);
+            facts.push(f);
+          });
         });
         var total = num(Object.keys(svcTotal).reduce(function (a, k) { return a + svcTotal[k]; }, 0));
         var count = function (t) { return facts.filter(function (f) { return f.subject_type === t; }).length; };

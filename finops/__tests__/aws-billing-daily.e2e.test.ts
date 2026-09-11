@@ -191,7 +191,7 @@ describe('finops/wf1-aws-billing-daily', () => {
     // two cloud-query rounds: the day's calls, then the instance types seen
     expect(queries.map((q) => q.__step)).toEqual(['query', 'query_types']);
     const calls = queries[0]?.calls as Array<{ id: string; params?: { TimePeriod?: { Start: string; End: string } } }>;
-    expect(calls.map((c) => c.id)).toEqual(['identity', 'by_service', 'by_usage_type', 'ec2_by_resource', 'rds_by_tag', 'instances', 'volumes', 'tagged', 'lbs', 'db_clusters', 'db_instances']);
+    expect(calls.map((c) => c.id)).toEqual(['identity', 'by_service', 'by_usage_type', 'ec2_by_resource', 'rds_by_tag', 'instances', 'volumes', 'tagged', 'lbs', 'db_clusters', 'db_instances', 'svc_by_tag_aws-lambda', 'fn_tags']);
     expect(calls[3]?.params?.GroupBy).toEqual([{ Type: 'DIMENSION', Key: 'RESOURCE_ID' }, { Type: 'DIMENSION', Key: 'INSTANCE_TYPE' }]);
     expect(calls[4]?.params?.GroupBy).toEqual([{ Type: 'TAG', Key: 'application' }, { Type: 'DIMENSION', Key: 'USAGE_TYPE' }]);
     expect(calls[1]?.params?.TimePeriod).toEqual({ Start: '2026-09-09', End: '2026-09-10' });
