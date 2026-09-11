@@ -575,6 +575,22 @@
         ],
         "description": "null dimensions of the scope/service the fact belongs to (e.g. {environment: production})",
         "additionalProperties": true
+      },
+      "charge_type": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "scope",
+          "service",
+          "application",
+          null
+        ],
+        "description": "Invoice line type: through a null scope, a null service, or the application itself (unmapped resource attributed by rule)",
+        "index": [
+          "filter"
+        ]
       }
     },
     "required": [
