@@ -1,7 +1,7 @@
 {
   "slug": "cost_mapping_suggestion",
   "name": "Cost Mapping Suggestion",
-  "description": "A rule the inference workflow proposes from evidence (null tags/services, application parameters, naming conventions). Same shape as cost_mapping_rule plus evidence and the unallocated cost it would recover. A human accepts it (copies it into cost_mapping_rule with status=active) or rejects it.",
+  "description": "A rule proposed by the inference workflow from evidence (null services, application parameters, naming). A human accepts it into cost_mapping_rule or rejects it.",
   "schema": {
     "type": "object",
     "required": [
@@ -108,7 +108,7 @@
           ],
           "principals": [
             {
-              "id": 732189543,
+              "id": 26,
               "type": "user"
             }
           ]
@@ -133,7 +133,7 @@
           ],
           "principals": [
             {
-              "id": 732189543,
+              "id": 26,
               "type": "user"
             }
           ]

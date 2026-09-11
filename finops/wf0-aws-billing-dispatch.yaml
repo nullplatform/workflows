@@ -1,6 +1,7 @@
 # finops/wf0-aws-billing-dispatch.yaml
 #
-# Multi-account dispatcher: one `target` per AWS account to collect, each with
+# Daily loop: collect (wf1 per target) → allocate (wf2, rules) → suggest (evidence for the
+# rest). Multi-account dispatcher: one `target` per AWS account to collect, each with
 # ITS OWN agent (tags), role (AssumeRole ARN + ExternalId) and region. Fans out
 # `wf1-aws-billing-daily` once per target and summarizes. The association of
 # facts → account is NOT taken from this config: every fact carries
@@ -36,7 +37,11 @@ inputs:
   dry_run:
     type: boolean
     required: false
-    description: "Build facts without writing"
+    description: "Build facts without writing (collection, allocation and suggestions)"
+  allocate:
+    type: boolean
+    required: false
+    description: "Run the allocator + suggestions after collection (default true)"
 
 variables:
   targets:
@@ -54,6 +59,7 @@ steps:
         targets: { type: array, required: false, description: "Targets override" }
         callback_base_url: { type: string, required: false, description: "Engine URL for the worker callback" }
         dry_run: { type: boolean, required: false, description: "Build facts without writing" }
+        allocate: { type: boolean, required: false, description: "Run allocator + suggestions after collection (default true)" }
 
   - id: daily_cron
     type: trigger
@@ -74,6 +80,7 @@ steps:
       date: "${{ workflow.inputs.date }}"
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
+      allocate: "${{ workflow.inputs.allocate }}"
     config:
       language: javascript
       code: |
@@ -90,7 +97,10 @@ steps:
                    package_version: t.package_version || null, region: t.region || null, expected_account: t.expected_account ? String(t.expected_account) : null,
                    date: inputs.date || null, callback_base_url: inputs.callback_base_url || null, dry_run: !!inputs.dry_run };
         });
-        return { runs: runs, count: runs.length };
+        function iso(dt) { return dt.toISOString().slice(0, 10); }
+        var day = inputs.date && /^\d{4}-\d{2}-\d{2}$/.test(String(inputs.date)) ? String(inputs.date) : iso(new Date(Date.now() - 86400000));
+        var doAlloc = inputs.allocate === undefined || inputs.allocate === null || inputs.allocate === "" ? true : !!inputs.allocate;
+        return { runs: runs, count: runs.length, day: day, allocate: doAlloc ? [{ date: day, dry_run: !!inputs.dry_run }] : [] };
 
   - id: collect
     type: module
@@ -130,11 +140,76 @@ steps:
         var total = accounts.reduce(function (a, x) { return a + (Number(x.daily_total_usd) || 0); }, 0);
         return { targets: runs.length, accounts: accounts, total_usd: Math.round(total * 1e6) / 1e6 };
 
+  # ── allocate the day (rules → allocated facts + rollup per application). One item, or none when allocate=false.
+  - id: allocate
+    type: module
+    plugin_type: sub-workflow
+    name: "Allocate the day (wf2)"
+    forEach:
+      expression: "${{ steps.prep.outputs.allocate }}"
+      itemVariable: run
+      spreadItem: true
+    config:
+      # Definition id of finops/wf2-allocate-daily.yaml (patched at publish time).
+      workflowId: FINOPS_ALLOCATE_DAILY_ID
+      alias: live
+      waitForCompletion: true
+
+  - id: suggest_prep
+    type: module
+    plugin_type: code-exec
+    name: "Unallocated leaves → suggestion run"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+      results: "${{ steps.allocate.outputs.items }}"
+    config:
+      language: javascript
+      code: |
+        var r = (inputs.results || [])[0] || {}; var o = r.outputs || r || {};
+        var leaves = o.unallocated_leaves || [];
+        var summary = o.summary || null;
+        return { allocation: summary, runs: leaves.length ? [{ date: String(inputs.day), unallocated_leaves: leaves, dry_run: !!inputs.dry_run }] : [] };
+
+  - id: suggest
+    type: module
+    plugin_type: sub-workflow
+    name: "Suggest mapping rules (evidence)"
+    forEach:
+      expression: "${{ steps.suggest_prep.outputs.runs }}"
+      itemVariable: run
+      spreadItem: true
+    config:
+      # Definition id of finops/wf-suggest-mappings.yaml (patched at publish time).
+      workflowId: FINOPS_SUGGEST_MAPPINGS_ID
+      alias: live
+      waitForCompletion: true
+
+  - id: final
+    type: module
+    plugin_type: code-exec
+    name: "Daily summary"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      collection: "${{ steps.summary.outputs }}"
+      allocation: "${{ steps.suggest_prep.outputs.allocation }}"
+      suggestions: "${{ steps.suggest.outputs.items }}"
+    config:
+      language: javascript
+      code: |
+        var sg = (inputs.suggestions || [])[0] || {}; var so = sg.outputs || sg || {};
+        return { collection: inputs.collection || null, allocation: inputs.allocation || null, suggestions: so.summary || null };
+
 connections:
   - { from: start, to: prep }
   - { from: daily_cron, to: prep }
   - { from: prep, to: collect }
   - { from: collect, to: summary }
+  - { from: summary, to: allocate }
+  - { from: allocate, to: suggest_prep }
+  - { from: suggest_prep, to: suggest }
+  - { from: suggest, to: final }
 
 outputs:
-  summary: "${{ steps.summary.outputs }}"
+  summary: "${{ steps.final.outputs }}"

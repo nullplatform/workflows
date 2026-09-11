@@ -31,6 +31,8 @@ const TARGETS = [
 describe('finops/wf0-aws-billing-dispatch', () => {
   it('fans out one collector run per target with its agent, role and version, and summarizes per account', async () => {
     const runs: Array<Record<string, unknown>> = [];
+    const allocations: Array<Record<string, unknown>> = [];
+    const suggestions: Array<Record<string, unknown>> = [];
     const result = await runWorkflowE2E({
       yamlPath: YAML,
       inputs: { date: '2026-09-09', targets: TARGETS, dry_run: true },
@@ -38,7 +40,15 @@ describe('finops/wf0-aws-billing-dispatch', () => {
         manual: passthroughTrigger,
         cron: passthroughTrigger,
         'sub-workflow': {
-          handler: (ctx: { inputs: Record<string, unknown> }) => {
+          handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
+            if (ctx.stepId === 'allocate') {
+              allocations.push(ctx.inputs);
+              return { status: 'success' as const, outputs: { summary: { day: '2026-09-09', total_usd: 42.816, allocated_usd: 30, unallocated_usd: 12.816 }, unallocated_leaves: [{ id: 'raw-x', cost_usd: 12.816 }] }, activePorts: ['default'] };
+            }
+            if (ctx.stepId === 'suggest') {
+              suggestions.push(ctx.inputs);
+              return { status: 'success' as const, outputs: { summary: { suggestions: 1, recovers_usd: 12.816 } }, activePorts: ['default'] };
+            }
             runs.push(ctx.inputs);
             const acct = ctx.inputs.target_name === 'prod' ? '111122223333' : '444455556666';
             return {
@@ -70,10 +80,18 @@ describe('finops/wf0-aws-billing-dispatch', () => {
     expect(runs[1]?.assume_role_arn ?? null).toBeNull();
     expect(runs[1]?.agent_nrn ?? null).toBeNull();
 
-    const summary = result.outputs?.summary as { targets: number; total_usd: number; accounts: Array<Record<string, unknown>> };
+    const out = result.outputs?.summary as { collection: { targets: number; total_usd: number; accounts: Array<Record<string, unknown>> }; allocation: Record<string, unknown>; suggestions: Record<string, unknown> };
+    const summary = out.collection;
     expect(summary.targets).toBe(2);
     expect(summary.total_usd).toBeCloseTo(42.816, 6);
     expect(summary.accounts.map((a) => [a.target, a.account])).toEqual([['prod', '111122223333'], ['dev', '444455556666']]);
+    // collection → allocation (same day, same dry_run) → suggestions fed with the unallocated leaves
+    expect(allocations).toHaveLength(1);
+    expect(allocations[0]).toMatchObject({ date: '2026-09-09', dry_run: true }); // spreadItem also passes `index`/`run`, ignored by the child
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0]).toMatchObject({ date: '2026-09-09', dry_run: true, unallocated_leaves: [{ id: 'raw-x', cost_usd: 12.816 }] });
+    expect(out.allocation).toMatchObject({ allocated_usd: 30, unallocated_usd: 12.816 });
+    expect(out.suggestions).toMatchObject({ suggestions: 1 });
   });
 
   it('refuses to run without targets or with a target lacking agent_tags', async () => {

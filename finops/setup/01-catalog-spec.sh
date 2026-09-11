@@ -36,6 +36,15 @@ EOF
 )
 [[ -n "$ORG_ID" ]] || ORG_ID=1255165411
 echo "organization: $ORG_ID"
+TOKEN_USER_ID=$(python3 - "$NP_TOKEN" <<'PY'
+import base64, json, sys, re
+p = sys.argv[1].split('.')[1]; p += '=' * (-len(p) % 4)
+g = json.loads(base64.urlsafe_b64decode(p)).get('cognito:groups', [])
+m = [re.sub(r'.*user=', '', x) for x in g if 'user=' in x]
+print(m[0] if m else 0)
+PY
+)
+echo "admin user for grants: ${ADMIN_USER_ID:-$TOKEN_USER_ID}"
 
 api() { # method path [body-file]
   local m="$1" p="$2" b="${3:-}"
@@ -50,7 +59,10 @@ api() { # method path [body-file]
 for slug in cost_daily cost_mapping_rule cost_mapping_suggestion; do
   f="$SPECS_DIR/$slug.spec.json"
   body=$(mktemp)
-  jq --arg nrn "organization=$ORG_ID" '. + {nrn: $nrn}' "$f" > "$body"
+  # Spec grants must name a user of THIS org: rewrite the admin principal in the JSON
+  # (732189543 is the placeholder) to ADMIN_USER_ID, default = the user of the token.
+  jq --arg nrn "organization=$ORG_ID" --argjson admin "${ADMIN_USER_ID:-$TOKEN_USER_ID}" \
+     '. + {nrn: $nrn} | (.. | objects | select(.type? == "user" and .id? == 732189543) | .id) |= $admin' "$f" > "$body"
 
   out=$(api POST "/catalog/specifications" "$body")
   st=$(tail -n1 <<<"$out"); res=$(sed '$d' <<<"$out")
@@ -61,7 +73,7 @@ for slug in cost_daily cost_mapping_rule cost_mapping_suggestion; do
       | jq -r --arg s "$slug" '[.. | objects | select(.slug? == $s)] | .[0].id // empty')
     [[ -n "$sid" ]] || { echo "FAILED: $slug exists but id not resolvable: $res"; exit 1; }
     # NOTA: el PATCH rechaza la key `relations` dentro de schema (400) — se quita
-    patch=$(mktemp); jq '{schema: (.schema | del(.relations)), description: .description, name: .name}' "$f" > "$patch"
+    patch=$(mktemp); jq '{schema: (.schema | del(.relations)), description: .description, name: .name}' "$body" > "$patch"
     out=$(api PATCH "/catalog/specifications/$sid" "$patch")
     st=$(tail -n1 <<<"$out")
     [[ "$st" =~ ^2 ]] && echo "updated $slug ($sid)" || { echo "FAILED patch $slug ($st): $(sed '$d' <<<"$out")"; exit 1; }

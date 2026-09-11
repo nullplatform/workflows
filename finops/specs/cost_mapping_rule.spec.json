@@ -1,7 +1,7 @@
 {
   "slug": "cost_mapping_rule",
   "name": "Cost Mapping Rule",
-  "description": "One rule that maps cloud cost to a null owner (application/scope/service/namespace), a cluster or a shared bucket. Evaluated by the allocator per raw fact: enabled+active rules by ascending priority, first match wins. See finops/docs/mapping-rules-design.md.",
+  "description": "Maps cloud cost to a null owner (application/scope/service), a cluster or a shared bucket. The allocator evaluates active rules by priority per raw fact; first match wins. See docs/mapping-rules-design.md.",
   "schema": {
     "type": "object",
     "required": [
@@ -128,7 +128,7 @@
           ],
           "principals": [
             {
-              "id": 732189543,
+              "id": 26,
               "type": "user"
             }
           ]
@@ -153,7 +153,7 @@
           ],
           "principals": [
             {
-              "id": 732189543,
+              "id": 26,
               "type": "user"
             }
           ]

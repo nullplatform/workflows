@@ -330,7 +330,10 @@
         ]
       },
       "rule_id": {
-        "type": "string",
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "cost_mapping_rule that produced an allocated fact (or 'default:<name>')",
         "index": [
           "filter"
@@ -346,7 +349,10 @@
         ]
       },
       "share": {
-        "type": "number",
+        "type": [
+          "number",
+          "null"
+        ],
         "description": "Fraction (0..1) of the source fact allocated to this target"
       },
       "collected_at": {
@@ -359,15 +365,24 @@
         ]
       },
       "usage_hours": {
-        "type": "number",
+        "type": [
+          "number",
+          "null"
+        ],
         "description": "Instance-hours summed into an aggregated bucket (e.g. ec2-instances-unattributed)"
       },
       "instances_seen": {
-        "type": "integer",
+        "type": [
+          "integer",
+          "null"
+        ],
         "description": "How many of the aggregated instances still existed at collection time (the rest terminated during the day)"
       },
       "instance_types": {
-        "type": "object",
+        "type": [
+          "object",
+          "null"
+        ],
         "description": "Instance type \u2192 count for aggregated buckets (only for instances still present at collection)",
         "additionalProperties": {
           "type": "integer"
@@ -381,38 +396,59 @@
         ]
       },
       "tags": {
-        "type": "object",
+        "type": [
+          "object",
+          "null"
+        ],
         "description": "Cloud tags of the subject (evidence for mapping rules)",
         "additionalProperties": true
       },
       "host": {
-        "type": "string",
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Primary endpoint/host of the subject (databases, caches) \u2014 evidence for mapping rules"
       },
       "category": {
-        "type": "string",
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Cost category of an allocated fact: compute, kubernetes, database, storage, network, observability, messaging, security, cdn, other",
         "index": [
           "filter"
         ]
       },
       "source_fact_id": {
-        "type": "string",
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Raw fact an allocated fact was derived from"
       },
       "application_slug": {
-        "type": "string",
+        "type": [
+          "string",
+          "null"
+        ],
         "description": "Application slug when the target was resolved by name"
       },
       "by_category": {
-        "type": "object",
+        "type": [
+          "object",
+          "null"
+        ],
         "description": "Rollup rows: category \u2192 USD",
         "additionalProperties": {
           "type": "number"
         }
       },
       "by_cloud_service": {
-        "type": "object",
+        "type": [
+          "object",
+          "null"
+        ],
         "description": "Rollup rows: cloud service \u2192 USD",
         "additionalProperties": {
           "type": "number"
