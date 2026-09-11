@@ -37,7 +37,8 @@
           "scope",
           "service",
           "application",
-          "bucket"
+          "bucket",
+          "unallocated"
         ],
         "index": [
           "filter"
@@ -312,7 +313,8 @@
           "aws_ce",
           "aws_cur",
           "k8s",
-          "manual"
+          "manual",
+          "finops_allocator"
         ]
       },
       "allocation_method": {
@@ -323,6 +325,12 @@
           "cluster_split_cpu_mem",
           "service_owner",
           "rule",
+          "direct",
+          "split",
+          "map",
+          "by_metric",
+          "rollup",
+          "cluster_pending_consumption",
           "unallocated"
         ],
         "index": [
