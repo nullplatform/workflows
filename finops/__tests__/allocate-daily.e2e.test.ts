@@ -119,16 +119,16 @@ describe('finops/wf2-allocate-daily', () => {
     expect(byId[`alloc-service-shared-db-${D}-app-100`]).toMatchObject({ application_id: '100', cost_usd: 6, share: 0.75, allocation_method: 'split', rule_id: 'shared-db-by-database' });
     expect(byId[`alloc-service-shared-db-${D}-app-200`]).toMatchObject({ application_id: '200', cost_usd: 2, share: 0.25 });
     // by_metric: Performance Insights shares → owners; the share nobody owns stays visibly unallocated
-    expect(byId[`alloc-service-metrics-db-${D}-app-100`]).toMatchObject({ application_id: '100', cost_usd: 6, share: 0.6, allocation_method: 'by_metric', rule_id: 'metrics-db-by-load' });
-    expect(byId[`alloc-service-metrics-db-${D}-app-300`]).toMatchObject({ application_id: '300', cost_usd: 3, share: 0.3 });
+    expect(byId[`alloc-service-metrics-db-${D}-app-100-orders`]).toMatchObject({ application_id: '100', cost_usd: 6, share: 0.6, allocation_method: 'by_metric', rule_id: 'metrics-db-by-load' });
+    expect(byId[`alloc-service-metrics-db-${D}-app-300-ledger`]).toMatchObject({ application_id: '300', cost_usd: 3, share: 0.3 });
     expect(byId[`alloc-service-metrics-db-${D}-scratch-unallocated`]).toMatchObject({ cost_usd: 1, share: 0.1, allocation_method: 'unallocated', metric_key: 'scratch', rule_id: 'metrics-db-by-load' });
     // regex capture → application_slug
     expect(byId[`alloc-resource-loggroup-catalog-entities-api-${D}-app-entities-api`]).toMatchObject({ application_slug: 'entities-api', cost_usd: 1.5, rule_id: 'log-groups-by-name', category: 'observability' });
     // cluster components split by the consumption metric on the cluster row; the uncovered share is k8s overhead
-    expect(byId[`alloc-bucket-runtime-nodes-${D}-app-100`]).toMatchObject({ application_id: '100', scope_id: '777', cost_usd: 2.5, share: 0.5, allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', category: 'kubernetes' });
-    expect(byId[`alloc-bucket-runtime-nodes-${D}-app-400`]).toMatchObject({ application_id: '400', cost_usd: 1.25 });
-    expect(byId[`alloc-bucket-runtime-nodes-${D}-cluster-runtime`]).toMatchObject({ cluster: 'runtime', cost_usd: 1.25, share: 0.25, allocation_method: 'kubernetes_overhead' });
-    expect(byId[`alloc-bucket-runtime-networking-${D}-app-100`]).toMatchObject({ cost_usd: 1.5, category: 'kubernetes' });
+    expect(byId[`alloc-bucket-runtime-nodes-${D}-app-100-777`]).toMatchObject({ application_id: '100', scope_id: '777', cost_usd: 2.5, share: 0.5, allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', category: 'kubernetes' });
+    expect(byId[`alloc-bucket-runtime-nodes-${D}-app-400-999`]).toMatchObject({ application_id: '400', cost_usd: 1.25 });
+    expect(byId[`alloc-bucket-runtime-nodes-${D}-cluster-runtime-kubernetes-overhead`]).toMatchObject({ cluster: 'runtime', cost_usd: 1.25, share: 0.25, allocation_method: 'kubernetes_overhead' });
+    expect(byId[`alloc-bucket-runtime-networking-${D}-app-100-777`]).toMatchObject({ cost_usd: 1.5, category: 'kubernetes' });
     // security → shared bucket with the rule's category
     expect(byId[`alloc-cloud_service-guardduty-${D}-remainder-bucket-shared-platform`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1, category: 'security', rule_id: 'security-is-platform' });
     // what nobody claims

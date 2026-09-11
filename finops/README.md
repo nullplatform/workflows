@@ -201,6 +201,13 @@ several hundred scopes will need `allocate` to write in chunks instead of return
 The summary reports `cluster_pending_usd` (clusters without consumption shares yet) separately
 from `kubernetes_overhead_usd` (what no scope covered once the shares exist).
 
+Allocated ids are `alloc-<raw id>-<owner>` plus the metric key for `by_metric` rows
+(`…-app-<id>-<scope id>` / `…-app-<id>-<db name>`), so an application with several scopes on the
+same cluster component gets one row per scope (they used to collide and the upsert kept one).
+After the writes, a **stale sweep** (`read_allocated → stale → delete_stale`) deletes the day's
+`allocated` rows this run did not produce (older allocator revisions, rules that stopped matching),
+so re-allocating a day never double counts in the lake; `summary.stale_deleted` says how many.
+
 ## Deploying to an organization (done for nullplatform, org 4, 2026-09-11)
 
 Everything is per organization; nothing is registered on the platform as a package.

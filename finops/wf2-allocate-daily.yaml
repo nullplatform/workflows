@@ -90,7 +90,7 @@ steps:
         // cloud_service, cluster, …); `day` was added later and `date` is ignored → read all raw rows and
         // filter by day here. TODO: switch to the lake (customers_lake.catalog_entities) once volume grows.
         var org = String(inputs.org_nrn || "");
-        return { day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, rule_filters: { status: "active" }, scope_filters: { nrn: org, status: "active" }, service_query: { nrn: org, show_descendants: "true", limit: "500" } };
+        return { day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, allocated_filters: { stage: "allocated" }, rule_filters: { status: "active" }, scope_filters: { nrn: org, status: "active" }, service_query: { nrn: org, show_descendants: "true", limit: "500" } };
 
   - id: read_raw
     type: module
@@ -308,7 +308,7 @@ steps:
             }
             var o = p.owner; var key = ownerKey(o);
             var method = hit.rule.cluster_pending ? "cluster_pending_consumption" : p.overhead ? "kubernetes_overhead" : (hit.rule.method === "by_metric_parent" ? "by_metric" : (hit.rule.method || (hit.rule.target && hit.rule.target.split ? "split" : hit.rule.target && hit.rule.target.map ? "map" : "direct")));
-            var a = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(key), cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), category: rcat });
+            var a = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(key) + (p.key ? "-" + slug(p.key) : ""), cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), category: rcat });
             OWNER.forEach(function (k) { if (o[k] !== undefined) a[k] = o[k]; });
             allocated.push(a); sumAlloc += amt;
             if (o.cluster && !o.application_id) { var pc = p.overhead ? overhead : perCluster; pc[o.cluster] = num((pc[o.cluster] || 0) + amt); return; }
@@ -347,7 +347,8 @@ steps:
           if (a.metric_key && a.allocation_method === "unallocated") unLeaves.push({ id: a.source_fact_id + "#" + a.metric_key, cloud_service: a.cloud_service, subject_type: a.subject_type, subject_id: a.subject_id, resource_type: a.resource_type || null, host: byId[a.source_fact_id] ? (byId[a.source_fact_id].host || null) : null, tags: null, cost_usd: a.cost_usd, kind: "metric_key", metric_key: a.metric_key, rule_id: a.rule_id });
         });
         unLeaves.sort(function (x, y) { return y.cost_usd - x.cost_usd; });
-        return { day: d, facts: allocated, count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0) - Object.keys(overhead).reduce(function (s, k) { return s + overhead[k]; }, 0)),
+        var seen = {}; allocated.forEach(function (a) { if (seen[a.id]) throw new Error("duplicate allocated id " + a.id); seen[a.id] = true; });
+        return { day: d, facts: allocated, ids: Object.keys(seen), count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0) - Object.keys(overhead).reduce(function (s, k) { return s + overhead[k]; }, 0)),
                  cluster_pending_usd: perCluster, kubernetes_overhead_usd: overhead, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
                  unallocated_leaves: unLeaves.slice(0, 200) };
 
@@ -444,6 +445,54 @@ steps:
       alias: live
       waitForCompletion: true
 
+  # ── stale sweep: re-allocating a day must not leave rows from a previous allocation behind.
+  - id: read_allocated
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "Allocated rows already in the catalog"
+    inputs:
+      filters: "${{ steps.prep.outputs.allocated_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "catalog/instances/cost_daily"
+      filters: { stage: "allocated" }
+      limit: 100
+      maxPages: 500
+
+  - id: stale
+    type: module
+    plugin_type: code-exec
+    name: "Rows of the day this run did not produce"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      ids: "${{ steps.allocate.outputs.ids }}"
+      existing: "${{ steps.read_allocated.outputs.items }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day); var mine = {}; (inputs.ids || []).forEach(function (id) { mine[id] = true; });
+        var stale = (inputs.existing || []).filter(function (r) { return r && r.stage === "allocated" && (r.day === d || r.date === d) && !mine[r.id]; });
+        var usd = Math.round(stale.reduce(function (s, r) { return s + (Number(r.cost_usd) || 0); }, 0) * 1e6) / 1e6;
+        return { count: stale.length, stale_usd: usd, ids: stale.map(function (r) { return r.id; }).slice(0, 50),
+                 list: inputs.dry_run ? [] : stale.map(function (r) { return { path: "/catalog/instances/cost_daily/" + encodeURIComponent(r.id) }; }) };
+
+  - id: delete_stale
+    type: module
+    plugin_type: np-api-call
+    name: "Delete stale allocated rows (fan-out)"
+    forEach:
+      expression: "${{ steps.stale.outputs.list }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: DELETE
+      path: "/catalog/instances/cost_daily/placeholder"
+
   - id: summary
     type: module
     plugin_type: code-exec
@@ -453,11 +502,12 @@ steps:
       summary: "${{ steps.allocate.outputs.summary }}"
       results: "${{ steps.write_facts.outputs.items }}"
       invoices: "${{ steps.write_invoices.outputs.items }}"
+      stale: "${{ steps.stale.outputs }}"
       invoice_count: "${{ steps.invoices.outputs.count }}"
     config:
       language: javascript
       code: |
-        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0; s.invoices_written = s.dry_run ? 0 : (inputs.invoices || []).length; s.written = s.dry_run ? 0 : (inputs.results || []).length + s.invoices_written; return s;
+        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0; s.invoices_written = s.dry_run ? 0 : (inputs.invoices || []).length; s.written = s.dry_run ? 0 : (inputs.results || []).length + s.invoices_written; s.stale_rows = (inputs.stale || {}).count || 0; s.stale_usd = (inputs.stale || {}).stale_usd || 0; s.stale_deleted = s.dry_run ? 0 : s.stale_rows; return s;
 
 connections:
   - { from: start, to: prep }
@@ -474,7 +524,10 @@ connections:
   - { from: allocate, to: invoices }
   - { from: invoices, to: invoice_gate }
   - { from: invoice_gate, to: write_invoices }
-  - { from: write_facts, to: summary }
+  - { from: write_facts, to: read_allocated }
+  - { from: read_allocated, to: stale }
+  - { from: stale, to: delete_stale }
+  - { from: delete_stale, to: summary }
   - { from: write_invoices, to: summary }
 
 outputs:
