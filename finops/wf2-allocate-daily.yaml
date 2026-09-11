@@ -285,7 +285,7 @@ steps:
         }
 
         // ── 3) allocated facts
-        var allocated = []; var perApp = {}; var unalloc = {}; var perCluster = {}; var sumLeaves = 0, sumAlloc = 0;
+        var allocated = []; var perApp = {}; var unalloc = {}; var perCluster = {}; var overhead = {}; var sumLeaves = 0, sumAlloc = 0;
         function ownerKey(o) { return o.application_id ? "app-" + o.application_id : o.scope_id ? "scope-" + o.scope_id : o.service_id ? "svc-" + o.service_id : o.namespace_id ? "ns-" + o.namespace_id : o.cluster ? "cluster-" + o.cluster : o.bucket ? "bucket-" + o.bucket : o.application_slug ? "app-" + o.application_slug : "unknown"; }
         leaves.forEach(function (L) {
           var f = L.fact; var cost = num(f.cost_usd); sumLeaves += cost;
@@ -293,7 +293,8 @@ steps:
           var base = { date: d, day: d, stage: "allocated", subject_type: f.subject_type, subject_id: f.subject_id, subject_name: f.subject_name || f.subject_id,
                        cloud: f.cloud || "aws", cloud_account: f.cloud_account || null, cloud_service: L.service, region: f.region || null, cluster: f.cluster || null,
                        resource_id: f.resource_id || null, resource_type: f.resource_type || null, component: f.component || null, usage_type: f.usage_type || null,
-                       source: "finops_allocator", source_fact_id: f.id, parent_id: f.id, collected_at: now, collector: String(inputs.allocator), category: cat };
+                       source: "finops_allocator", source_fact_id: f.id, parent_id: f.id, collected_at: now, collector: String(inputs.allocator), category: cat,
+                       scope_name: f.scope_name || null, scope_type: f.scope_type || null, service_name: f.service_name || null };
           if (!hit) {
             var u = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-unallocated", cost_usd: cost, share: 1, allocation_method: "unallocated", rule_id: null });
             allocated.push(u); unalloc[L.service] = num((unalloc[L.service] || 0) + cost); sumAlloc += cost; return;
@@ -310,21 +311,18 @@ steps:
             var a = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(key), cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), category: rcat });
             OWNER.forEach(function (k) { if (o[k] !== undefined) a[k] = o[k]; });
             allocated.push(a); sumAlloc += amt;
-            if (o.cluster && !o.application_id) { perCluster[o.cluster] = num((perCluster[o.cluster] || 0) + amt); return; }
-            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, by_category: {}, by_cloud_service: {}, by_charge_type: {}, by_environment: {}, facts: 0, accounts: {}, charge_items: [] });
+            if (o.cluster && !o.application_id) { var pc = p.overhead ? overhead : perCluster; pc[o.cluster] = num((pc[o.cluster] || 0) + amt); return; }
+            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, by_category: {}, by_cloud_service: {}, facts: 0 });
             app.cost_usd = num(app.cost_usd + amt); app.by_category[rcat] = num((app.by_category[rcat] || 0) + amt); app.by_cloud_service[L.service] = num((app.by_cloud_service[L.service] || 0) + amt); app.facts += 1;
-            var acctOf = f.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null; if (acctOf) app.accounts[String(acctOf)] = true;
-            // Invoice line: charged through a null SCOPE (any type), a null SERVICE, or the application itself.
+            // The null OBJECT the cost came through (a scope of any type, a service, or the application) + its dimensions.
             var scopeId = o.scope_id || f.scope_id || (p.key && hit.rule.method === "by_metric_parent" ? String(p.key) : null);
             var serviceId = !scopeId && (o.service_id || f.service_id) ? String(o.service_id || f.service_id) : null;
-            var ctype = scopeId ? "scope" : serviceId ? "service" : "application";
+            a.charge_type = scopeId ? "scope" : serviceId ? "service" : "application";
+            if (scopeId) { a.scope_id = String(scopeId); a.scope_name = a.scope_name || (scopeInfo[String(scopeId)] || {}).name || null; a.scope_type = a.scope_type || (scopeInfo[String(scopeId)] || {}).type || null; }
+            if (serviceId) { a.service_id = serviceId; a.service_name = a.service_name || (serviceInfo[serviceId] || {}).name || f.subject_name || null; }
             var dims = dimsFor(scopeId ? String(scopeId) : null, serviceId, f); var env = dims && dims.environment ? String(dims.environment) : null;
-            var item = { charge_type: ctype, scope_id: scopeId ? String(scopeId) : null, scope_name: scopeId ? (o.scope_name || f.scope_name || (scopeInfo[String(scopeId)] || {}).name || null) : null, scope_type: scopeId ? (o.scope_type || f.scope_type || (scopeInfo[String(scopeId)] || {}).type || null) : null,
-                         service_id: serviceId, service_name: serviceId ? (f.service_name || (serviceInfo[serviceId] || {}).name || f.subject_name || null) : null, dimensions: dims, environment: env,
-                         category: rcat, cloud_service: L.service, subject_type: f.subject_type, subject_id: f.subject_id, subject_name: f.subject_name || f.subject_id, cluster: f.cluster || null, component: f.component || null,
-                         cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), source_fact_id: f.id };
-            app.charge_items.push(item); app.by_charge_type[ctype] = num((app.by_charge_type[ctype] || 0) + amt); var ek = env || "none"; app.by_environment[ek] = num((app.by_environment[ek] || 0) + amt);
             a.dimensions = dims; if (env) a.environment = env;
+            a.cloud_account = a.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null;
           });
         });
         // ── 4) rollups: one per owner, one for unallocated
@@ -335,18 +333,6 @@ steps:
                     by_category: a.by_category, by_cloud_service: a.by_cloud_service, quantity: a.facts, units: "facts" };
           OWNER.forEach(function (kk) { if (o[kk] !== undefined) r[kk] = o[kk]; });
           allocated.push(r);
-        });
-        // application_cost_daily: one INVOICE per null application: flat charge items + totals.
-        var appRows = []; var byCost = function (x, y) { return y.cost_usd - x.cost_usd; };
-        Object.keys(perApp).forEach(function (k) {
-          var a = perApp[k]; var o = a.owner; if (!o.application_id) return;
-          var items = a.charge_items.slice().sort(byCost);
-          // scope name/type for k8s scopes come from the wf3 rows when the owner did not carry them
-          items.forEach(function (it) { if (it.scope_id && (!it.scope_name || !it.scope_type)) { var kf = raw.filter(function (f) { return f.source === "k8s" && String(f.scope_id) === it.scope_id; })[0]; if (kf) { it.scope_name = it.scope_name || kf.scope_name || null; it.scope_type = it.scope_type || kf.scope_type || null; } } });
-          appRows.push({ id: String(o.application_id) + "-" + d, date: d, day: d, application_id: String(o.application_id), application_slug: o.application_slug || null, namespace_id: o.namespace_id || null, account_id: o.account_id || null,
-            total_usd: a.cost_usd, currency: "USD", charge_items: items, charge_items_count: items.length,
-            totals: { by_charge_type: a.by_charge_type, by_environment: a.by_environment, by_category: a.by_category, by_cloud_service: a.by_cloud_service },
-            cloud_accounts: Object.keys(a.accounts), allocator: String(inputs.allocator), computed_at: now });
         });
         var unTotal = num(Object.keys(unalloc).reduce(function (s, k) { return s + unalloc[k]; }, 0));
         allocated.push({ id: "alloc-unallocated-" + d, date: d, day: d, stage: "allocated", subject_type: "unallocated", subject_id: "unallocated", subject_name: "Not attributable yet",
@@ -361,23 +347,99 @@ steps:
           if (a.metric_key && a.allocation_method === "unallocated") unLeaves.push({ id: a.source_fact_id + "#" + a.metric_key, cloud_service: a.cloud_service, subject_type: a.subject_type, subject_id: a.subject_id, resource_type: a.resource_type || null, host: byId[a.source_fact_id] ? (byId[a.source_fact_id].host || null) : null, tags: null, cost_usd: a.cost_usd, kind: "metric_key", metric_key: a.metric_key, rule_id: a.rule_id });
         });
         unLeaves.sort(function (x, y) { return y.cost_usd - x.cost_usd; });
-        var writes = allocated.map(function (f) { return { fact: f, catalog_slug: "cost_daily" }; }).concat(appRows.map(function (r) { return { fact: r, catalog_slug: "application_cost_daily" }; }));
-        return { day: d, facts: allocated, app_rows: appRows, to_write: inputs.dry_run ? [] : writes, count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0)),
-                 cluster_pending_usd: perCluster, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
+        return { day: d, facts: allocated, count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0) - Object.keys(overhead).reduce(function (s, k) { return s + overhead[k]; }, 0)),
+                 cluster_pending_usd: perCluster, kubernetes_overhead_usd: overhead, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
                  unallocated_leaves: unLeaves.slice(0, 200) };
+
+  # The sandbox caps a step's output at 1 MB: the allocated facts travel ONCE (allocate.facts); this
+  # gate only decides whether they are written (dry_run) so nothing is duplicated in one output.
+  - id: gate
+    type: module
+    plugin_type: code-exec
+    name: "Write gate"
+    inputs:
+      facts: "${{ steps.allocate.outputs.facts }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        return { list: inputs.dry_run ? [] : (inputs.facts || []).map(function (f) { return { fact: f, catalog_slug: "cost_daily" }; }) };
 
   - id: write_facts
     type: module
     plugin_type: sub-workflow
     name: "Upsert allocated facts (fan-out)"
     forEach:
-      expression: "${{ steps.allocate.outputs.to_write }}"
+      expression: "${{ steps.gate.outputs.list }}"
       itemVariable: row
       spreadItem: true
       parallel: true
       maxConcurrency: 8
     config:
       # Definition id of finops/wf-cost-fact-upsert.yaml (patched at publish time).
+      workflowId: FINOPS_COST_FACT_UPSERT_ID
+      alias: live
+      waitForCompletion: true
+
+  # ── invoices: one application_cost_daily row per application, built from the allocated facts.
+  - id: invoices
+    type: module
+    plugin_type: code-exec
+    name: "Invoices per application"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      facts: "${{ steps.allocate.outputs.facts }}"
+      allocator: "${{ variables.allocator }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day); var now = new Date().toISOString();
+        function num(x) { return Math.round((Number(x) || 0) * 1e6) / 1e6; }
+        var apps = {};
+        (inputs.facts || []).forEach(function (a) {
+          if (!a || a.stage !== "allocated" || !a.application_id || a.allocation_method === "rollup" || a.subject_type === "unallocated" || a.subject_type === "application") return;
+          var id = String(a.application_id);
+          var app = apps[id] || (apps[id] = { application_id: id, application_slug: a.application_slug || null, namespace_id: a.namespace_id || null, account_id: a.account_id || null, total: 0, by_charge_type: {}, by_environment: {}, by_category: {}, by_cloud_service: {}, accounts: {}, items: [] });
+          if (!app.application_slug && a.application_slug) app.application_slug = a.application_slug;
+          var amt = num(a.cost_usd); var ctype = a.charge_type || (a.scope_id ? "scope" : a.service_id ? "service" : "application"); var env = a.environment || "none"; var cat = a.category || "other"; var svc = a.cloud_service || "other";
+          app.total = num(app.total + amt); app.by_charge_type[ctype] = num((app.by_charge_type[ctype] || 0) + amt); app.by_environment[env] = num((app.by_environment[env] || 0) + amt);
+          app.by_category[cat] = num((app.by_category[cat] || 0) + amt); app.by_cloud_service[svc] = num((app.by_cloud_service[svc] || 0) + amt); if (a.cloud_account) app.accounts[String(a.cloud_account)] = true;
+          app.items.push({ charge_type: ctype, scope_id: a.scope_id || null, scope_name: a.scope_name || null, scope_type: a.scope_type || null, service_id: a.service_id || null, service_name: a.service_name || null,
+                           dimensions: a.dimensions || null, environment: a.environment || null, category: cat, cloud_service: a.cloud_service || null, subject_type: a.subject_type, subject_id: a.subject_id, subject_name: a.subject_name || a.subject_id,
+                           cluster: a.cluster || null, component: a.component || null, cost_usd: amt, share: num(a.share), allocation_method: a.allocation_method, rule_id: a.rule_id || null, source_fact_id: a.source_fact_id || null });
+        });
+        var rows = Object.keys(apps).map(function (id) {
+          var a = apps[id]; a.items.sort(function (x, y) { return y.cost_usd - x.cost_usd; });
+          return { id: id + "-" + d, date: d, day: d, application_id: id, application_slug: a.application_slug, namespace_id: a.namespace_id, account_id: a.account_id, total_usd: a.total, currency: "USD",
+                   charge_items: a.items, charge_items_count: a.items.length, totals: { by_charge_type: a.by_charge_type, by_environment: a.by_environment, by_category: a.by_category, by_cloud_service: a.by_cloud_service },
+                   cloud_accounts: Object.keys(a.accounts), allocator: String(inputs.allocator), computed_at: now };
+        }).sort(function (x, y) { return y.total_usd - x.total_usd; });
+        return { count: rows.length, rows: rows };
+
+  - id: invoice_gate
+    type: module
+    plugin_type: code-exec
+    name: "Invoice write gate"
+    inputs:
+      rows: "${{ steps.invoices.outputs.rows }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        return { list: inputs.dry_run ? [] : (inputs.rows || []).map(function (r) { return { fact: r, catalog_slug: "application_cost_daily" }; }) };
+
+  - id: write_invoices
+    type: module
+    plugin_type: sub-workflow
+    name: "Upsert invoices (fan-out)"
+    forEach:
+      expression: "${{ steps.invoice_gate.outputs.list }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+    config:
       workflowId: FINOPS_COST_FACT_UPSERT_ID
       alias: live
       waitForCompletion: true
@@ -390,10 +452,12 @@ steps:
     inputs:
       summary: "${{ steps.allocate.outputs.summary }}"
       results: "${{ steps.write_facts.outputs.items }}"
+      invoices: "${{ steps.write_invoices.outputs.items }}"
+      invoice_count: "${{ steps.invoices.outputs.count }}"
     config:
       language: javascript
       code: |
-        var s = Object.assign({}, inputs.summary || {}); s.written = s.dry_run ? 0 : (inputs.results || []).length; return s;
+        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0; s.invoices_written = s.dry_run ? 0 : (inputs.invoices || []).length; s.written = s.dry_run ? 0 : (inputs.results || []).length + s.invoices_written; return s;
 
 connections:
   - { from: start, to: prep }
@@ -405,11 +469,16 @@ connections:
   - { from: read_rules, to: allocate }
   - { from: scopes, to: allocate }
   - { from: services, to: allocate }
-  - { from: allocate, to: write_facts }
+  - { from: allocate, to: gate }
+  - { from: gate, to: write_facts }
+  - { from: allocate, to: invoices }
+  - { from: invoices, to: invoice_gate }
+  - { from: invoice_gate, to: write_invoices }
   - { from: write_facts, to: summary }
+  - { from: write_invoices, to: summary }
 
 outputs:
   summary: "${{ steps.summary.outputs }}"
   facts: "${{ steps.allocate.outputs.facts }}"
-  app_rows: "${{ steps.allocate.outputs.app_rows }}"
+  app_rows: "${{ steps.invoices.outputs.rows }}"
   unallocated_leaves: "${{ steps.allocate.outputs.unallocated_leaves }}"

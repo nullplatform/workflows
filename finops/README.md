@@ -190,6 +190,17 @@ scope's consumption share = its chargeable cost (`max(usage, request)` per hour 
 over the cluster cost. What no scope covers stays with the cluster as `kubernetes_overhead`. The
 scope rows (`raw-k8s-scope-*`, `source: k8s`) keep usage vs request, so waste per scope is visible.
 
+### Step chain and the 1 MB step output
+
+`wf2` runs `prep → read_raw + read_rules + scopes + services → allocate → (gate → write_facts) +
+(invoices → invoice_gate → write_invoices) → summary`. The code sandbox caps a step's output at
+1 MB, so the allocated facts leave `allocate` exactly once (the gates only decide whether the
+fan-outs write, for `dry_run`) and the invoices are built in their own step from those facts.
+For nullplatform the outputs are ~850 KB (752 facts) and ~450 KB (48 invoices): a customer with
+several hundred scopes will need `allocate` to write in chunks instead of returning the facts.
+The summary reports `cluster_pending_usd` (clusters without consumption shares yet) separately
+from `kubernetes_overhead_usd` (what no scope covered once the shares exist).
+
 ## Deploying to an organization (done for nullplatform, org 4, 2026-09-11)
 
 Everything is per organization; nothing is registered on the platform as a package.
@@ -216,7 +227,9 @@ Everything is per organization; nothing is registered on the platform as a packa
    find account-level agents from the organization root), `org_nrn`, dispatcher targets.
 5. **Publish** (from the engine repo, so the DSL parser resolves):
    `NP_TOKEN=<bearer> pnpm tsx finops/setup/publish.ts finops --base https://api.nullplatform.com --vars finops/setup/vars.<org>.json`
-   and later `--update tool-cloud-query.yaml=<id>,…` for new revisions. The dispatcher
+   and later `--update <file>=<id>,…` for new revisions — **always with all seven ids**: a
+   partial list would publish the omitted files as NEW definitions (with a live cron on the
+   dispatcher copy); the script refuses that unless `--allow-create` is passed. The dispatcher
    (`wf0`) owns the schedule (04:15 UTC): collect → k8s consumption (`k8s_clusters` in the vars) →
    allocate → suggest. `wf1`/`wf2`/`wf3` have no cron of their own.
 6. **Rules**: start from `setup/rules.<org>.json` (copy the nullplatform one) and load it with

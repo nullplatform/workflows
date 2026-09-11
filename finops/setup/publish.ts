@@ -59,6 +59,12 @@ const ORDER: Array<{ file: string; placeholder?: string }> = [
   { file: 'wf2-allocate-daily.yaml', placeholder: 'FINOPS_ALLOCATE_DAILY_ID' },
   { file: 'wf0-aws-billing-dispatch.yaml' },
 ];
+// A PARTIAL --update creates brand-new definitions (with live crons) for the files it omits — that
+// happened once in prod. Either update every file or none (pass --allow-create to mix on purpose).
+if (Object.keys(updates).length && !args.includes('--allow-create')) {
+  const missing = ORDER.map((o) => o.file).filter((f) => !updates[f]);
+  if (missing.length) throw new Error(`--update covers ${Object.keys(updates).length}/${ORDER.length} files; missing ${missing.join(', ')} (add them, or pass --allow-create to publish them as NEW definitions)`);
+}
 
 async function api(method: string, path: string, body?: unknown): Promise<Record<string, unknown>> {
   const r = await fetch(base + path, {

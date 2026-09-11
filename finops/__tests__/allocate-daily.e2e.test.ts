@@ -172,7 +172,9 @@ describe('finops/wf2-allocate-daily', () => {
     const leafRows = facts.filter((f) => f.allocation_method !== 'rollup' && f.subject_type !== 'unallocated');
     expect(leafRows.reduce((s, f) => s + Number(f.cost_usd), 0)).toBeCloseTo(48, 6);
     expect(summary.unallocated_usd).toBe(6.5);
-    expect(summary.cluster_pending_usd).toEqual({ runtime: 2 });
+    // wf3 published shares for the cluster: nothing is pending, what no scope covers is overhead
+    expect(summary.cluster_pending_usd).toEqual({});
+    expect(summary.kubernetes_overhead_usd).toEqual({ runtime: 2 });
     expect(summary.allocated_usd).toBeCloseTo(39.5, 6);
     expect((summary.applications as Array<{ owner: string; cost_usd: number }>)[0]).toMatchObject({ owner: 'app-100', cost_usd: 30 });
 

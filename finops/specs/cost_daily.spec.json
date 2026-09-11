@@ -329,6 +329,7 @@
           "direct",
           "direct_resource",
           "direct_tag",
+          "kubernetes_overhead",
           "map",
           "rollup",
           "rule",
