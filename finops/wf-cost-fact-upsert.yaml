@@ -112,6 +112,9 @@ steps:
       apiKey: "${{ secrets.NP_API_KEY }}"
       method: PATCH
       path: "/catalog/instances/placeholder/placeholder"
+      # 409 = a concurrent PATCH of the same deterministic id (the step's own retry, or a second allocator
+      # the engine spawned): the row exists with this run's content. Reported as an output, accepted below.
+      failOnHttpError: false
       query:
         upsert: "true"
       body: {}
@@ -130,7 +133,7 @@ steps:
       language: javascript
       code: |
         var res = inputs.results || []; var failed = [];
-        res.forEach(function (r, i) { var o = (r || {}).outputs || r || {}; var st = Number(o.status || 0); if (!(st >= 200 && st < 300)) failed.push({ index: i, status: st }); });
+        res.forEach(function (r, i) { var o = (r || {}).outputs || r || {}; var st = Number(o.status || 0); if (!((st >= 200 && st < 300) || st === 409)) failed.push({ index: i, status: st }); });
         if (failed.length) throw new Error("upsert failed for " + failed.length + "/" + res.length + " rows (first: status " + failed[0].status + ")");
         return { count: Number(inputs.count) || 0, written: inputs.dry_run ? 0 : res.length, ids: inputs.ids || [] };
 
