@@ -162,7 +162,7 @@
     "confidence": 0.6,
     "scope": {
       "cloud_service": "Amazon Relational Database Service",
-      "resource_type": "rds:cluster"
+      "resource_type": "rds:db"
     },
     "match": [
       {

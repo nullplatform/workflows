@@ -211,3 +211,19 @@ cut by environment / namespace / account.
 - [ ] untagged S3 / DynamoDB / SQS: naming rule or tagging request
 - [ ] IAM role for the worker (IRSA), agent Helm values (`allowedRegistries`, pin, `serviceAccount`)
 - [ ] run `wf1-aws-billing-daily` in `dry_run`, review the summary, then write
+
+
+## 6. From mapping by hand to rules (2026-09-11)
+
+Everything §1–§5 discovered for one account becomes DATA, not code:
+
+1. Run the collector once (`dry_run`), open `wf2`'s `unallocated_leaves` (or the
+   `alloc-unallocated-<day>` row): that is the list to work through, ordered by USD.
+2. For each leaf, find the evidence: null tags (`tags.application_id` → `capture`), a null
+   service host (`default:null-service` already handles it), application parameters (the
+   suggestion workflow scans them; `setup/03-mapping-rules.sh` loads what you accept), naming
+   conventions (regex with named groups → `capture`), or a business decision (`bucket`).
+3. Shared resources get a `split` now and a `by_metric` later (Performance Insights `db.name`,
+   log-group `IncomingBytes`, k8s requests): the rule stays, only the method changes.
+4. Re-run `wf2` for the day: rules are versioned and every allocated row records its `rule_id`,
+   so a day can be re-allocated after a rule change without re-collecting billing.

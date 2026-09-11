@@ -82,9 +82,10 @@ steps:
       code: |
         function iso(dt) { return dt.toISOString().slice(0, 10); }
         var day = inputs.date && /^\d{4}-\d{2}-\d{2}$/.test(String(inputs.date)) ? String(inputs.date) : iso(new Date(Date.now() - 86400000));
-        var f = { day: day, stage: "raw" };
-        if (inputs.cloud_account) f.cloud_account = String(inputs.cloud_account);
-        return { day: day, raw_filters: f, rule_filters: { status: "active" } };
+        // Catalog list filters only work on fields indexed when the spec was CREATED (stage, subject_type,
+        // cloud_service, cluster, …); `day` was added later and `date` is ignored → read all raw rows and
+        // filter by day here. TODO: switch to the lake (customers_lake.catalog_entities) once volume grows.
+        return { day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, rule_filters: { status: "active" } };
 
   - id: read_raw
     type: module
@@ -97,7 +98,7 @@ steps:
       entity: "catalog/instances/cost_daily"
       filters: { stage: "raw" }
       limit: 100
-      maxPages: 100
+      maxPages: 200
 
   - id: read_rules
     type: module
@@ -121,6 +122,7 @@ steps:
       day: "${{ steps.prep.outputs.day }}"
       raw: "${{ steps.read_raw.outputs.items }}"
       rules: "${{ steps.read_rules.outputs.items }}"
+      cloud_account: "${{ steps.prep.outputs.cloud_account }}"
       categories: "${{ variables.categories }}"
       allocator: "${{ variables.allocator }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
@@ -128,7 +130,7 @@ steps:
       language: javascript
       code: |
         var d = String(inputs.day); var now = new Date().toISOString();
-        var raw = (inputs.raw || []).filter(function (f) { return f && f.stage === "raw" && f.date === d; });
+        var raw = (inputs.raw || []).filter(function (f) { return f && f.stage === "raw" && (f.date === d || f.day === d) && (!inputs.cloud_account || String(f.cloud_account) === String(inputs.cloud_account)); });
         if (!raw.length) throw new Error("no raw facts for " + d + " (run finops_aws_billing_daily first)");
         var rules = (inputs.rules || []).filter(function (r) { return r && r.enabled !== false && r.status === "active" && r.target; })
           .map(function (r) { return JSON.parse(JSON.stringify(r)); })

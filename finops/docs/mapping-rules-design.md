@@ -1,7 +1,12 @@
 # Mapping rules: how cloud resources become null owners (design, 2026-09-11)
 
-Status: proposal after the kwik-e-mart and nullplatform runs. Nothing here is built yet
-except the inference sources listed under "evidence".
+Status (2026-09-11): IMPLEMENTED for phase A — specs `cost_mapping_rule` /
+`cost_mapping_suggestion`, allocator `wf2-allocate-daily.yaml` (scope/match/capture/split/map,
+priority, defaults, reconciliation), inference `wf-suggest-mappings.yaml` (null services by host,
+application parameters), daily loop in `wf0`. Not yet: `by_metric` (needs the consumption
+collectors: Performance Insights by `db.name`, log-group `IncomingBytes`, k8s usage), naming-
+convention inference, action items for unallocated cost. The README's "Configuration" section is
+the user-facing version of this document.
 
 ## Problem
 
