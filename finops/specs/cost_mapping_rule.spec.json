@@ -103,62 +103,62 @@
         "type": "string",
         "description": "ISO timestamp"
       }
-    }
-  },
-  "authorization": {
-    "entities": {
-      "grants": [
-        {
-          "actions": [
-            "read",
-            "list",
-            "create",
-            "write",
-            "delete"
-          ],
-          "principals": [
-            {
-              "type": "*"
-            }
-          ]
-        },
-        {
-          "actions": [
-            "*"
-          ],
-          "principals": [
-            {
-              "id": 26,
-              "type": "user"
-            }
-          ]
-        }
-      ]
     },
-    "specification": {
-      "grants": [
-        {
-          "actions": [
-            "read"
-          ],
-          "principals": [
-            {
-              "type": "*"
-            }
-          ]
-        },
-        {
-          "actions": [
-            "*"
-          ],
-          "principals": [
-            {
-              "id": 26,
-              "type": "user"
-            }
-          ]
-        }
-      ]
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 26,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 26,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
     }
   }
 }

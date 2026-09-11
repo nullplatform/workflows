@@ -109,62 +109,62 @@
         "type": "integer",
         "description": "Number of charge items"
       }
-    }
-  },
-  "authorization": {
-    "entities": {
-      "grants": [
-        {
-          "actions": [
-            "read",
-            "list",
-            "create",
-            "write",
-            "delete"
-          ],
-          "principals": [
-            {
-              "type": "*"
-            }
-          ]
-        },
-        {
-          "actions": [
-            "*"
-          ],
-          "principals": [
-            {
-              "id": 732189543,
-              "type": "user"
-            }
-          ]
-        }
-      ]
     },
-    "specification": {
-      "grants": [
-        {
-          "actions": [
-            "read"
-          ],
-          "principals": [
-            {
-              "type": "*"
-            }
-          ]
-        },
-        {
-          "actions": [
-            "*"
-          ],
-          "principals": [
-            {
-              "id": 732189543,
-              "type": "user"
-            }
-          ]
-        }
-      ]
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write",
+              "delete"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 732189543,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
     }
   }
 }
