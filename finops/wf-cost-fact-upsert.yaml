@@ -1,21 +1,31 @@
 # finops/wf-cost-fact-upsert.yaml
 #
-# Child: upsert ONE cost_daily fact into the catalog. Called by the collectors
-# through `sub-workflow` + `forEach` (one child per fact, bounded parallelism).
+# Child: upsert a BATCH of cost_daily facts (or one `fact`) into the catalog. Called by the
+# collectors through `sub-workflow` + `forEach` (one child per batch, bounded parallelism).
+# Batches keep the parent's Temporal history small: 752 children per day re-ran in a loop
+# in prod (2026-09-11) once the parent state passed ~2 MB; 20 children of 40 facts do not.
 # `PATCH /catalog/instances/cost_daily/{id}?upsert=true` merges at top level,
 # so each writer owns its fields (cost-finout lesson).
 id: finops_cost_fact_upsert
 name: "FinOps — Upsert cost_daily fact"
 description: >
-  Upserts one cost_daily catalog instance (PATCH ?upsert=true, top-level merge).
+  Upserts a batch of cost_daily catalog instances (PATCH ?upsert=true, top-level merge).
 path: "/finops"
 semantic_version: 0.1.0
 
 inputs:
   fact:
     type: object
-    required: true
-    description: "A cost_daily fact (must carry id, date, stage, subject_type, subject_id, cloud, cost_usd, source, allocation_method, collected_at); for other slugs only `id` is required"
+    required: false
+    description: "ONE cost_daily fact (must carry id, date, stage, subject_type, subject_id, cloud, cost_usd, source, allocation_method, collected_at); for other slugs only `id` is required"
+  facts:
+    type: array
+    required: false
+    description: "A BATCH of facts (same rules as `fact`); either `fact` or `facts` is required"
+  dry_run:
+    type: boolean
+    required: false
+    description: "Validate only, write nothing"
   catalog_slug:
     type: string
     required: false
@@ -36,8 +46,16 @@ steps:
       inputs:
         fact:
           type: object
-          required: true
-          description: "cost_daily fact"
+          required: false
+          description: "one cost_daily fact"
+        facts:
+          type: array
+          required: false
+          description: "a batch of facts"
+        dry_run:
+          type: boolean
+          required: false
+          description: "validate only"
         catalog_slug:
           type: string
           required: false
@@ -46,37 +64,50 @@ steps:
   - id: check
     type: module
     plugin_type: code-exec
-    name: "Validate fact"
+    name: "Validate facts"
     inputs:
       fact: "${{ workflow.inputs.fact }}"
+      facts: "${{ workflow.inputs.facts }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
       catalog_slug: "${{ workflow.inputs.catalog_slug }}"
       default_slug: "${{ variables.catalog_slug }}"
     config:
       language: javascript
       code: |
-        var f = inputs.fact || {};
+        var list = Array.isArray(inputs.facts) ? inputs.facts.slice() : [];
+        if (inputs.fact && typeof inputs.fact === "object") list.push(inputs.fact);
+        if (!list.length) throw new Error("fact or facts is required");
         var slug = String(inputs.catalog_slug || inputs.default_slug || "cost_daily");
         if (!/^[a-z0-9_]+$/.test(slug)) throw new Error("catalog_slug must be a spec slug (got " + slug + ")");
         var req = slug === "cost_daily" ? ["id","date","stage","subject_type","subject_id","cloud","cost_usd","source","allocation_method","collected_at"] : ["id"];
-        var missing = req.filter(function (k) { return f[k] === undefined || f[k] === null || f[k] === ""; });
-        if (missing.length) throw new Error("fact is missing " + missing.join(", ") + " (id=" + f.id + ")");
-        if (slug === "cost_daily" && typeof f.cost_usd !== "number") throw new Error("cost_usd must be a number (id=" + f.id + ")");
-        if (!/^[A-Za-z0-9_.-]+$/.test(String(f.id))) throw new Error("id must be a catalog-safe slug (got " + f.id + ")");
-        return { id: String(f.id), fact: f, slug: slug, path: "/catalog/instances/" + slug + "/" + String(f.id) };
+        var seen = {};
+        var rows = list.map(function (f) {
+          f = f || {};
+          var missing = req.filter(function (k) { return f[k] === undefined || f[k] === null || f[k] === ""; });
+          if (missing.length) throw new Error("fact is missing " + missing.join(", ") + " (id=" + f.id + ")");
+          if (slug === "cost_daily" && typeof f.cost_usd !== "number") throw new Error("cost_usd must be a number (id=" + f.id + ")");
+          if (!/^[A-Za-z0-9_.-]+$/.test(String(f.id))) throw new Error("id must be a catalog-safe slug (got " + f.id + ")");
+          if (seen[f.id]) throw new Error("duplicate id in batch: " + f.id); seen[f.id] = true;
+          return { path: "/catalog/instances/" + slug + "/" + String(f.id), body: f };
+        });
+        return { count: rows.length, ids: rows.map(function (r) { return r.body.id; }), slug: slug, rows: inputs.dry_run ? [] : rows, dry_run: !!inputs.dry_run };
 
   - id: upsert
     type: module
     plugin_type: np-api-call
-    name: "PATCH catalog instance (upsert)"
+    name: "PATCH catalog instances (upsert, fan-out)"
+    forEach:
+      expression: "${{ steps.check.outputs.rows }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
     error_handling:
       retry_policy:
         max_attempts: 3
         initial_interval: "2s"
         backoff_strategy: exponential
         jitter: 0.3
-    inputs:
-      path: "${{ steps.check.outputs.path }}"
-      body: "${{ steps.check.outputs.fact }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       method: PATCH
@@ -85,10 +116,30 @@ steps:
         upsert: "true"
       body: {}
 
+  - id: result
+    type: module
+    plugin_type: code-exec
+    name: "Batch result"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      count: "${{ steps.check.outputs.count }}"
+      ids: "${{ steps.check.outputs.ids }}"
+      dry_run: "${{ steps.check.outputs.dry_run }}"
+      results: "${{ steps.upsert.outputs.items }}"
+    config:
+      language: javascript
+      code: |
+        var res = inputs.results || []; var failed = [];
+        res.forEach(function (r, i) { var o = (r || {}).outputs || r || {}; var st = Number(o.status || 0); if (!(st >= 200 && st < 300)) failed.push({ index: i, status: st }); });
+        if (failed.length) throw new Error("upsert failed for " + failed.length + "/" + res.length + " rows (first: status " + failed[0].status + ")");
+        return { count: Number(inputs.count) || 0, written: inputs.dry_run ? 0 : res.length, ids: inputs.ids || [] };
+
 connections:
   - { from: start, to: check }
   - { from: check, to: upsert }
+  - { from: upsert, to: result }
 
 outputs:
-  id: "${{ steps.check.outputs.id }}"
-  status: "${{ steps.upsert.outputs.status }}"
+  count: "${{ steps.result.outputs.count }}"
+  written: "${{ steps.result.outputs.written }}"
+  ids: "${{ steps.result.outputs.ids }}"

@@ -384,7 +384,7 @@ describe('finops/wf-cost-fact-upsert', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.path).toBe('/catalog/instances/cost_daily/raw-cloud_service-amazon-s3-2026-09-09');
     expect(calls[0]?.body).toEqual(fact);
-    expect(result.outputs?.id).toBe(fact.id);
+    expect(result.outputs).toMatchObject({ count: 1, written: 1, ids: [fact.id] });
   });
 
   it('rejects a fact missing required keys before calling the API', async () => {

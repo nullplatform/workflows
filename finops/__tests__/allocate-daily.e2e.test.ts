@@ -95,14 +95,17 @@ describe('finops/wf2-allocate-daily', () => {
         'np-api-call': servicesStub,
         'sub-workflow': {
           handler: (ctx: { inputs: Record<string, unknown> }) => {
-            written.push(ctx.inputs.fact as Record<string, unknown>);
-            return { status: 'success' as const, outputs: { id: (ctx.inputs.fact as { id: string }).id, status: 200 }, activePorts: ['default'] };
+            // batch child: { facts[], catalog_slug, dry_run }
+            const facts = ctx.inputs.facts as Array<Record<string, unknown>>;
+            expect(facts.length).toBeLessThanOrEqual(40);
+            if (!ctx.inputs.dry_run) for (const f of facts) written.push({ ...f, _slug: ctx.inputs.catalog_slug });
+            return { status: 'success' as const, outputs: { count: facts.length, written: ctx.inputs.dry_run ? 0 : facts.length, ids: facts.map((f) => f.id) }, activePorts: ['default'] };
           },
           executeMode: 'all' as const,
         },
       },
     });
-    const facts = result.outputs?.facts as Array<Record<string, unknown>>;
+    const facts = (result.outputs?.batches as Array<{ facts: Array<Record<string, unknown>> }>).flatMap((b) => b.facts);
     const summary = result.outputs?.summary as Record<string, unknown>;
     const byId = Object.fromEntries(facts.map((f) => [f.id, f]));
 
@@ -144,7 +147,7 @@ describe('finops/wf2-allocate-daily', () => {
     expect(byId[`alloc-app-300-${D}`]).toMatchObject({ cost_usd: 3 });
     expect(byId[`alloc-app-400-${D}`]).toMatchObject({ cost_usd: 2 });
     // application_cost_daily: one INVOICE per application — flat charge items with the null object each came through
-    const appRows = result.outputs?.app_rows as Array<Record<string, unknown>>;
+    const appRows = (result.outputs?.invoice_batches as Array<{ facts: Array<Record<string, unknown>> }>).flatMap((b) => b.facts);
     type Item = Record<string, unknown>;
     const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; charge_items: Item[]; totals: { by_charge_type: Record<string, number>; by_category: Record<string, number>; by_cloud_service: Record<string, number> } };
     expect(app100).toMatchObject({ date: D, day: D, application_id: '100', namespace_id: '5', total_usd: 30, currency: 'USD', charge_items_count: 6, cloud_accounts: ['111122223333'] });
@@ -189,7 +192,7 @@ describe('finops/wf2-allocate-daily', () => {
 
   it('dry_run computes everything and writes nothing; no raw facts is an error', async () => {
     const written: unknown[] = [];
-    const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { written.push(ctx.inputs.fact); return { status: 'success' as const, outputs: {}, activePorts: ['default'] }; }, executeMode: 'all' as const };
+    const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { if (!ctx.inputs.dry_run) written.push(...(ctx.inputs.facts as unknown[])); return { status: 'success' as const, outputs: { written: 0 }, activePorts: ['default'] }; }, executeMode: 'all' as const };
     const r = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'np-api-call': servicesStub, 'sub-workflow': stub } });
     expect(written).toHaveLength(0);
     expect((r.outputs?.summary as { written: number; dry_run: boolean })).toMatchObject({ written: 0, dry_run: true });
