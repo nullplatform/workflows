@@ -3,6 +3,7 @@ import { createPlugin, registerManifest } from "@nullplatform/plugin";
 import { runRequest, validateRequest, type CloudQueryRequest } from "./runner";
 import { assumeRole, callerIdentity, createAwsFactory } from "./aws-factory";
 import { postCallback } from "./callback";
+import { buildReceipt } from "./receipt";
 
 // The manifest declares identity + channel routing. This package is dispatched
 // directly by workflows through `package-exec` (agent_command), so the channel
@@ -73,13 +74,20 @@ createPlugin({
       if ("arn" in identity) response.identity = identity;
       if (cq.callback?.token) response.token = cq.callback.token;
       if (cq.callback) {
+        // Callback mode: the RESULTS travel to the engine through the callback
+        // and the command completion carries a receipt only (see receipt.ts —
+        // completions above ~400 KB are dropped by the platform and re-delivered).
+        const body = JSON.stringify(response);
         const cb = await postCallback(cq.callback.url, response);
-        response.callbackDelivered = cb.ok;
-        log(`[cloud-query] callback ${cb.ok ? `delivered (HTTP ${cb.status})` : `FAILED: ${cb.error}`}`);
-        if (!cb.ok) {
-          req.emit({ stdout: JSON.stringify(response) });
-          return { success: false, errorCode: "CALLBACK_FAILED", error: cb.error, data: response };
+        log(`[cloud-query] callback ${cb.ok ? `delivered (HTTP ${cb.status}, ${body.length} bytes)` : `FAILED: ${cb.error}`}`);
+        const receipt = buildReceipt(response, cb, body.length);
+        req.emit({ stdout: JSON.stringify(receipt) });
+        if (!cb.ok) return { success: false, errorCode: "CALLBACK_FAILED", error: cb.error, data: receipt };
+        const failedCalls = response.calls.filter((c) => !c.ok);
+        if (failedCalls.length > 0) {
+          return { success: false, errorCode: "CALLS_FAILED", error: failedCalls.map((c) => `${c.id}: ${c.errorCode} ${c.error}`).join("; "), data: receipt };
         }
+        return { success: true, data: receipt };
       }
       req.emit({ stdout: JSON.stringify(response) });
       const failed = response.calls.filter((c) => !c.ok);

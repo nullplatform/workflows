@@ -424,35 +424,53 @@ steps:
         var lbsTagged = tagged.filter(function (x) { return /:elasticloadbalancing:.*:loadbalancer\//.test(x.arn); });
         var lbsByCluster = {}; lbsTagged.forEach(function (x) { var c = clusterOf(x.tags); if (c) lbsByCluster[c] = (lbsByCluster[c] || 0) + 1; });
         var lbsAll = ((r.lbs || {}).LoadBalancers || []).length || lbsTagged.length;
-        // ── 4) EC2 instances: cost + hours per instance (CE resource-level) × tags → scope / resource facts.
+        // ── 4) EC2 instances (CE resource-level) × tags. One row per SUBJECT, not per instance:
+        //   scope-tagged instance → `scope` fact (direct); cluster node → summed into the cluster's
+        //   `nodes` component (no per-node row); anything else that is an instance → ONE
+        //   `bucket` row per day (`ec2-instances-unattributed`: mostly nodes that terminated
+        //   before collection — Karpenter churn — plus untagged VMs); non-instance resources
+        //   (NAT gateways, …) keep a `resource` row. Keeps the day at tens of rows, not hundreds.
         var ec2ParentId = svcFactId[String(inputs.ec2_service)] || null;
         var cl = {}; // cluster -> {nodes, nodeIds[], coreH, gbH, volGb, instCount}
         function clusterAcc(name) { return cl[name] || (cl[name] = { nodes: 0, nodeIds: [], coreH: 0, gbH: 0, volGb: 0, instCount: 0 }); }
         var totalInstances = Object.keys(inst).length;
+        var unattr = { cost: 0, unbl: 0, hours: 0, ids: 0, seen: 0, byType: {} };
         ((r.ec2_by_resource || {}).ResultsByTime || []).forEach(function (rt) {
           (rt.Groups || []).forEach(function (g) {
             var rid = g.Keys[0]; var c = amort(g); var hours = qty(g);
             if (!rid || rid === "NoResourceId" || (c === 0 && hours === 0)) return;
+            var isInstance = /^i-[0-9a-z]+$/i.test(rid);
             var i = inst[rid] || { type: null, tags: {}, cluster: null };
             var t = i.tags; var dims = npDims(t); var f;
+            if (i.cluster) {
+              var a = clusterAcc(i.cluster); var cap = typeCap[i.type] || { vcpu: 0, gib: 0 };
+              a.nodes += c; a.nodeIds.push(rid); a.instCount += 1; a.coreH += cap.vcpu * hours; a.gbH += cap.gib * hours; a.volGb += (volGbByInstance[rid] || 0);
+              return; // node cost lives in the cluster row (component `nodes`)
+            }
             if (dims.scope_id) {
               f = base("raw", "scope", dims.scope_id); f.allocation_method = "direct_tag";
               Object.keys(dims).forEach(function (k) { f[k] = dims[k]; });
               f.subject_name = t.Name || dims.scope_name || rid;
+            } else if (isInstance) {
+              unattr.cost += c; unattr.unbl += unbl(g); unattr.hours += hours; unattr.ids += 1; if (inst[rid]) unattr.seen += 1;
+              if (i.type) unattr.byType[i.type] = (unattr.byType[i.type] || 0) + 1;
+              return;
             } else {
               f = base("raw", "resource", rid); f.subject_name = t.Name || rid;
-              if (i.cluster) { f.allocation_method = "cluster_split_cpu_mem"; }
             }
-            var rtype = /^i-[0-9a-z]+$/i.test(rid) ? "ec2:instance" : (function () { var m = /^arn:aws:([^:]+):[^:]*:[^:]*:([^\/:]+)/.exec(rid); return m ? (m[1] + ":" + m[2]) : "ec2:other"; })();
+            var rtype = isInstance ? "ec2:instance" : (function () { var m = /^arn:aws:([^:]+):[^:]*:[^:]*:([^\/:]+)/.exec(rid); return m ? (m[1] + ":" + m[2]) : "ec2:other"; })();
             f.cloud_service = String(inputs.ec2_service); f.resource_id = rid; f.resource_type = rtype; f.usage_type = i.type || null;
             f.region = region; f.cluster = i.cluster; f.cost_usd = c; f.unblended_usd = unbl(g); f.quantity = hours; f.units = hours ? "Hrs" : null;
             f.parent_id = ec2ParentId; facts.push(f);
-            if (i.cluster) {
-              var a = clusterAcc(i.cluster); var cap = typeCap[i.type] || { vcpu: 0, gib: 0 };
-              a.nodes += c; a.nodeIds.push(rid); a.instCount += 1; a.coreH += cap.vcpu * hours; a.gbH += cap.gib * hours; a.volGb += (volGbByInstance[rid] || 0);
-            }
           });
         });
+        if (unattr.ids > 0) {
+          var u = base("raw", "bucket", "ec2-instances-unattributed"); u.subject_name = "EC2 instances not attributable (terminated before collection or untagged)";
+          u.cloud_service = String(inputs.ec2_service); u.resource_type = "ec2:instance"; u.region = region; u.parent_id = ec2ParentId;
+          u.cost_usd = num(unattr.cost); u.unblended_usd = num(unattr.unbl); u.quantity = unattr.ids; u.units = "instances";
+          u.usage_hours = num(unattr.hours); u.instances_seen = unattr.seen; u.instance_types = unattr.byType; u.allocation_method = "unallocated";
+          facts.push(u);
+        }
         // ── 5) clusters: nodes + control plane + LBs + networking + storage + other, and blended rates.
         var clusters = Object.keys(cl);
         var nClusters = clusters.length || 1;

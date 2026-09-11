@@ -95,10 +95,11 @@ for (const { file, placeholder } of ORDER) {
   const id = String(existing ?? wf.id);
   const revision = typeof revObj === 'number' ? revObj : Number((revObj as Record<string, unknown> | undefined)?.revision ?? wf.revision ?? 1);
   if (existing) {
-    // Re-point the alias to the new revision (create it if the definition had none).
+    // Re-point the alias to the new revision (PUT /aliases/:alias); create it if the definition had none.
     try {
-      await api('PATCH', `/workflows/definitions/${id}/aliases/${alias}`, { revision });
-    } catch {
+      await api('PUT', `/workflows/definitions/${id}/aliases/${alias}`, { revision });
+    } catch (err) {
+      if (!/404/.test(String(err))) throw err;
       await api('POST', `/workflows/definitions/${id}/aliases`, { name: alias, revision });
     }
   } else {

@@ -358,6 +358,21 @@
           "string",
           "null"
         ]
+      },
+      "usage_hours": {
+        "type": "number",
+        "description": "Instance-hours summed into an aggregated bucket (e.g. ec2-instances-unattributed)"
+      },
+      "instances_seen": {
+        "type": "integer",
+        "description": "How many of the aggregated instances still existed at collection time (the rest terminated during the day)"
+      },
+      "instance_types": {
+        "type": "object",
+        "description": "Instance type \u2192 count for aggregated buckets (only for instances still present at collection)",
+        "additionalProperties": {
+          "type": "integer"
+        }
       }
     },
     "required": [

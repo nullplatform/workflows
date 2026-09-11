@@ -217,11 +217,9 @@ describe('finops/wf1-aws-billing-daily', () => {
       source: 'aws_ce',
     });
 
-    // cluster nodes are resources with the cluster dimension
-    const nodes = facts.filter((f) => f.subject_type === 'resource' && f.cluster === 'developent');
-    expect(nodes.map((n) => n.resource_id).sort()).toEqual(['i-node1', 'i-node2']);
-    expect(nodes[0]?.allocation_method).toBe('cluster_split_cpu_mem');
-    expect(nodes[0]?.quantity).toBe(24);
+    // cluster nodes get NO row of their own: their cost is the cluster's `nodes` component
+    expect(facts.filter((f) => f.subject_type === 'resource' && f.cluster === 'developent')).toEqual([]);
+    expect(facts.filter((f) => f.subject_type === 'resource' && f.resource_type === 'ec2:instance')).toEqual([]);
 
     // cluster = nodes 7.4 + control plane 2.4 + LBs 2.0×(2/4)=1.0 + networking (VPC 3.0 + NAT 1.5)=4.5
     //         + storage EBS 2.0×(40/80)=1.0 + other CPUCredits 0.5×(2/4)=0.25 → 16.55
@@ -249,8 +247,11 @@ describe('finops/wf1-aws-billing-daily', () => {
       environment: 'production', nrn: 'organization=1255165411:account=95118862:namespace=1649279267:application=1469122850', allocation_method: 'service_owner',
     });
 
-    // the loose instance is a plain resource, NoResourceId is dropped
-    expect(facts.find((f) => f.resource_id === 'i-loose')?.subject_type).toBe('resource');
+    // instances that are neither nodes nor scopes (terminated before collection, untagged)
+    // collapse into ONE bucket per day; NoResourceId is dropped
+    const loose = facts.find((f) => f.subject_id === 'ec2-instances-unattributed');
+    expect(loose).toMatchObject({ subject_type: 'bucket', cost_usd: 4.85, quantity: 1, units: 'instances', usage_hours: 24, allocation_method: 'unallocated', resource_type: 'ec2:instance' });
+    expect(facts.some((f) => f.resource_id === 'i-loose')).toBe(false);
     expect(facts.some((f) => f.resource_id === 'NoResourceId')).toBe(false);
 
     // every fact carries the required keys and provenance
