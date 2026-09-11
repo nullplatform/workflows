@@ -109,7 +109,7 @@ Nothing about a customer's resources lives in code. Three layers, per organizati
      Regex named groups become `$captures`.
    - `target`: a literal owner (`application_id`, `scope_id`, `service_id`, `namespace_id`, `cluster`,
      `bucket`), or `capture` (take the owner from the fact / a regex group), or `split` (weights), or
-     `map` (`key` → owner table). `method`: `direct | split | map | by_metric`.
+     `map` (`key` → owner table). `method`: `direct | split | map | by_metric | spread`.
    - `by_metric`: the collector attaches a consumption metric to the fact (`metric: pi.db.load`,
      `metric_shares: {database → share}` — Performance Insights DB load by database on the cluster
      writer, one call per RDS subject per day); the rule's `map.entries` say which application owns
@@ -123,6 +123,25 @@ Nothing about a customer's resources lives in code. Three layers, per organizati
        "target": { "map": { "key": "db.name", "entries": {
          "core_entities_api": { "application_id": "1182532716" }, "tracing_api_production": { "application_id": "518811741" },
          "notifications": { "application_id": "1593752815" }, "approvals": { "application_id": "1372325109" }, "…": "…" } } } }
+     ```
+   - CloudWatch Logs: `wf1` lists every log group (`storedBytes`) and asks `IncomingBytes` per group
+     for the day, and attaches them as `metric_shares` to the CloudWatch usage-type buckets —
+     ingestion (`DataProcessing-Bytes`, vended logs: `cloudwatch.IncomingBytes`) and storage
+     (`TimedStorage-ByteHrs`: `cloudwatch.StoredBytes`), keyed by log group name. A `by_metric` rule
+     with `map.entries` {log group → application} hands the log cost to its application; groups nobody
+     owns (cluster/system logs) stay visible as `metric_key` unallocated rows. Metric, alarm and
+     dashboard usage types carry no shares.
+   - `spread`: platform cost shared by EVERY application of the day, weighted by what each one already
+     carries (`target.spread.weights: attributed`, default) or equally (`equal`). Resolved after the
+     main pass, so the weights are the day's attribution, never the spread itself; the rollups and the
+     invoices show it as `allocation_method: spread`, `charge_type: application`, category from the
+     rule (`platform`). With no application attributed yet the leaf stays unallocated. Example,
+     AWS Config / GuardDuty / KMS / the CloudWatch remainder:
+
+     ```json
+     { "id": "platform-spread", "priority": 900, "method": "spread", "category": "platform",
+       "scope": { "cloud_service": { "regex": "AWS Config|GuardDuty|Key Management|Inspector|Secrets Manager|Macie|CloudWatch|Virtual Private Cloud" } },
+       "target": { "spread": { "weights": "attributed" } } }
      ```
      Keep an equal-`split` rule with lower priority as the fallback for days without PI data.
    - `category` overrides the cost category derived from the cloud service.

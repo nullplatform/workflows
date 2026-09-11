@@ -225,6 +225,10 @@ steps:
             params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost"], GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }] } },
           { id: "by_usage_type", service: "ce", operation: "GetCostAndUsage",
             params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost", "UsageQuantity"], GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }, { Type: "DIMENSION", Key: "USAGE_TYPE" }] } },
+          // CloudWatch Logs: every log group (name + stored bytes). Phase 2 adds IncomingBytes per group for the
+          // day; both become metric_shares on the CloudWatch usage-type buckets (ingestion / storage) so a
+          // by_metric rule can hand log costs to the application each group belongs to.
+          { id: "log_groups", service: "logs", operation: "DescribeLogGroups", params: { limit: 50 }, paginate: true, maxPages: 20 },
           { id: "ec2_by_resource", service: "ce", operation: "GetCostAndUsageWithResources",
             params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost", "UsageQuantity"], GroupBy: [{ Type: "DIMENSION", Key: "RESOURCE_ID" }, { Type: "DIMENSION", Key: "INSTANCE_TYPE" }],
                       Filter: { Dimensions: { Key: "SERVICE", Values: [String(inputs.ec2_service)] } } } },
@@ -317,7 +321,16 @@ steps:
           calls.push({ id: "pi_" + p.subject, service: "pi", operation: "GetResourceMetrics", params: { ServiceType: "RDS", Identifier: p.res, StartTime: day + "T00:00:00Z", EndTime: next + "T00:00:00Z", PeriodInSeconds: 86400,
                        MetricQueries: [{ Metric: "db.load.avg", GroupBy: { Group: "db", Limit: 25 } }] } });
         });
-        return { types: list, pi_subjects: pi.map(function (p) { return p.subject; }), calls: calls };
+        // CloudWatch Logs ingestion per log group for the day (AWS/Logs IncomingBytes, Sum). Query ids must be
+        // [a-z][a-zA-Z0-9_]*, so the id → log group name map travels to build_facts as log_metric_ids.
+        var groups = (((inputs.results || {}).log_groups || {}).logGroups || []).map(function (g) { return g.logGroupName; }).filter(Boolean);
+        var logIds = {}; var chunk = 100;
+        for (var ci = 0; ci < groups.length; ci += chunk) {
+          var qs = groups.slice(ci, ci + chunk).map(function (name, j) { var id = "q" + (ci + j); logIds[id] = name;
+            return { Id: id, MetricStat: { Metric: { Namespace: "AWS/Logs", MetricName: "IncomingBytes", Dimensions: [{ Name: "LogGroupName", Value: name }] }, Period: 86400, Stat: "Sum" } }; });
+          calls.push({ id: "cw_logs_in_" + (ci / chunk), service: "cloudwatch", operation: "GetMetricData", params: { StartTime: day + "T00:00:00Z", EndTime: next + "T00:00:00Z", MetricDataQueries: qs } });
+        }
+        return { types: list, pi_subjects: pi.map(function (p) { return p.subject; }), log_groups: groups.length, calls: calls, log_metric_ids: logIds };
 
   - id: query_types
     type: module
@@ -370,6 +383,7 @@ steps:
       np_services: "${{ steps.np_services.outputs.body }}"
       results: "${{ steps.query.outputs.results }}"
       types_results: "${{ steps.query_types.outputs.results }}"
+      log_metric_ids: "${{ steps.prep_types.outputs.log_metric_ids }}"
       identity: "${{ steps.query.outputs.identity }}"
       failed: "${{ steps.query_types.outputs.failed }}"
       region: "${{ steps.prep.outputs.region }}"
@@ -443,6 +457,13 @@ steps:
           f.subject_name = svc; f.cloud_service = svc; f.cost_usd = num(svcTotal[svc]); f.unblended_usd = num(svcUnbl[svc]);
           svcFactId[svc] = f.id; facts.push(f);
         });
+        // CloudWatch Logs shares by log group: stored bytes (phase 1) and IncomingBytes of the day (phase 2).
+        function normShares(m, metric) { var tot = 0; Object.keys(m).forEach(function (k) { tot += m[k]; }); var out = {}; if (tot > 0) Object.keys(m).forEach(function (k) { if (m[k] > 0) out[k] = num(m[k] / tot); }); return { metric: metric, shares: out, total: tot }; }
+        var lgStored = {}; ((r.log_groups || {}).logGroups || []).forEach(function (g) { if (g.logGroupName && Number(g.storedBytes) > 0) lgStored[g.logGroupName] = Number(g.storedBytes); });
+        var lgIn = {}; var logIds = inputs.log_metric_ids || {};
+        Object.keys(inputs.types_results || {}).forEach(function (k) { if (k.indexOf("cw_logs_in_") !== 0) return;
+          ((inputs.types_results[k] || {}).MetricDataResults || []).forEach(function (m) { var name = logIds[m.Id]; var v = (m.Values || []).reduce(function (a, b) { return a + (Number(b) || 0); }, 0); if (name && v > 0) lgIn[name] = v; }); });
+        var logStored = normShares(lgStored, "cloudwatch.StoredBytes"); var logIn = normShares(lgIn, "cloudwatch.IncomingBytes");
         // ── 2) bucket per (service, usage_type): breakdown of the service fact (parent_id).
         var usage = []; // [{svc, ut, cost, qty, unit}]
         ((r.by_usage_type || {}).ResultsByTime || []).forEach(function (rt) {
@@ -452,6 +473,12 @@ steps:
             usage.push({ svc: svc, ut: ut, cost: c, qty: qty(g), unit: g.Metrics.UsageQuantity ? g.Metrics.UsageQuantity.Unit : null });
             var f = base("raw", "bucket", slug(svc) + "|" + slug(ut));
             f.subject_name = svc + " / " + ut; f.cloud_service = svc; f.usage_type = ut; f.cost_usd = c; f.unblended_usd = unbl(g);
+            // CloudWatch Logs buckets carry the per-log-group shares (ingestion ← IncomingBytes of the day,
+            // storage ← storedBytes). A by_metric rule keyed by log group name splits them by application.
+            if (/cloudwatch/i.test(svc)) {
+              var lgShares = /DataProcessing|VendedLog|Ingest/i.test(ut) ? logIn : /TimedStorage|StorageUsage/i.test(ut) ? logStored : null;
+              if (lgShares && lgShares.total > 0) { f.metric = lgShares.metric; f.metric_shares = lgShares.shares; }
+            }
             f.quantity = qty(g); f.units = f.quantity ? (g.Metrics.UsageQuantity ? g.Metrics.UsageQuantity.Unit : null) : null;
             f.parent_id = svcFactId[svc] || null; facts.push(f);
           });

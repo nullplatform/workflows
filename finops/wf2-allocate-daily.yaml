@@ -242,6 +242,7 @@ steps:
             if (!e) return [];
             return [{ share: 1, owner: resolveTarget(e, fact, caps) }].filter(function (x) { return x.owner; });
           }
+          if (method === "spread") return [{ share: 1, owner: null, spread: true }]; // resolved in §3b once every application of the day is known
           if (method === "by_metric_parent") {
             // Cluster components: the consumption metric lives on the PARENT cluster row (wf3 attaches
             // metric_shares {scope_id → share} + metric_owners {scope_id → dims}). Shares sum to < 1: the
@@ -289,6 +290,7 @@ steps:
 
         // ── 3) allocated facts
         var allocated = []; var perApp = {}; var unalloc = {}; var perCluster = {}; var overhead = {}; var sumLeaves = 0, sumAlloc = 0;
+        var spreadLeaves = []; var spreadTotal = 0; // rules with method "spread": shared by every application of the day (§3b)
         function ownerKey(o) { return o.application_id ? "app-" + o.application_id : o.scope_id ? "scope-" + o.scope_id : o.service_id ? "svc-" + o.service_id : o.namespace_id ? "ns-" + o.namespace_id : o.cluster ? "cluster-" + o.cluster : o.bucket ? "bucket-" + o.bucket : o.application_slug ? "app-" + o.application_slug : "unknown"; }
         leaves.forEach(function (L) {
           var f = L.fact; var cost = num(f.cost_usd); sumLeaves += cost;
@@ -302,6 +304,7 @@ steps:
             var u = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-unallocated", cost_usd: cost, share: 1, allocation_method: "unallocated", rule_id: null });
             allocated.push(u); unalloc[L.service] = num((unalloc[L.service] || 0) + cost); sumAlloc += cost; return;
           }
+          if (hit.rule.method === "spread") { spreadLeaves.push({ L: L, base: base, hit: hit, cost: cost }); return; }
           var rcat = hit.rule.category || cat;
           hit.parts.forEach(function (p) {
             var amt = num(cost * p.share);
@@ -326,6 +329,29 @@ steps:
             var dims = dimsFor(scopeId ? String(scopeId) : null, serviceId, f); var env = dims && dims.environment ? String(dims.environment) : null;
             a.dimensions = dims; if (env) a.environment = env;
             a.cloud_account = a.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null;
+          });
+        });
+        // ── 3b) spread: platform cost every application of the account shares. Weights = each application's
+        // cost attributed so far (default) or equal. Decided AFTER the main pass so the weights are the day's
+        // attribution, never the spread itself. No application yet → the leaf stays visibly unallocated.
+        var spreadWeights = {}; Object.keys(perApp).forEach(function (k) { if (perApp[k].owner.application_id) spreadWeights[k] = num(perApp[k].cost_usd); });
+        spreadLeaves.forEach(function (S) {
+          var f = S.L.fact; var mode = String(((S.hit.rule.target || {}).spread || {}).weights || "attributed"); var rcat = S.hit.rule.category || "platform";
+          var keys = Object.keys(spreadWeights); var w = {}; var tot = 0;
+          keys.forEach(function (k) { var v = mode === "equal" ? 1 : spreadWeights[k]; if (v > 0) { w[k] = v; tot += v; } });
+          if (tot <= 0) { keys.forEach(function (k) { w[k] = 1; }); tot = keys.length; }
+          if (!tot) {
+            var un = Object.assign({}, S.base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-unallocated", cost_usd: S.cost, share: 1, allocation_method: "unallocated", rule_id: String(S.hit.rule.id) });
+            allocated.push(un); unalloc[S.L.service] = num((unalloc[S.L.service] || 0) + S.cost); sumAlloc += S.cost; return;
+          }
+          var wk = Object.keys(w); var acc = 0;
+          wk.forEach(function (k, i) {
+            var share = w[k] / tot; var amt = i === wk.length - 1 ? num(S.cost - acc) : num(S.cost * share); acc = num(acc + amt); var o = perApp[k].owner;
+            var a = Object.assign({}, S.base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(k) + "-spread", cost_usd: amt, share: num(share), allocation_method: "spread", rule_id: String(S.hit.rule.id), category: rcat, charge_type: "application" });
+            OWNER.forEach(function (kk) { if (o[kk] !== undefined) a[kk] = o[kk]; });
+            var dims = dimsFor(null, null, f); a.dimensions = dims; if (dims && dims.environment) a.environment = String(dims.environment);
+            allocated.push(a); sumAlloc += amt; spreadTotal = num(spreadTotal + amt);
+            var app = perApp[k]; app.cost_usd = num(app.cost_usd + amt); app.by_category[rcat] = num((app.by_category[rcat] || 0) + amt); app.by_cloud_service[S.L.service] = num((app.by_cloud_service[S.L.service] || 0) + amt); app.facts += 1;
           });
         });
         // ── 4) rollups: one per owner, one for unallocated
@@ -355,7 +381,7 @@ steps:
         // re-ran in a loop in prod once the parent state grew). The facts live ONCE, here.
         var batches = []; for (var bi = 0; bi < allocated.length; bi += 40) batches.push({ facts: allocated.slice(bi, bi + 40), catalog_slug: "cost_daily", dry_run: !!inputs.dry_run });
         return { day: d, batches: batches, ids: Object.keys(seen), count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0) - Object.keys(overhead).reduce(function (s, k) { return s + overhead[k]; }, 0)),
-                 cluster_pending_usd: perCluster, kubernetes_overhead_usd: overhead, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
+                 cluster_pending_usd: perCluster, kubernetes_overhead_usd: overhead, platform_spread_usd: spreadTotal, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
                  unallocated_leaves: unLeaves.slice(0, 200) };
 
   - id: write_facts

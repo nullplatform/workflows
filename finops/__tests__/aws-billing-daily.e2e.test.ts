@@ -42,9 +42,10 @@ function ceGroups(groups: Array<[string[], number, number?]>, unit = 'Hrs') {
   };
 }
 
+const CW = 'AmazonCloudWatch';
 const RESULTS = {
   identity: { Account: '688720756067' },
-  by_service: ceGroups([[[EC2], 12.5], [[EKS], 2.4], [['Amazon Simple Storage Service'], 0.6], [[ELB], 2.0], [[VPC], 3.0], [[EC2O], 4.0], [[RDS], 1.0]]),
+  by_service: ceGroups([[[EC2], 12.5], [[EKS], 2.4], [['Amazon Simple Storage Service'], 0.6], [[ELB], 2.0], [[VPC], 3.0], [[EC2O], 4.0], [[RDS], 1.0], [[CW], 3.0]]),
   by_usage_type: ceGroups([
     [[EC2, 'BoxUsage:c5a.xlarge'], 7.4, 24],
     [[EC2, 'BoxUsage:t3.micro'], 5.1, 72],
@@ -57,7 +58,12 @@ const RESULTS = {
     [[EC2O, 'NatGateway-Hours'], 1.5, 24],
     [[EC2O, 'CPUCredits:t3'], 0.5, 5],
     [[RDS, 'Aurora:StorageUsage'], 1.0, 1],
+    [[CW, 'DataProcessing-Bytes'], 2.0, 40],
+    [[CW, 'TimedStorage-ByteHrs'], 0.5, 300],
+    [[CW, 'MetricMonitorUsage'], 0.5, 12],
   ]),
+  // CloudWatch Logs: log groups + stored bytes (phase 1); IncomingBytes per group comes in phase 2
+  log_groups: { logGroups: [{ logGroupName: '/nullplatform/orders/prod', storedBytes: 300 }, { logGroupName: '/nullplatform/ledger/prod', storedBytes: 100 }, { logGroupName: '/aws/eks/runtime/cluster', storedBytes: 0 }] },
   ec2_by_resource: ceGroups([
     [['i-node1'], 3.7, 24],
     [['i-node2'], 3.7, 24],
@@ -135,6 +141,7 @@ const TYPES_RESULTS = {
     { Key: { Metric: 'db.load.avg', Dimensions: { 'db.name': 'orders', 'db.id': 'x' } }, DataPoints: [{ Value: 0.75 }] },
     { Key: { Metric: 'db.load.avg', Dimensions: { 'db.name': 'ledger', 'db.id': 'y' } }, DataPoints: [{ Value: 0.25 }] },
   ] },
+  cw_logs_in_0: { MetricDataResults: [{ Id: 'q0', Values: [80, 20] }, { Id: 'q1', Values: [0] }, { Id: 'q2', Values: [900] }] },
   instance_types: {
     InstanceTypes: [
       { InstanceType: 'c5a.xlarge', VCpuInfo: { DefaultVCpus: 4 }, MemoryInfo: { SizeInMiB: 8192 } },
@@ -191,9 +198,10 @@ describe('finops/wf1-aws-billing-daily', () => {
     // two cloud-query rounds: the day's calls, then the instance types seen
     expect(queries.map((q) => q.__step)).toEqual(['query', 'query_types']);
     const calls = queries[0]?.calls as Array<{ id: string; params?: { TimePeriod?: { Start: string; End: string } } }>;
-    expect(calls.map((c) => c.id)).toEqual(['identity', 'by_service', 'by_usage_type', 'ec2_by_resource', 'rds_by_tag', 'instances', 'volumes', 'tagged', 'lbs', 'db_clusters', 'db_instances', 'svc_by_tag_aws-lambda', 'fn_tags']);
-    expect(calls[3]?.params?.GroupBy).toEqual([{ Type: 'DIMENSION', Key: 'RESOURCE_ID' }, { Type: 'DIMENSION', Key: 'INSTANCE_TYPE' }]);
-    expect(calls[4]?.params?.GroupBy).toEqual([{ Type: 'TAG', Key: 'application' }, { Type: 'DIMENSION', Key: 'USAGE_TYPE' }]);
+    expect(calls.map((c) => c.id)).toEqual(['identity', 'by_service', 'by_usage_type', 'log_groups', 'ec2_by_resource', 'rds_by_tag', 'instances', 'volumes', 'tagged', 'lbs', 'db_clusters', 'db_instances', 'svc_by_tag_aws-lambda', 'fn_tags']);
+    expect(calls[4]?.params?.GroupBy).toEqual([{ Type: 'DIMENSION', Key: 'RESOURCE_ID' }, { Type: 'DIMENSION', Key: 'INSTANCE_TYPE' }]);
+    expect(calls[5]?.params?.GroupBy).toEqual([{ Type: 'TAG', Key: 'application' }, { Type: 'DIMENSION', Key: 'USAGE_TYPE' }]);
+    expect(calls[3]).toMatchObject({ service: 'logs', paginate: true });
     expect(calls[1]?.params?.TimePeriod).toEqual({ Start: '2026-09-09', End: '2026-09-10' });
     expect(queries[0]?.agent_tags).toEqual({ package: 'cloud-query', local: 'x' });
     expect(queries.map((q) => q.agent_nrn)).toEqual(['organization=1255165411:account=95118862', 'organization=1255165411:account=95118862']);
@@ -206,15 +214,15 @@ describe('finops/wf1-aws-billing-daily', () => {
     const typeCalls = queries[1]?.calls as Array<{ id: string; params: { InstanceTypes: string[] } }>;
     expect(typeCalls[0]?.params.InstanceTypes).toEqual(['c5a.xlarge', 't3.micro']);
 
-    // sum rule over cloud_service (7 services, 25.5 amortized)
+    // sum rule over cloud_service (8 services, 28.5 amortized)
     const svc = facts.filter((f) => f.subject_type === 'cloud_service');
-    expect(svc).toHaveLength(7);
-    expect(svc.reduce((a, f) => a + (f.cost_usd as number), 0)).toBeCloseTo(25.5, 6);
-    expect(summary.daily_total_usd).toBeCloseTo(25.5, 6);
+    expect(svc).toHaveLength(8);
+    expect(svc.reduce((a, f) => a + (f.cost_usd as number), 0)).toBeCloseTo(28.5, 6);
+    expect(summary.daily_total_usd).toBeCloseTo(28.5, 6);
 
     // usage-type buckets are breakdowns of their service fact
     const utBuckets = facts.filter((f) => f.subject_type === 'bucket' && f.usage_type);
-    expect(utBuckets).toHaveLength(11);
+    expect(utBuckets).toHaveLength(14);
     expect(utBuckets.find((b) => b.usage_type === 'BoxUsage:c5a.xlarge')?.parent_id).toBe(`raw-cloud_service-amazon-elastic-compute-cloud-compute-2026-09-09`);
 
     // tagged scope: direct_tag with null dimensions from the instance tags
@@ -262,7 +270,13 @@ describe('finops/wf1-aws-billing-daily', () => {
     expect(facts.find((f) => f.subject_type === 'service' && f.subject_id === 'transactions')?.host).toMatch(/rds\.amazonaws\.com$/);
     // second round asked Performance Insights for the cluster WRITER, and the shares by database travel with the fact
     const round2 = queries[1]?.calls as Array<{ id: string; service: string; params: Record<string, unknown> }>;
-    expect(round2.map((c) => c.id)).toEqual(['instance_types', 'pi_transactions']);
+    expect(round2.map((c) => c.id)).toEqual(['instance_types', 'pi_transactions', 'cw_logs_in_0']);
+    expect(round2[2]).toMatchObject({ service: 'cloudwatch', params: { StartTime: '2026-09-09T00:00:00Z', EndTime: '2026-09-10T00:00:00Z' } });
+    expect((round2[2]?.params.MetricDataQueries as Array<{ Id: string; MetricStat: { Metric: { Dimensions: Array<{ Value: string }> } } }>).map((q) => [q.Id, q.MetricStat.Metric.Dimensions[0]?.Value])).toEqual([['q0', '/nullplatform/orders/prod'], ['q1', '/nullplatform/ledger/prod'], ['q2', '/aws/eks/runtime/cluster']]);
+    // CloudWatch Logs buckets carry the per-log-group shares: ingestion by IncomingBytes (100 vs 900), storage by storedBytes (300 vs 100)
+    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'DataProcessing-Bytes')).toMatchObject({ metric: 'cloudwatch.IncomingBytes', metric_shares: { '/nullplatform/orders/prod': 0.1, '/aws/eks/runtime/cluster': 0.9 } });
+    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'TimedStorage-ByteHrs')).toMatchObject({ metric: 'cloudwatch.StoredBytes', metric_shares: { '/nullplatform/orders/prod': 0.75, '/nullplatform/ledger/prod': 0.25 } });
+    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'MetricMonitorUsage')?.metric_shares).toBeUndefined();
     expect(round2[1]).toMatchObject({ service: 'pi', params: { Identifier: 'db-WRITER', StartTime: '2026-09-09T00:00:00Z', EndTime: '2026-09-10T00:00:00Z', PeriodInSeconds: 86400 } });
     expect(facts.find((f) => f.subject_id === 'transactions')).toMatchObject({ metric: 'pi.db.load', metric_shares: { orders: 0.75, ledger: 0.25 } });
 

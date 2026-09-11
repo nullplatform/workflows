@@ -1,0 +1,29 @@
+[
+  {
+    "id": "itti-security-compliance-platform-spread",
+    "name": "Security & compliance services → every application (platform cost)",
+    "enabled": true, "status": "active", "priority": 900, "source": "seed", "confidence": 1,
+    "description": "AWS Config, GuardDuty, KMS, Inspector, Secrets Manager, Macie: nobody owns them, every application of the account shares them in proportion to the cost it already carries.",
+    "scope": { "cloud_service": { "regex": "AWS Config|GuardDuty|Key Management|Inspector|Secrets Manager|Macie" } },
+    "method": "spread", "category": "platform",
+    "target": { "spread": { "weights": "attributed" } }
+  },
+  {
+    "id": "itti-cloudwatch-remainder-platform-spread",
+    "name": "CloudWatch not attributable by log group → every application (platform cost)",
+    "enabled": true, "status": "active", "priority": 910, "source": "seed", "confidence": 1,
+    "description": "Metrics, alarms, dashboards and the log groups nobody owns. Log ingestion/storage buckets carry metric_shares by log group and are handled by the by_metric rule first (lower priority number wins).",
+    "scope": { "cloud_service": { "regex": "CloudWatch" } },
+    "method": "spread", "category": "observability",
+    "target": { "spread": { "weights": "attributed" } }
+  },
+  {
+    "id": "itti-network-platform-spread",
+    "name": "VPC / networking → every application (platform cost)",
+    "enabled": true, "status": "active", "priority": 920, "source": "seed", "confidence": 1,
+    "description": "VPC endpoints, public IPs, NAT: shared network plumbing of the account.",
+    "scope": { "cloud_service": { "regex": "Virtual Private Cloud" } },
+    "method": "spread", "category": "network",
+    "target": { "spread": { "weights": "attributed" } }
+  }
+]

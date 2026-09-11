@@ -200,4 +200,39 @@ describe('finops/wf2-allocate-daily', () => {
       runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub([], []), 'np-api-call': servicesStub, 'sub-workflow': stub } }),
     ).rejects.toThrow(/no raw facts for 2026-01-01/);
   });
+
+  it('spread: a platform service is shared by every application, weighted by what each one already carries', async () => {
+    const CONFIG = 'AWS Config';
+    const raw = [...RAW, { id: `raw-cloud_service-config-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cloud_service', subject_id: CONFIG, subject_name: CONFIG, cloud: 'aws', cloud_service: CONFIG, cost_usd: 10 }];
+    const rules = [...RULES, { id: 'config-is-platform-spread', name: 'AWS Config → every app', enabled: true, status: 'active', priority: 20, scope: { cloud_service: { regex: 'AWS Config' } }, method: 'spread', target: { spread: { weights: 'attributed' } }, category: 'platform' }];
+    const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { const facts = ctx.inputs.facts as Array<Record<string, unknown>>; return { status: 'success' as const, outputs: { count: facts.length, written: 0, ids: facts.map((f) => f.id) }, activePorts: ['default'] }; }, executeMode: 'all' as const };
+    const run = (r: typeof raw, ru: typeof rules) => runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(r, ru), 'np-api-call': servicesStub, 'sub-workflow': stub } });
+    const base = (await run(RAW, RULES)).outputs?.summary as Record<string, unknown>;
+    const result = await run(raw, rules);
+    const summary = result.outputs?.summary as Record<string, unknown>;
+    const facts = (result.outputs?.batches as Array<{ facts: Array<Record<string, unknown>> }>).flatMap((b) => b.facts);
+    const byId = Object.fromEntries(facts.map((f) => [f.id, f]));
+    expect(summary.total_usd).toBe(Number(base.total_usd) + 10);
+    expect(summary.platform_spread_usd).toBe(10);
+    expect(summary.unallocated_usd).toBe(base.unallocated_usd); // nothing new is unallocated: the spread lands on the apps
+    // weights = each application's attribution BEFORE the spread (the baseline run), never the spread itself
+    const baseApps = base.applications as Array<{ owner: string; application_id: string | null; cost_usd: number }>;
+    const appsBase = baseApps.filter((a) => a.application_id); // owners known only by slug get nothing: the spread needs an application id
+    const tot = appsBase.reduce((s, a) => s + a.cost_usd, 0);
+    const spread = facts.filter((a) => a.allocation_method === 'spread');
+    expect(spread.length).toBe(appsBase.length);
+    expect(Math.round(spread.reduce((s, a) => s + Number(a.cost_usd), 0) * 1e6) / 1e6).toBe(10);
+    for (const a of appsBase) {
+      const row = byId[`alloc-cloud_service-config-${D}-remainder-${a.owner}-spread`];
+      expect(row).toMatchObject({ allocation_method: 'spread', category: 'platform', charge_type: 'application', rule_id: 'config-is-platform-spread', cloud_service: CONFIG });
+      expect(Number(row?.cost_usd)).toBeCloseTo((10 * a.cost_usd) / tot, 5);
+    }
+    // the rollup and the by_category of each app include their share
+    const app100base = appsBase.find((a) => a.owner === 'app-100') as { cost_usd: number };
+    expect(Number((byId[`alloc-app-100-${D}`] as Record<string, unknown>).cost_usd)).toBeCloseTo(app100base.cost_usd + (10 * app100base.cost_usd) / tot, 5);
+    expect(((byId[`alloc-app-100-${D}`] as Record<string, unknown>).by_category as Record<string, number>).platform).toBeCloseTo((10 * app100base.cost_usd) / tot, 5);
+    // a spread rule when no application has cost yet → the leaf stays visibly unallocated
+    const lonely = await run([raw[raw.length - 1] as (typeof raw)[number]], rules);
+    expect((lonely.outputs?.summary as Record<string, unknown>).unallocated_usd).toBe(10);
+  });
 });
