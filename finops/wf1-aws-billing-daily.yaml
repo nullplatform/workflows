@@ -314,11 +314,12 @@ steps:
         (((inputs.results || {}).db_clusters || {}).DBClusters || []).forEach(function (c) {
           var w = (c.DBClusterMembers || []).filter(function (m) { return m.IsClusterWriter; })[0] || (c.DBClusterMembers || [])[0];
           var inst = w ? byInst[w.DBInstanceIdentifier] : null;
-          if (inst && inst.PerformanceInsightsEnabled && inst.DbiResourceId) pi.push({ subject: c.DBClusterIdentifier, res: inst.DbiResourceId });
+          if (inst && inst.PerformanceInsightsEnabled && inst.DbiResourceId) pi.push({ subject: c.DBClusterIdentifier, res: inst.DbiResourceId, engine: c.Engine || inst.Engine });
         });
-        Object.keys(byInst).forEach(function (id) { var i = byInst[id]; if (!i.DBClusterIdentifier && i.PerformanceInsightsEnabled && i.DbiResourceId) pi.push({ subject: id, res: i.DbiResourceId }); });
+        Object.keys(byInst).forEach(function (id) { var i = byInst[id]; if (!i.DBClusterIdentifier && i.PerformanceInsightsEnabled && i.DbiResourceId) pi.push({ subject: id, res: i.DbiResourceId, engine: i.Engine }); });
         pi.forEach(function (p) {
-          calls.push({ id: "pi_" + p.subject, service: "pi", operation: "GetResourceMetrics", params: { ServiceType: "RDS", Identifier: p.res, StartTime: day + "T00:00:00Z", EndTime: next + "T00:00:00Z", PeriodInSeconds: 86400,
+          // Performance Insights ServiceType: DocumentDB clusters are "DOCDB" (an RDS ServiceType is rejected: "invalid for engine chimera")
+          calls.push({ id: "pi_" + p.subject, service: "pi", operation: "GetResourceMetrics", params: { ServiceType: /docdb/i.test(String(p.engine || "")) ? "DOCDB" : "RDS", Identifier: p.res, StartTime: day + "T00:00:00Z", EndTime: next + "T00:00:00Z", PeriodInSeconds: 86400,
                        MetricQueries: [{ Metric: "db.load.avg", GroupBy: { Group: "db", Limit: 25 } }] } });
         });
         // CloudWatch Logs ingestion per log group for the day (AWS/Logs IncomingBytes, Sum). Query ids must be
