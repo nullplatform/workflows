@@ -19,7 +19,7 @@ Read first:
 | `wf-cost-fact-upsert.yaml` | Child: `PATCH /catalog/instances/<slug>/<id>?upsert=true` for one fact (fan-out target) |
 | `specs/cost_daily.spec.json` | Catalog spec (51 fields): subject, null dimensions, cloud dimensions, amortized `cost_usd` + `unblended_usd`, capacity/rates, provenance. Logical id `<stage>-<subject_type>-<slug>-<date>`. |
 | `setup/01-catalog-spec.sh` | Creates/updates the spec (needs a session bearer; org API keys get 403) |
-| `setup/publish-local.ts` | Publishes the three workflows to a local engine, patching child ids |
+| `setup/publish.ts` | Publishes the three workflows to a local engine, patching child ids |
 | `__tests__/` | E2E on the local executor, plugins stubbed at the plugin level |
 
 State (2026-09-10): verified live against kwik-e-mart in dry-run (116 facts/day,
@@ -49,7 +49,7 @@ the published engine); the E2E tests run against the stub and pass.
    ```
 3. **Publish** the tool on the local engine. `npx np-workflow publish` refuses
    (its plugin catalog is the published engine), so normalize with the engine's
-   own DSL and POST it (verified 2026-09-10; the `publish-local.ts` snippet lives
+   own DSL and POST it (verified 2026-09-10; the `publish.ts` snippet lives
    in the phase-0 plan, Task 8): `POST /workflows/definitions` with the parsed
    YAML, then `POST /workflows/definitions/:id/aliases {name: live, revision}` and
    `POST .../aliases/live/activate`. Note: the engine's `PORT` must not collide

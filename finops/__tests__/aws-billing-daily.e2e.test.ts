@@ -155,7 +155,7 @@ describe('finops/wf1-aws-billing-daily', () => {
       inputs: { date: '2026-09-09', agent_tags: { package: 'cloud-query', local: 'x' }, agent_nrn: 'organization=1255165411:account=95118862', assume_role_arn: 'arn:aws:iam::111122223333:role/np-finops', assume_role_external_id: 'kwik-ext', package_version: '0.0.1', expected_account: '688720756067', target_name: 'kwik' },
       pluginStubs: {
         manual: passthroughTrigger,
-        cron: passthroughTrigger,
+        cron: passthroughTrigger, // wf1 has no cron since the dispatcher schedules it; harmless
         'np-api-call': npApiStub,
         'sub-workflow': {
           handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
@@ -273,7 +273,7 @@ describe('finops/wf1-aws-billing-daily', () => {
       inputs: { date: '2026-09-09', dry_run: true },
       pluginStubs: {
         manual: passthroughTrigger,
-        cron: passthroughTrigger,
+        cron: passthroughTrigger, // wf1 has no cron since the dispatcher schedules it; harmless
         'np-api-call': npApiStub,
         'sub-workflow': {
           handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {

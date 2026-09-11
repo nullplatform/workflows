@@ -89,6 +89,11 @@ describe('finops/tool-cloud-query', () => {
     expect(seen[0]?.mode).toBe('async');
     // the released image travels as an immutable reference (default from variables.image)
     expect(String(seen[0]?.image)).toMatch(/^public\.ecr\.aws\/nullplatform\/agent-plugins\/workflows\/aws-cost-explorer@sha256:[a-f0-9]{64}$/);
+    // …and ALSO as the oci_image artifact inside the action context (works on engines without the `image` input)
+    const pkg = (seen[0]?.action_context as { notification: { package: { slug: string; revision: { artifacts: Array<{ type: string; meta: { registry: string; repository: string; digest: string } }> } } } }).notification.package;
+    expect(pkg.slug).toBe('cloud-query');
+    expect(pkg.revision.artifacts[0]?.type).toBe('oci_image');
+    expect(pkg.revision.artifacts[0]?.meta).toEqual({ registry: 'public.ecr.aws', repository: 'nullplatform/agent-plugins/workflows/aws-cost-explorer', digest: expect.stringMatching(/^sha256:[a-f0-9]{64}$/) });
   });
 
   it('scopes the agent selector to agent_nrn when given (agents registered under an account)', async () => {

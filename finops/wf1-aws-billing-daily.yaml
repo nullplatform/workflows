@@ -173,14 +173,6 @@ steps:
           required: false
           description: "Expected AWS account id"
 
-  - id: daily_cron
-    type: trigger
-    plugin_type: cron
-    name: "Daily 04:30 UTC"
-    config:
-      schedule: "30 4 * * *"
-      timezone: "UTC"
-
   - id: prep
     type: module
     plugin_type: code-exec
@@ -576,7 +568,6 @@ steps:
 
 connections:
   - { from: start, to: prep }
-  - { from: daily_cron, to: prep }
   - { from: prep, to: query }
   - { from: query, to: prep_types }
   - { from: prep_types, to: query_types }
