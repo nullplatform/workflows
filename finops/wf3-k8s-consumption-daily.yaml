@@ -108,7 +108,7 @@ steps:
       apiKey: "${{ secrets.NP_API_KEY }}"
       sql: |
         SELECT s.id AS scope_id, s.name AS scope_name, s.scope_slug AS scope_slug,
-               s.nrn AS scope_nrn, s.type AS scope_type, a.app_name AS app_name, a.app_slug AS app_slug
+               s.nrn AS scope_nrn, s.type AS scope_type, a.app_name AS app_name, a.application_slug AS app_slug
         FROM core_entities_scope AS s FINAL
         JOIN core_entities_application AS a FINAL
           ON s.application_id = a.app_id AND a._deleted = 0
