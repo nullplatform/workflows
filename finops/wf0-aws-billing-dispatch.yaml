@@ -124,6 +124,9 @@ steps:
   - id: collect
     type: module
     plugin_type: sub-workflow
+    # Children return their facts/batches for tests and drill-down; the dispatcher only needs the summary
+    # (and the allocator's unallocated leaves). Keeps the parent's history and the next step's input small.
+    output_projection: ["items[].outputs.summary", "items[].outputs.unallocated_leaves", "items[]._childExecutionId", "summary", "unallocated_leaves"]
     name: "Collect per account (fan-out)"
     forEach:
       expression: "${{ steps.prep.outputs.runs }}"
@@ -163,6 +166,9 @@ steps:
   - id: k8s
     type: module
     plugin_type: sub-workflow
+    # Children return their facts/batches for tests and drill-down; the dispatcher only needs the summary
+    # (and the allocator's unallocated leaves). Keeps the parent's history and the next step's input small.
+    output_projection: ["items[].outputs.summary", "items[].outputs.unallocated_leaves", "items[]._childExecutionId", "summary", "unallocated_leaves"]
     name: "k8s consumption per scope (wf3)"
     forEach:
       expression: "${{ steps.prep.outputs.k8s }}"
@@ -178,6 +184,9 @@ steps:
   - id: allocate
     type: module
     plugin_type: sub-workflow
+    # Children return their facts/batches for tests and drill-down; the dispatcher only needs the summary
+    # (and the allocator's unallocated leaves). Keeps the parent's history and the next step's input small.
+    output_projection: ["items[].outputs.summary", "items[].outputs.unallocated_leaves", "items[]._childExecutionId", "summary", "unallocated_leaves"]
     name: "Allocate the day (wf2)"
     forEach:
       expression: "${{ steps.prep.outputs.allocate }}"

@@ -34,6 +34,12 @@ CI note: `npm run validate` skips `finops/tool-cloud-query.yaml` — the publish
 
 State (2026-09-11): LIVE in nullplatform's organization (org 4): daily loop published with alias `live`, rules seeded from `setup/rules.nullplatform.json`, 2026-09-09 collected (384 USD amortized). Engine plugin `np-package-call` is deployed (workflow-system 0.0.125).
 
+## Bringing it to a customer
+
+Read [`docs/customer-onboarding.md`](docs/customer-onboarding.md): discovery questions, worker
+identity + agent rule, catalog specs and their traps, publishing, the first day, the dashboard and
+the operational limits — everything learned on nullplatform's own org.
+
 ## Local loop
 
 1. **Engine** (from the engine worktree that has the plugin):
