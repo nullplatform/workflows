@@ -90,20 +90,23 @@ steps:
         // cloud_service, cluster, …); `day` was added later and `date` is ignored → read all raw rows and
         // filter by day here. TODO: switch to the lake (customers_lake.catalog_entities) once volume grows.
         var org = String(inputs.org_nrn || "");
-        return { day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, allocated_filters: { stage: "allocated" }, rule_filters: { status: "active" }, scope_filters: { nrn: org, status: "active" }, service_query: { nrn: org, show_descendants: "true", limit: "500" } };
+        var rawSql = "SELECT data FROM (SELECT id, argMax(data, _version) AS data, argMax(_deleted, _version) AS del FROM catalog_entities WHERE entity_specification_id IN (SELECT id FROM catalog_entity_specifications FINAL WHERE slug = 'cost_daily' AND _deleted = 0) GROUP BY id HAVING del = 0) WHERE JSONExtractString(data, 'stage') = 'raw' AND JSONExtractString(data, 'day') = '" + day + "' QUALIFY parseDateTimeBestEffortOrNull(JSONExtractString(data, 'collected_at')) >= max(parseDateTimeBestEffortOrNull(JSONExtractString(data, 'collected_at'))) OVER (PARTITION BY JSONExtractString(data, 'source')) - INTERVAL 30 MINUTE";
+        return { raw_sql: rawSql, day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, allocated_filters: { stage: "allocated" }, rule_filters: { status: "active" }, scope_filters: { nrn: org, status: "active" }, service_query: { nrn: org, show_descendants: "true", limit: "500" } };
 
+  # The catalog list cannot filter by day (only the fields indexed at spec creation), so it returned
+  # EVERY day's raw facts: 5 days of itti = 2.3 MB, over the 2 MB step budget. The Lake filters by day;
+  # the latest run per source (30-minute window: wf3 patches the cluster row minutes after wf1) is what
+  # the catalog holds after the collectors' stale sweeps.
   - id: read_raw
     type: module
-    plugin_type: np-entity-paginated-fetch
-    name: "Raw facts of the day"
+    plugin_type: np-lake-query
+    name: "Raw facts of the day (Lake)"
     inputs:
-      filters: "${{ steps.prep.outputs.raw_filters }}"
+      sql: "${{ steps.prep.outputs.raw_sql }}"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
-      entity: "catalog/instances/cost_daily"
-      filters: { stage: "raw" }
-      limit: 100
-      maxPages: 200
+      sql: "SELECT 1"
+      maxRows: 20000
 
   - id: read_rules
     type: module
@@ -154,7 +157,7 @@ steps:
     join_strategy: all
     inputs:
       day: "${{ steps.prep.outputs.day }}"
-      raw: "${{ steps.read_raw.outputs.items }}"
+      raw: "${{ steps.read_raw.outputs.rows }}"
       rules: "${{ steps.read_rules.outputs.items }}"
       cloud_account: "${{ steps.prep.outputs.cloud_account }}"
       scopes: "${{ steps.scopes.outputs.items }}"
@@ -166,7 +169,8 @@ steps:
       language: javascript
       code: |
         var d = String(inputs.day); var now = new Date().toISOString();
-        var raw = (inputs.raw || []).filter(function (f) { return f && f.stage === "raw" && (f.date === d || f.day === d) && (!inputs.cloud_account || String(f.cloud_account) === String(inputs.cloud_account)); });
+        var rawIn = (inputs.raw || []).map(function (r) { if (r && typeof r.data === "string") { try { return JSON.parse(r.data); } catch (e) { return null; } } return r && r.data && typeof r.data === "object" ? r.data : r; });
+        var raw = rawIn.filter(function (f) { return f && f.stage === "raw" && (f.date === d || f.day === d) && (!inputs.cloud_account || String(f.cloud_account) === String(inputs.cloud_account)); });
         if (!raw.length) throw new Error("no raw facts for " + d + " (run finops_aws_billing_daily first)");
         var rules = (inputs.rules || []).filter(function (r) { return r && r.enabled !== false && r.status === "active" && r.target; })
           .map(function (r) { return JSON.parse(JSON.stringify(r)); })

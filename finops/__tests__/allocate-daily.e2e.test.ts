@@ -73,10 +73,13 @@ const SCOPES_API = [
 ];
 const SERVICES_API = { results: [{ id: 'svc-1', name: 'Orders DB', dimensions: { environment: 'production' } }] };
 const servicesStub = { handler: () => ({ status: 'success' as const, outputs: { status: 200, body: SERVICES_API }, activePorts: ['default'] }), executeMode: 'all' as const };
+function lakeStub(raw = RAW) {
+  return { handler: (ctx: { inputs: Record<string, unknown> }) => { expect(String(ctx.inputs.sql)).toContain("JSONExtractString(data, 'day') = '"); return { status: 'success' as const, outputs: { rows: raw.map((f) => ({ data: JSON.stringify(f) })), rowCount: raw.length }, activePorts: ['default'] }; }, executeMode: 'all' as const };
+}
 function fetchStub(raw = RAW, rules = RULES) {
   return {
     handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
-      const items = ctx.stepId === 'read_rules' ? rules : ctx.stepId === 'scopes' ? SCOPES_API : raw;
+      const items = ctx.stepId === 'read_rules' ? rules : ctx.stepId === 'scopes' ? SCOPES_API : [];
       return { status: 'success' as const, outputs: { items, totalFetched: items.length, pages: 1 }, activePorts: ['default'] };
     },
     executeMode: 'all' as const,
@@ -91,7 +94,7 @@ describe('finops/wf2-allocate-daily', () => {
       inputs: { date: D },
       pluginStubs: {
         manual: passthroughTrigger,
-        'np-entity-paginated-fetch': fetchStub(),
+        'np-entity-paginated-fetch': fetchStub(), 'np-lake-query': lakeStub(),
         'np-api-call': servicesStub,
         'sub-workflow': {
           handler: (ctx: { inputs: Record<string, unknown> }) => {
@@ -196,11 +199,11 @@ describe('finops/wf2-allocate-daily', () => {
   it('dry_run computes everything and writes nothing; no raw facts is an error', async () => {
     const written: unknown[] = [];
     const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { if (!ctx.inputs.dry_run) written.push(...(ctx.inputs.facts as unknown[])); return { status: 'success' as const, outputs: { written: 0 }, activePorts: ['default'] }; }, executeMode: 'all' as const };
-    const r = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'np-api-call': servicesStub, 'sub-workflow': stub } });
+    const r = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'np-lake-query': lakeStub(), 'np-api-call': servicesStub, 'sub-workflow': stub } });
     expect(written).toHaveLength(0);
     expect((r.outputs?.summary as { written: number; dry_run: boolean })).toMatchObject({ written: 0, dry_run: true });
     await expect(
-      runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub([], []), 'np-api-call': servicesStub, 'sub-workflow': stub } }),
+      runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub([], []), 'np-lake-query': lakeStub([]), 'np-api-call': servicesStub, 'sub-workflow': stub } }),
     ).rejects.toThrow(/no raw facts for 2026-01-01/);
   });
 
@@ -209,7 +212,7 @@ describe('finops/wf2-allocate-daily', () => {
     const raw = [...RAW, { id: `raw-cloud_service-config-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cloud_service', subject_id: CONFIG, subject_name: CONFIG, cloud: 'aws', cloud_service: CONFIG, cost_usd: 10 }];
     const rules = [...RULES, { id: 'config-is-platform-spread', name: 'AWS Config → every app', enabled: true, status: 'active', priority: 20, scope: { cloud_service: { regex: 'AWS Config' } }, method: 'spread', target: { spread: { weights: 'attributed' } }, category: 'platform' }];
     const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { const facts = ctx.inputs.facts as Array<Record<string, unknown>>; return { status: 'success' as const, outputs: { count: facts.length, written: 0, ids: facts.map((f) => f.id) }, activePorts: ['default'] }; }, executeMode: 'all' as const };
-    const run = (r: typeof raw, ru: typeof rules) => runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(r, ru), 'np-api-call': servicesStub, 'sub-workflow': stub } });
+    const run = (r: typeof raw, ru: typeof rules) => runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(r, ru), 'np-lake-query': lakeStub(r), 'np-api-call': servicesStub, 'sub-workflow': stub } });
     const base = (await run(RAW, RULES)).outputs?.summary as Record<string, unknown>;
     const result = await run(raw, rules);
     const summary = result.outputs?.summary as Record<string, unknown>;
@@ -252,7 +255,7 @@ describe('finops/wf2-allocate-daily', () => {
       { id: 'cw-rest-spread', name: 'rest of X-Ray → every app', enabled: true, status: 'active', priority: 900, scope: { cloud_service: { regex: 'X-Ray' } }, method: 'spread', category: 'observability', target: { spread: { weights: 'equal' } } },
     ];
     const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { const facts = ctx.inputs.facts as Array<Record<string, unknown>>; return { status: 'success' as const, outputs: { count: facts.length, written: 0, ids: facts.map((f) => f.id) }, activePorts: ['default'] }; }, executeMode: 'all' as const };
-    const result = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(raw, rules), 'np-api-call': servicesStub, 'sub-workflow': stub } });
+    const result = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(raw, rules), 'np-lake-query': lakeStub(raw), 'np-api-call': servicesStub, 'sub-workflow': stub } });
     const summary = result.outputs?.summary as Record<string, unknown>;
     const facts = (result.outputs?.batches as Array<{ facts: Array<Record<string, unknown>> }>).flatMap((b) => b.facts);
     const byId = Object.fromEntries(facts.map((f) => [f.id, f]));
@@ -265,7 +268,7 @@ describe('finops/wf2-allocate-daily', () => {
     expect(facts.find((f) => String(f.id).startsWith(`alloc-bucket-cw-alarms-`))).toBeUndefined();
     const spread = facts.filter((f) => f.allocation_method === 'spread' && f.cloud_service === CW);
     expect(Math.round(spread.reduce((s, f) => s + Number(f.cost_usd), 0) * 1e6) / 1e6).toBe(6);
-    const base = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'np-api-call': servicesStub, 'sub-workflow': stub } });
+    const base = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'np-lake-query': lakeStub(), 'np-api-call': servicesStub, 'sub-workflow': stub } });
     expect(summary.unallocated_usd).toBe(Number((base.outputs?.summary as Record<string, unknown>).unallocated_usd) + 1);
   });
 });
