@@ -121,6 +121,8 @@ steps:
   - id: scopes
     type: module
     plugin_type: np-entity-paginated-fetch
+    # The parent's Temporal history carries every step result: keep only what the allocator reads.
+    output_projection: ["items[].id", "items[].name", "items[].type", "items[].dimensions", "totalFetched", "pages"]
     name: "Scopes (dimensions)"
     inputs:
       filters: "${{ steps.prep.outputs.scope_filters }}"
@@ -134,6 +136,7 @@ steps:
   - id: services
     type: module
     plugin_type: np-api-call
+    output_projection: ["status", "body.results[].id", "body.results[].name", "body.results[].slug", "body.results[].dimensions", "body.data[].id", "body.data[].name", "body.data[].slug", "body.data[].dimensions"]
     name: "Services (dimensions)"
     inputs:
       query: "${{ steps.prep.outputs.service_query }}"
@@ -428,6 +431,7 @@ steps:
   - id: read_allocated
     type: module
     plugin_type: np-entity-paginated-fetch
+    output_projection: ["items[].id", "items[].day", "items[].date", "items[].stage", "items[].cost_usd", "totalFetched", "pages"]
     name: "Allocated rows already in the catalog"
     inputs:
       filters: "${{ steps.prep.outputs.allocated_filters }}"
