@@ -434,7 +434,7 @@ steps:
           var amt = num(a.cost_usd); var ctype = a.charge_type || (a.scope_id ? "scope" : a.service_id ? "service" : "application"); var env = a.environment || "none"; var cat = a.category || "other"; var svc = a.cloud_service || "other";
           app.total = num(app.total + amt); app.by_charge_type[ctype] = num((app.by_charge_type[ctype] || 0) + amt); app.by_environment[env] = num((app.by_environment[env] || 0) + amt);
           app.by_category[cat] = num((app.by_category[cat] || 0) + amt); app.by_cloud_service[svc] = num((app.by_cloud_service[svc] || 0) + amt); if (a.cloud_account) app.accounts[String(a.cloud_account)] = true;
-          app.items.push({ charge_type: ctype, scope_id: a.scope_id || null, scope_name: a.scope_name || null, scope_type: a.scope_type || null, service_id: a.service_id || null, service_name: a.service_name || null,
+          app.items.push({ charge_type: ctype, scope_id: a.scope_id || null, scope_name: a.scope_name || null, scope_type: a.scope_type || null, service_id: a.service_id || null, service_name: a.service_name || null, service_kind: a.service_kind || null,
                            dimensions: a.dimensions || null, environment: a.environment || null, category: cat, cloud_service: a.cloud_service || null, subject_type: a.subject_type, subject_id: a.subject_id, subject_name: a.subject_name || a.subject_id,
                            cluster: a.cluster || null, component: a.component || null, cost_usd: amt, share: num(a.share), allocation_method: a.allocation_method, rule_id: a.rule_id || null, source_fact_id: a.source_fact_id || null });
         });
