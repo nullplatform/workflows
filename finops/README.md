@@ -208,6 +208,19 @@ After the writes, a **stale sweep** (`read_allocated → stale → delete_stale`
 `allocated` rows this run did not produce (older allocator revisions, rules that stopped matching),
 so re-allocating a day never double counts in the lake; `summary.stale_deleted` says how many.
 
+`wf1` does the same for its own raw rows (`source: aws_ce`, never wf3's `k8s` rows), so a
+resource that disappears or a collector revision that renames ids leaves nothing behind.
+
+### Writes go in batches, never one child per row
+
+The upsert child (`wf-cost-fact-upsert.yaml`) takes `facts[]` (plus `dry_run`) and fans out the
+PATCHes inside; the collectors and the allocator send batches of 40 (invoices 25). A per-row
+sub-workflow fan-out (752 children for one day) pushed the parent's Temporal history to 14 MB and
+its workflow tasks past the 10 s timeout, which re-issues child starts in a loop. The read steps
+carry `output_projection` for the same reason. Spec grants: every principal may create/write/
+delete `cost_daily`, `application_cost_daily`, `cost_mapping_rule` and `cost_mapping_suggestion`
+entities — the workflows write with the organization's API key, which is not the spec's owner.
+
 ## Deploying to an organization (done for nullplatform, org 4, 2026-09-11)
 
 Everything is per organization; nothing is registered on the platform as a package.
