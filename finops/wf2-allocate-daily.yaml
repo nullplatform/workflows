@@ -273,11 +273,20 @@ steps:
             OWNER.forEach(function (k) { if (o[k] !== undefined) a[k] = o[k]; });
             allocated.push(a); sumAlloc += amt;
             if (o.cluster && !o.application_id) { perCluster[o.cluster] = num((perCluster[o.cluster] || 0) + amt); return; }
-            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, kubernetes_usd: 0, by_category: {}, by_cloud_service: {}, facts: 0, items: [], accounts: {} });
+            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, by_category: {}, by_cloud_service: {}, facts: 0, accounts: {}, scopes: {}, services: {}, app_items: [] });
             app.cost_usd = num(app.cost_usd + amt); app.by_category[rcat] = num((app.by_category[rcat] || 0) + amt); app.by_cloud_service[L.service] = num((app.by_cloud_service[L.service] || 0) + amt); app.facts += 1;
-            if (method === "by_metric" && hit.rule.method === "by_metric_parent") app.kubernetes_usd = num(app.kubernetes_usd + amt);
             var acctOf = f.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null; if (acctOf) app.accounts[String(acctOf)] = true;
-            app.items.push({ subject_type: f.subject_type, subject_id: f.subject_id, subject_name: f.subject_name || f.subject_id, cloud_service: L.service, category: rcat, cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), cluster: f.cluster || null, component: f.component || null, scope_id: o.scope_id || (p.key && hit.rule.method === "by_metric_parent" ? String(p.key) : null), source_fact_id: f.id });
+            // The item goes under the null OBJECT it came through: a scope (any type), a service, or the application itself.
+            var scopeId = o.scope_id || f.scope_id || (p.key && hit.rule.method === "by_metric_parent" ? String(p.key) : null);
+            var item = { subject_type: f.subject_type, subject_id: f.subject_id, subject_name: f.subject_name || f.subject_id, cloud_service: L.service, category: rcat, cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), cluster: f.cluster || null, component: f.component || null, source_fact_id: f.id };
+            if (scopeId) {
+              var sc = app.scopes[scopeId] || (app.scopes[scopeId] = { scope_id: String(scopeId), scope_name: o.scope_name || f.scope_name || null, scope_type: o.scope_type || f.scope_type || null, cost_usd: 0, by_category: {}, items: [] });
+              sc.cost_usd = num(sc.cost_usd + amt); sc.by_category[rcat] = num((sc.by_category[rcat] || 0) + amt); sc.items.push(item);
+            } else if (o.service_id || f.service_id) {
+              var svid = String(o.service_id || f.service_id);
+              var sv = app.services[svid] || (app.services[svid] = { service_id: svid, service_name: f.service_name || f.subject_name || null, cost_usd: 0, by_category: {}, items: [] });
+              sv.cost_usd = num(sv.cost_usd + amt); sv.by_category[rcat] = num((sv.by_category[rcat] || 0) + amt); sv.items.push(item);
+            } else app.app_items.push(item);
           });
         });
         // ── 4) rollups: one per owner, one for unallocated
@@ -289,14 +298,18 @@ steps:
           OWNER.forEach(function (kk) { if (o[kk] !== undefined) r[kk] = o[kk]; });
           allocated.push(r);
         });
-        // application_cost_daily: one row per null application (owners with an application_id) with the detail.
-        var k8sRows = {}; raw.forEach(function (f) { if (f.source === "k8s" && f.subject_type === "scope" && f.application_id) { var a = k8sRows[f.application_id] || (k8sRows[f.application_id] = { core_h_chargeable: 0, gb_h_chargeable: 0, core_h_used: 0, gb_h_used: 0, usage_usd: 0, waste_usd: 0, scopes: 0 }); ["core_h_chargeable", "gb_h_chargeable", "core_h_used", "gb_h_used", "usage_usd", "waste_usd"].forEach(function (k) { a[k] = num(a[k] + (Number(f[k]) || 0)); }); a.scopes += 1; } });
-        var appRows = [];
+        // application_cost_daily: one row per null application, split by its scopes and services.
+        var k8sByScope = {}; raw.forEach(function (f) { if (f.source === "k8s" && f.subject_type === "scope" && f.scope_id) k8sByScope[String(f.scope_id)] = { core_h_chargeable: num(f.core_h_chargeable), gb_h_chargeable: num(f.gb_h_chargeable), core_h_used: num(f.core_h_used), gb_h_used: num(f.gb_h_used), usage_usd: num(f.usage_usd), waste_usd: num(f.waste_usd), scope_name: f.scope_name || null, scope_type: f.scope_type || null }; });
+        var appRows = []; var byCost = function (x, y) { return y.cost_usd - x.cost_usd; };
         Object.keys(perApp).forEach(function (k) {
           var a = perApp[k]; var o = a.owner; if (!o.application_id) return;
+          var scopes = Object.keys(a.scopes).map(function (id) { var sc = a.scopes[id]; var c = k8sByScope[id]; if (c) { sc.consumption = { core_h_chargeable: c.core_h_chargeable, gb_h_chargeable: c.gb_h_chargeable, core_h_used: c.core_h_used, gb_h_used: c.gb_h_used, usage_usd: c.usage_usd, waste_usd: c.waste_usd }; sc.scope_name = sc.scope_name || c.scope_name; sc.scope_type = sc.scope_type || c.scope_type; } sc.items.sort(byCost); return sc; }).sort(byCost);
+          var services = Object.keys(a.services).map(function (id) { var sv = a.services[id]; sv.items.sort(byCost); return sv; }).sort(byCost);
+          var cons = null; scopes.forEach(function (sc) { if (!sc.consumption) return; cons = cons || { core_h_chargeable: 0, gb_h_chargeable: 0, core_h_used: 0, gb_h_used: 0, usage_usd: 0, waste_usd: 0, scopes: 0 }; Object.keys(sc.consumption).forEach(function (kk) { cons[kk] = num(cons[kk] + sc.consumption[kk]); }); cons.scopes += 1; });
+          var scopesUsd = num(scopes.reduce(function (s2, x) { return s2 + x.cost_usd; }, 0)), servicesUsd = num(services.reduce(function (s2, x) { return s2 + x.cost_usd; }, 0));
           appRows.push({ id: String(o.application_id) + "-" + d, day: d, date: d, application_id: String(o.application_id), application_slug: o.application_slug || null, namespace_id: o.namespace_id || null, account_id: o.account_id || null,
-            total_usd: a.cost_usd, direct_usd: num(a.cost_usd - a.kubernetes_usd), kubernetes_usd: a.kubernetes_usd, by_category: a.by_category, by_cloud_service: a.by_cloud_service,
-            items: a.items.sort(function (x, y) { return y.cost_usd - x.cost_usd; }), kubernetes: k8sRows[String(o.application_id)] || null, facts: a.facts, cloud_accounts: Object.keys(a.accounts), currency: "USD", allocator: String(inputs.allocator), computed_at: now });
+            total_usd: a.cost_usd, scopes_usd: scopesUsd, services_usd: servicesUsd, application_usd: num(a.cost_usd - scopesUsd - servicesUsd), by_category: a.by_category, by_cloud_service: a.by_cloud_service,
+            scopes: scopes, services: services, application_items: a.app_items.sort(byCost), consumption: cons, items_count: a.facts, cloud_accounts: Object.keys(a.accounts), currency: "USD", allocator: String(inputs.allocator), computed_at: now });
         });
         var unTotal = num(Object.keys(unalloc).reduce(function (s, k) { return s + unalloc[k]; }, 0));
         allocated.push({ id: "alloc-unallocated-" + d, date: d, day: d, stage: "allocated", subject_type: "unallocated", subject_id: "unallocated", subject_name: "Not attributable yet",

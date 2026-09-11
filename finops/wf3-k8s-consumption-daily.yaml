@@ -220,12 +220,12 @@ steps:
           var cost = num(chCore * C.rate_cpu + chGb * C.rate_mem); var usage = num(usedCore * C.rate_cpu + usedGb * C.rate_mem);
           var f = { id: "raw-k8s-scope-" + s.scope_id + "-" + d, date: d, day: d, stage: "raw", subject_type: "scope", subject_id: s.scope_id, subject_name: (s.app_slug ? s.app_slug + "." : "") + (s.scope_slug || s.scope_name || s.scope_id),
                     cloud: "aws", cloud_account: inputs.cluster_body.cloud_account || null, cloud_service: null, cluster: cname, region: inputs.cluster_body.region || null, source: "k8s", collected_at: now, collector: String(inputs.collector),
-                    scope_id: s.scope_id, scope_name: s.scope_name || null, application_id: s.application_id, application_slug: s.app_slug || null, namespace_id: s.namespace_id, account_id: s.account_id, nrn: s.nrn,
+                    scope_id: s.scope_id, scope_name: s.scope_name || null, scope_type: s.scope_type || null, application_id: s.application_id, application_slug: s.app_slug || null, namespace_id: s.namespace_id, account_id: s.account_id, nrn: s.nrn,
                     cost_usd: cost, usage_usd: usage, waste_usd: num(Math.max(cost - usage, 0)), core_h_chargeable: num(chCore), gb_h_chargeable: num(chGb), core_h_used: num(usedCore), gb_h_used: num(usedGb),
                     core_h_requested: num(reqCore), gb_h_requested: num(reqGb), pods_avg: podsN ? num(pods / podsN) : null, quantity: samples, units: "samples",
                     rate_cpu_usd_core_h: C.rate_cpu, rate_mem_usd_gb_h: C.rate_mem, allocation_method: "direct_resource", metric: "k8s.chargeable" };
           facts.push(f); sum += cost;
-          if (cost > 0) { shares[s.scope_id] = cost; owners[s.scope_id] = { application_id: s.application_id, namespace_id: s.namespace_id, scope_id: s.scope_id, account_id: s.account_id, application_slug: s.app_slug || null }; }
+          if (cost > 0) { shares[s.scope_id] = cost; owners[s.scope_id] = { application_id: s.application_id, namespace_id: s.namespace_id, scope_id: s.scope_id, account_id: s.account_id, application_slug: s.app_slug || null, scope_name: s.scope_name || null, scope_type: s.scope_type || null }; }
         });
         var clusterCost = num(C.cost_usd); var denom = clusterCost > 0 ? Math.max(clusterCost, sum) : sum; // shares never exceed 1
         Object.keys(shares).forEach(function (k) { shares[k] = denom ? num(shares[k] / denom) : 0; });

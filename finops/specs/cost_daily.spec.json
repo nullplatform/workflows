@@ -556,6 +556,13 @@
           "null"
         ],
         "description": "Cluster: cost not covered by any scope (system namespaces, idle headroom)"
+      },
+      "scope_type": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null scope type (web_pool_k8s, custom, lambda, \u2026) when known"
       }
     },
     "required": [

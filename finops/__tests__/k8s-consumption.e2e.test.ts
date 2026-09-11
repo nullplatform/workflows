@@ -62,7 +62,7 @@ describe('finops/wf3-k8s-consumption-daily', () => {
     // cluster row patched with shares by scope (over the cluster cost) and the overhead
     const cluster = written.find((w) => (w.fact as { id: string }).id === `raw-cluster-runtime-${D}`)?.fact as Record<string, unknown>;
     expect(cluster).toMatchObject({ metric: 'k8s.chargeable', metric_shares: { 777: 0.0025, 999: 0.0003 }, k8s_overhead_usd: 99.72, cost_usd: 100 });
-    expect((cluster.metric_owners as Record<string, Record<string, unknown>>)[777]).toEqual({ application_id: '100', namespace_id: '5', scope_id: '777', account_id: '17', application_slug: 'orders-api' });
+    expect((cluster.metric_owners as Record<string, Record<string, unknown>>)[777]).toEqual({ application_id: '100', namespace_id: '5', scope_id: '777', account_id: '17', application_slug: 'orders-api', scope_name: 'prod', scope_type: 'web_pool_k8s' });
     const summary = result.outputs?.summary as Record<string, unknown>;
     expect(summary).toMatchObject({ scopes: 3, with_data: 2, scopes_cost_usd: 0.28, overhead_usd: 99.72, cluster_cost_usd: 100, written: 3, error_count: 0 });
     expect(written.map((w) => w.catalog_slug)).toEqual(['cost_daily', 'cost_daily', 'cost_daily']);

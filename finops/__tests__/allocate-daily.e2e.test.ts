@@ -136,15 +136,26 @@ describe('finops/wf2-allocate-daily', () => {
     expect(byId[`alloc-app-100-${D}`]).toMatchObject({ subject_type: 'application', application_id: '100', cost_usd: 30, by_category: { compute: 2, database: 24, kubernetes: 4 }, quantity: 6 });
     expect(byId[`alloc-app-300-${D}`]).toMatchObject({ cost_usd: 3 });
     expect(byId[`alloc-app-400-${D}`]).toMatchObject({ cost_usd: 2 });
-    // application_cost_daily: the per-app entity with the detail
+    // application_cost_daily: the per-app entity, split by the null objects the cost came through
     const appRows = result.outputs?.app_rows as Array<Record<string, unknown>>;
-    const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; direct_usd: number; kubernetes_usd: number; items: Array<Record<string, unknown>>; kubernetes: Record<string, unknown>; by_category: Record<string, number> };
-    expect(app100).toMatchObject({ application_id: '100', namespace_id: '5', total_usd: 30, direct_usd: 26, kubernetes_usd: 4, by_category: { compute: 2, database: 24, kubernetes: 4 }, facts: 6, cloud_accounts: ['111122223333'] });
-    expect(app100.items).toHaveLength(6);
-    expect(app100.items[0]).toMatchObject({ subject_id: 'orders-db', cost_usd: 12, rule_id: 'default:null-service' });
-    expect(app100.items.find((i) => i.component === 'nodes')).toMatchObject({ scope_id: '777', cost_usd: 2.5, allocation_method: 'by_metric' });
-    expect(app100.kubernetes).toEqual({ core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, usage_usd: 1, waste_usd: 3, scopes: 1 });
+    type Item = Record<string, unknown>; type Owner = { scope_id?: string; service_id?: string; cost_usd: number; items: Item[]; consumption?: Record<string, number>; scope_type?: string | null };
+    const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; scopes_usd: number; services_usd: number; application_usd: number; scopes: Owner[]; services: Owner[]; application_items: Item[]; consumption: Record<string, number>; by_category: Record<string, number> };
+    expect(app100).toMatchObject({ application_id: '100', namespace_id: '5', total_usd: 30, scopes_usd: 6, services_usd: 12, application_usd: 12, by_category: { compute: 2, database: 24, kubernetes: 4 }, items_count: 6, cloud_accounts: ['111122223333'] });
+    // scope 777: the EC2 instance tagged with the scope (2) + its share of the cluster nodes (2.5) and networking (1.5), with the k8s consumption alongside
+    expect(app100.scopes).toHaveLength(1);
+    expect(app100.scopes[0]).toMatchObject({ scope_id: '777', cost_usd: 6, by_category: { compute: 2, kubernetes: 4 }, consumption: { core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, usage_usd: 1, waste_usd: 3 } });
+    expect(app100.scopes[0].items.map((i) => [i.subject_id, i.cost_usd])).toEqual([['runtime|nodes', 2.5], ['777', 2], ['runtime|networking', 1.5]]);
+    expect(app100.scopes[0].items[0]).toMatchObject({ component: 'nodes', allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', category: 'kubernetes' });
+    // service svc-1 (orders-db, by null service host): 12
+    expect(app100.services).toHaveLength(1);
+    expect(app100.services[0]).toMatchObject({ service_id: 'svc-1', cost_usd: 12, items: [{ subject_id: 'orders-db', rule_id: 'default:null-service', cost_usd: 12 }] });
+    // neither a scope nor a service: the shared clusters split by rule/metric (6 + 6) are attributed to the application directly
+    expect(app100.application_items).toHaveLength(2);
+    expect(app100.application_items.map((i) => [i.subject_id, i.cost_usd, i.allocation_method]).sort()).toEqual([['metrics-db', 6, 'by_metric'], ['shared-db', 6, 'split']]);
+    expect(app100.consumption).toEqual({ core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, usage_usd: 1, waste_usd: 3, scopes: 1 });
+    expect(app100.scopes_usd + app100.services_usd + app100.application_usd).toBeCloseTo(app100.total_usd, 6);
     expect(appRows.map((r) => r.id).sort()).toEqual([`100-${D}`, `200-${D}`, `300-${D}`, `400-${D}`]);
+    expect((appRows.find((r) => r.id === `400-${D}`) as { scopes: Owner[] }).scopes[0]).toMatchObject({ scope_id: '999', cost_usd: 2 });
     expect(written.filter((w) => (w as { id: string }).id === `100-${D}`)).toHaveLength(1);
     expect(byId[`alloc-app-200-${D}`]).toMatchObject({ cost_usd: 2 });
     expect(byId[`alloc-bucket-shared-platform-${D}`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1 });

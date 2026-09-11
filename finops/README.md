@@ -21,7 +21,7 @@ Read first:
 | `wf-suggest-mappings.yaml` | **Inference**: unallocated leaves × evidence (null services by host, application parameters) → `cost_mapping_suggestion` rows (`proposed`) with evidence, confidence and the USD they would recover. |
 | `wf-cost-fact-upsert.yaml` | Child: `PATCH /catalog/instances/<slug>/<id>?upsert=true` for one row (facts, rules, suggestions — `catalog_slug` input) |
 | `specs/cost_daily.spec.json` | Catalog spec (62 fields): subject, null dimensions, cloud dimensions, amortized `cost_usd` + `unblended_usd`, capacity/rates, evidence (`tags`, `host`), allocation provenance (`rule_id`, `share`, `source_fact_id`, `category`), rollups. Logical id `<stage>-<subject_type>-<slug>-<date>`; `day` = filterable copy of `date`. |
-| `specs/application_cost_daily.spec.json` | The per-application daily entity: `<application_id>-<day>` with `total_usd`, `direct_usd`, `kubernetes_usd`, `by_category`, `by_cloud_service`, `items[]` (resource by resource with the rule that attributed it), `kubernetes` (core-h/GiB-h chargeable and used, usage/waste USD, scopes). |
+| `specs/application_cost_daily.spec.json` | The per-application daily entity: `<application_id>-<day>` with `total_usd` = `scopes_usd` + `services_usd` + `application_usd`, `by_category`, `by_cloud_service`, and the resources behind it nested under the null object they came through: `scopes[]` (any scope type — k8s, lambda, custom — each with its `items[]` and, for k8s, its `consumption`), `services[]` (databases, caches…), `application_items[]` (attributed to the app by tag or rule without a scope/service). Every item carries the rule that attributed it. |
 | `specs/cost_mapping_rule.spec.json`, `specs/cost_mapping_suggestion.spec.json` | The rules as data (see [docs/mapping-rules-design.md](./docs/mapping-rules-design.md)) and what the inference proposes. |
 | `setup/01-catalog-spec.sh` | Creates/updates the three specs (session bearer; the admin grant is rewritten to the token's user) |
 | `setup/02-aws-worker-identity.sh` | Worker pod identity for clusters without IaC (Pod Identity role + SA + the agent rule) |
@@ -161,9 +161,23 @@ What the allocator writes (`stage: allocated`, all in `cost_daily`):
 | unallocated | `alloc-unallocated-<day>` | `by_cloud_service` = the gap to close with rules |
 
 **The per-application entity**: `GET /catalog/instances/application_cost_daily/<application_id>-<day>`
-(or list `?application_id=<id>` / `?day=<day>`): `total_usd`, `direct_usd` + `kubernetes_usd`, `by_category`,
-`by_cloud_service`, `items[]` (each resource, its category, USD, share and `rule_id`), `kubernetes`
-(core-h / GiB-h chargeable and used, usage vs waste USD, number of scopes).
+(or list `?application_id=<id>` / `?day=<day>`):
+
+```json
+{ "id": "2044993572-2026-09-09", "application_id": "2044993572", "application_slug": "entities-api",
+  "total_usd": 9.1, "scopes_usd": 3.52, "services_usd": 5.58, "application_usd": 0,
+  "by_category": { "database": 5.58, "kubernetes": 3.52 },
+  "scopes": [ { "scope_id": "596334143", "scope_name": "production", "scope_type": "web_pool_k8s", "cost_usd": 3.52,
+                "consumption": { "core_h_chargeable": 96, "gb_h_chargeable": 380, "core_h_used": 22, "gb_h_used": 190, "usage_usd": 1.2, "waste_usd": 2.3 },
+                "items": [ { "subject_id": "runtime|nodes", "component": "nodes", "category": "kubernetes", "cost_usd": 2.1, "share": 0.013, "allocation_method": "by_metric", "rule_id": "default:cluster-consumption" }, "…" ] } ],
+  "services": [ { "service_id": "38879e91-…", "service_name": "oltp-database", "cost_usd": 3.59, "items": [ { "subject_id": "oltp-database", "rule_id": "default:null-service", "cost_usd": 3.59 } ] } ],
+  "application_items": [ { "subject_id": "postgres-approvals-api-db", "cost_usd": 1.99, "allocation_method": "by_metric", "rule_id": "rds-approvals-by-database-load" } ],
+  "consumption": { "core_h_chargeable": 96, "gb_h_chargeable": 380, "…": "…", "scopes": 1 } }
+```
+
+A scope is any null scope (k8s, lambda, custom/EC2) and always carries its `scope_id`; a service is a
+null service; `application_items` is what a rule or tag attributes to the application without a
+scope or service (a queue, a bucket, a shared database's share).
 
 Other queries: `GET /catalog/instances/cost_daily?stage=allocated&application_id=<id>` (allocated
 facts of one app), `…&stage=allocated&subject_type=unallocated` (the gap),
