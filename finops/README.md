@@ -227,6 +227,15 @@ carry `output_projection` for the same reason. Spec grants: every principal may 
 delete `cost_daily`, `application_cost_daily`, `cost_mapping_rule` and `cost_mapping_suggestion`
 entities — the workflows write with the organization's API key, which is not the spec's owner.
 
+## Dashboard
+
+`setup/report-finops.py --spec-id <cost_daily spec uuid>` generates the "FinOps — Costos por
+aplicación" dynamic report (Lake-backed): filters period / account / application / environment /
+charge type / null service / scope type; KPIs (total = applications + shared platform + Kubernetes
+overhead + unallocated); daily stacked bars by charge type; top applications; donuts by
+environment, cloud service and category; tables per application, per invoice item (with the day)
+and shared/unallocated. See `docs/customer-onboarding.md § 6` for the query rules it encodes.
+
 ## Deploying to an organization (done for nullplatform, org 4, 2026-09-11)
 
 Everything is per organization; nothing is registered on the platform as a package.
