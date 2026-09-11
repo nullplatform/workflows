@@ -142,10 +142,11 @@ for key,label,expr in GROUPINGS:
     pr={"day":st()}; pr.update({v.replace('`',''):num() for v in vals}); pr["otros"]=num()
     schema["properties"][prop]=arr(pr)
     queries["daily-by-"+key.replace("_","-")]={"source":q,"params":P_ALL,"target":"#/properties/"+prop}
-    # one tab per grouping (JSON Forms Categorization); the table and the donut follow the selector instead
-    DAILY_TABS.append({"type":"Category","label":label,"elements":[{"type":"Control","scope":"#/properties/"+prop,"label":"Gasto diario por "+label.lower(),
-      "options":{"widget":"bar-chart","showBackground":true,"categoryKey":"day","series":[{"dataKey":v.replace('`',''),"name":v} for v in vals]+[{"dataKey":"otros","name":"otros"}],"stacked":true,"xAxisLabel":"Día","yAxisLabel":"USD","height":340,"borderRadius":3,"showLegend":true}}]})
-DAILY_CHARTS=[{"type":"Categorization","elements":DAILY_TABS}]
+    # Tabs (Categorization) render the hidden charts with zero width → 1px "lines". A 2-column grid of
+    # charts instead; the table and the donut follow the "Agrupar por" selector.
+    DAILY_TABS.append({"type":"Control","scope":"#/properties/"+prop,"label":"Gasto diario por "+label.lower(),
+      "options":{"widget":"bar-chart","showBackground":true,"categoryKey":"day","series":[{"dataKey":v.replace('`',''),"name":v} for v in vals]+[{"dataKey":"otros","name":"otros"}],"stacked":true,"xAxisLabel":"Día","yAxisLabel":"USD","height":300,"borderRadius":3,"showLegend":true}})
+DAILY_CHARTS=[{"type":"HorizontalLayout","options":{"columns":[6,6]},"elements":DAILY_TABS[i:i+2]} for i in range(0,len(DAILY_TABS),2)]
 schema["properties"].update({
   "groupBy":{"type":"string","oneOf":[{"const":k,"title":l} for k,l,_ in GROUPINGS],"default":"application"},
   "scopeId":{"type":"string","default":""},
