@@ -159,6 +159,9 @@ function cloudQueryStub(seen: Array<Record<string, unknown>> = []) {
   };
 }
 
+// The stale sweep reads the day's existing raw rows; nothing pre-exists in these fixtures.
+const emptyFetchStub = { handler: () => ({ status: 'success' as const, outputs: { items: [], totalFetched: 0, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const };
+
 describe('finops/wf1-aws-billing-daily', () => {
   it('builds dimensioned facts whose cloud_service sum equals the daily total, and fans out one upsert per fact', async () => {
     const queries: Array<Record<string, unknown>> = [];
@@ -170,11 +173,13 @@ describe('finops/wf1-aws-billing-daily', () => {
         manual: passthroughTrigger,
         cron: passthroughTrigger, // wf1 has no cron since the dispatcher schedules it; harmless
         'np-api-call': npApiStub,
+        'np-entity-paginated-fetch': emptyFetchStub,
         'sub-workflow': {
           handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
             if (ctx.stepId === 'query' || ctx.stepId === 'query_types') return cloudQueryStub(queries).handler(ctx);
-            written.push(ctx.inputs.fact as Record<string, unknown>);
-            return { status: 'success' as const, outputs: { id: (ctx.inputs.fact as { id: string }).id, status: 200 }, activePorts: ['default'] };
+            const facts = ctx.inputs.facts as Array<Record<string, unknown>>;
+            if (!ctx.inputs.dry_run) written.push(...facts);
+            return { status: 'success' as const, outputs: { count: facts.length, written: ctx.inputs.dry_run ? 0 : facts.length, ids: facts.map((f) => f.id) }, activePorts: ['default'] };
           },
           executeMode: 'all' as const,
         },
@@ -307,10 +312,11 @@ describe('finops/wf1-aws-billing-daily', () => {
         manual: passthroughTrigger,
         cron: passthroughTrigger, // wf1 has no cron since the dispatcher schedules it; harmless
         'np-api-call': npApiStub,
+        'np-entity-paginated-fetch': emptyFetchStub,
         'sub-workflow': {
           handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
             if (ctx.stepId === 'query' || ctx.stepId === 'query_types') return cloudQueryStub().handler(ctx);
-            written.push(ctx.inputs);
+            if (!ctx.inputs.dry_run) written.push(...(ctx.inputs.facts as unknown[]));
             return { status: 'success' as const, outputs: {}, activePorts: ['default'] };
           },
           executeMode: 'all' as const,
@@ -332,6 +338,8 @@ describe('finops/wf1-aws-billing-daily', () => {
           manual: passthroughTrigger,
           cron: passthroughTrigger,
           'np-api-call': npApiStub,
+          'np-entity-paginated-fetch': emptyFetchStub,
+        'np-entity-paginated-fetch': emptyFetchStub,
           'sub-workflow': {
             handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => cloudQueryStub().handler(ctx),
             executeMode: 'all' as const,
@@ -350,6 +358,8 @@ describe('finops/wf1-aws-billing-daily', () => {
           manual: passthroughTrigger,
           cron: passthroughTrigger,
           'np-api-call': npApiStub,
+          'np-entity-paginated-fetch': emptyFetchStub,
+        'np-entity-paginated-fetch': emptyFetchStub,
           'sub-workflow': {
             handler: () => ({ status: 'success' as const, outputs: { results: {}, identity: null, failed: ['by_service'] }, activePorts: ['default'] }),
             executeMode: 'all' as const,

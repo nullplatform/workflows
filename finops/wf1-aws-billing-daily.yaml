@@ -629,24 +629,75 @@ steps:
         var summary = { day: d, account: acct, target: inputs.target_name || null, services: Object.keys(svcTotal).length, daily_total_usd: total,
                         buckets: count("bucket"), scopes: count("scope"), resources: count("resource"), databases: count("service"),
                         clusters: clusterFacts, facts: facts.length, dry_run: !!inputs.dry_run };
-        return { facts: facts, to_write: inputs.dry_run ? [] : facts, summary: summary };
+        // Batches of 40 → a handful of upsert children (a per-fact fan-out bloats the parent's Temporal history).
+        var batches = []; for (var bi = 0; bi < facts.length; bi += 40) batches.push({ facts: facts.slice(bi, bi + 40), catalog_slug: "cost_daily", dry_run: !!inputs.dry_run });
+        return { raw_filters: { stage: "raw" }, facts: facts, batches: batches, ids: facts.map(function (f) { return f.id; }), summary: summary };
 
   - id: write_facts
     type: module
     plugin_type: sub-workflow
     name: "Upsert facts (fan-out)"
     forEach:
-      expression: "${{ steps.build_facts.outputs.to_write }}"
-      itemVariable: fact
+      expression: "${{ steps.build_facts.outputs.batches }}"
+      itemVariable: batch
+      spreadItem: true
       parallel: true
-      maxConcurrency: 5
-    inputs:
-      fact: "${{ fact }}"
+      maxConcurrency: 4
     config:
       # Definition id of finops/wf-cost-fact-upsert.yaml (patched at publish time).
       workflowId: FINOPS_COST_FACT_UPSERT_ID
       alias: live
       waitForCompletion: true
+
+  # ── stale sweep: raw rows of the day that THIS collection did not produce (older wf1 revisions,
+  # resources that no longer exist) would double count; wf3's k8s rows (source k8s) are not ours.
+  - id: read_existing
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "Raw rows already in the catalog"
+    output_projection: ["items[].id", "items[].day", "items[].date", "items[].stage", "items[].source", "items[].cost_usd", "totalFetched", "pages"]
+    inputs:
+      filters: "${{ steps.build_facts.outputs.raw_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "catalog/instances/cost_daily"
+      filters: { stage: "raw" }
+      limit: 100
+      maxPages: 200
+
+  - id: stale
+    type: module
+    plugin_type: code-exec
+    name: "Rows of the day this collection did not produce"
+    metadata: { fanOutPerItem: false }
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      ids: "${{ steps.build_facts.outputs.ids }}"
+      existing: "${{ steps.read_existing.outputs.items }}"
+      dry_run: "${{ workflow.inputs.dry_run }}"
+    config:
+      language: javascript
+      code: |
+        var d = String(inputs.day); var mine = {}; (inputs.ids || []).forEach(function (id) { mine[id] = true; });
+        var stale = (inputs.existing || []).filter(function (r) { return r && r.stage === "raw" && r.source === "aws_ce" && (r.day === d || r.date === d) && !mine[r.id]; });
+        var usd = Math.round(stale.reduce(function (s, r) { return s + (Number(r.cost_usd) || 0); }, 0) * 1e6) / 1e6;
+        return { count: stale.length, stale_usd: usd, ids: stale.map(function (r) { return r.id; }).slice(0, 50),
+                 list: inputs.dry_run ? [] : stale.map(function (r) { return { path: "/catalog/instances/cost_daily/" + encodeURIComponent(r.id) }; }) };
+
+  - id: delete_stale
+    type: module
+    plugin_type: np-api-call
+    name: "Delete stale raw rows (fan-out)"
+    forEach:
+      expression: "${{ steps.stale.outputs.list }}"
+      itemVariable: row
+      spreadItem: true
+      parallel: true
+      maxConcurrency: 5
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: DELETE
+      path: "/catalog/instances/cost_daily/placeholder"
 
   - id: summary
     type: module
@@ -659,16 +710,17 @@ steps:
       # After a forEach fan-out, `outputs.items` carries one entry per child run
       # (live engine wraps each as {outputs, _childExecutionId}; the E2E stub flat).
       written: "${{ steps.write_facts.outputs.items }}"
+      stale: "${{ steps.stale.outputs }}"
     config:
       language: javascript
       code: |
         // inputs are frozen in the sandbox: build a new object instead of mutating.
         var s = inputs.summary || {};
-        var w = inputs.written;
-        var n = Array.isArray(w) ? w.length : 0;
+        var n = (inputs.written || []).reduce(function (acc, r) { var o = (r || {}).outputs || r || {}; return acc + (Number(o.written) || 0); }, 0);
         var out = {};
         Object.keys(s).forEach(function (k) { out[k] = s[k]; });
         out.written = s.dry_run ? 0 : n;
+        out.stale_rows = (inputs.stale || {}).count || 0; out.stale_usd = (inputs.stale || {}).stale_usd || 0; out.stale_deleted = s.dry_run ? 0 : out.stale_rows;
         return out;
 
 connections:
@@ -679,7 +731,10 @@ connections:
   - { from: query_types, to: np_services }
   - { from: np_services, to: build_facts }
   - { from: build_facts, to: write_facts }
-  - { from: write_facts, to: summary }
+  - { from: write_facts, to: read_existing }
+  - { from: read_existing, to: stale }
+  - { from: stale, to: delete_stale }
+  - { from: delete_stale, to: summary }
 
 outputs:
   summary: "${{ steps.summary.outputs }}"
