@@ -60,9 +60,9 @@ for slug in cost_daily cost_mapping_rule cost_mapping_suggestion application_cos
   f="$SPECS_DIR/$slug.spec.json"
   body=$(mktemp)
   # Spec grants must name a user of THIS org: rewrite the admin principal in the JSON
-  # (732189543 is the placeholder) to ADMIN_USER_ID, default = the user of the token.
+  # (every `type: user` principal, placeholder 732189543) to ADMIN_USER_ID, default = the token's user.
   jq --arg nrn "organization=$ORG_ID" --argjson admin "${ADMIN_USER_ID:-$TOKEN_USER_ID}" \
-     '. + {nrn: $nrn} | (.. | objects | select(.type? == "user" and .id? == 732189543) | .id) |= $admin' "$f" > "$body"
+     '. + {nrn: $nrn} | (.. | objects | select(.type? == "user") | .id) |= $admin' "$f" > "$body"
 
   out=$(api POST "/catalog/specifications" "$body")
   st=$(tail -n1 <<<"$out"); res=$(sed '$d' <<<"$out")

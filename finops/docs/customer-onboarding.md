@@ -33,7 +33,8 @@ Answer these before touching anything; each one changes the configuration.
 | Which shared databases hold many logical databases? | `rds DescribeDBClusters` + Performance Insights `GetResourceMetrics` (`db.load.avg` by `db`) | shared clusters are split by database load (`by_metric`), never mapped to one app |
 | Who consumes each shared database? | application **parameters** (`GET /parameter?nrn=<app>`): hosts / CNAMEs (`*.db.nullservices.io`), `DB_NAME`-like values | seeds the `by_metric` map (database name → application) |
 | Which null services exist and what is their host? | `GET /service?nrn=<org>&show_descendants=true` | RDS/ElastiCache/OpenSearch whose endpoint equals a service host are `service_owner` automatically |
-| Where do the agents run and with what identity? | `GET /agent` (needs `nrn` — account-level agents are invisible from the org root), the agent's `NP_WORKER_RULES` / `NP_ALLOWED_REGISTRIES` | the worker pod needs a read-only cloud role (see §2) |
+| Which null account maps to which AWS account? | `GET /runtime_configuration?nrn=<account nrn>` then `GET /runtime_configuration/<id>` → `values.aws.account_id` + `region` (one config per dimension; the org-level one is the default) | one `wf0` target per (null account, AWS account); `expected_account` guards the pairing. itti: 49 null accounts, ~2 AWS accounts each (us-east-1 + sa-east-1) |
+| Where do the agents run, which VERSION, with what identity? | `GET /controlplane/agent?nrn=<org or account nrn>&limit=100&offset=…` (paginate; account-level agents are invisible from the org root), field `version`; the agent's `NP_WORKER_RULES` / `NP_ALLOWED_REGISTRIES` | **`package-exec` needs controlplane-agent ≥ 0.9.0 (use 0.11.1, what null runs).** An older agent answers `ping` but never emits `started` for `package-exec`, so the API returns `Command failed to start after all retry attempts` (10 s × 3 attempts, agentId `unknown`) — that error means "old agent", not "bad request". itti's 107 agents were 0.4.1–0.8.0; the worker pod needs a read-only cloud role (see §2) |
 | Amortized or unblended? | Cost Explorer both metrics | we attribute **amortized** (Savings Plans / RIs spread over covered usage); the console defaults to unblended, so the daily total looks ~25% lower there. Both are stored (`cost_usd`, `unblended_usd`) |
 
 Do the discovery calls through the agent with the cloud-query package
@@ -57,7 +58,21 @@ customers will not hand us any.
    side (`tool-cloud-query.yaml` variable `image`) — a tag can be re-pointed by anyone who can push.
 
 Verify with a sync `sts GetCallerIdentity` through the tool: the ARN must be the worker role, not
-the node role.
+the node role. Before the workflows exist in the org, the same probe as a curl (session or API-key
+bearer of THAT org; read-only, ~200 ms on a working agent):
+
+```bash
+curl -s -X POST https://api.nullplatform.com/controlplane/agent_command \
+  -H "Authorization: Bearer $NP_TOKEN" -H 'Content-Type: application/json' -d '{
+  "selector": {"stage": "sdlc"}, "nrn": "organization=<org>:account=<account>",
+  "execution_config": {"retry": {"max_attempts": 1}},
+  "command": {"type": "package-exec", "data": {
+    "package": {"slug": "cloud-query", "image": "public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer@sha256:<digest>"},
+    "environment": {"NP_ACTION_CONTEXT": "{\"cloud_query\":{\"provider\":\"aws\",\"region\":\"us-east-1\",\"calls\":[{\"id\":\"who\",\"service\":\"sts\",\"operation\":\"GetCallerIdentity\",\"params\":{}}]}}"}}}}'
+```
+
+`executions[0].results.stdOut` is the worker's JSON (`calls[0].result.Arn`). Operation names are the
+SDK's PascalCase (`GetCallerIdentity`); a wrong name returns an empty stdout, not an error.
 
 Since agents-api #228/#230 and engine #182 the image travels as `command.data.package =
 {slug, image}`; the platform lowers it into the worker's `oci_image` artifact, so no package
@@ -77,6 +92,9 @@ Traps that cost us hours:
   `schema.authorization.entities.grants` must give `read,list,create,write,delete` to `*` (or to
   the key's principal) on every spec — the script rewrites the placeholder admin `732189543` to the
   token's user; the 403 on `application_cost_daily` was exactly this.
+- The spec files keep the placeholder principal `732189543`; the script rewrites EVERY `type: user`
+  grant to the token's user (a foreign user id → 400 `authorization references unknown user_id`).
+  Never commit an org-specific user id into `specs/*.spec.json`.
 - Enums (`source`, `allocation_method`, `subject_type`, `charge_type`) must contain every value a
   workflow emits; the spec description is capped at 255 chars.
 - **DELETEs never reach the Lake**: `catalog_entities` keeps deleted instances with `_deleted=0`.
@@ -95,6 +113,12 @@ NP_TOKEN=<bearer> pnpm tsx finops/setup/publish.ts finops \
 Copy `setup/vars.nullplatform.json` and set: `agent_tags` + `agent_nrn` (REQUIRED for account-level
 agents), `org_nrn`, the dispatcher `targets` (one per account; `expected_account` guards a wrong
 agent/role pairing), `k8s_clusters`, the cluster's Prometheus URL for `wf3` (`collector_cmd`).
+
+The workflows read `${{ secrets.NP_API_KEY }}`: a config entry named `NP_API_KEY` must exist at
+`/finops` or be inherited from `/` (`GET /workflows/config?path=/finops`). If the agent is not ready
+yet, publish anyway and turn the daily cron off until it is
+(`POST /workflows/definitions/<wf0 id>/aliases/live/deactivate`; `…/activate` later) — otherwise
+`wf0` fails every morning at 04:15 UTC.
 
 For new revisions ALWAYS pass all seven ids (`--update file=id,…`); a partial list creates NEW
 definitions with a live cron (the script refuses unless `--allow-create`). Save the printed ids.
@@ -125,6 +149,9 @@ with the np-report skill (`POST /report`, draft; publishing is a separate step).
   query on change;
 - an area chart with one day renders nothing → stacked bars;
 - KPIs: total = applications + shared platform buckets + Kubernetes overhead + unallocated.
+- It can be created before the first collection: every query must still run with empty params
+  (KPIs return one row of 0/NULL, arrays return nothing) — verify with `ch_query.sh` as in the
+  np-report skill, then `POST /report` with the customer's session bearer.
 
 ## 7. Operations
 
