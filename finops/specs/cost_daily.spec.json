@@ -320,17 +320,17 @@
       "allocation_method": {
         "type": "string",
         "enum": [
-          "direct_tag",
-          "direct_resource",
-          "cluster_split_cpu_mem",
-          "service_owner",
-          "rule",
-          "direct",
-          "split",
-          "map",
           "by_metric",
-          "rollup",
           "cluster_pending_consumption",
+          "cluster_split_cpu_mem",
+          "direct",
+          "direct_resource",
+          "direct_tag",
+          "map",
+          "rollup",
+          "rule",
+          "service_owner",
+          "split",
           "unallocated"
         ],
         "index": [
@@ -461,6 +461,30 @@
         "additionalProperties": {
           "type": "number"
         }
+      },
+      "metric": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Consumption metric attached to the fact (e.g. pi.db.load) whose shares split it under a by_metric rule"
+      },
+      "metric_shares": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "metric key (database name, log group, namespace\u2026) \u2192 share 0..1 of the metric on the day",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "metric_key": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "For by_metric allocations: the metric key this portion corresponds to"
       }
     },
     "required": [

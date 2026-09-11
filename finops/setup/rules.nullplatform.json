@@ -36,122 +36,6 @@
     "category": "observability"
   },
   {
-    "id": "rds-approvals-shared-by-consumers",
-    "name": "postgres-approvals-api-db split among its consumers (parameters)",
-    "description": "Equal split among the applications whose parameters reference the cluster host; refine with Performance Insights db.load by db.name (by_metric) when 0.0.3 lands.",
-    "enabled": true,
-    "status": "active",
-    "priority": 100,
-    "source": "inferred",
-    "confidence": 0.6,
-    "scope": {
-      "cloud_service": "Amazon Relational Database Service",
-      "resource_type": "rds:cluster"
-    },
-    "match": [
-      {
-        "field": "host",
-        "equals": "postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
-      }
-    ],
-    "method": "split",
-    "target": {
-      "split": [
-        {
-          "weight": 1,
-          "target": {
-            "application_id": "518811741",
-            "application_slug": "tracing-api"
-          }
-        },
-        {
-          "weight": 1,
-          "target": {
-            "application_id": "1182532716",
-            "application_slug": "core-entities-api"
-          }
-        },
-        {
-          "weight": 1,
-          "target": {
-            "application_id": "1302811219",
-            "application_slug": "parameters-api"
-          }
-        },
-        {
-          "weight": 1,
-          "target": {
-            "application_id": "1311001341",
-            "application_slug": "users-api"
-          }
-        },
-        {
-          "weight": 1,
-          "target": {
-            "application_id": "1449966796",
-            "application_slug": "ui-plugins"
-          }
-        },
-        {
-          "weight": 1,
-          "target": {
-            "application_id": "1556752344",
-            "application_slug": "entities-ingestor"
-          }
-        },
-        {
-          "weight": 1,
-          "target": {
-            "application_id": "2044993572",
-            "application_slug": "entities-api"
-          }
-        }
-      ]
-    },
-    "evidence": [
-      {
-        "kind": "parameter",
-        "detail": "frontend.ui-plugins parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "1449966796"
-      },
-      {
-        "kind": "parameter",
-        "detail": "catalog.tracing-api parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "518811741"
-      },
-      {
-        "kind": "parameter",
-        "detail": "catalog.tracing-api parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "518811741"
-      },
-      {
-        "kind": "parameter",
-        "detail": "catalog.entities-ingestor parameter CORE_ENTITIES_DB_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "1556752344"
-      },
-      {
-        "kind": "parameter",
-        "detail": "catalog.entities-api parameter DATABASE_HOST references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "2044993572"
-      },
-      {
-        "kind": "parameter",
-        "detail": "main.users-api parameter DB_HOSTNAME references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "1311001341"
-      },
-      {
-        "kind": "parameter",
-        "detail": "main.core-entities-api parameter DB_HOSTNAME references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "1182532716"
-      },
-      {
-        "kind": "parameter",
-        "detail": "main.parameters-api parameter DB_HOSTNAME references postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com",
-        "application_id": "1302811219"
-      }
-    ]
-  },
-  {
     "id": "rds-shared-apis-by-consumers",
     "name": "postgres-shared-apis split among its consumers (parameters)",
     "description": "Equal split among the applications whose parameters reference the instance host.",
@@ -242,5 +126,211 @@
         "application_id": "1302811219"
       }
     ]
+  },
+  {
+    "id": "rds-approvals-by-database-load",
+    "name": "postgres-approvals-api-db: split by Performance Insights load per database",
+    "enabled": true,
+    "status": "active",
+    "priority": 90,
+    "source": "inferred",
+    "confidence": 0.9,
+    "description": "The cluster hosts 15 databases. Each day wf1 attaches the DB load share per database (PI db.load.avg by db.name on the writer); this map says which application owns each database (DB name \u2192 app, from parameters + PI users). Databases not in the map stay visibly unallocated.",
+    "scope": {
+      "cloud_service": "Amazon Relational Database Service",
+      "resource_type": "rds:cluster"
+    },
+    "match": [
+      {
+        "field": "host",
+        "equals": "postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
+      },
+      {
+        "field": "metric",
+        "equals": "pi.db.load"
+      }
+    ],
+    "method": "by_metric",
+    "target": {
+      "map": {
+        "key": "db.name",
+        "entries": {
+          "core_entities_api": {
+            "application_id": "1182532716",
+            "application_slug": "core-entities-api"
+          },
+          "tracing_api_production": {
+            "application_id": "518811741",
+            "application_slug": "tracing-api"
+          },
+          "notifications": {
+            "application_id": "1593752815",
+            "application_slug": "notifications-center-api"
+          },
+          "services": {
+            "application_id": "691537498",
+            "application_slug": "service-api"
+          },
+          "catalog_entities_api_production": {
+            "application_id": "2044993572",
+            "application_slug": "entities-api"
+          },
+          "oltp_database": {
+            "application_id": "2044993572",
+            "application_slug": "entities-api"
+          },
+          "approvals": {
+            "application_id": "1372325109",
+            "application_slug": "approvals-api"
+          },
+          "temporal": {
+            "application_id": "918966291",
+            "application_slug": "workflow-system"
+          },
+          "temporal_visibility": {
+            "application_id": "918966291",
+            "application_slug": "workflow-system"
+          },
+          "workflow_system": {
+            "application_id": "918966291",
+            "application_slug": "workflow-system"
+          },
+          "params_api": {
+            "application_id": "1302811219",
+            "application_slug": "parameters-api"
+          },
+          "users_api": {
+            "application_id": "1311001341",
+            "application_slug": "users-api"
+          },
+          "scm_data": {
+            "application_id": "897065762",
+            "application_slug": "migrations-api"
+          },
+          "providers": {
+            "application_id": "278401067",
+            "application_slug": "providers-api"
+          },
+          "governance_action_items": {
+            "application_id": "1793933981",
+            "application_slug": "action-items-api"
+          }
+        }
+      }
+    },
+    "evidence": [
+      {
+        "kind": "performance_insights",
+        "detail": "2026-09-09 writer db.load.avg by db.name: core_entities_api 28%, tracing_api_production 18%, notifications 15%, services 11%, catalog_entities_api_production 6%, approvals 5%, temporal 5%, params_api 3%, workflow_system 2%, users_api 1.5%, scm_data 1.3%, providers 1.2%, governance_action_items 0.8%, temporal_visibility 0.5%, oltp_database 0.4%"
+      }
+    ]
+  },
+  {
+    "id": "rds-approvals-shared-by-consumers-fallback",
+    "name": "postgres-approvals-api-db: equal split among consumers (fallback when PI shares are missing)",
+    "enabled": true,
+    "status": "active",
+    "priority": 100,
+    "source": "inferred",
+    "confidence": 0.6,
+    "scope": {
+      "cloud_service": "Amazon Relational Database Service",
+      "resource_type": "rds:cluster"
+    },
+    "match": [
+      {
+        "field": "host",
+        "equals": "postgres-approvals-api-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
+      }
+    ],
+    "method": "split",
+    "target": {
+      "split": [
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1182532716",
+            "application_slug": "core-entities-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1302811219",
+            "application_slug": "parameters-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1311001341",
+            "application_slug": "users-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1372325109",
+            "application_slug": "approvals-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1593752815",
+            "application_slug": "notifications-center-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "1793933981",
+            "application_slug": "action-items-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "2044993572",
+            "application_slug": "entities-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "278401067",
+            "application_slug": "providers-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "518811741",
+            "application_slug": "tracing-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "691537498",
+            "application_slug": "service-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "897065762",
+            "application_slug": "migrations-api"
+          }
+        },
+        {
+          "weight": 1,
+          "target": {
+            "application_id": "918966291",
+            "application_slug": "workflow-system"
+          }
+        }
+      ]
+    }
   }
 ]

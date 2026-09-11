@@ -99,8 +99,22 @@ Nothing about a customer's resources lives in code. Three layers, per organizati
      Regex named groups become `$captures`.
    - `target`: a literal owner (`application_id`, `scope_id`, `service_id`, `namespace_id`, `cluster`,
      `bucket`), or `capture` (take the owner from the fact / a regex group), or `split` (weights), or
-     `map` (`key` → owner table). `method`: `direct | split | map | by_metric` (by_metric lands with
-     the consumption collectors; until then it falls back to unallocated).
+     `map` (`key` → owner table). `method`: `direct | split | map | by_metric`.
+   - `by_metric`: the collector attaches a consumption metric to the fact (`metric: pi.db.load`,
+     `metric_shares: {database → share}` — Performance Insights DB load by database on the cluster
+     writer, one call per RDS subject per day); the rule's `map.entries` say which application owns
+     each key; keys without an owner stay visibly unallocated (`metric_key` on the row). Example, the
+     shared approvals Aurora (15 databases):
+
+     ```json
+     { "id": "rds-approvals-by-database-load", "priority": 90, "method": "by_metric",
+       "scope": { "cloud_service": "Amazon Relational Database Service", "resource_type": "rds:cluster" },
+       "match": [{ "field": "host", "equals": "postgres-approvals-api-db.cluster-….rds.amazonaws.com" }, { "field": "metric", "equals": "pi.db.load" }],
+       "target": { "map": { "key": "db.name", "entries": {
+         "core_entities_api": { "application_id": "1182532716" }, "tracing_api_production": { "application_id": "518811741" },
+         "notifications": { "application_id": "1593752815" }, "approvals": { "application_id": "1372325109" }, "…": "…" } } } }
+     ```
+     Keep an equal-`split` rule with lower priority as the fallback for days without PI data.
    - `category` overrides the cost category derived from the cloud service.
 
    Three defaults ship with the allocator, lowest priority: `default:null-service` (fact carries

@@ -26,7 +26,7 @@ const GD = 'Amazon GuardDuty';
 const CW = 'AmazonCloudWatch';
 
 const RAW = [
-  svc(EC2, 'ec2', 10), svc(RDS, 'rds', 20), svc(VPC, 'vpc', 3), svc(GD, 'guardduty', 1), svc(CW, 'cloudwatch', 4),
+  svc(EC2, 'ec2', 10), svc(RDS, 'rds', 30), svc(VPC, 'vpc', 3), svc(GD, 'guardduty', 1), svc(CW, 'cloudwatch', 4),
   // EC2: a null scope (tags → dims from wf1), a cluster nodes component, the unattributed bucket → remainder 2
   { id: `raw-scope-777-${D}`, date: D, day: D, stage: 'raw', subject_type: 'scope', subject_id: '777', subject_name: 'ns.app.prod', cloud: 'aws', cloud_service: EC2, parent_id: `raw-cloud_service-ec2-${D}`,
     cost_usd: 2, scope_id: '777', application_id: '100', namespace_id: '5', account_id: '1', tags: { scope_id: '777', application_id: '100' }, resource_id: 'i-1', resource_type: 'ec2:instance' },
@@ -39,6 +39,9 @@ const RAW = [
     cost_usd: 12, service_id: 'svc-1', application_id: '100', namespace_id: '5', account_id: '1', host: 'orders-db.cluster-abc.us-east-1.rds.amazonaws.com', resource_type: 'rds:cluster', tags: { application: 'orders' } },
   { id: `raw-service-shared-db-${D}`, date: D, day: D, stage: 'raw', subject_type: 'service', subject_id: 'shared-db', subject_name: 'shared-db', cloud: 'aws', cloud_service: RDS, parent_id: `raw-cloud_service-rds-${D}`,
     cost_usd: 8, host: 'shared-db.cluster-abc.us-east-1.rds.amazonaws.com', resource_type: 'rds:cluster', tags: { application: 'shared' } },
+  // a cluster with Performance Insights shares by database (by_metric rule below): 60% orders, 30% ledger, 10% scratch (no owner)
+  { id: `raw-service-metrics-db-${D}`, date: D, day: D, stage: 'raw', subject_type: 'service', subject_id: 'metrics-db', subject_name: 'metrics-db', cloud: 'aws', cloud_service: RDS, parent_id: `raw-cloud_service-rds-${D}`,
+    cost_usd: 10, host: 'metrics-db.cluster-abc.us-east-1.rds.amazonaws.com', resource_type: 'rds:cluster', metric: 'pi.db.load', metric_shares: { orders: 0.6, ledger: 0.3, scratch: 0.1 } },
   // usage-type buckets are informational — must not be allocated (they overlap the leaves)
   { id: `raw-bucket-rds-aurora-storageio-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'rds|Aurora:StorageIOUsage', cloud: 'aws', cloud_service: RDS, parent_id: `raw-cloud_service-rds-${D}`, usage_type: 'Aurora:StorageIOUsage', cost_usd: 7 },
   // CloudWatch: a log-group resource named <namespace>.<application>
@@ -52,6 +55,9 @@ const RULES = [
   { id: 'shared-db-by-database', name: 'shared Aurora split', enabled: true, status: 'active', priority: 20, scope: { resource_type: 'rds:cluster' },
     match: [{ field: 'host', equals: 'shared-db.cluster-abc.us-east-1.rds.amazonaws.com' }],
     method: 'split', target: { split: [{ weight: 3, target: { application_id: '100', namespace_id: '5' } }, { weight: 1, target: { application_id: '200', namespace_id: '6' } }] } },
+  { id: 'metrics-db-by-load', name: 'metrics-db by database load', enabled: true, status: 'active', priority: 25, scope: { resource_type: 'rds:cluster' },
+    match: [{ field: 'host', equals: 'metrics-db.cluster-abc.us-east-1.rds.amazonaws.com' }, { field: 'metric', equals: 'pi.db.load' }],
+    method: 'by_metric', target: { map: { key: 'db.name', entries: { orders: { application_id: '100', namespace_id: '5' }, ledger: { application_id: '300' } } } } },
   { id: 'log-groups-by-name', name: 'log groups <ns>.<app>', enabled: true, status: 'active', priority: 30, scope: { resource_type: 'logs:log-group' },
     match: [{ field: 'subject_name', regex: '^(?<ns>[a-z0-9-]+)\\.(?<app>[a-z0-9-]+)$' }], target: { capture: { application_slug: '$app' } } },
   { id: 'disabled-rule', name: 'would steal everything', enabled: false, status: 'active', priority: 1, target: { bucket: 'nope' } },
@@ -91,9 +97,9 @@ describe('finops/wf2-allocate-daily', () => {
     const byId = Object.fromEntries(facts.map((f) => [f.id, f]));
 
     // leaves: scope, nodes, unattributed, EC2 remainder 2, orders-db, shared-db, networking, GuardDuty remainder, log group, CloudWatch remainder 2.5
-    expect(summary.leaves).toBe(10);
-    expect(summary.total_usd).toBe(38);
-    expect(summary.rules_active).toBe(3);
+    expect(summary.leaves).toBe(11);
+    expect(summary.total_usd).toBe(48);
+    expect(summary.rules_active).toBe(4);
 
     // default:null-dims — the scope row already carries the owner
     expect(byId[`alloc-scope-777-${D}-app-100`]).toMatchObject({ stage: 'allocated', application_id: '100', scope_id: '777', cost_usd: 2, share: 1, rule_id: 'default:null-dims', category: 'compute', source_fact_id: `raw-scope-777-${D}` });
@@ -102,6 +108,10 @@ describe('finops/wf2-allocate-daily', () => {
     // split rule 3:1 on the shared cluster
     expect(byId[`alloc-service-shared-db-${D}-app-100`]).toMatchObject({ application_id: '100', cost_usd: 6, share: 0.75, allocation_method: 'split', rule_id: 'shared-db-by-database' });
     expect(byId[`alloc-service-shared-db-${D}-app-200`]).toMatchObject({ application_id: '200', cost_usd: 2, share: 0.25 });
+    // by_metric: Performance Insights shares → owners; the share nobody owns stays visibly unallocated
+    expect(byId[`alloc-service-metrics-db-${D}-app-100`]).toMatchObject({ application_id: '100', cost_usd: 6, share: 0.6, allocation_method: 'by_metric', rule_id: 'metrics-db-by-load' });
+    expect(byId[`alloc-service-metrics-db-${D}-app-300`]).toMatchObject({ application_id: '300', cost_usd: 3, share: 0.3 });
+    expect(byId[`alloc-service-metrics-db-${D}-scratch-unallocated`]).toMatchObject({ cost_usd: 1, share: 0.1, allocation_method: 'unallocated', metric_key: 'scratch', rule_id: 'metrics-db-by-load' });
     // regex capture → application_slug
     expect(byId[`alloc-resource-loggroup-catalog-entities-api-${D}-app-entities-api`]).toMatchObject({ application_slug: 'entities-api', cost_usd: 1.5, rule_id: 'log-groups-by-name', category: 'observability' });
     // cluster components wait for phase 3
@@ -118,18 +128,19 @@ describe('finops/wf2-allocate-daily', () => {
     expect(facts.some((f) => f.source_fact_id === `raw-cluster-runtime-${D}`)).toBe(false);
 
     // rollups
-    expect(byId[`alloc-app-100-${D}`]).toMatchObject({ subject_type: 'application', application_id: '100', cost_usd: 20, by_category: { compute: 2, database: 18 }, quantity: 3 });
+    expect(byId[`alloc-app-100-${D}`]).toMatchObject({ subject_type: 'application', application_id: '100', cost_usd: 26, by_category: { compute: 2, database: 24 }, quantity: 4 });
+    expect(byId[`alloc-app-300-${D}`]).toMatchObject({ cost_usd: 3 });
     expect(byId[`alloc-app-200-${D}`]).toMatchObject({ cost_usd: 2 });
     expect(byId[`alloc-bucket-shared-platform-${D}`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1 });
-    expect(byId[`alloc-unallocated-${D}`]).toMatchObject({ subject_type: 'unallocated', cost_usd: 5.5, by_cloud_service: { [EC2]: 3, [CW]: 2.5 } });
+    expect(byId[`alloc-unallocated-${D}`]).toMatchObject({ subject_type: 'unallocated', cost_usd: 6.5, by_cloud_service: { [EC2]: 3, [CW]: 2.5, [RDS]: 1 } });
 
     // Σ leaves = Σ services = allocated + cluster + unallocated
     const leafRows = facts.filter((f) => f.allocation_method !== 'rollup' && f.subject_type !== 'unallocated');
-    expect(leafRows.reduce((s, f) => s + Number(f.cost_usd), 0)).toBeCloseTo(38, 6);
-    expect(summary.unallocated_usd).toBe(5.5);
+    expect(leafRows.reduce((s, f) => s + Number(f.cost_usd), 0)).toBeCloseTo(48, 6);
+    expect(summary.unallocated_usd).toBe(6.5);
     expect(summary.cluster_pending_usd).toEqual({ runtime: 8 });
-    expect(summary.allocated_usd).toBeCloseTo(24.5, 6);
-    expect((summary.applications as Array<{ owner: string; cost_usd: number }>)[0]).toMatchObject({ owner: 'app-100', cost_usd: 20 });
+    expect(summary.allocated_usd).toBeCloseTo(33.5, 6);
+    expect((summary.applications as Array<{ owner: string; cost_usd: number }>)[0]).toMatchObject({ owner: 'app-100', cost_usd: 26 });
 
     // everything was written, every row carries the required keys
     expect(written).toHaveLength(facts.length);

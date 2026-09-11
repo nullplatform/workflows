@@ -259,6 +259,7 @@ steps:
     inputs:
       results: "${{ steps.query.outputs.results }}"
       failed: "${{ steps.query.outputs.failed }}"
+      day: "${{ steps.prep.outputs.day }}"
     config:
       language: javascript
       code: |
@@ -269,7 +270,23 @@ steps:
           (res.Instances || []).forEach(function (i) { if (i.InstanceType) types[i.InstanceType] = true; });
         });
         var list = Object.keys(types).sort();
-        return { types: list, calls: [{ id: "instance_types", service: "ec2", operation: "DescribeInstanceTypes", params: { InstanceTypes: list.length ? list : ["t3.micro"] } }] };
+        var calls = [{ id: "instance_types", service: "ec2", operation: "DescribeInstanceTypes", params: { InstanceTypes: list.length ? list : ["t3.micro"] } }];
+        // Performance Insights: DB load by DATABASE for each RDS subject (the writer of an Aurora
+        // cluster, or the instance itself). This is what splits a shared cluster by consumer.
+        var day = String(inputs.day); var next = new Date(new Date(day + "T00:00:00Z").getTime() + 86400000).toISOString().slice(0, 10);
+        var byInst = {}; (((inputs.results || {}).db_instances || {}).DBInstances || []).forEach(function (i) { byInst[i.DBInstanceIdentifier] = i; });
+        var pi = [];
+        (((inputs.results || {}).db_clusters || {}).DBClusters || []).forEach(function (c) {
+          var w = (c.DBClusterMembers || []).filter(function (m) { return m.IsClusterWriter; })[0] || (c.DBClusterMembers || [])[0];
+          var inst = w ? byInst[w.DBInstanceIdentifier] : null;
+          if (inst && inst.PerformanceInsightsEnabled && inst.DbiResourceId) pi.push({ subject: c.DBClusterIdentifier, res: inst.DbiResourceId });
+        });
+        Object.keys(byInst).forEach(function (id) { var i = byInst[id]; if (!i.DBClusterIdentifier && i.PerformanceInsightsEnabled && i.DbiResourceId) pi.push({ subject: id, res: i.DbiResourceId }); });
+        pi.forEach(function (p) {
+          calls.push({ id: "pi_" + p.subject, service: "pi", operation: "GetResourceMetrics", params: { ServiceType: "RDS", Identifier: p.res, StartTime: day + "T00:00:00Z", EndTime: next + "T00:00:00Z", PeriodInSeconds: 86400,
+                       MetricQueries: [{ Metric: "db.load.avg", GroupBy: { Group: "db", Limit: 25 } }] } });
+        });
+        return { types: list, pi_subjects: pi.map(function (p) { return p.subject; }), calls: calls };
 
   - id: query_types
     type: module
@@ -540,6 +557,18 @@ steps:
             if (np.application) f.application_id = np.application; if (np.namespace) f.namespace_id = np.namespace; if (np.account) f.account_id = np.account;
             var dm = sv.dimensions || {}; if (dm.environment) f.environment = dm.environment;
             f.allocation_method = "service_owner";
+          }
+          // Performance Insights db.load by database → shares (evidence for by_metric rules; a shared cluster
+          // is split by who actually loads it). Absent when PI is off or the call failed: the row stays whole.
+          var piRes = (inputs.types_results || {})["pi_" + db.id];
+          if (piRes && piRes.MetricList) {
+            var shares = {}; var tot = 0;
+            piRes.MetricList.forEach(function (m) {
+              var dims = (m.Key || {}).Dimensions || {}; var name = dims["db.name"]; if (!name) return;
+              var vals = (m.DataPoints || []).map(function (x) { return Number(x.Value) || 0; }); var v = vals.length ? vals.reduce(function (a, b) { return a + b; }, 0) / vals.length : 0;
+              if (v > 0) { shares[name] = v; tot += v; }
+            });
+            if (tot > 0) { Object.keys(shares).forEach(function (k) { shares[k] = num(shares[k] / tot); }); f.metric = "pi.db.load"; f.metric_shares = shares; }
           }
           facts.push(f);
         });

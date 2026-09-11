@@ -81,8 +81,12 @@ const RESULTS = {
     ],
   },
   lbs: { LoadBalancers: [{ LoadBalancerName: 'k8s-a' }, { LoadBalancerName: 'k8s-b' }, { LoadBalancerName: 'null-main' }, { LoadBalancerName: 'other' }] },
-  db_clusters: { DBClusters: [{ DBClusterIdentifier: 'transactions', DBClusterArn: 'arn:aws:rds:us-east-1:1:cluster:transactions', Engine: 'aurora-mysql', TagList: [], Endpoint: 'transactions.cluster-abc.us-east-1.rds.amazonaws.com' }] },
-  db_instances: { DBInstances: [] },
+  db_clusters: { DBClusters: [{ DBClusterIdentifier: 'transactions', DBClusterArn: 'arn:aws:rds:us-east-1:1:cluster:transactions', Engine: 'aurora-mysql', TagList: [], Endpoint: 'transactions.cluster-abc.us-east-1.rds.amazonaws.com',
+    DBClusterMembers: [{ DBInstanceIdentifier: 'transactions-writer', IsClusterWriter: true }, { DBInstanceIdentifier: 'transactions-reader', IsClusterWriter: false }] }] },
+  db_instances: { DBInstances: [
+    { DBInstanceIdentifier: 'transactions-writer', DBClusterIdentifier: 'transactions', DbiResourceId: 'db-WRITER', PerformanceInsightsEnabled: true },
+    { DBInstanceIdentifier: 'transactions-reader', DBClusterIdentifier: 'transactions', DbiResourceId: 'db-READER', PerformanceInsightsEnabled: true },
+  ] },
   instances: {
     Reservations: [
       {
@@ -122,6 +126,12 @@ const npApiStub = {
 };
 
 const TYPES_RESULTS = {
+  // Performance Insights db.load by database on the cluster WRITER (second round)
+  pi_transactions: { MetricList: [
+    { Key: { Metric: 'db.load.avg' }, DataPoints: [{ Value: 1.0 }] },
+    { Key: { Metric: 'db.load.avg', Dimensions: { 'db.name': 'orders', 'db.id': 'x' } }, DataPoints: [{ Value: 0.75 }] },
+    { Key: { Metric: 'db.load.avg', Dimensions: { 'db.name': 'ledger', 'db.id': 'y' } }, DataPoints: [{ Value: 0.25 }] },
+  ] },
   instance_types: {
     InstanceTypes: [
       { InstanceType: 'c5a.xlarge', VCpuInfo: { DefaultVCpus: 4 }, MemoryInfo: { SizeInMiB: 8192 } },
@@ -237,6 +247,11 @@ describe('finops/wf1-aws-billing-daily', () => {
     for (const f of facts) expect(f.day).toBe('2026-09-09');
     expect(facts.find((f) => f.subject_type === 'scope')?.tags).toMatchObject({ scope_id: expect.any(String) });
     expect(facts.find((f) => f.subject_type === 'service' && f.subject_id === 'transactions')?.host).toMatch(/rds\.amazonaws\.com$/);
+    // second round asked Performance Insights for the cluster WRITER, and the shares by database travel with the fact
+    const round2 = queries[1]?.calls as Array<{ id: string; service: string; params: Record<string, unknown> }>;
+    expect(round2.map((c) => c.id)).toEqual(['instance_types', 'pi_transactions']);
+    expect(round2[1]).toMatchObject({ service: 'pi', params: { Identifier: 'db-WRITER', StartTime: '2026-09-09T00:00:00Z', EndTime: '2026-09-10T00:00:00Z', PeriodInSeconds: 86400 } });
+    expect(facts.find((f) => f.subject_id === 'transactions')).toMatchObject({ metric: 'pi.db.load', metric_shares: { orders: 0.75, ledger: 0.25 } });
 
     // blended rates over reserved capacity: 2 × c5a.xlarge × 24 h = 192 core-h, 384 GiB-h; cpu_share 0.5
     expect(cluster?.cpu_capacity_core_h).toBe(192);

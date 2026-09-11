@@ -201,7 +201,19 @@ steps:
             if (!e) return [];
             return [{ share: 1, owner: resolveTarget(e, fact, caps) }].filter(function (x) { return x.owner; });
           }
-          if (method === "by_metric") return []; // not implemented yet → unallocated (phase 3)
+          if (method === "by_metric") {
+            // The fact carries `metric_shares` {key → share} (e.g. Performance Insights db.load by db.name,
+            // attached by the collector). `target.map.entries` maps each key to an owner; keys without an
+            // owner stay unallocated (returned as an explicit `unallocated` part so the gap is visible).
+            var shares = fact.metric_shares; if (!shares || typeof shares !== "object") return [];
+            var entries = (t.map && t.map.entries) || {}; var parts = [];
+            Object.keys(shares).forEach(function (k) {
+              var s = Number(shares[k]) || 0; if (s <= 0) return;
+              var e = entries[k]; var o = e ? resolveTarget(e, fact, caps) : null;
+              parts.push(o ? { share: s, owner: o, key: k } : { share: s, owner: null, key: k });
+            });
+            return parts;
+          }
           var o = resolveTarget(t, fact, caps); return o ? [{ share: 1, owner: o }] : [];
         }
         var defaults = [
@@ -239,7 +251,12 @@ steps:
           }
           var rcat = hit.rule.category || cat;
           hit.parts.forEach(function (p) {
-            var o = p.owner; var amt = num(cost * p.share); var key = ownerKey(o);
+            var amt = num(cost * p.share);
+            if (!p.owner) { // by_metric key without an owner in the map → unallocated portion, key kept for the suggestion pass
+              var un = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(p.key) + "-unallocated", cost_usd: amt, share: num(p.share), allocation_method: "unallocated", rule_id: String(hit.rule.id), metric_key: String(p.key) });
+              allocated.push(un); unalloc[L.service] = num((unalloc[L.service] || 0) + amt); sumAlloc += amt; return;
+            }
+            var o = p.owner; var key = ownerKey(o);
             var method = hit.rule.cluster_pending ? "cluster_pending_consumption" : (hit.rule.method || (hit.rule.target && hit.rule.target.split ? "split" : hit.rule.target && hit.rule.target.map ? "map" : "direct"));
             var a = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(key), cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), category: rcat });
             OWNER.forEach(function (k) { if (o[k] !== undefined) a[k] = o[k]; });
