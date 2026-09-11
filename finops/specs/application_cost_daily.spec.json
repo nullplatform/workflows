@@ -1,7 +1,7 @@
 {
   "slug": "application_cost_daily",
   "name": "Application Cost Daily",
-  "description": "One invoice per application per day: total USD, the charge items (each attributed through a null scope, a null service, or the application itself, with category, cloud service and the rule that attributed it) and totals by charge type, category and cloud service. Written by the allocator.",
+  "description": "One invoice per application per day: total USD, charge items (each charged through a null scope, a null service, or the application itself, with category, cloud service and the attributing rule) and totals. Written by the allocator.",
   "schema": {
     "type": "object",
     "required": [
@@ -44,7 +44,10 @@
           "string",
           "null"
         ],
-        "description": "null application slug"
+        "description": "null application slug",
+        "index": [
+          "filter"
+        ]
       },
       "namespace_id": {
         "type": [
@@ -91,7 +94,7 @@
       },
       "charge_items": {
         "type": "array",
-        "description": "The invoice lines: [{charge_type: scope|service|application, scope_id?, scope_name?, scope_type?, service_id?, service_name?, category, cloud_service, subject_type, subject_id, subject_name, cluster?, component?, cost_usd, share, allocation_method, rule_id, source_fact_id}]",
+        "description": "Invoice lines: [{charge_type: scope|service|application, scope_id, scope_name, scope_type, service_id, service_name, category, cloud_service, subject_type, subject_id, subject_name, cluster, component, cost_usd, share, allocation_method, rule_id, source_fact_id}] \u2014 every key present (null when it does not apply) so lake queries can arrayJoin/JSONExtract uniformly",
         "items": {
           "type": "object",
           "additionalProperties": true
@@ -100,14 +103,6 @@
       "totals": {
         "type": "object",
         "description": "{by_charge_type: {scope, service, application}, by_category: {\u2026}, by_cloud_service: {\u2026}}",
-        "additionalProperties": true
-      },
-      "consumption": {
-        "type": [
-          "object",
-          "null"
-        ],
-        "description": "Kubernetes usage vs request per scope: {scope_id \u2192 {core_h_chargeable, gb_h_chargeable, core_h_used, gb_h_used, core_h_requested, gb_h_requested, usage_usd, waste_usd}} plus `total`",
         "additionalProperties": true
       },
       "charge_items_count": {

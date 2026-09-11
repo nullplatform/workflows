@@ -139,7 +139,7 @@ describe('finops/wf2-allocate-daily', () => {
     // application_cost_daily: one INVOICE per application — flat charge items with the null object each came through
     const appRows = result.outputs?.app_rows as Array<Record<string, unknown>>;
     type Item = Record<string, unknown>;
-    const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; charge_items: Item[]; totals: { by_charge_type: Record<string, number>; by_category: Record<string, number>; by_cloud_service: Record<string, number> }; consumption: Record<string, Record<string, number>> };
+    const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; charge_items: Item[]; totals: { by_charge_type: Record<string, number>; by_category: Record<string, number>; by_cloud_service: Record<string, number> } };
     expect(app100).toMatchObject({ date: D, day: D, application_id: '100', namespace_id: '5', total_usd: 30, currency: 'USD', charge_items_count: 6, cloud_accounts: ['111122223333'] });
     expect(app100.totals).toEqual({ by_charge_type: { scope: 6, service: 12, application: 12 }, by_category: { compute: 2, database: 24, kubernetes: 4 }, by_cloud_service: { [EC2]: 4.5, [RDS]: 24, [VPC]: 1.5 } });
     expect(app100.charge_items.map((i) => [i.charge_type, i.subject_id, i.cost_usd])).toEqual([
@@ -149,9 +149,6 @@ describe('finops/wf2-allocate-daily', () => {
     expect(app100.charge_items[3]).toMatchObject({ charge_type: 'scope', scope_id: '777', component: 'nodes', cluster: 'runtime', category: 'kubernetes', allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', share: 0.5 });
     expect(app100.charge_items[4]).toMatchObject({ charge_type: 'scope', scope_id: '777', subject_type: 'scope', category: 'compute', rule_id: 'default:null-dims' });
     expect(app100.charge_items[1]).toMatchObject({ charge_type: 'application', scope_id: null, service_id: null, allocation_method: 'split', rule_id: 'shared-db-by-database' });
-    // Kubernetes usage vs request per scope (from the wf3 rows), and the total
-    expect(app100.consumption[777]).toEqual({ core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, core_h_requested: 0, gb_h_requested: 0, usage_usd: 1, waste_usd: 3 });
-    expect(app100.consumption.total).toMatchObject({ core_h_chargeable: 48, usage_usd: 1, waste_usd: 3, scopes: 1 });
     const sum = Object.values(app100.totals.by_charge_type).reduce((a, b) => a + b, 0);
     expect(sum).toBeCloseTo(app100.total_usd, 6);
     expect(appRows.map((r) => r.id).sort()).toEqual([`100-${D}`, `200-${D}`, `300-${D}`, `400-${D}`]);

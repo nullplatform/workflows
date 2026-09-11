@@ -30,6 +30,8 @@ Read first:
 | `docs/iam/` | Read-only policy + trust documents for the worker role (IRSA, Pod Identity, cross-account) |
 | `__tests__/` | 16 E2E tests on the local executor, plugins stubbed at the plugin level |
 
+CI note: `npm run validate` skips `finops/tool-cloud-query.yaml` — the published `@nullplatform/workflow-kit` (0.1.0) predates the `np-package-call` plugin and reports it as unregistered; the file is covered by the E2E tests and validated by the engine on publish. Remove the exclusion when the kit is re-released from the current engine.
+
 State (2026-09-11): LIVE in nullplatform's organization (org 4): daily loop published with alias `live`, rules seeded from `setup/rules.nullplatform.json`, 2026-09-09 collected (384 USD amortized). Engine plugin `np-package-call` is deployed (workflow-system 0.0.125).
 
 ## Local loop

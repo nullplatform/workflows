@@ -297,18 +297,16 @@ steps:
           allocated.push(r);
         });
         // application_cost_daily: one INVOICE per null application: flat charge items + totals.
-        var k8sByScope = {}; raw.forEach(function (f) { if (f.source === "k8s" && f.subject_type === "scope" && f.scope_id) k8sByScope[String(f.scope_id)] = { core_h_chargeable: num(f.core_h_chargeable), gb_h_chargeable: num(f.gb_h_chargeable), core_h_used: num(f.core_h_used), gb_h_used: num(f.gb_h_used), core_h_requested: num(f.core_h_requested), gb_h_requested: num(f.gb_h_requested), usage_usd: num(f.usage_usd), waste_usd: num(f.waste_usd) }; });
         var appRows = []; var byCost = function (x, y) { return y.cost_usd - x.cost_usd; };
         Object.keys(perApp).forEach(function (k) {
           var a = perApp[k]; var o = a.owner; if (!o.application_id) return;
           var items = a.charge_items.slice().sort(byCost);
-          items.forEach(function (it) { if (it.scope_id && k8sByScope[it.scope_id]) { var kf = raw.filter(function (f) { return f.source === "k8s" && String(f.scope_id) === it.scope_id; })[0]; if (kf) { it.scope_name = it.scope_name || kf.scope_name || null; it.scope_type = it.scope_type || kf.scope_type || null; } } });
-          var cons = null; var seenScopes = {};
-          items.forEach(function (it) { if (!it.scope_id || seenScopes[it.scope_id] || !k8sByScope[it.scope_id]) return; seenScopes[it.scope_id] = true; cons = cons || { total: { core_h_chargeable: 0, gb_h_chargeable: 0, core_h_used: 0, gb_h_used: 0, core_h_requested: 0, gb_h_requested: 0, usage_usd: 0, waste_usd: 0, scopes: 0 } }; cons[it.scope_id] = k8sByScope[it.scope_id]; Object.keys(k8sByScope[it.scope_id]).forEach(function (kk) { cons.total[kk] = num(cons.total[kk] + k8sByScope[it.scope_id][kk]); }); cons.total.scopes += 1; });
+          // scope name/type for k8s scopes come from the wf3 rows when the owner did not carry them
+          items.forEach(function (it) { if (it.scope_id && (!it.scope_name || !it.scope_type)) { var kf = raw.filter(function (f) { return f.source === "k8s" && String(f.scope_id) === it.scope_id; })[0]; if (kf) { it.scope_name = it.scope_name || kf.scope_name || null; it.scope_type = it.scope_type || kf.scope_type || null; } } });
           appRows.push({ id: String(o.application_id) + "-" + d, date: d, day: d, application_id: String(o.application_id), application_slug: o.application_slug || null, namespace_id: o.namespace_id || null, account_id: o.account_id || null,
             total_usd: a.cost_usd, currency: "USD", charge_items: items, charge_items_count: items.length,
             totals: { by_charge_type: a.by_charge_type, by_category: a.by_category, by_cloud_service: a.by_cloud_service },
-            consumption: cons, cloud_accounts: Object.keys(a.accounts), allocator: String(inputs.allocator), computed_at: now });
+            cloud_accounts: Object.keys(a.accounts), allocator: String(inputs.allocator), computed_at: now });
         });
         var unTotal = num(Object.keys(unalloc).reduce(function (s, k) { return s + unalloc[k]; }, 0));
         allocated.push({ id: "alloc-unallocated-" + d, date: d, day: d, stage: "allocated", subject_type: "unallocated", subject_id: "unallocated", subject_name: "Not attributable yet",
