@@ -93,10 +93,28 @@ const ids: Record<string, string> = {};
 for (const { file, placeholder } of ORDER) {
   let yaml = readFileSync(resolve(dir, file), 'utf8');
   for (const [ph, id] of Object.entries(ids)) yaml = yaml.split(ph).join(id);
-  const parsed = parseYamlWorkflow(yaml) as Record<string, unknown>;
+  let parsed = parseYamlWorkflow(yaml) as Record<string, unknown>;
+  // Decider ports (`source_port: "true"|"false"` on a `conditional`) are only known with a plugin
+  // registry, which the standalone parser lacks: it reports CONNECTION_SOURCE_PORT_UNKNOWN for every
+  // such edge. The server re-validates with the registry, so parse a copy without those ports and
+  // put them back on the normalized connections (matched by edge id).
+  const portErrs = (parsed.errors as Array<{ code?: string }> | undefined) ?? [];
+  if (portErrs.length && portErrs.every((e) => e.code === 'graph/CONNECTION_SOURCE_PORT_UNKNOWN')) {
+    const ports: Record<string, string> = {};
+    const stripped = yaml.replace(/^(\s*-\s*\{[^}]*\bid:\s*([A-Za-z0-9_-]+)[^}]*),\s*source_port:\s*"([^"]+)"([^}]*\})/gm, (_m, head: string, id: string, port: string, tail: string) => { ports[id] = port; return head + tail; });
+    parsed = parseYamlWorkflow(stripped) as Record<string, unknown>;
+    const w = (parsed.workflow ?? parsed.definition) as { connections?: Array<{ id?: string; sourcePort?: string }> } | undefined;
+    for (const c of w?.connections ?? []) if (c.id && ports[c.id]) c.sourcePort = ports[c.id];
+    if (Object.keys(ports).length === 0) throw new Error(`${file}: decider port errors but no \`- { id, …, source_port }\` edges found to restore`);
+  }
   if (Array.isArray(parsed.errors) && parsed.errors.length) throw new Error(`${file}: ${JSON.stringify(parsed.errors).slice(0, 600)}`);
   const def = (parsed.definition ?? parsed.workflow ?? parsed.value ?? parsed) as Record<string, unknown>;
   applyVars(def);
+  // The normalizer turns duration strings ("150s") into milliseconds, but the http-request plugin's
+  // configSchema wants the STRING form: put it back as "<ms>ms".
+  for (const st of Object.values((def.steps ?? {}) as Record<string, { pluginType?: string; config?: Record<string, unknown> }>)) {
+    if (st.pluginType === 'http-request' && st.config && typeof st.config.timeout === 'number') st.config.timeout = `${st.config.timeout}ms`;
+  }
   const existing = updates[file];
   const created = existing ? await api('PUT', `/workflows/definitions/${existing}`, def) : await api('POST', '/workflows/definitions', def);
   const wf = (created.workflow ?? created) as Record<string, unknown>;
