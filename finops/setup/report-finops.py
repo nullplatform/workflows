@@ -9,6 +9,9 @@ Rules that matter (learned on nullplatform, org 4):
 - `argMax(data, _version)` over the spec's rows instead of `FINAL` on the whole table (6–8 s → ~1 s);
 - filter `params` keys MUST equal the schema property names or the frontend never re-runs the query;
 - an area chart with a single day renders nothing → stacked bars;
+- stacked bars with many series + `borderRadius` render as 1px outlines: no borderRadius, explicit `colors`;
+- `rule` (SHOW/HIDE) is ignored, tabs (Categorization) render hidden charts with zero width, nested
+  query targets are never written → one chart per grouping in a 2-column grid;
 - KPIs add up: total = applications + shared platform + Kubernetes overhead + unallocated.
 """
 import argparse, json, sys
@@ -132,6 +135,7 @@ def top_values(expr):
     except Exception: return None
 def sq(v): return v.replace("'", "''")
 DAILY_CHARTS=[]; DAILY_TABS=[]
+PALETTE=["#3b82f6","#f59e0b","#10b981","#ef4444","#8b5cf6","#06b6d4","#f97316","#84cc16","#ec4899","#64748b","#a3a3a3"]
 for key,label,expr in GROUPINGS:
     if key in ('scope','rule'): continue
     vals=top_values(expr) or ["%s-%d" % (key, i+1) for i in range(ARGS.top)]
@@ -145,7 +149,7 @@ for key,label,expr in GROUPINGS:
     # Tabs (Categorization) render the hidden charts with zero width → 1px "lines". A 2-column grid of
     # charts instead; the table and the donut follow the "Agrupar por" selector.
     DAILY_TABS.append({"type":"Control","scope":"#/properties/"+prop,"label":"Gasto diario por "+label.lower(),
-      "options":{"widget":"bar-chart","showBackground":true,"categoryKey":"day","series":[{"dataKey":v.replace('`',''),"name":v} for v in vals]+[{"dataKey":"otros","name":"otros"}],"stacked":true,"xAxisLabel":"Día","yAxisLabel":"USD","height":300,"borderRadius":3,"showLegend":true}})
+      "options":{"widget":"bar-chart","showBackground":true,"categoryKey":"day","series":[{"dataKey":v.replace('`',''),"name":v} for v in vals]+[{"dataKey":"otros","name":"otros"}],"stacked":true,"colors":PALETTE[:len(vals)+1],"xAxisLabel":"Día","yAxisLabel":"USD","height":300,"showLegend":true}})
 DAILY_CHARTS=[{"type":"HorizontalLayout","options":{"columns":[6,6]},"elements":DAILY_TABS[i:i+2]} for i in range(0,len(DAILY_TABS),2)]
 schema["properties"].update({
   "groupBy":{"type":"string","oneOf":[{"const":k,"title":l} for k,l,_ in GROUPINGS],"default":"application"},
