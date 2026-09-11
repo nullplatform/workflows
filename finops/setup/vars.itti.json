@@ -16,7 +16,10 @@
         "agent_nrn": "organization=1049493649:account=1041301647",
         "org_nrn": "organization=1049493649",
         "region": "us-east-1",
-        "expected_account": "985539773184"
+        "expected_account": "985539773184",
+        "dimensions": {
+          "environment": "development"
+        }
       }
     ],
     "k8s_clusters": [

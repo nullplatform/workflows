@@ -81,6 +81,10 @@ inputs:
     description: "If set, the run FAILS when the worker's STS identity is another AWS account (wrong agent/role pairing)"
 
 variables:
+  account_dimensions:
+    type: object
+    required: false
+    description: "null dimensions the whole AWS account maps to (e.g. {environment: development}); stamped on every fact that has no scope/service of its own, so application-level charges carry the environment"
   agent_tags:
     initialValue: { package: "cloud-query" }
   # Per-customer role configuration. Set these on the customer's revision (or
@@ -438,6 +442,7 @@ steps:
       collector: "${{ variables.collector }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
       expected_account: "${{ workflow.inputs.expected_account }}"
+      account_dimensions: "${{ workflow.inputs.account_dimensions }}"
       target_name: "${{ workflow.inputs.target_name }}"
     config:
       language: javascript
@@ -464,8 +469,10 @@ steps:
         function qty(g) { return num((g.Metrics.UsageQuantity || {}).Amount); }
         function base(stage, type, id) {
           // Logical id: every part is also a field. Dashes only — the catalog path rejects ':' and '/'.
+          var acctDims = inputs.account_dimensions && typeof inputs.account_dimensions === "object" && Object.keys(inputs.account_dimensions).length ? inputs.account_dimensions : null;
           return { id: stage + "-" + type + "-" + slug(id) + "-" + d, date: d, day: d, stage: stage, subject_type: type, subject_id: id,
                    cloud: "aws", cloud_account: acct, source: "aws_ce", collected_at: now, collector: String(inputs.collector),
+                   dimensions: acctDims, environment: acctDims && acctDims.environment ? String(acctDims.environment) : null,
                    allocation_method: "unallocated" };
         }
         // Tag conventions seen in the wild: plain (EC2/Lambda/ECR) and `nullplatform:`-prefixed (API Gateway).

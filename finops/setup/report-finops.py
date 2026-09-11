@@ -131,7 +131,7 @@ def top_values(expr):
         return [v for v in vals if v] or None
     except Exception: return None
 def sq(v): return v.replace("'", "''")
-DAILY_CHARTS=[]
+DAILY_CHARTS=[]; DAILY_TABS=[]
 for key,label,expr in GROUPINGS:
     if key=='scope': continue
     vals=top_values(expr) or ["%s-%d" % (key, i+1) for i in range(ARGS.top)]
@@ -142,9 +142,10 @@ for key,label,expr in GROUPINGS:
     pr={"day":st()}; pr.update({v.replace('`',''):num() for v in vals}); pr["otros"]=num()
     schema["properties"][prop]=arr(pr)
     queries["daily-by-"+key.replace("_","-")]={"source":q,"params":P_ALL,"target":"#/properties/"+prop}
-    DAILY_CHARTS.append({"type":"Control","scope":"#/properties/"+prop,"label":"Gasto diario por "+label.lower(),
-      "rule":{"effect":"SHOW","condition":{"scope":"#/properties/groupBy","schema":{"const":key}}},
-      "options":{"widget":"bar-chart","showBackground":true,"categoryKey":"day","series":[{"dataKey":v.replace('`',''),"name":v} for v in vals]+[{"dataKey":"otros","name":"otros"}],"stacked":true,"xAxisLabel":"Día","yAxisLabel":"USD","height":340,"borderRadius":3,"showLegend":true}})
+    # one tab per grouping (JSON Forms Categorization); the table and the donut follow the selector instead
+    DAILY_TABS.append({"type":"Category","label":label,"elements":[{"type":"Control","scope":"#/properties/"+prop,"label":"Gasto diario por "+label.lower(),
+      "options":{"widget":"bar-chart","showBackground":true,"categoryKey":"day","series":[{"dataKey":v.replace('`',''),"name":v} for v in vals]+[{"dataKey":"otros","name":"otros"}],"stacked":true,"xAxisLabel":"Día","yAxisLabel":"USD","height":340,"borderRadius":3,"showLegend":true}}]})
+DAILY_CHARTS=[{"type":"Categorization","elements":DAILY_TABS}]
 schema["properties"].update({
   "groupBy":{"type":"string","oneOf":[{"const":k,"title":l} for k,l,_ in GROUPINGS],"default":"application"},
   "scopeId":{"type":"string","default":""},
