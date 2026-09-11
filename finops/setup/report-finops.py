@@ -12,7 +12,7 @@ Rules that matter (learned on nullplatform, org 4):
 - KPIs add up: total = applications + shared platform + Kubernetes overhead + unallocated.
 """
 import argparse, json, sys
-ap = argparse.ArgumentParser(); ap.add_argument('--spec-id', required=True, help='uuid of the cost_daily spec in the organization'); ap.add_argument('--out', default='np-report-finops.json'); ap.add_argument('--usage-spec-id', default='', help='uuid of the scope_usage_daily spec (adds the Kubernetes usage / right-sizing section)')
+ap = argparse.ArgumentParser(); ap.add_argument('--spec-id', required=True, help='uuid of the cost_daily spec in the organization'); ap.add_argument('--out', default='np-report-finops.json'); ap.add_argument('--usage-spec-id', default='', help='uuid of the scope_usage_daily spec (adds the Kubernetes usage / right-sizing section)'); ap.add_argument('--top', type=int, default=8, help='series per grouping in the daily explorer chart (top-N of the last 30 days + otros)'); ap.add_argument('--no-lake', action='store_true', help='do not query the Lake for the top-N (placeholder series)')
 ARGS = ap.parse_args()
 J="JSONExtractString(assumeNotNull(c.data),'%s')"
 F="JSONExtractFloat(assumeNotNull(c.data),'%s')"
@@ -23,8 +23,8 @@ INNER=f"SELECT id, argMax(data, _version) AS data FROM catalog_entities WHERE en
 BASE=f"""SELECT {J % 'day'} AS day, {J % 'application_id'} AS application_id, {J % 'application_slug'} AS application_slug, {J % 'charge_type'} AS charge_type, {J % 'scope_id'} AS scope_id, {J % 'scope_name'} AS scope_name, {J % 'scope_type'} AS scope_type, {J % 'service_id'} AS service_id, {J % 'service_name'} AS service_name, {J % 'environment'} AS environment, {J % 'category'} AS category, {J % 'cloud_service'} AS cloud_service, {J % 'subject_type'} AS subject_type, {J % 'subject_name'} AS subject_name, {J % 'allocation_method'} AS allocation_method, {J % 'rule_id'} AS rule_id, {J % 'bucket'} AS bucket, {J % 'cluster'} AS cluster, {F % 'cost_usd'} AS cost_usd, {J % 'collected_at'} AS collected_at FROM ({INNER}) AS c WHERE {J % 'stage'} = 'allocated' AND {J % 'allocation_method'} != 'rollup' AND {J % 'subject_type'} != 'unallocated' AND {DATE} QUALIFY collected_at = max(collected_at) OVER (PARTITION BY day)"""
 # app join: application → namespace → account (names + account filter)
 APPJ="LEFT JOIN core_entities_application AS a FINAL ON toString(a.app_id) = f.application_id AND a._deleted = 0 LEFT JOIN core_entities_namespace AS n FINAL ON n.namespace_id = a.namespace_id AND n._deleted = 0 LEFT JOIN core_entities_account AS ac FINAL ON ac.account_id = n.account_id AND ac._deleted = 0"
-APPW="f.application_id != '' AND ({accountId:String} = '' OR toString(n.account_id) = {accountId:String}) AND ({applicationId:String} = '' OR f.application_id = {applicationId:String}) AND ({environment:String} = '' OR f.environment = {environment:String}) AND ({chargeType:String} = '' OR f.charge_type = {chargeType:String}) AND ({serviceId:String} = '' OR f.service_id = {serviceId:String}) AND ({scopeType:String} = '' OR f.scope_type = {scopeType:String})"
-P_ALL={"startDate":{"scope":"#/properties/startDate"},"endDate":{"scope":"#/properties/endDate"},"accountId":{"scope":"#/properties/accountId"},"applicationId":{"scope":"#/properties/applicationId"},"environment":{"scope":"#/properties/environment"},"chargeType":{"scope":"#/properties/chargeType"},"serviceId":{"scope":"#/properties/serviceId"},"scopeType":{"scope":"#/properties/scopeType"}}
+APPW="f.application_id != '' AND ({scopeId:String} = '' OR f.scope_id = {scopeId:String}) AND ({accountId:String} = '' OR toString(n.account_id) = {accountId:String}) AND ({applicationId:String} = '' OR f.application_id = {applicationId:String}) AND ({environment:String} = '' OR f.environment = {environment:String}) AND ({chargeType:String} = '' OR f.charge_type = {chargeType:String}) AND ({serviceId:String} = '' OR f.service_id = {serviceId:String}) AND ({scopeType:String} = '' OR f.scope_type = {scopeType:String})"
+P_ALL={"startDate":{"scope":"#/properties/startDate"},"endDate":{"scope":"#/properties/endDate"},"scopeId":{"scope":"#/properties/scopeId"},"accountId":{"scope":"#/properties/accountId"},"applicationId":{"scope":"#/properties/applicationId"},"environment":{"scope":"#/properties/environment"},"chargeType":{"scope":"#/properties/chargeType"},"serviceId":{"scope":"#/properties/serviceId"},"scopeType":{"scope":"#/properties/scopeType"}}
 P_DATE={"startDate":{"scope":"#/properties/startDate"},"endDate":{"scope":"#/properties/endDate"}}
 APPS=f"WITH f AS ({BASE}) SELECT round(sum(f.cost_usd), 2) AS appsUsd FROM f {APPJ} WHERE {APPW} FORMAT JSON"
 TOTAL=f"WITH f AS ({BASE}) SELECT round(sum(f.cost_usd), 2) AS totalUsd, round(sumIf(f.cost_usd, f.allocation_method = 'kubernetes_overhead'), 2) AS overheadUsd, round(sumIf(f.cost_usd, f.allocation_method = 'unallocated'), 2) AS unallocatedUsd, round(sumIf(f.cost_usd, f.application_id = '' AND f.allocation_method NOT IN ('unallocated', 'kubernetes_overhead')), 2) AS sharedUsd, round(sumIf(f.cost_usd, f.application_id != '') * 100.0 / greatest(sum(f.cost_usd), 0.000001), 1) AS attributedPct FROM f FORMAT JSON"
@@ -107,6 +107,63 @@ queries={
  "apps-table":{"source":APPTABLE,"params":P_ALL,"target":"#/properties/appsTable"},
  "objects-table":{"source":OBJTABLE,"params":P_ALL,"target":"#/properties/objectsTable"},
  "shared-table":{"source":SHARED,"params":P_DATE,"target":"#/properties/sharedTable"}}
+# ── Cost explorer: one grouping selector drives the daily stacked chart, the breakdown donut and the
+# group table. Charts need FIXED series, so the daily chart of each grouping pivots the top-N values
+# of the last 30 days (read from the Lake at generation time; regenerate when the top changes) + otros.
+import os, subprocess
+GROUPINGS=[("application","Aplicación","coalesce(nullIf(a.application_slug, ''), f.application_slug, f.application_id)"),
+           ("cloud_service","Servicio de nube","f.cloud_service"),("category","Categoría","if(f.category = '', 'other', f.category)"),
+           ("environment","Environment","if(f.environment = '', 'sin dimensión', f.environment)"),("charge_type","Tipo de cargo","f.charge_type"),
+           ("scope_type","Tipo de scope","if(f.scope_type = '', '-', f.scope_type)"),("namespace","Namespace","coalesce(nullIf(n.namespace_name, ''), 'sin namespace')"),
+           ("scope","Scope","if(f.scope_name = '', '-', concat(coalesce(nullIf(a.application_slug, ''), f.application_slug, f.application_id), ' / ', f.scope_name))")]
+GEXPR="multiIf(" + ", ".join("{groupBy:String} = '%s', %s" % (k, e) for k,_,e in GROUPINGS) + ", " + GROUPINGS[0][2] + ")"
+P_EXP=dict(P_ALL, groupBy={"scope":"#/properties/groupBy"})
+GTOTAL="(SELECT sum(cost_usd) FROM (SELECT f.cost_usd AS cost_usd FROM f " + APPJ + " WHERE " + APPW + "))"
+GTABLE="WITH f AS (%s) SELECT %s AS grupo, round(sum(f.cost_usd), 2) AS usd, round(sum(f.cost_usd) * 100.0 / greatest(%s, 0.000001), 1) AS pct, uniqExact(f.day) AS days, round(sum(f.cost_usd) / greatest(uniqExact(f.day), 1), 2) AS perDay, uniqExact(f.application_id) AS apps FROM f %s WHERE %s GROUP BY grupo ORDER BY usd DESC LIMIT 100 FORMAT JSON" % (BASE, GEXPR, GTOTAL, APPJ, APPW)
+GDONUT="WITH f AS (%s) SELECT %s AS label, round(sum(f.cost_usd), 2) AS value FROM f %s WHERE %s GROUP BY label ORDER BY value DESC LIMIT 12 FORMAT JSON" % (BASE, GEXPR, APPJ, APPW)
+def top_values(expr):
+    if ARGS.no_lake or not (os.environ.get('NP_TOKEN') or os.environ.get('NP_API_KEY')): return None
+    CH=os.path.expanduser('~/.claude/plugins/cache/nullplatform-internal/np-governance/1.3.1/skills/np-lake/scripts/ch_query.sh')
+    sql="WITH f AS (%s) SELECT %s AS g, sum(f.cost_usd) AS usd FROM f %s WHERE f.application_id != '' GROUP BY g ORDER BY usd DESC LIMIT %d" % (BASE, expr, APPJ, ARGS.top)
+    try:
+        out=subprocess.run([CH,'--format','tsv','--param','startDate=','--param','endDate=',sql],capture_output=True,text=True,timeout=120).stdout.strip().split('\n')
+        vals=[l.split('\t')[0] for l in out[1:] if l.strip() and 'Exception' not in l and 'Querying' not in l]
+        return [v for v in vals if v] or None
+    except Exception: return None
+def sq(v): return v.replace("'", "''")
+DAILY_CHARTS=[]
+for key,label,expr in GROUPINGS:
+    if key=='scope': continue
+    vals=top_values(expr) or ["%s-%d" % (key, i+1) for i in range(ARGS.top)]
+    cols=", ".join("round(sumIf(f.cost_usd, %s = '%s'), 2) AS `%s`" % (expr, sq(v), v.replace('`','')) for v in vals)
+    inlist=", ".join("'%s'" % sq(v) for v in vals)
+    q="WITH f AS (%s) SELECT f.day AS day, %s, round(sumIf(f.cost_usd, %s NOT IN (%s)), 2) AS otros FROM f %s WHERE %s GROUP BY day ORDER BY day FORMAT JSON" % (BASE, cols, expr, inlist, APPJ, APPW)
+    prop="dailyBy"+"".join(w.capitalize() for w in key.split("_"))
+    pr={"day":st()}; pr.update({v.replace('`',''):num() for v in vals}); pr["otros"]=num()
+    schema["properties"][prop]=arr(pr)
+    queries["daily-by-"+key.replace("_","-")]={"source":q,"params":P_ALL,"target":"#/properties/"+prop}
+    DAILY_CHARTS.append({"type":"Control","scope":"#/properties/"+prop,"label":"Gasto diario por "+label.lower(),
+      "rule":{"effect":"SHOW","condition":{"scope":"#/properties/groupBy","schema":{"const":key}}},
+      "options":{"widget":"bar-chart","showBackground":true,"categoryKey":"day","series":[{"dataKey":v.replace('`',''),"name":v} for v in vals]+[{"dataKey":"otros","name":"otros"}],"stacked":true,"xAxisLabel":"Día","yAxisLabel":"USD","height":340,"borderRadius":3,"showLegend":true}})
+schema["properties"].update({
+  "groupBy":{"type":"string","oneOf":[{"const":k,"title":l} for k,l,_ in GROUPINGS],"default":"application"},
+  "scopeId":{"type":"string","default":""},
+  "groupTable":arr({"grupo":st(),"usd":num(),"pct":num(),"days":num(),"perDay":num(),"apps":num()}),
+  "groupDonut":arr({"label":st(),"value":num()})})
+ENUM_SCOPE="WITH f AS (%s) SELECT f.scope_id AS id, anyLast(concat(f.scope_name, ' (', coalesce(nullIf(f.application_slug, ''), f.application_id), ')')) AS name FROM f WHERE f.charge_type = 'scope' AND f.scope_id != '' GROUP BY id ORDER BY name FORMAT JSON" % BASE
+queries.update({"enum-scopes":{"source":ENUM_SCOPE,"params":P_DATE,"target":"#/properties/scopeId","mapping":"enum"},
+  "group-table":{"source":GTABLE,"params":P_EXP,"target":"#/properties/groupTable"},"group-donut":{"source":GDONUT,"params":P_EXP,"target":"#/properties/groupDonut"}})
+EXPLORER_UI=[
+ {"type":"Label","text":"##### Explorador de costos\nGasto diario según la agrupación elegida (apilado por las principales categorías del período; el resto en *otros*), la participación de cada grupo y su tabla. Todos los filtros de arriba aplican; **Scope** acota a un scope puntual.","options":{"format":"markdown"}},
+ {"type":"HorizontalLayout","elements":[{"type":"Control","scope":"#/properties/groupBy","label":"Agrupar por"},{"type":"Control","scope":"#/properties/scopeId","label":"Scope"}]},
+]+DAILY_CHARTS+[
+ {"type":"HorizontalLayout","options":{"columns":[7,5]},"elements":[
+   {"type":"Control","scope":"#/properties/groupTable","label":"Gasto por grupo","options":{"widget":"data-table","features":["sorting","pagination"],"pagination":{"pageSize":15,"pageSizeOptions":[15,50,100]},"emptyState":{"title":"Sin costos","description":"No hay costos atribuidos para estos filtros."},"columns":[
+     {"id":"grupo","header":"Grupo","accessor":"grupo","fixed":{"position":"left"}},{"id":"usd","header":"USD","accessor":"usd"},{"id":"pct","header":"% del total","accessor":"pct"},{"id":"perDay","header":"USD/día","accessor":"perDay"},{"id":"days","header":"Días","accessor":"days"},{"id":"apps","header":"Apps","accessor":"apps"}]}},
+   {"type":"Control","scope":"#/properties/groupDonut","label":"Participación","options":{"widget":"donut-chart","showBackground":true,"labelKey":"label","valueKey":"value","donutSize":"55%","showTotal":true,"totalLabel":"USD","height":360}}]}]
+_i=[i for i,e in enumerate(ui["elements"]) if e.get("type")=="Label" and str(e.get("text","")).startswith("##### Evolución diaria")][0]
+ui["elements"][_i:_i]=EXPLORER_UI
+
 # ── Kubernetes usage per scope (scope_usage_daily): the right-sizing view next to the cost ──
 if ARGS.usage_spec_id:
     UI_=f"SELECT id, argMax(data, _version) AS data FROM catalog_entities WHERE entity_specification_id = '{ARGS.usage_spec_id}' GROUP BY id HAVING argMax(_deleted, _version) = 0"
