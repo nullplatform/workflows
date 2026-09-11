@@ -23,7 +23,8 @@
       {
         "cluster": "runtime"
       }
-    ]
+    ],
+    "allocate_in_chain": false
   },
   "finops_suggest_mappings": {
     "org_nrn": "organization=4",

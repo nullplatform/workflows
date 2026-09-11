@@ -52,6 +52,9 @@ inputs:
     description: "Override of variables.k8s_clusters: [{cluster}]"
 
 variables:
+  # true: wf0 runs the allocator as a child after k8s (one chain); false: wf2 runs on its own daily cron.
+  allocate_in_chain:
+    initialValue: true
   targets:
     initialValue: []
   # Kubernetes clusters whose consumption splits their cost: [{cluster}] (wf3 variables hold the agent + collector per org).
@@ -94,6 +97,7 @@ steps:
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
       allocate: "${{ workflow.inputs.allocate }}"
+      allocate_default: "${{ variables.allocate_in_chain }}"
       k8s: "${{ workflow.inputs.k8s }}"
       k8s_clusters: "${{ workflow.inputs.k8s_clusters }}"
       k8s_clusters_default: "${{ variables.k8s_clusters }}"
@@ -115,7 +119,9 @@ steps:
         });
         function iso(dt) { return dt.toISOString().slice(0, 10); }
         var day = inputs.date && /^\d{4}-\d{2}-\d{2}$/.test(String(inputs.date)) ? String(inputs.date) : iso(new Date(Date.now() - 86400000));
-        var doAlloc = inputs.allocate === undefined || inputs.allocate === null || inputs.allocate === "" ? true : !!inputs.allocate;
+        // Default from variables.allocate_in_chain: false = the allocator runs on its own cron (wf2 05:00 UTC)
+        // instead of as a child here — see docs/customer-onboarding.md §5.1 (engine retry of long children).
+        var doAlloc = inputs.allocate === undefined || inputs.allocate === null || inputs.allocate === "" ? (inputs.allocate_default !== false && String(inputs.allocate_default) !== "false") : !!inputs.allocate;
         var doK8s = inputs.k8s === undefined || inputs.k8s === null || inputs.k8s === "" ? true : !!inputs.k8s;
         var clusters = Array.isArray(inputs.k8s_clusters) && inputs.k8s_clusters.length ? inputs.k8s_clusters : (Array.isArray(inputs.k8s_clusters_default) ? inputs.k8s_clusters_default : []);
         var k8s = doK8s ? clusters.map(function (c) { return { date: day, cluster: String(c.cluster), dry_run: !!inputs.dry_run }; }) : [];

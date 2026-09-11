@@ -26,7 +26,8 @@
       {
         "cluster": "eks-1-tuti-null-use1-dev"
       }
-    ]
+    ],
+    "allocate_in_chain": false
   },
   "finops_suggest_mappings": {
     "org_nrn": "organization=1049493649",

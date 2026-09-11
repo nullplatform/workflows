@@ -73,9 +73,20 @@ steps:
         dry_run: { type: boolean, required: false, description: "Compute without writing" }
         cloud_account: { type: string, required: false, description: "Restrict to one cloud account" }
 
+  # Daily allocation of yesterday, 45 minutes after the dispatcher's 04:15 UTC collection (see wf0
+  # variables.allocate_in_chain: with it false, this cron is the daily allocation).
+  - id: daily_cron
+    type: trigger
+    plugin_type: cron
+    name: "Daily 05:00 UTC"
+    config:
+      schedule: "0 5 * * *"
+      timezone: "UTC"
+
   - id: prep
     type: module
     plugin_type: code-exec
+    join_strategy: any
     name: "Day + filters"
     inputs:
       date: "${{ workflow.inputs.date }}"
@@ -537,6 +548,7 @@ steps:
 
 connections:
   - { from: start, to: prep }
+  - { from: daily_cron, to: prep }
   - { from: prep, to: read_raw }
   - { from: prep, to: read_rules }
   - { from: prep, to: scopes }
