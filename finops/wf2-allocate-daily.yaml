@@ -198,7 +198,8 @@ steps:
           var rem = num((Number(s.cost_usd) || 0) - covered);
           if (Math.abs(rem) >= 0.000001) {
             leaves.push({ fact: { id: s.id + "-remainder", date: d, subject_type: "cloud_service", subject_id: s.subject_id, subject_name: name + " / remainder", cloud_service: name,
-                                  cloud: s.cloud, cloud_account: s.cloud_account, region: s.region || null, cost_usd: rem, parent_id: s.id, synthetic: true }, service: name, kind: "remainder" });
+                                  cloud: s.cloud, cloud_account: s.cloud_account, region: s.region || null, cost_usd: rem, parent_id: s.id, synthetic: true,
+                                  dimensions: s.dimensions || null, environment: s.environment || null }, service: name, kind: "remainder" });
           }
         });
 
