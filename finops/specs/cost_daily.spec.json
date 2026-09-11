@@ -206,7 +206,7 @@
       },
       "cost_usd": {
         "type": "number",
-        "description": "Amortized cost (Savings Plans / RIs spread over covered usage) \u2014 the chargeback basis"
+        "description": "Amortized cost (Savings Plans / RIs spread over covered usage) — the chargeback basis"
       },
       "unblended_usd": {
         "type": [
@@ -294,14 +294,14 @@
           "number",
           "null"
         ],
-        "description": "Cluster: share of cost_usd attributed to CPU when deriving rates (rest \u2192 memory)"
+        "description": "Cluster: share of cost_usd attributed to CPU when deriving rates (rest → memory)"
       },
       "rate_cpu_usd_core_h": {
         "type": [
           "number",
           "null"
         ],
-        "description": "Cluster blended rate: USD per vCPU-hour (\u00f71000 for millicore-hour)"
+        "description": "Cluster blended rate: USD per vCPU-hour (÷1000 for millicore-hour)"
       },
       "rate_mem_usd_gb_h": {
         "type": [
@@ -396,7 +396,7 @@
           "object",
           "null"
         ],
-        "description": "Instance type \u2192 count for aggregated buckets (only for instances still present at collection)",
+        "description": "Instance type → count for aggregated buckets (only for instances still present at collection)",
         "additionalProperties": {
           "type": "integer"
         }
@@ -421,7 +421,7 @@
           "string",
           "null"
         ],
-        "description": "Primary endpoint/host of the subject (databases, caches) \u2014 evidence for mapping rules"
+        "description": "Primary endpoint/host of the subject (databases, caches) — evidence for mapping rules"
       },
       "category": {
         "type": [
@@ -452,7 +452,7 @@
           "object",
           "null"
         ],
-        "description": "Rollup rows: category \u2192 USD",
+        "description": "Rollup rows: category → USD",
         "additionalProperties": {
           "type": "number"
         }
@@ -462,7 +462,7 @@
           "object",
           "null"
         ],
-        "description": "Rollup rows: cloud service \u2192 USD",
+        "description": "Rollup rows: cloud service → USD",
         "additionalProperties": {
           "type": "number"
         }
@@ -479,7 +479,7 @@
           "object",
           "null"
         ],
-        "description": "metric key (database name, log group, namespace\u2026) \u2192 share 0..1 of the metric on the day",
+        "description": "metric key (database name, log group, namespace…) → share 0..1 of the metric on the day",
         "additionalProperties": {
           "type": "number"
         }
@@ -503,7 +503,7 @@
           "object",
           "null"
         ],
-        "description": "metric key \u2192 owner dims {application_id, namespace_id, scope_id, account_id, application_slug} when the collector knows the owner (k8s scopes by label)",
+        "description": "metric key → owner dims {application_id, namespace_id, scope_id, account_id, application_slug} when the collector knows the owner (k8s scopes by label)",
         "additionalProperties": true
       },
       "core_h_chargeable": {
@@ -511,14 +511,14 @@
           "number",
           "null"
         ],
-        "description": "Kubernetes: \u03a3 hours max(usage, request) CPU cores"
+        "description": "Kubernetes: Σ hours max(usage, request) CPU cores"
       },
       "gb_h_chargeable": {
         "type": [
           "number",
           "null"
         ],
-        "description": "Kubernetes: \u03a3 hours max(usage, request) memory GiB"
+        "description": "Kubernetes: Σ hours max(usage, request) memory GiB"
       },
       "core_h_used": {
         "type": [
@@ -567,7 +567,7 @@
           "string",
           "null"
         ],
-        "description": "null scope type (web_pool_k8s, custom, lambda, \u2026) when known"
+        "description": "null scope type (web_pool_k8s, custom, lambda, …) when known"
       },
       "dimensions": {
         "type": [
@@ -592,6 +592,13 @@
         "index": [
           "filter"
         ]
+      },
+      "usage_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "scope_usage_daily row this k8s scope fact was priced from (usage-<scope_id>-<day>)"
       }
     },
     "required": [

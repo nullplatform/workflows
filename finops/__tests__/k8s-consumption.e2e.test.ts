@@ -65,8 +65,15 @@ describe('finops/wf3-k8s-consumption-daily', () => {
     expect(cluster).toMatchObject({ metric: 'k8s.chargeable', metric_shares: { 777: 0.0025, 999: 0.0003 }, k8s_overhead_usd: 99.72, cost_usd: 100 });
     expect((cluster.metric_owners as Record<string, Record<string, unknown>>)[777]).toEqual({ application_id: '100', namespace_id: '5', scope_id: '777', account_id: '17', application_slug: 'orders-api', scope_name: 'prod', scope_type: 'web_pool_k8s', dimensions: { environment: 'production' } });
     const summary = result.outputs?.summary as Record<string, unknown>;
-    expect(summary).toMatchObject({ scopes: 3, with_data: 2, scopes_cost_usd: 0.28, overhead_usd: 99.72, cluster_cost_usd: 100, written: 3, error_count: 0 });
-    expect(written.map((w) => w.catalog_slug)).toEqual(['cost_daily', 'cost_daily', 'cost_daily']);
+    // 2 usage rows (scope_usage_daily) + 2 priced facts + the cluster row
+    expect(summary).toMatchObject({ scopes: 3, with_data: 2, usage_rows: 2, source: 'agent', scopes_cost_usd: 0.28, overhead_usd: 99.72, cluster_cost_usd: 100, written: 5, error_count: 0 });
+    expect(written.map((w) => w.catalog_slug)).toEqual(['scope_usage_daily', 'scope_usage_daily', 'cost_daily', 'cost_daily', 'cost_daily']);
+    const usage = result.outputs?.usage as Array<Record<string, unknown>>;
+    expect(usage.map((u) => u.id)).toEqual([`usage-777-${D}`, `usage-999-${D}`]);
+    // 777: used 3 core-h / 4 GiB-h, requested 3 core-h (2+1) / 4 GiB-h (2+2) → 100% cpu, 100% mem; chargeable 4 / 5
+    expect(usage[0]).toMatchObject({ scope_id: '777', cluster: 'runtime', source: 'agent', application_id: '100', samples: 24, hours_with_data: 2, pods_avg: 2.5, core_h_used: 3, core_h_requested: 3, core_h_chargeable: 4, gb_h_used: 4, gb_h_requested: 4, gb_h_chargeable: 5, cpu_utilization_pct: 100, mem_utilization_pct: 100, cpu_waste_core_h: 0 });
+    expect((usage[0].hours as unknown[]).length).toBe(2);
+    expect(facts[0]).toMatchObject({ usage_id: `usage-777-${D}` });
   });
 
   it('fails clearly when the day has no raw cluster row', async () => {

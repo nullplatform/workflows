@@ -34,6 +34,17 @@ CI note: `npm run validate` skips `finops/tool-cloud-query.yaml` — the publish
 
 State (2026-09-11): LIVE in nullplatform's organization (org 4): daily loop published with alias `live`, rules seeded from `setup/rules.nullplatform.json`, 2026-09-09 collected (384 USD amortized). Engine plugin `np-package-call` is deployed (workflow-system 0.0.125).
 
+## Scope usage (right-sizing) and its price
+
+`wf3` writes two things per scope-day. First `scope_usage_daily` (`usage-<scope_id>-<day>`): the
+consumption itself — per-hour CPU/memory used vs requested, pods, `core_h_*`/`gb_h_*` totals,
+`*_chargeable` = Σ max(used, requested), utilization % and waste — from the agent collector
+(Prometheus) or from New Relic (`collector_mode: newrelic`, one NRQL per cluster-day). Then the
+priced `cost_daily` scope fact (`raw-k8s-scope-<scope_id>-<day>`, `usage_id` → the usage row) and the
+cluster row's `metric_shares`. The usage entity is the right-sizing source (utilization per scope
+over time, straight from the Lake) and what a re-pricing reads; the cost side never needs the
+metrics source again.
+
 ## Bringing it to a customer
 
 Read [`docs/customer-onboarding.md`](docs/customer-onboarding.md): discovery questions, worker

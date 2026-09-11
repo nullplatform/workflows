@@ -56,7 +56,7 @@ api() { # method path [body-file]
   fi
 }
 
-for slug in cost_daily cost_mapping_rule cost_mapping_suggestion application_cost_daily; do
+for slug in cost_daily scope_usage_daily cost_mapping_rule cost_mapping_suggestion application_cost_daily; do
   f="$SPECS_DIR/$slug.spec.json"
   body=$(mktemp)
   # Spec grants must name a user of THIS org: rewrite the admin principal in the JSON

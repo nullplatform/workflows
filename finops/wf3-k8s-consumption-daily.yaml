@@ -328,7 +328,7 @@ steps:
         var d = String(inputs.day); var now = new Date().toISOString(); var C = inputs.cluster || {}; var cname = String(inputs.cluster_name);
         function num(x) { return Math.round((Number(x) || 0) * 1e6) / 1e6; }
         var scopes = inputs.scopes || []; var results = String(inputs.collector_mode) === "newrelic" ? (inputs.results_nr || []) : (inputs.results || []);
-        var facts = []; var shares = {}; var owners = {}; var sum = 0; var withData = 0; var errors = [];
+        var facts = []; var usageRows = []; var shares = {}; var owners = {}; var sum = 0; var withData = 0; var errors = []; var mode = String(inputs.collector_mode || "agent");
         scopes.forEach(function (s, i) {
           var r = results[i] || {}; var o = r.outputs || r; var parsed = null;
           try { parsed = JSON.parse(String(o.stdout || "")); } catch (e) { errors.push({ scope_id: s.scope_id, error: "stdout is not JSON: " + String(o.stdout || o.stderr || "").slice(0, 120) }); return; }
@@ -349,20 +349,29 @@ steps:
                     scope_id: s.scope_id, scope_name: s.scope_name || null, scope_type: s.scope_type || null, dimensions: s.dimensions || null, environment: (s.dimensions || {}).environment || null, application_id: s.application_id, application_slug: s.app_slug || null, namespace_id: s.namespace_id, account_id: s.account_id, nrn: s.nrn,
                     cost_usd: cost, usage_usd: usage, waste_usd: num(Math.max(cost - usage, 0)), core_h_chargeable: num(chCore), gb_h_chargeable: num(chGb), core_h_used: num(usedCore), gb_h_used: num(usedGb),
                     core_h_requested: num(reqCore), gb_h_requested: num(reqGb), pods_avg: podsN ? num(pods / podsN) : null, quantity: samples, units: "samples",
-                    rate_cpu_usd_core_h: C.rate_cpu, rate_mem_usd_gb_h: C.rate_mem, allocation_method: "direct_resource", metric: "k8s.chargeable" };
+                    rate_cpu_usd_core_h: C.rate_cpu, rate_mem_usd_gb_h: C.rate_mem, allocation_method: "direct_resource", metric: "k8s.chargeable", usage_id: "usage-" + s.scope_id + "-" + d };
           facts.push(f); sum += cost;
+          // The scope's consumption as its own entity (scope_usage_daily): the right-sizing source, and what the
+          // pricing above is derived from — re-pricing a day never needs the metrics source again.
+          usageRows.push({ id: "usage-" + s.scope_id + "-" + d, date: d, day: d, scope_id: s.scope_id, scope_name: s.scope_name || null, scope_slug: s.scope_slug || null, scope_type: s.scope_type || null,
+                       application_id: s.application_id, application_slug: s.app_slug || null, namespace_id: s.namespace_id, account_id: s.account_id, nrn: s.nrn, cluster: cname,
+                       cloud: "aws", cloud_account: inputs.cluster_body.cloud_account || null, region: inputs.cluster_body.region || null, dimensions: s.dimensions || null, environment: (s.dimensions || {}).environment || null,
+                       source: mode, collector: String(inputs.collector), collected_at: now, samples: samples, pods_avg: podsN ? num(pods / podsN) : null, hours_with_data: hrs.length,
+                       core_h_used: num(usedCore), core_h_requested: num(reqCore), core_h_chargeable: num(chCore), gb_h_used: num(usedGb), gb_h_requested: num(reqGb), gb_h_chargeable: num(chGb),
+                       cpu_utilization_pct: reqCore > 0 ? num(100 * usedCore / reqCore) : null, mem_utilization_pct: reqGb > 0 ? num(100 * usedGb / reqGb) : null,
+                       cpu_waste_core_h: num(Math.max(reqCore - usedCore, 0)), mem_waste_gb_h: num(Math.max(reqGb - usedGb, 0)), hours: hrs });
           if (cost > 0) { shares[s.scope_id] = cost; owners[s.scope_id] = { application_id: s.application_id, namespace_id: s.namespace_id, scope_id: s.scope_id, account_id: s.account_id, application_slug: s.app_slug || null, scope_name: s.scope_name || null, scope_type: s.scope_type || null, dimensions: s.dimensions || null }; }
         });
         var clusterCost = num(C.cost_usd); var denom = clusterCost > 0 ? Math.max(clusterCost, sum) : sum; // shares never exceed 1
         Object.keys(shares).forEach(function (k) { shares[k] = denom ? num(shares[k] / denom) : 0; });
         var overhead = num(Math.max(clusterCost - sum, 0));
         var clusterRow = Object.assign({}, inputs.cluster_body, { metric: "k8s.chargeable", metric_shares: shares, metric_owners: owners, k8s_overhead_usd: overhead, collected_at: now });
-        var writes = facts.map(function (f) { return { fact: f, catalog_slug: "cost_daily" }; });
+        var writes = usageRows.map(function (u) { return { fact: u, catalog_slug: "scope_usage_daily" }; }).concat(facts.map(function (f) { return { fact: f, catalog_slug: "cost_daily" }; }));
         if (Object.keys(shares).length) writes.push({ fact: clusterRow, catalog_slug: "cost_daily" });
-        var summary = { day: d, cluster: cname, cluster_cost_usd: clusterCost, scopes: scopes.length, with_data: withData, scopes_cost_usd: num(sum), overhead_usd: overhead, coverage_pct: clusterCost ? num(100 * Math.min(sum, clusterCost) / clusterCost) : 0,
+        var summary = { day: d, cluster: cname, source: mode, cluster_cost_usd: clusterCost, scopes: scopes.length, with_data: withData, usage_rows: usageRows.length, scopes_cost_usd: num(sum), overhead_usd: overhead, coverage_pct: clusterCost ? num(100 * Math.min(sum, clusterCost) / clusterCost) : 0,
                         rate_cpu_usd_core_h: C.rate_cpu, rate_mem_usd_gb_h: C.rate_mem, errors: errors.slice(0, 20), error_count: errors.length, dry_run: !!inputs.dry_run,
                         top: facts.slice().sort(function (a, b) { return b.cost_usd - a.cost_usd; }).slice(0, 15).map(function (f) { return { scope: f.subject_name, application_id: f.application_id, cost_usd: f.cost_usd, usage_usd: f.usage_usd, core_h_chargeable: f.core_h_chargeable, gb_h_chargeable: f.gb_h_chargeable }; }) };
-        return { facts: facts, cluster_row: clusterRow, to_write: inputs.dry_run ? [] : writes, summary: summary };
+        return { facts: facts, usage: usageRows, cluster_row: clusterRow, to_write: inputs.dry_run ? [] : writes, summary: summary };
 
   - id: write
     type: module
@@ -414,3 +423,4 @@ connections:
 outputs:
   summary: "${{ steps.summary.outputs }}"
   facts: "${{ steps.build.outputs.facts }}"
+  usage: "${{ steps.build.outputs.usage }}"

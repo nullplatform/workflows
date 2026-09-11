@@ -84,7 +84,7 @@ registration is needed. Without `image` the organization's registered package ru
 
 ## 3. Catalog specs
 
-`setup/01-catalog-spec.sh` creates or patches the four specs from `specs/*.spec.json`.
+`setup/01-catalog-spec.sh` creates or patches the five specs from `specs/*.spec.json` (`cost_daily`, `scope_usage_daily`, the two mapping specs, `application_cost_daily`).
 
 Traps that cost us hours:
 - **Undeclared attributes are dropped silently.** Patch the spec BEFORE writing a new field
