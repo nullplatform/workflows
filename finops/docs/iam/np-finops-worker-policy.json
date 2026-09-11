@@ -41,14 +41,19 @@
       "Effect": "Allow",
       "Action": [
         "cloudwatch:GetMetricData",
-        "cloudwatch:ListMetrics"
+        "cloudwatch:ListMetrics",
+        "logs:DescribeLogGroups",
+        "pi:GetResourceMetrics",
+        "pi:DescribeDimensionKeys"
       ],
       "Resource": "*"
     },
     {
       "Sid": "Identity",
       "Effect": "Allow",
-      "Action": ["sts:GetCallerIdentity"],
+      "Action": [
+        "sts:GetCallerIdentity"
+      ],
       "Resource": "*"
     }
   ]

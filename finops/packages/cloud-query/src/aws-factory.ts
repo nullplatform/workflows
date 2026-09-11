@@ -11,6 +11,8 @@ import * as sts from "@aws-sdk/client-sts";
 import * as tagging from "@aws-sdk/client-resource-groups-tagging-api";
 import * as elbv2 from "@aws-sdk/client-elastic-load-balancing-v2";
 import * as rds from "@aws-sdk/client-rds";
+import * as pi from "@aws-sdk/client-pi";
+import * as logs from "@aws-sdk/client-cloudwatch-logs";
 import type { ClientFactory, SdkClient } from "./runner";
 
 type Ctor = new (cfg: Record<string, unknown>) => SdkClient;
@@ -25,6 +27,10 @@ const SERVICES: Record<string, { module: Module; client: Ctor; region?: string }
   tagging: { module: tagging as Module, client: tagging.ResourceGroupsTaggingAPIClient as unknown as Ctor },
   elbv2: { module: elbv2 as Module, client: elbv2.ElasticLoadBalancingV2Client as unknown as Ctor },
   rds: { module: rds as Module, client: rds.RDSClient as unknown as Ctor },
+  // RDS Performance Insights: DB load per database / user / SQL — the per-database split of a shared cluster.
+  pi: { module: pi as Module, client: pi.PIClient as unknown as Ctor },
+  // CloudWatch Logs: log groups (names carry the app) for the CloudWatch ingestion/storage split.
+  logs: { module: logs as Module, client: logs.CloudWatchLogsClient as unknown as Ctor },
 };
 
 export const SUPPORTED_SERVICES = Object.keys(SERVICES);

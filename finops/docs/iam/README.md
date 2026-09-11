@@ -2,7 +2,7 @@
 
 | File | Attach to | Purpose |
 |---|---|---|
-| `np-finops-worker-policy.json` | the role that READS billing (worker role, or the per-account role when AssumeRole is used) | least-privilege read-only for phases 1–3 (Cost Explorer, inventory, tags, CloudWatch). Every action is a read; `Resource: "*"` because these APIs are not resource-scoped. |
+| `np-finops-worker-policy.json` | the role that READS billing (worker role, or the per-account role when AssumeRole is used) | least-privilege read-only for phases 1–3 (Cost Explorer, inventory, tags, CloudWatch metrics + log groups, RDS Performance Insights). Every action is a read; `Resource: "*"` because these APIs are not resource-scoped. |
 | `np-finops-worker-policy-cur.json` | same role, only when the account has a CUR queried through Athena | scoped to the finops Athena workgroup, the CUR Glue database/table and the two buckets — replace every placeholder |
 | `trust-irsa.json` | the worker role, EKS with IRSA | one OIDC provider per cluster; `sub` pins the agent namespace + service account `np-cloud-query` |
 | `trust-pod-identity.json` | the worker role, EKS Pod Identity | scoped to the cluster ARN + account (`aws:SourceArn`/`aws:SourceAccount`); then `aws eks create-pod-identity-association --cluster-name <c> --namespace <ns> --service-account np-cloud-query --role-arn <role>` |
