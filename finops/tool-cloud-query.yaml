@@ -168,17 +168,9 @@ steps:
         if (img && !/^[a-z0-9.-]+(:\d+)?\/[a-z0-9._\/-]+@sha256:[a-f0-9]{64}$/i.test(img)) throw new Error("image must be registry/repository@sha256:<digest> (got " + img + ")");
         var ver = String(inputs.package_version || "").trim();
         if (ver && !/^\d+\.\d+\.\d+([-.][A-Za-z0-9.]+)?$/.test(ver)) throw new Error("package_version must be semver (got " + ver + ")");
+        // The image travels as np-package-call's `image` input → command.data.package = {slug, image}
+        // (agents-api #228/#230 lowers it into the worker's oci_image artifact). Nothing to embed here.
         var ac = { cloud_query: cq };
-        if (img) {
-          // Carry the image as the oci_image artifact of the action context ourselves
-          // (what np-package-call's `image` input does since PR #181). The agent resolves
-          // notification.package.revision.artifacts[oci_image] → no platform package
-          // registration needed; engines whose plugin predates `image` still work.
-          var im = /^([a-z0-9.-]+(?::\d+)?)\/([a-z0-9._\/-]+)@(sha256:[a-f0-9]{64})$/i.exec(img);
-          var pkg = { slug: "cloud-query", revision: { artifacts: [{ type: "oci_image", meta: { registry: im[1], repository: im[2], digest: im[3] } }] } };
-          if (ver) { pkg.version = ver; pkg.revision.version = ver; }
-          ac.notification = { package: pkg };
-        }
         return { action_context: ac, agent_selector: selector, mode: inputs.mode === "sync" ? "sync" : "async", callback_base_url: cb, image: img || null, version: ver || null };
 
   - id: call_package
