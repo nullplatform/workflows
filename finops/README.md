@@ -308,6 +308,35 @@ Everything is per organization; nothing is registered on the platform as a packa
    (the `date` query filter is ignored by the catalog list API today — filter on other
    fields or query the lake).
 
+### itti / tuti (org 1049493649, account 1041301647 → AWS 985539773184, 2026-09-11)
+
+Second organization, and the one that shaped most of the model:
+
+- **Agent**: `np-agent-itti-tuti-sdlc` upgraded to 0.11.1 the same day (0.6.0 has no `package-exec`);
+  identity = the agent's pod-identity role (`npagents-itti-tuti-sdlc-assumed-pod-identity-npagent`),
+  enough for Cost Explorer, EC2/RDS describes, tagging, Performance Insights and CloudWatch Logs.
+  `ListMetricStreams` and `ListCostAllocationTags` (linked account) are denied.
+- **Billing shape** (09-10, 89.38 USD, amortized = unblended, no Savings Plans): EKS cluster
+  `eks-1-tuti-null-use1-dev` 50% (Spot nodes, no Karpenter, 6–28 nodes/hour), CloudWatch 19% (67% of it
+  a metric stream, 25% EMF custom metrics), AWS Config 12%, Aurora + DocumentDB 10%.
+- **No Cost Explorer resource-level data**: `wf1` prices the cluster from the `INSTANCE_TYPE` rows
+  (running nodes → cluster by type, else the account's sole cluster).
+- **Pod metrics from New Relic** (`collector_mode: newrelic`, account 6332316): one NRQL per cluster-day
+  over `K8sContainerSample` FACET `label.scope_id` × hour; 29 scopes; `scope_usage_daily` per scope.
+- **Databases without null services**: the 6 null services of the account are an S3 bucket, an Amplify
+  scope and placeholders without `host`; `aurora-main` / `elasticache-main` / the DocumentDB service were
+  deleted months ago. Rules come from the applications' parameters (`DB_HOST` + `DB_NAME` → exact
+  Aurora database, `DBM_HOST` → DocumentDB `<app>db`, `REDIS_HOST` → ElastiCache consumers) and PI
+  `db.load` shares; charged as `service` / `service_kind: cloud`.
+- **CloudWatch**: logs and EMF metrics to their application (`<namespace>.<application>` naming), the
+  metric stream + Config + GuardDuty/KMS/Inspector/Secrets/Macie + VPC as `spread` platform cost.
+- **Result**: 94.8% attributed on 09-10 (84.74 of 89.38), 94.6% on 09-09, 86.8% on 09-08 (6.6 USD of
+  Kubernetes overhead: capacity no scope requested that day). Unattributed ≈ 3.3 USD/day (EC2 Other,
+  ELB, SQS, cluster/RDS log groups).
+- **Vars**: `setup/vars.itti.json` (target `dimensions: {environment: development}` — the whole AWS
+  account is one dimension value, stamped on application-level charges); rules `setup/rules.itti.json`.
+- Dashboard `645e6dbf-b83b-4b4a-97ab-215ab1912d4d` (published), see `docs/customer-onboarding.md` §6.
+
 ### What nullplatform's first day looked like (2026-09-09, account 283477532906)
 
 275 rows: 38 `cloud_service`, 222 `bucket` (usage types + cluster components + one
