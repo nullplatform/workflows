@@ -114,9 +114,13 @@ NP_TOKEN=<bearer> pnpm tsx finops/setup/publish.ts finops \
   --base https://api.nullplatform.com --vars finops/setup/vars.<org>.json
 ```
 
-Copy `setup/vars.nullplatform.json` and set: `agent_tags` + `agent_nrn` (REQUIRED for account-level
+Copy `setup/vars.nullplatform.json` (or `vars.itti.json` for a New Relic / single-dimension account) and set: `agent_tags` + `agent_nrn` (REQUIRED for account-level
 agents), `org_nrn`, the dispatcher `targets` (one per account; `expected_account` guards a wrong
-agent/role pairing), `k8s_clusters`, the cluster's Prometheus URL for `wf3` (`collector_cmd`).
+agent/role pairing; `dimensions` = the null dimension the whole AWS account maps to, e.g.
+`{environment: development}`, stamped on every fact without a scope/service of its own),
+`k8s_clusters`, and for `wf3` either the cluster's Prometheus URL (`collector_cmd`, `collector_mode:
+agent`) or `collector_mode: newrelic` + config entries `NR_USER_KEY` / `NR_ACCOUNT_ID` at `/finops`
+(`org_nrn` of `wf3` = the subtree whose scopes the cluster serves).
 
 The workflows read `${{ secrets.NP_API_KEY }}`: a config entry named `NP_API_KEY` must exist at
 `/finops` or be inherited from `/` (`GET /workflows/config?path=/finops`). If the agent is not ready
