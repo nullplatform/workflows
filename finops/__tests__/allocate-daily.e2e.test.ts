@@ -136,26 +136,26 @@ describe('finops/wf2-allocate-daily', () => {
     expect(byId[`alloc-app-100-${D}`]).toMatchObject({ subject_type: 'application', application_id: '100', cost_usd: 30, by_category: { compute: 2, database: 24, kubernetes: 4 }, quantity: 6 });
     expect(byId[`alloc-app-300-${D}`]).toMatchObject({ cost_usd: 3 });
     expect(byId[`alloc-app-400-${D}`]).toMatchObject({ cost_usd: 2 });
-    // application_cost_daily: the per-app entity, split by the null objects the cost came through
+    // application_cost_daily: one INVOICE per application — flat charge items with the null object each came through
     const appRows = result.outputs?.app_rows as Array<Record<string, unknown>>;
-    type Item = Record<string, unknown>; type Owner = { scope_id?: string; service_id?: string; cost_usd: number; items: Item[]; consumption?: Record<string, number>; scope_type?: string | null };
-    const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; scopes_usd: number; services_usd: number; application_usd: number; scopes: Owner[]; services: Owner[]; application_items: Item[]; consumption: Record<string, number>; by_category: Record<string, number> };
-    expect(app100).toMatchObject({ application_id: '100', namespace_id: '5', total_usd: 30, scopes_usd: 6, services_usd: 12, application_usd: 12, by_category: { compute: 2, database: 24, kubernetes: 4 }, items_count: 6, cloud_accounts: ['111122223333'] });
-    // scope 777: the EC2 instance tagged with the scope (2) + its share of the cluster nodes (2.5) and networking (1.5), with the k8s consumption alongside
-    expect(app100.scopes).toHaveLength(1);
-    expect(app100.scopes[0]).toMatchObject({ scope_id: '777', cost_usd: 6, by_category: { compute: 2, kubernetes: 4 }, consumption: { core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, usage_usd: 1, waste_usd: 3 } });
-    expect(app100.scopes[0].items.map((i) => [i.subject_id, i.cost_usd])).toEqual([['runtime|nodes', 2.5], ['777', 2], ['runtime|networking', 1.5]]);
-    expect(app100.scopes[0].items[0]).toMatchObject({ component: 'nodes', allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', category: 'kubernetes' });
-    // service svc-1 (orders-db, by null service host): 12
-    expect(app100.services).toHaveLength(1);
-    expect(app100.services[0]).toMatchObject({ service_id: 'svc-1', cost_usd: 12, items: [{ subject_id: 'orders-db', rule_id: 'default:null-service', cost_usd: 12 }] });
-    // neither a scope nor a service: the shared clusters split by rule/metric (6 + 6) are attributed to the application directly
-    expect(app100.application_items).toHaveLength(2);
-    expect(app100.application_items.map((i) => [i.subject_id, i.cost_usd, i.allocation_method]).sort()).toEqual([['metrics-db', 6, 'by_metric'], ['shared-db', 6, 'split']]);
-    expect(app100.consumption).toEqual({ core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, usage_usd: 1, waste_usd: 3, scopes: 1 });
-    expect(app100.scopes_usd + app100.services_usd + app100.application_usd).toBeCloseTo(app100.total_usd, 6);
+    type Item = Record<string, unknown>;
+    const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; charge_items: Item[]; totals: { by_charge_type: Record<string, number>; by_category: Record<string, number>; by_cloud_service: Record<string, number> }; consumption: Record<string, Record<string, number>> };
+    expect(app100).toMatchObject({ date: D, day: D, application_id: '100', namespace_id: '5', total_usd: 30, currency: 'USD', charge_items_count: 6, cloud_accounts: ['111122223333'] });
+    expect(app100.totals).toEqual({ by_charge_type: { scope: 6, service: 12, application: 12 }, by_category: { compute: 2, database: 24, kubernetes: 4 }, by_cloud_service: { [EC2]: 4.5, [RDS]: 24, [VPC]: 1.5 } });
+    expect(app100.charge_items.map((i) => [i.charge_type, i.subject_id, i.cost_usd])).toEqual([
+      ['service', 'orders-db', 12], ['application', 'shared-db', 6], ['application', 'metrics-db', 6], ['scope', 'runtime|nodes', 2.5], ['scope', '777', 2], ['scope', 'runtime|networking', 1.5],
+    ]);
+    expect(app100.charge_items[0]).toMatchObject({ charge_type: 'service', service_id: 'svc-1', service_name: 'Orders DB', scope_id: null, category: 'database', rule_id: 'default:null-service', share: 1 });
+    expect(app100.charge_items[3]).toMatchObject({ charge_type: 'scope', scope_id: '777', component: 'nodes', cluster: 'runtime', category: 'kubernetes', allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', share: 0.5 });
+    expect(app100.charge_items[4]).toMatchObject({ charge_type: 'scope', scope_id: '777', subject_type: 'scope', category: 'compute', rule_id: 'default:null-dims' });
+    expect(app100.charge_items[1]).toMatchObject({ charge_type: 'application', scope_id: null, service_id: null, allocation_method: 'split', rule_id: 'shared-db-by-database' });
+    // Kubernetes usage vs request per scope (from the wf3 rows), and the total
+    expect(app100.consumption[777]).toEqual({ core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, core_h_requested: 0, gb_h_requested: 0, usage_usd: 1, waste_usd: 3 });
+    expect(app100.consumption.total).toMatchObject({ core_h_chargeable: 48, usage_usd: 1, waste_usd: 3, scopes: 1 });
+    const sum = Object.values(app100.totals.by_charge_type).reduce((a, b) => a + b, 0);
+    expect(sum).toBeCloseTo(app100.total_usd, 6);
     expect(appRows.map((r) => r.id).sort()).toEqual([`100-${D}`, `200-${D}`, `300-${D}`, `400-${D}`]);
-    expect((appRows.find((r) => r.id === `400-${D}`) as { scopes: Owner[] }).scopes[0]).toMatchObject({ scope_id: '999', cost_usd: 2 });
+    expect((appRows.find((r) => r.id === `400-${D}`) as { charge_items: Item[] }).charge_items[0]).toMatchObject({ charge_type: 'scope', scope_id: '999', cost_usd: 1.25 });
     expect(written.filter((w) => (w as { id: string }).id === `100-${D}`)).toHaveLength(1);
     expect(byId[`alloc-app-200-${D}`]).toMatchObject({ cost_usd: 2 });
     expect(byId[`alloc-bucket-shared-platform-${D}`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1 });

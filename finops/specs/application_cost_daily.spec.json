@@ -1,14 +1,16 @@
 {
   "slug": "application_cost_daily",
   "name": "Application Cost Daily",
-  "description": "One row per application per day: total USD, split by the application's scopes (any type) and services, breakdown by category and cloud service, and every resource behind it under its scope or service (with the rule that attributed it). Written by the allocator.",
+  "description": "One invoice per application per day: total USD, the charge items (each attributed through a null scope, a null service, or the application itself, with category, cloud service and the rule that attributed it) and totals by charge type, category and cloud service. Written by the allocator.",
   "schema": {
     "type": "object",
     "required": [
       "id",
+      "date",
       "day",
       "application_id",
       "total_usd",
+      "charge_items",
       "computed_at"
     ],
     "properties": {
@@ -21,14 +23,14 @@
       },
       "day": {
         "type": "string",
-        "description": "YYYY-MM-DD (UTC)",
+        "description": "Same as date; filterable copy",
         "index": [
           "filter"
         ]
       },
       "date": {
         "type": "string",
-        "description": "Same as day"
+        "description": "Invoice day, YYYY-MM-DD (UTC)"
       },
       "application_id": {
         "type": "string",
@@ -68,20 +70,6 @@
         "type": "number",
         "description": "Total attributed to the application on the day (amortized)"
       },
-      "by_category": {
-        "type": "object",
-        "description": "category \u2192 USD (compute, kubernetes, database, storage, network, observability, messaging, security, cdn, other)",
-        "additionalProperties": {
-          "type": "number"
-        }
-      },
-      "by_cloud_service": {
-        "type": "object",
-        "description": "cloud service \u2192 USD",
-        "additionalProperties": {
-          "type": "number"
-        }
-      },
       "cloud_accounts": {
         "type": "array",
         "description": "Cloud accounts the cost came from",
@@ -101,53 +89,30 @@
         "type": "string",
         "description": "ISO timestamp"
       },
-      "scopes_usd": {
-        "type": "number",
-        "description": "\u03a3 cost attributed through the application's SCOPES (any type: k8s, lambda, custom/EC2, \u2026)"
-      },
-      "services_usd": {
-        "type": "number",
-        "description": "\u03a3 cost attributed through the application's SERVICES (databases, caches, \u2026)"
-      },
-      "application_usd": {
-        "type": "number",
-        "description": "Cost attributed to the application without a scope or service (e.g. by application tag)"
-      },
-      "scopes": {
+      "charge_items": {
         "type": "array",
-        "description": "[{scope_id, scope_name, scope_type, cost_usd, by_category, consumption?: {core_h_chargeable, gb_h_chargeable, core_h_used, gb_h_used, usage_usd, waste_usd}, items: [{subject_type, subject_id, subject_name, cloud_service, category, cost_usd, share, allocation_method, rule_id, cluster, component}]}]",
+        "description": "The invoice lines: [{charge_type: scope|service|application, scope_id?, scope_name?, scope_type?, service_id?, service_name?, category, cloud_service, subject_type, subject_id, subject_name, cluster?, component?, cost_usd, share, allocation_method, rule_id, source_fact_id}]",
         "items": {
           "type": "object",
           "additionalProperties": true
         }
       },
-      "services": {
-        "type": "array",
-        "description": "[{service_id, service_name, cost_usd, by_category, items: [...]}]",
-        "items": {
-          "type": "object",
-          "additionalProperties": true
-        }
-      },
-      "application_items": {
-        "type": "array",
-        "description": "Items attributed directly to the application (no scope/service): same item shape",
-        "items": {
-          "type": "object",
-          "additionalProperties": true
-        }
+      "totals": {
+        "type": "object",
+        "description": "{by_charge_type: {scope, service, application}, by_category: {\u2026}, by_cloud_service: {\u2026}}",
+        "additionalProperties": true
       },
       "consumption": {
         "type": [
           "object",
           "null"
         ],
-        "description": "\u03a3 over the application's k8s scopes: {core_h_chargeable, gb_h_chargeable, core_h_used, gb_h_used, usage_usd, waste_usd, scopes}",
+        "description": "Kubernetes usage vs request per scope: {scope_id \u2192 {core_h_chargeable, gb_h_chargeable, core_h_used, gb_h_used, core_h_requested, gb_h_requested, usage_usd, waste_usd}} plus `total`",
         "additionalProperties": true
       },
-      "items_count": {
+      "charge_items_count": {
         "type": "integer",
-        "description": "How many allocated facts were rolled up"
+        "description": "Number of charge items"
       }
     }
   },
