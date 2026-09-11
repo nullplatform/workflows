@@ -119,6 +119,9 @@ steps:
   - id: lake_scopes
     type: module
     plugin_type: np-lake-query
+    # Only the subtree the cluster serves (variables.org_nrn: the org, or one account) — an org with
+    # thousands of scopes dragged ~0.5 MB through the parent's history. No SQL comments in the query:
+    # the Lake splits statements on ';' and rejects "two statements".
     name: "Active k8s-capable scopes (lake)"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
@@ -131,8 +134,6 @@ steps:
         WHERE s._deleted = 0
           AND s.status = 'active'
           AND s.type IN ('web_pool_k8s', 'custom', 'web_pool')
-          -- only the subtree the cluster serves (variables.org_nrn: the org, or one account); an org
-          -- with thousands of scopes would otherwise drag ~0.5 MB through the parent's history
           AND (s.nrn = '${{ variables.org_nrn }}' OR s.nrn LIKE '${{ variables.org_nrn }}:%')
         LIMIT 5000
 
