@@ -114,6 +114,7 @@ GROUPINGS=[("application","Aplicación","coalesce(nullIf(a.application_slug, '')
            ("cloud_service","Servicio de nube","f.cloud_service"),("category","Categoría","if(f.category = '', 'other', f.category)"),
            ("environment","Environment","if(f.environment = '', 'sin dimensión', f.environment)"),("charge_type","Tipo de cargo","f.charge_type"),
            ("scope_type","Tipo de scope","if(f.scope_type = '', '-', f.scope_type)"),("namespace","Namespace","coalesce(nullIf(n.namespace_name, ''), 'sin namespace')"),
+           ("allocation_method","Método de atribución","f.allocation_method"),("rule","Regla","if(f.rule_id = '', '-', f.rule_id)"),
            ("scope","Scope","if(f.scope_name = '', '-', concat(coalesce(nullIf(a.application_slug, ''), f.application_slug, f.application_id), ' / ', f.scope_name))")]
 GEXPR="multiIf(" + ", ".join("{groupBy:String} = '%s', %s" % (k, e) for k,_,e in GROUPINGS) + ", " + GROUPINGS[0][2] + ")"
 P_EXP=dict(P_ALL, groupBy={"scope":"#/properties/groupBy"})
@@ -132,7 +133,7 @@ def top_values(expr):
 def sq(v): return v.replace("'", "''")
 DAILY_CHARTS=[]; DAILY_TABS=[]
 for key,label,expr in GROUPINGS:
-    if key=='scope': continue
+    if key in ('scope','rule'): continue
     vals=top_values(expr) or ["%s-%d" % (key, i+1) for i in range(ARGS.top)]
     cols=", ".join("round(sumIf(f.cost_usd, %s = '%s'), 2) AS `%s`" % (expr, sq(v), v.replace('`','')) for v in vals)
     inlist=", ".join("'%s'" % sq(v) for v in vals)
