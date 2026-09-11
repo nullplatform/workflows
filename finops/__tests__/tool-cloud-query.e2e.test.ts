@@ -91,6 +91,30 @@ describe('finops/tool-cloud-query', () => {
     expect(String(seen[0]?.image)).toMatch(/^public\.ecr\.aws\/nullplatform\/agent-plugins\/workflows\/aws-cost-explorer@sha256:[a-f0-9]{64}$/);
   });
 
+  it('scopes the agent selector to agent_nrn when given (agents registered under an account)', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    await runWorkflowE2E({
+      yamlPath: YAML,
+      inputs: {
+        agent_tags: { cluster: 'runtime' },
+        agent_nrn: 'organization=4:account=17',
+        calls: [{ id: 'who', service: 'sts', operation: 'GetCallerIdentity' }],
+      },
+      pluginStubs: {
+        manual: passthroughTrigger,
+        'np-package-call': packageCallStub({ commandId: 'c1', agentId: 'a1', response: RESPONSE, calls: RESPONSE.calls, failed: [], mode: 'async' }, seen),
+      },
+    });
+    expect(seen[0]?.agent_selector).toEqual({ nrn: 'organization=4:account=17', tags: { cluster: 'runtime' } });
+    await expect(
+      runWorkflowE2E({
+        yamlPath: YAML,
+        inputs: { agent_tags: { cluster: 'runtime' }, agent_nrn: 'not-an-nrn', calls: [{ id: 'who', service: 'sts', operation: 'GetCallerIdentity' }] },
+        pluginStubs: { manual: passthroughTrigger, 'np-package-call': packageCallStub({ commandId: 'c1', agentId: 'a1', response: RESPONSE, calls: RESPONSE.calls, failed: [], mode: 'async' }) },
+      }),
+    ).rejects.toThrow(/agent_nrn is not an NRN/);
+  });
+
   it('surfaces failed calls in outputs when the plugin reports them', async () => {
     const failedCall = { id: 'big', ok: false, errorCode: 'RESULT_TOO_LARGE', error: 'too big' };
     const seen: Array<Record<string, unknown>> = [];

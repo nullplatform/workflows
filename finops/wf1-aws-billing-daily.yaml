@@ -43,6 +43,14 @@ inputs:
     type: object
     required: false
     description: "Agent selector tags. Default: variables.agent_tags"
+  agent_nrn:
+    type: string
+    required: false
+    description: "NRN subtree of the agent (e.g. organization=4:account=17). Default: variables.agent_nrn"
+  org_nrn:
+    type: string
+    required: false
+    description: "Root NRN for listing null services (mapping DB hosts → services). Default: variables.org_nrn"
   callback_base_url:
     type: string
     required: false
@@ -106,6 +114,9 @@ variables:
   # Root NRN for listing null services (mapping cloud databases/caches → null service by host).
   org_nrn:
     initialValue: "organization=1255165411"
+  # NRN subtree of the agent; needed when the agent is registered under an account.
+  agent_nrn:
+    initialValue: ""
   collector:
     initialValue: "finops_aws_billing_daily@0.2.0"
 
@@ -125,6 +136,14 @@ steps:
           type: object
           required: false
           description: "Agent selector tags"
+        agent_nrn:
+          type: string
+          required: false
+          description: "NRN subtree of the agent"
+        org_nrn:
+          type: string
+          required: false
+          description: "Root NRN for listing null services"
         callback_base_url:
           type: string
           required: false
@@ -171,6 +190,10 @@ steps:
       date: "${{ workflow.inputs.date }}"
       agent_tags: "${{ workflow.inputs.agent_tags }}"
       default_tags: "${{ variables.agent_tags }}"
+      agent_nrn: "${{ workflow.inputs.agent_nrn }}"
+      agent_nrn_default: "${{ variables.agent_nrn }}"
+      org_nrn: "${{ workflow.inputs.org_nrn }}"
+      org_nrn_default: "${{ variables.org_nrn }}"
       region: "${{ variables.aws_region }}"
       ec2_service: "${{ variables.ec2_service_name }}"
       role_arn: "${{ workflow.inputs.assume_role_arn }}"
@@ -187,6 +210,9 @@ steps:
         var next = iso(new Date(new Date(day + "T00:00:00Z").getTime() + 86400000));
         var period = { Start: day, End: next };
         var tags = (inputs.agent_tags && Object.keys(inputs.agent_tags).length) ? inputs.agent_tags : inputs.default_tags;
+        var agentNrn = String(inputs.agent_nrn || inputs.agent_nrn_default || "").trim();
+        var orgNrn = String(inputs.org_nrn || inputs.org_nrn_default || "").trim();
+        if (!/^organization=\d+/.test(orgNrn)) throw new Error("org_nrn must start with organization=<id> (got " + orgNrn + ")");
         var calls = [
           { id: "identity", service: "sts", operation: "GetCallerIdentity" },
           { id: "by_service", service: "ce", operation: "GetCostAndUsage",
@@ -212,7 +238,7 @@ steps:
         if (roleArn && !/^arn:aws:iam::\d{12}:role\/[\w+=,.@\/-]+$/.test(roleArn)) throw new Error("assume_role_arn is not an IAM role ARN: " + roleArn);
         var roleExt = String(inputs.role_ext || inputs.role_ext_default || "").trim();
         var ver = String(inputs.package_version || inputs.package_version_default || "").trim();
-        return { day: day, calls: calls, agent_tags: tags, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null, package_version: ver || null };
+        return { day: day, calls: calls, agent_tags: tags, agent_nrn: agentNrn || null, org_nrn: orgNrn, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null, package_version: ver || null };
 
   - id: query
     type: module
@@ -220,6 +246,7 @@ steps:
     name: "cloud-query (agent)"
     inputs:
       agent_tags: "${{ steps.prep.outputs.agent_tags }}"
+      agent_nrn: "${{ steps.prep.outputs.agent_nrn }}"
       calls: "${{ steps.prep.outputs.calls }}"
       region: "${{ steps.prep.outputs.region }}"
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
@@ -258,6 +285,7 @@ steps:
     name: "cloud-query: instance types"
     inputs:
       agent_tags: "${{ steps.prep.outputs.agent_tags }}"
+      agent_nrn: "${{ steps.prep.outputs.agent_nrn }}"
       calls: "${{ steps.prep_types.outputs.calls }}"
       region: "${{ steps.prep.outputs.region }}"
       callback_base_url: "${{ workflow.inputs.callback_base_url }}"
@@ -278,6 +306,11 @@ steps:
     name: "null services (descendants)"
     inputs:
       day: "${{ steps.prep.outputs.day }}"
+      # Inputs override config in np-api-call; the NRN is per run (org override).
+      query:
+        nrn: "${{ steps.prep.outputs.org_nrn }}"
+        show_descendants: "true"
+        limit: "500"
     config:
       apiKey: "${{ secrets.NP_API_KEY }}"
       method: GET

@@ -18,6 +18,8 @@ const TARGETS = [
   {
     name: 'prod',
     agent_tags: { package: 'cloud-query', account: 'prod' },
+    agent_nrn: 'organization=4:account=17',
+    org_nrn: 'organization=4',
     assume_role_arn: 'arn:aws:iam::111122223333:role/np-finops',
     assume_role_external_id: 'ext-prod',
     package_version: '0.0.1',
@@ -55,6 +57,8 @@ describe('finops/wf0-aws-billing-dispatch', () => {
     expect(runs[0]).toMatchObject({
       date: '2026-09-09',
       agent_tags: { package: 'cloud-query', account: 'prod' },
+      agent_nrn: 'organization=4:account=17',
+      org_nrn: 'organization=4',
       assume_role_arn: 'arn:aws:iam::111122223333:role/np-finops',
       assume_role_external_id: 'ext-prod',
       package_version: '0.0.1',
@@ -64,6 +68,7 @@ describe('finops/wf0-aws-billing-dispatch', () => {
     });
     expect(runs[1]).toMatchObject({ agent_tags: { package: 'cloud-query', account: 'dev' }, region: 'us-west-2', target_name: 'dev' });
     expect(runs[1]?.assume_role_arn ?? null).toBeNull();
+    expect(runs[1]?.agent_nrn ?? null).toBeNull();
 
     const summary = result.outputs?.summary as { targets: number; total_usd: number; accounts: Array<Record<string, unknown>> };
     expect(summary.targets).toBe(2);
