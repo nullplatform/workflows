@@ -62,7 +62,7 @@ variables:
     initialValue: "agent"
   cluster:
     initialValue: "runtime"
-  # Organization NRN for the scopes listing (dimensions live in the API, not in the lake).
+  # NRN subtree of the scopes this cluster serves (the org, or one account): lake + API listings.
   org_nrn:
     initialValue: "organization=1255165411"
   # Agent that can reach the cluster's Prometheus (the same one the cost tracker uses).
@@ -131,12 +131,16 @@ steps:
         WHERE s._deleted = 0
           AND s.status = 'active'
           AND s.type IN ('web_pool_k8s', 'custom', 'web_pool')
+          -- only the subtree the cluster serves (variables.org_nrn: the org, or one account); an org
+          -- with thousands of scopes would otherwise drag ~0.5 MB through the parent's history
+          AND (s.nrn = '${{ variables.org_nrn }}' OR s.nrn LIKE '${{ variables.org_nrn }}:%')
         LIMIT 5000
 
   - id: scope_dims
     type: module
     plugin_type: np-entity-paginated-fetch
     name: "Scopes with dimensions (API)"
+    output_projection: ["items[].id", "items[].dimensions", "totalFetched", "pages"]
     inputs:
       filters: "${{ steps.prep.outputs.scope_filters }}"
     config:

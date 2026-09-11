@@ -36,7 +36,7 @@
     },
     "agent_nrn": "organization=1049493649:account=1041301647",
     "collector_cmd": "nullplatform/platform-scopes-override/cost/collect_metrics --prom http://prometheus-server.default.svc.cluster.local",
-    "org_nrn": "organization=1049493649",
+    "org_nrn": "organization=1049493649:account=1041301647",
     "collector_mode": "newrelic"
   },
   "finops_allocate_daily": {
