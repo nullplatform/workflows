@@ -95,7 +95,7 @@ export async function runCall(call: CloudCall, region: string, factory: ClientFa
     const client = factory.client(call.service, region);
     const paginate = call.paginate ?? true;
     const maxPages = call.maxPages ?? 20;
-    let input: Record<string, unknown> = { ...(call.params ?? {}) };
+    let input: Record<string, unknown> = coerceDates({ ...(call.params ?? {}) }) as Record<string, unknown>;
     const merged: Record<string, unknown> = {};
     let pages = 0;
     for (;;) {
@@ -115,6 +115,26 @@ export async function runCall(call: CloudCall, region: string, factory: ClientFa
     const e = err as { name?: string; message?: string };
     return { id: call.id, ok: false, durationMs: Date.now() - started, errorCode: e.name ?? "CALL_FAILED", error: e.message ?? String(err) };
   }
+}
+
+/**
+ * JSON has no Date: SDK inputs that are timestamps (Performance Insights StartTime/EndTime,
+ * CloudWatch GetMetricData StartTime/EndTime, …) arrive as ISO-8601 strings. Convert strings
+ * under keys ending in `Time`/`Timestamp` that parse as a date. Cost Explorer's
+ * TimePeriod.Start/End are plain YYYY-MM-DD strings under other keys and stay untouched.
+ */
+export function coerceDates(value: unknown, key = ""): unknown {
+  if (Array.isArray(value)) return value.map((v) => coerceDates(v, key));
+  if (value && typeof value === "object" && !(value instanceof Date)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = coerceDates(v, k);
+    return out;
+  }
+  if (typeof value === "string" && /(Time|Timestamp)$/.test(key) && /^\d{4}-\d{2}-\d{2}T[\d:.]+(Z|[+-]\d{2}:\d{2})$/.test(value)) {
+    const d = new Date(value);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  return value;
 }
 
 export async function runRequest(req: CloudQueryRequest, factory: ClientFactory, onProgress?: (line: string) => void): Promise<CloudQueryResponse> {

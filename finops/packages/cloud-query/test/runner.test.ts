@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mergePage, runCall, runRequest, validateRequest, type ClientFactory } from "../src/runner";
+import { coerceDates, mergePage, runCall, runRequest, validateRequest, type ClientFactory } from "../src/runner";
 
 /** Fake factory: pages keyed by the token the caller passes back. */
 function fakeFactory(pages: Record<string, Record<string, unknown>>, seen: Record<string, unknown>[] = []): ClientFactory {
@@ -121,5 +121,16 @@ describe("validateRequest", () => {
     const calls = [{ id: "a", service: "ce", operation: "GetCostAndUsage" }];
     expect(validateRequest({ calls, callback: { url: "ftp://x" } })).toContain("callback.url");
     expect(validateRequest({ calls, callback: { url: "http://host.docker.internal:3000/cb", token: "t" } })).toBeUndefined();
+  });
+});
+
+describe("coerceDates", () => {
+  test("turns ISO strings under *Time keys into Dates, leaves Cost Explorer periods alone", () => {
+    const out = coerceDates({ StartTime: "2026-09-09T00:00:00Z", EndTime: "2026-09-10T00:00:00.000Z", TimePeriod: { Start: "2026-09-09", End: "2026-09-10" }, MetricQueries: [{ Metric: "db.load.avg" }], Name: "x" }) as Record<string, unknown>;
+    expect(out.StartTime).toBeInstanceOf(Date);
+    expect((out.EndTime as Date).toISOString()).toBe("2026-09-10T00:00:00.000Z");
+    expect(out.TimePeriod).toEqual({ Start: "2026-09-09", End: "2026-09-10" });
+    expect(out.MetricQueries).toEqual([{ Metric: "db.load.avg" }]);
+    expect(out.Name).toBe("x");
   });
 });
