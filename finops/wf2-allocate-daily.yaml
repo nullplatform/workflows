@@ -389,7 +389,9 @@ steps:
         // Batches of 40 → ~20 upsert children per day instead of one per fact (the per-fact fan-out
         // re-ran in a loop in prod once the parent state grew). The facts live ONCE, here.
         var batches = []; for (var bi = 0; bi < allocated.length; bi += 40) batches.push({ facts: allocated.slice(bi, bi + 40), catalog_slug: "cost_daily", dry_run: !!inputs.dry_run });
-        return { day: d, batches: batches, ids: Object.keys(seen), count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0) - Object.keys(overhead).reduce(function (s, k) { return s + overhead[k]; }, 0)),
+        // batches_out: the workflow output. Only a DRY RUN returns the batches (a real day is ~1 MB and a parent
+        // waiting on this child gets the whole output into its history; the summary step must not receive them either).
+        return { day: d, batches: batches, batches_out: inputs.dry_run ? batches : [], ids: Object.keys(seen), count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0) - Object.keys(overhead).reduce(function (s, k) { return s + overhead[k]; }, 0)),
                  cluster_pending_usd: perCluster, kubernetes_overhead_usd: overhead, platform_spread_usd: spreadTotal, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
                  unallocated_leaves: unLeaves.slice(0, 200) };
 
@@ -416,6 +418,7 @@ steps:
     name: "Invoices per application"
     metadata: { fanOutPerItem: false }
     inputs:
+      dry_run: "${{ workflow.inputs.dry_run }}"
       day: "${{ steps.prep.outputs.day }}"
       batches: "${{ steps.allocate.outputs.batches }}"
       allocator: "${{ variables.allocator }}"
@@ -445,7 +448,7 @@ steps:
                    cloud_accounts: Object.keys(a.accounts), allocator: String(inputs.allocator), computed_at: now };
         }).sort(function (x, y) { return y.total_usd - x.total_usd; });
         var batches = []; for (var bi = 0; bi < rows.length; bi += 25) batches.push({ facts: rows.slice(bi, bi + 25), catalog_slug: "application_cost_daily", dry_run: !!inputs.dry_run });
-        return { count: rows.length, batches: batches };
+        return { count: rows.length, batches: batches, batches_out: inputs.dry_run ? batches : [] };
 
   - id: write_invoices
     type: module
@@ -522,15 +525,10 @@ steps:
       invoices: "${{ steps.write_invoices.outputs.items }}"
       stale: "${{ steps.stale.outputs }}"
       invoice_count: "${{ steps.invoices.outputs.count }}"
-      batches: "${{ steps.allocate.outputs.batches }}"
-      invoice_batches: "${{ steps.invoices.outputs.batches }}"
     config:
       language: javascript
       code: |
-        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0;
-        // The batches (~1 MB on a real day) only leave this workflow on a DRY RUN: a parent that waits on
-        // this child gets the whole output into its Temporal history, and a >1 MB child result wedged wf0.
-        s.batches = s.dry_run ? (inputs.batches || []) : []; s.invoice_batches = s.dry_run ? (inputs.invoice_batches || []) : []; function wr(list) { return (list || []).reduce(function (n, r) { var o = (r || {}).outputs || r || {}; return n + (Number(o.written) || 0); }, 0); }
+        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0; function wr(list) { return (list || []).reduce(function (n, r) { var o = (r || {}).outputs || r || {}; return n + (Number(o.written) || 0); }, 0); }
         s.invoices_written = s.dry_run ? 0 : wr(inputs.invoices); s.written = s.dry_run ? 0 : wr(inputs.results) + s.invoices_written; s.stale_rows = (inputs.stale || {}).count || 0; s.stale_usd = (inputs.stale || {}).stale_usd || 0; s.stale_deleted = s.dry_run ? 0 : s.stale_rows; return s;
 
 connections:
@@ -555,6 +553,6 @@ connections:
 outputs:
   summary: "${{ steps.summary.outputs }}"
   # dry_run only (see summary): a real day returns [] so the dispatcher's history stays small
-  batches: "${{ steps.summary.outputs.batches }}"
-  invoice_batches: "${{ steps.summary.outputs.invoice_batches }}"
+  batches: "${{ steps.allocate.outputs.batches_out }}"
+  invoice_batches: "${{ steps.invoices.outputs.batches_out }}"
   unallocated_leaves: "${{ steps.allocate.outputs.unallocated_leaves }}"
