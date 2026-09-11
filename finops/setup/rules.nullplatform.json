@@ -348,7 +348,7 @@
     "match": [
       {
         "field": "host",
-        "equals": "postgres-controlplane-db.cluster.cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
+        "equals": "postgres-controlplane-db.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
       },
       {
         "field": "metric",
@@ -397,7 +397,7 @@
     "match": [
       {
         "field": "host",
-        "equals": "postgres-auth-db-1.cluster.cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
+        "equals": "postgres-auth-db-1.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
       }
     ],
     "method": "direct",
@@ -431,7 +431,7 @@
     "match": [
       {
         "field": "host",
-        "equals": "postgres-ai-agent-data.cluster.cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
+        "equals": "postgres-ai-agent-data.cluster-cyxdwo6asfl3.us-east-1.rds.amazonaws.com"
       }
     ],
     "method": "direct",
