@@ -190,7 +190,10 @@ steps:
           raw.forEach(function (f) {
             var isRes = f.parent_id === s.id && (f.subject_type === "scope" || f.subject_type === "resource" || f.subject_type === "service" || (f.subject_type === "bucket" && f.subject_id === "ec2-instances-unattributed"));
             var isComp = f.subject_type === "bucket" && f.component && f.cloud_service === name;
-            if (isRes || isComp) { leaves.push({ fact: f, service: name, kind: isComp ? "cluster_component" : f.subject_type }); covered += Number(f.cost_usd) || 0; }
+            // usage-type buckets are informational EXCEPT when the collector attached consumption shares to them
+            // (CloudWatch Logs ingestion/storage by log group, EMF metrics by application): those are leaves.
+            var isMetricBucket = f.subject_type === "bucket" && f.usage_type && f.parent_id === s.id && f.metric_shares && typeof f.metric_shares === "object";
+            if (isRes || isComp || isMetricBucket) { leaves.push({ fact: f, service: name, kind: isComp ? "cluster_component" : isMetricBucket ? "usage_type" : f.subject_type }); covered += Number(f.cost_usd) || 0; }
           });
           var rem = num((Number(s.cost_usd) || 0) - covered);
           if (Math.abs(rem) >= 0.000001) {
@@ -261,7 +264,8 @@ steps:
             var entries = (t.map && t.map.entries) || {}; var parts = [];
             Object.keys(shares).forEach(function (k) {
               var s = Number(shares[k]) || 0; if (s <= 0) return;
-              var e = entries[k]; var o = e ? resolveTarget(e, fact, caps) : null;
+              // owner: the rule's map first, else the owner the collector resolved for the key (fact.metric_owners)
+              var e = entries[k] || ((fact.metric_owners || {})[k]); var o = e ? resolveTarget(e, fact, caps) : null;
               parts.push(o ? { share: s, owner: o, key: k } : { share: s, owner: null, key: k });
             });
             return parts;

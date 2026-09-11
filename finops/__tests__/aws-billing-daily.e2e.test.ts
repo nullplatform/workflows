@@ -63,7 +63,7 @@ const RESULTS = {
     [[CW, 'MetricMonitorUsage'], 0.5, 12],
   ]),
   // CloudWatch Logs: log groups + stored bytes (phase 1); IncomingBytes per group comes in phase 2
-  log_groups: { logGroups: [{ logGroupName: '/nullplatform/orders/prod', storedBytes: 300 }, { logGroupName: '/nullplatform/ledger/prod', storedBytes: 100 }, { logGroupName: '/aws/eks/runtime/cluster', storedBytes: 0 }] },
+  log_groups: { logGroups: [{ logGroupName: 'nullplatform.orders', storedBytes: 300 }, { logGroupName: 'nullplatform.ledger.http_agg', storedBytes: 100 }, { logGroupName: '/aws/eks/runtime/cluster', storedBytes: 0 }, { logGroupName: 'nullplatform.orders.sys_agg', storedBytes: 0 }] },
   ec2_by_resource: ceGroups([
     [['i-node1'], 3.7, 24],
     [['i-node2'], 3.7, 24],
@@ -129,8 +129,11 @@ const NP_SERVICES = {
     { id: 'other', name: 'Lending DB', type: 'dependency', entity_nrn: 'organization=1255165411:account=95118862:namespace=1:application=2', attributes: { hostname: '172.20.78.58' } },
   ],
 };
+/** applications + namespaces of the account: `<namespace>.<application>` names the platform's log groups / EMF namespaces */
+const NP_APPS = { results: [{ id: 4242, slug: 'orders', namespace_id: 77 }, { id: 4343, slug: 'ledger', namespace_id: 77 }, { id: 4444, slug: 'orphan', namespace_id: 99 }] };
+const NP_NAMESPACES = { results: [{ id: 77, slug: 'nullplatform' }] };
 const npApiStub = {
-  handler: () => ({ status: 'success' as const, outputs: { status: 200, body: NP_SERVICES }, activePorts: ['default'] }),
+  handler: (ctx: { stepId: string }) => ({ status: 'success' as const, outputs: { status: 200, body: ctx.stepId === 'np_apps' ? NP_APPS : ctx.stepId === 'np_namespaces' ? NP_NAMESPACES : NP_SERVICES }, activePorts: ['default'] }),
   executeMode: 'all' as const,
 };
 
@@ -141,7 +144,7 @@ const TYPES_RESULTS = {
     { Key: { Metric: 'db.load.avg', Dimensions: { 'db.name': 'orders', 'db.id': 'x' } }, DataPoints: [{ Value: 0.75 }] },
     { Key: { Metric: 'db.load.avg', Dimensions: { 'db.name': 'ledger', 'db.id': 'y' } }, DataPoints: [{ Value: 0.25 }] },
   ] },
-  cw_logs_in_0: { MetricDataResults: [{ Id: 'q0', Values: [80, 20] }, { Id: 'q1', Values: [0] }, { Id: 'q2', Values: [900] }] },
+  cw_logs_in_0: { MetricDataResults: [{ Id: 'q0', Values: [80, 20] }, { Id: 'q1', Values: [300] }, { Id: 'q2', Values: [900] }, { Id: 'q3', Values: [700] }] },
   instance_types: {
     InstanceTypes: [
       { InstanceType: 'c5a.xlarge', VCpuInfo: { DefaultVCpus: 4 }, MemoryInfo: { SizeInMiB: 8192 } },
@@ -272,11 +275,16 @@ describe('finops/wf1-aws-billing-daily', () => {
     const round2 = queries[1]?.calls as Array<{ id: string; service: string; params: Record<string, unknown> }>;
     expect(round2.map((c) => c.id)).toEqual(['instance_types', 'pi_transactions', 'cw_logs_in_0']);
     expect(round2[2]).toMatchObject({ service: 'cloudwatch', params: { StartTime: '2026-09-09T00:00:00Z', EndTime: '2026-09-10T00:00:00Z' } });
-    expect((round2[2]?.params.MetricDataQueries as Array<{ Id: string; MetricStat: { Metric: { Dimensions: Array<{ Value: string }> } } }>).map((q) => [q.Id, q.MetricStat.Metric.Dimensions[0]?.Value])).toEqual([['q0', '/nullplatform/orders/prod'], ['q1', '/nullplatform/ledger/prod'], ['q2', '/aws/eks/runtime/cluster']]);
-    // CloudWatch Logs buckets carry the per-log-group shares: ingestion by IncomingBytes (100 vs 900), storage by storedBytes (300 vs 100)
-    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'DataProcessing-Bytes')).toMatchObject({ metric: 'cloudwatch.IncomingBytes', metric_shares: { '/nullplatform/orders/prod': 0.1, '/aws/eks/runtime/cluster': 0.9 } });
-    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'TimedStorage-ByteHrs')).toMatchObject({ metric: 'cloudwatch.StoredBytes', metric_shares: { '/nullplatform/orders/prod': 0.75, '/nullplatform/ledger/prod': 0.25 } });
-    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'MetricMonitorUsage')?.metric_shares).toBeUndefined();
+    expect((round2[2]?.params.MetricDataQueries as Array<{ Id: string; MetricStat: { Metric: { Dimensions: Array<{ Value: string }> } } }>).map((q) => [q.Id, q.MetricStat.Metric.Dimensions[0]?.Value])).toEqual([['q0', 'nullplatform.orders'], ['q1', 'nullplatform.ledger.http_agg'], ['q2', '/aws/eks/runtime/cluster'], ['q3', 'nullplatform.orders.sys_agg']]);
+    // CloudWatch Logs buckets carry the per-log-group shares — ingestion by IncomingBytes (100 / 300 / 900 / 700 = 2000),
+    // storage by storedBytes (300 / 100) — plus the owner of every group that follows <namespace>.<application>
+    const owners = { 'nullplatform.orders': { application_id: '4242', namespace_id: '77', application_slug: 'orders', namespace_slug: 'nullplatform' }, 'nullplatform.ledger.http_agg': { application_id: '4343', application_slug: 'ledger' }, 'nullplatform.orders.sys_agg': { application_id: '4242' } };
+    const ingest = facts.find((f) => f.cloud_service === CW && f.usage_type === 'DataProcessing-Bytes') as Record<string, unknown>;
+    expect(ingest).toMatchObject({ metric: 'cloudwatch.IncomingBytes', metric_shares: { 'nullplatform.orders': 0.05, 'nullplatform.ledger.http_agg': 0.15, '/aws/eks/runtime/cluster': 0.45, 'nullplatform.orders.sys_agg': 0.35 }, metric_owners: owners });
+    expect(Object.keys(ingest.metric_owners as object)).not.toContain('/aws/eks/runtime/cluster');
+    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'TimedStorage-ByteHrs')).toMatchObject({ metric: 'cloudwatch.StoredBytes', metric_shares: { 'nullplatform.orders': 0.75, 'nullplatform.ledger.http_agg': 0.25 } });
+    // EMF custom metrics / metric stream: shares by the *_agg IncomingBytes per application (300 ledger vs 700 orders), owners by app key
+    expect(facts.find((f) => f.cloud_service === CW && f.usage_type === 'MetricMonitorUsage')).toMatchObject({ metric: 'cloudwatch.EmfBytes', metric_shares: { 'nullplatform.orders': 0.7, 'nullplatform.ledger': 0.3 }, metric_owners: { 'nullplatform.orders': { application_id: '4242' }, 'nullplatform.ledger': { application_id: '4343' } } });
     expect(round2[1]).toMatchObject({ service: 'pi', params: { Identifier: 'db-WRITER', StartTime: '2026-09-09T00:00:00Z', EndTime: '2026-09-10T00:00:00Z', PeriodInSeconds: 86400 } });
     expect(facts.find((f) => f.subject_id === 'transactions')).toMatchObject({ metric: 'pi.db.load', metric_shares: { orders: 0.75, ledger: 0.25 } });
 

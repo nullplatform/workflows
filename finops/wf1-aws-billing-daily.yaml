@@ -263,7 +263,7 @@ steps:
         if (roleArn && !/^arn:aws:iam::\d{12}:role\/[\w+=,.@\/-]+$/.test(roleArn)) throw new Error("assume_role_arn is not an IAM role ARN: " + roleArn);
         var roleExt = String(inputs.role_ext || inputs.role_ext_default || "").trim();
         var ver = String(inputs.package_version || inputs.package_version_default || "").trim();
-        return { day: day, calls: calls, agent_tags: tags, agent_nrn: agentNrn || null, org_nrn: orgNrn, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null, package_version: ver || null };
+        var acctNp = /account=(\d+)/.exec(String(agentNrn || "")); return { day: day, calls: calls, agent_tags: tags, agent_nrn: agentNrn || null, account_np_id: acctNp ? acctNp[1] : "", org_nrn: orgNrn, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null, package_version: ver || null };
 
   - id: query
     type: module
@@ -374,6 +374,41 @@ steps:
         limit: "500"
       failOnHttpError: false
 
+  - id: np_apps
+    type: module
+    plugin_type: np-api-call
+    name: "null applications of the agent's account"
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      query:
+        nrn: "${{ steps.prep.outputs.agent_nrn }}"
+        limit: "200"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/application"
+      query:
+        nrn: "${{ variables.agent_nrn }}"
+        limit: "200"
+      failOnHttpError: false
+
+  - id: np_namespaces
+    type: module
+    plugin_type: np-api-call
+    name: "null namespaces of the account (slugs for <namespace>.<application> names)"
+    inputs:
+      day: "${{ steps.prep.outputs.day }}"
+      query:
+        account_id: "${{ steps.prep.outputs.account_np_id }}"
+        limit: "100"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/namespace"
+      query:
+        limit: "100"
+      failOnHttpError: false
+
   - id: build_facts
     type: module
     plugin_type: code-exec
@@ -381,6 +416,8 @@ steps:
     inputs:
       day: "${{ steps.prep.outputs.day }}"
       np_services: "${{ steps.np_services.outputs.body }}"
+      np_apps: "${{ steps.np_apps.outputs.body }}"
+      np_namespaces: "${{ steps.np_namespaces.outputs.body }}"
       results: "${{ steps.query.outputs.results }}"
       types_results: "${{ steps.query_types.outputs.results }}"
       log_metric_ids: "${{ steps.prep_types.outputs.log_metric_ids }}"
@@ -464,6 +501,19 @@ steps:
         Object.keys(inputs.types_results || {}).forEach(function (k) { if (k.indexOf("cw_logs_in_") !== 0) return;
           ((inputs.types_results[k] || {}).MetricDataResults || []).forEach(function (m) { var name = logIds[m.Id]; var v = (m.Values || []).reduce(function (a, b) { return a + (Number(b) || 0); }, 0); if (name && v > 0) lgIn[name] = v; }); });
         var logStored = normShares(lgStored, "cloudwatch.StoredBytes"); var logIn = normShares(lgIn, "cloudwatch.IncomingBytes");
+        // null applications keyed <namespace slug>.<application slug> — the naming convention of the platform's
+        // log groups (`backend.cart-service`, `.http_agg`, `.sys_agg`) and of its EMF metric namespaces.
+        function listOf(x) { return Array.isArray(x) ? x : ((x && (x.results || x.data)) || []); }
+        var nsSlug = {}; listOf(inputs.np_namespaces).forEach(function (n) { if (n && n.id != null) nsSlug[String(n.id)] = n.slug || null; });
+        var appOwners = {};
+        listOf(inputs.np_apps).forEach(function (ap) { if (!ap || ap.id == null || !ap.slug) return; var ns = nsSlug[String(ap.namespace_id)]; if (!ns) return;
+          appOwners[ns + "." + ap.slug] = { application_id: String(ap.id), namespace_id: String(ap.namespace_id), application_slug: String(ap.slug), namespace_slug: String(ns) }; });
+        function appKeyOf(name) { var m = /^([a-z0-9-]+\.[a-z0-9-]+)(\..+)?$/i.exec(String(name || "")); return m && appOwners[m[1]] ? m[1] : null; }
+        var lgOwners = {}; Object.keys(lgStored).concat(Object.keys(lgIn)).forEach(function (g) { var k = appKeyOf(g); if (k) lgOwners[g] = appOwners[k]; });
+        // EMF metrics (`MetricStorage:AWS/Logs-EMF`, and the metric stream that forwards them) are produced from the
+        // `*_agg` log groups: their IncomingBytes per application are the proxy for metric updates / custom metrics.
+        var emfBytes = {}; Object.keys(lgIn).forEach(function (g) { if (!/_agg$/.test(g)) return; var k = appKeyOf(g); if (k) emfBytes[k] = (emfBytes[k] || 0) + lgIn[g]; });
+        var emf = normShares(emfBytes, "cloudwatch.EmfBytes");
         // ── 2) bucket per (service, usage_type): breakdown of the service fact (parent_id).
         var usage = []; // [{svc, ut, cost, qty, unit}]
         ((r.by_usage_type || {}).ResultsByTime || []).forEach(function (rt) {
@@ -476,8 +526,12 @@ steps:
             // CloudWatch Logs buckets carry the per-log-group shares (ingestion ← IncomingBytes of the day,
             // storage ← storedBytes). A by_metric rule keyed by log group name splits them by application.
             if (/cloudwatch/i.test(svc)) {
-              var lgShares = /DataProcessing|VendedLog|Ingest/i.test(ut) ? logIn : /TimedStorage|StorageUsage/i.test(ut) ? logStored : null;
-              if (lgShares && lgShares.total > 0) { f.metric = lgShares.metric; f.metric_shares = lgShares.shares; }
+              var lgShares = /DataProcessing|VendedLog|Ingest/i.test(ut) ? logIn : /TimedStorage|StorageUsage/i.test(ut) ? logStored : /MetricMonitorUsage|MetricStreamUsage/i.test(ut) ? emf : null;
+              if (lgShares && lgShares.total > 0) {
+                f.metric = lgShares.metric; f.metric_shares = lgShares.shares;
+                var own = {}; Object.keys(lgShares.shares).forEach(function (k) { var o = lgShares === emf ? appOwners[k] : lgOwners[k]; if (o) own[k] = o; });
+                if (Object.keys(own).length) f.metric_owners = own;
+              }
             }
             f.quantity = qty(g); f.units = f.quantity ? (g.Metrics.UsageQuantity ? g.Metrics.UsageQuantity.Unit : null) : null;
             f.parent_id = svcFactId[svc] || null; facts.push(f);
@@ -796,7 +850,9 @@ connections:
   - { from: query, to: prep_types }
   - { from: prep_types, to: query_types }
   - { from: query_types, to: np_services }
-  - { from: np_services, to: build_facts }
+  - { from: np_services, to: np_apps }
+  - { from: np_apps, to: np_namespaces }
+  - { from: np_namespaces, to: build_facts }
   - { from: build_facts, to: write_facts }
   - { from: write_facts, to: read_existing }
   - { from: read_existing, to: stale }

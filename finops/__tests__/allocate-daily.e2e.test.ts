@@ -235,4 +235,34 @@ describe('finops/wf2-allocate-daily', () => {
     const lonely = await run([raw[raw.length - 1] as (typeof raw)[number]], rules);
     expect((lonely.outputs?.summary as Record<string, unknown>).unallocated_usd).toBe(10);
   });
+
+  it('usage-type buckets with collector shares are leaves: by_metric resolves owners from metric_owners without a map', async () => {
+    const CW = 'AWS X-Ray'; // not in RAW (RAW already has a CloudWatch service with an unallocated remainder)
+    const raw = [...RAW,
+      { id: `raw-cloud_service-cw-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cloud_service', subject_id: CW, subject_name: CW, cloud: 'aws', cloud_service: CW, cost_usd: 10 },
+      { id: `raw-bucket-cw-ingest-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'cw|DataProcessing-Bytes', subject_name: 'cw / ingest', cloud: 'aws', cloud_service: CW, parent_id: `raw-cloud_service-cw-${D}`, usage_type: 'DataProcessing-Bytes', cost_usd: 4,
+        metric: 'cloudwatch.IncomingBytes', metric_shares: { 'ns.orders': 0.5, 'ns.ledger': 0.25, '/aws/eks/x/cluster': 0.25 }, metric_owners: { 'ns.orders': { application_id: '100', namespace_id: '5' }, 'ns.ledger': { application_id: '300' } } },
+      { id: `raw-bucket-cw-alarms-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'cw|AlarmMonitorUsage', cloud: 'aws', cloud_service: CW, parent_id: `raw-cloud_service-cw-${D}`, usage_type: 'AlarmMonitorUsage', cost_usd: 6 },
+    ];
+    const rules = [...RULES,
+      { id: 'cw-logs-by-group', name: 'logs → app of the group', enabled: true, status: 'active', priority: 100, scope: { cloud_service: { regex: 'X-Ray' }, usage_type: { regex: 'DataProcessing-Bytes' } }, match: [{ field: 'metric_shares', exists: true }], method: 'by_metric', category: 'observability', target: { map: { key: 'log_group', entries: {} } } },
+      { id: 'cw-rest-spread', name: 'rest of X-Ray → every app', enabled: true, status: 'active', priority: 900, scope: { cloud_service: { regex: 'X-Ray' } }, method: 'spread', category: 'observability', target: { spread: { weights: 'equal' } } },
+    ];
+    const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { const facts = ctx.inputs.facts as Array<Record<string, unknown>>; return { status: 'success' as const, outputs: { count: facts.length, written: 0, ids: facts.map((f) => f.id) }, activePorts: ['default'] }; }, executeMode: 'all' as const };
+    const result = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(raw, rules), 'np-api-call': servicesStub, 'sub-workflow': stub } });
+    const summary = result.outputs?.summary as Record<string, unknown>;
+    const facts = (result.outputs?.batches as Array<{ facts: Array<Record<string, unknown>> }>).flatMap((b) => b.facts);
+    const byId = Object.fromEntries(facts.map((f) => [f.id, f]));
+    expect(summary.total_usd).toBe(58);
+    // the ingest bucket is a leaf (4): 2 → app 100, 1 → app 300 (owners from the collector), 1 → unallocated with its key
+    expect(byId[`alloc-bucket-cw-ingest-${D}-app-100-ns-orders`]).toMatchObject({ application_id: '100', cost_usd: 2, share: 0.5, allocation_method: 'by_metric', rule_id: 'cw-logs-by-group', category: 'observability', charge_type: 'application' });
+    expect(byId[`alloc-bucket-cw-ingest-${D}-app-300-ns-ledger`]).toMatchObject({ application_id: '300', cost_usd: 1 });
+    expect(byId[`alloc-bucket-cw-ingest-${D}-aws-eks-x-cluster-unallocated`]).toMatchObject({ cost_usd: 1, allocation_method: 'unallocated', metric_key: '/aws/eks/x/cluster' });
+    // the alarms bucket has no shares → informational; the service remainder (10 − 4 = 6) goes to the spread rule
+    expect(facts.find((f) => String(f.id).startsWith(`alloc-bucket-cw-alarms-`))).toBeUndefined();
+    const spread = facts.filter((f) => f.allocation_method === 'spread' && f.cloud_service === CW);
+    expect(Math.round(spread.reduce((s, f) => s + Number(f.cost_usd), 0) * 1e6) / 1e6).toBe(6);
+    const base = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'np-api-call': servicesStub, 'sub-workflow': stub } });
+    expect(summary.unallocated_usd).toBe(Number((base.outputs?.summary as Record<string, unknown>).unallocated_usd) + 1);
+  });
 });

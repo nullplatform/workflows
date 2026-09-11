@@ -129,8 +129,12 @@ Nothing about a customer's resources lives in code. Three layers, per organizati
      ingestion (`DataProcessing-Bytes`, vended logs: `cloudwatch.IncomingBytes`) and storage
      (`TimedStorage-ByteHrs`: `cloudwatch.StoredBytes`), keyed by log group name. A `by_metric` rule
      with `map.entries` {log group → application} hands the log cost to its application; groups nobody
-     owns (cluster/system logs) stay visible as `metric_key` unallocated rows. Metric, alarm and
-     dashboard usage types carry no shares.
+     owns (cluster/system logs) stay visible as `metric_key` unallocated rows. When the group name follows
+     `<namespace>.<application>[.suffix]` (the platform's convention) `wf1` also attaches `metric_owners`
+     {key → application} from the account's applications, so the rule needs no `entries` at all
+     (`wf2` uses `map.entries[key]` first, then `metric_owners[key]`). EMF custom metrics
+     (`MetricMonitorUsage`, `MetricStreamUsage`) get shares by the `*_agg` log groups' IncomingBytes per
+     application (`cloudwatch.EmfBytes`). Alarm, dashboard and request usage types carry no shares.
    - `spread`: platform cost shared by EVERY application of the day, weighted by what each one already
      carries (`target.spread.weights: attributed`, default) or equally (`equal`). Resolved after the
      main pass, so the weights are the day's attribution, never the spread itself; the rollups and the

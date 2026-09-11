@@ -1,29 +1,132 @@
 [
   {
+    "id": "itti-cloudwatch-logs-by-log-group",
+    "name": "CloudWatch Logs ingestion/storage → application of the log group",
+    "enabled": true,
+    "status": "active",
+    "priority": 100,
+    "source": "seed",
+    "confidence": 0.95,
+    "description": "Log groups follow <namespace>.<application>[.http_agg|.sys_agg]; wf1 attaches IncomingBytes (ingestion) / storedBytes (storage) shares per group and the owner it resolved from the null applications (metric_owners). Groups nobody owns (/aws/eks/…, /aws/lambda/…, RDSOSMetrics) stay visibly unallocated with their metric_key.",
+    "scope": {
+      "cloud_service": {
+        "regex": "CloudWatch"
+      },
+      "usage_type": {
+        "regex": "DataProcessing-Bytes|VendedLog-Bytes|TimedStorage-ByteHrs"
+      }
+    },
+    "match": [
+      {
+        "field": "metric_shares",
+        "exists": true
+      }
+    ],
+    "method": "by_metric",
+    "category": "observability",
+    "target": {
+      "map": {
+        "key": "log_group",
+        "entries": {}
+      }
+    }
+  },
+  {
+    "id": "itti-cloudwatch-emf-metrics-by-app",
+    "name": "CloudWatch custom metrics (EMF) → application by *_agg log bytes",
+    "enabled": true,
+    "status": "active",
+    "priority": 110,
+    "source": "seed",
+    "confidence": 0.8,
+    "description": "MetricStorage:AWS/Logs-EMF is the custom metrics the platform derives from the <namespace>.<application>.http_agg / .sys_agg log groups; each application's share is its *_agg IncomingBytes. Metric stream usage (USE1-CW:MetricStreamUsage) is left to the platform spread until the stream's filter is confirmed to carry only application metrics — flip its usage_type into this rule's scope to attribute it the same way.",
+    "scope": {
+      "cloud_service": {
+        "regex": "CloudWatch"
+      },
+      "usage_type": {
+        "regex": "MetricMonitorUsage"
+      }
+    },
+    "match": [
+      {
+        "field": "metric",
+        "equals": "cloudwatch.EmfBytes"
+      }
+    ],
+    "method": "by_metric",
+    "category": "observability",
+    "target": {
+      "map": {
+        "key": "application",
+        "entries": {}
+      }
+    }
+  },
+  {
     "id": "itti-security-compliance-platform-spread",
     "name": "Security & compliance services → every application (platform cost)",
-    "enabled": true, "status": "active", "priority": 900, "source": "seed", "confidence": 1,
+    "enabled": true,
+    "status": "active",
+    "priority": 900,
+    "source": "seed",
+    "confidence": 1,
     "description": "AWS Config, GuardDuty, KMS, Inspector, Secrets Manager, Macie: nobody owns them, every application of the account shares them in proportion to the cost it already carries.",
-    "scope": { "cloud_service": { "regex": "AWS Config|GuardDuty|Key Management|Inspector|Secrets Manager|Macie" } },
-    "method": "spread", "category": "platform",
-    "target": { "spread": { "weights": "attributed" } }
+    "scope": {
+      "cloud_service": {
+        "regex": "AWS Config|GuardDuty|Key Management|Inspector|Secrets Manager|Macie"
+      }
+    },
+    "method": "spread",
+    "category": "platform",
+    "target": {
+      "spread": {
+        "weights": "attributed"
+      }
+    }
   },
   {
     "id": "itti-cloudwatch-remainder-platform-spread",
     "name": "CloudWatch not attributable by log group → every application (platform cost)",
-    "enabled": true, "status": "active", "priority": 910, "source": "seed", "confidence": 1,
+    "enabled": true,
+    "status": "active",
+    "priority": 910,
+    "source": "seed",
+    "confidence": 1,
     "description": "Metrics, alarms, dashboards and the log groups nobody owns. Log ingestion/storage buckets carry metric_shares by log group and are handled by the by_metric rule first (lower priority number wins).",
-    "scope": { "cloud_service": { "regex": "CloudWatch" } },
-    "method": "spread", "category": "observability",
-    "target": { "spread": { "weights": "attributed" } }
+    "scope": {
+      "cloud_service": {
+        "regex": "CloudWatch"
+      }
+    },
+    "method": "spread",
+    "category": "observability",
+    "target": {
+      "spread": {
+        "weights": "attributed"
+      }
+    }
   },
   {
     "id": "itti-network-platform-spread",
     "name": "VPC / networking → every application (platform cost)",
-    "enabled": true, "status": "active", "priority": 920, "source": "seed", "confidence": 1,
+    "enabled": true,
+    "status": "active",
+    "priority": 920,
+    "source": "seed",
+    "confidence": 1,
     "description": "VPC endpoints, public IPs, NAT: shared network plumbing of the account.",
-    "scope": { "cloud_service": { "regex": "Virtual Private Cloud" } },
-    "method": "spread", "category": "network",
-    "target": { "spread": { "weights": "attributed" } }
+    "scope": {
+      "cloud_service": {
+        "regex": "Virtual Private Cloud"
+      }
+    },
+    "method": "spread",
+    "category": "network",
+    "target": {
+      "spread": {
+        "weights": "attributed"
+      }
+    }
   }
 ]
