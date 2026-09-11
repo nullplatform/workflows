@@ -105,7 +105,9 @@ describe('finops/wf2-allocate-daily', () => {
         },
       },
     });
-    const facts = (result.outputs?.batches as Array<{ facts: Array<Record<string, unknown>> }>).flatMap((b) => b.facts);
+    // a real run returns no batches (they would sit in the parent's history): read what the upsert children got
+    expect(result.outputs?.batches).toEqual([]);
+    const facts = written.filter((w) => w._slug === 'cost_daily');
     const summary = result.outputs?.summary as Record<string, unknown>;
     const byId = Object.fromEntries(facts.map((f) => [f.id, f]));
 

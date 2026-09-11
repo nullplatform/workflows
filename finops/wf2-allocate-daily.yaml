@@ -517,10 +517,15 @@ steps:
       invoices: "${{ steps.write_invoices.outputs.items }}"
       stale: "${{ steps.stale.outputs }}"
       invoice_count: "${{ steps.invoices.outputs.count }}"
+      batches: "${{ steps.allocate.outputs.batches }}"
+      invoice_batches: "${{ steps.invoices.outputs.batches }}"
     config:
       language: javascript
       code: |
-        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0; function wr(list) { return (list || []).reduce(function (n, r) { var o = (r || {}).outputs || r || {}; return n + (Number(o.written) || 0); }, 0); }
+        var s = Object.assign({}, inputs.summary || {}); s.invoices = Number(inputs.invoice_count) || 0;
+        // The batches (~1 MB on a real day) only leave this workflow on a DRY RUN: a parent that waits on
+        // this child gets the whole output into its Temporal history, and a >1 MB child result wedged wf0.
+        s.batches = s.dry_run ? (inputs.batches || []) : []; s.invoice_batches = s.dry_run ? (inputs.invoice_batches || []) : []; function wr(list) { return (list || []).reduce(function (n, r) { var o = (r || {}).outputs || r || {}; return n + (Number(o.written) || 0); }, 0); }
         s.invoices_written = s.dry_run ? 0 : wr(inputs.invoices); s.written = s.dry_run ? 0 : wr(inputs.results) + s.invoices_written; s.stale_rows = (inputs.stale || {}).count || 0; s.stale_usd = (inputs.stale || {}).stale_usd || 0; s.stale_deleted = s.dry_run ? 0 : s.stale_rows; return s;
 
 connections:
@@ -544,6 +549,7 @@ connections:
 
 outputs:
   summary: "${{ steps.summary.outputs }}"
-  batches: "${{ steps.allocate.outputs.batches }}"
-  invoice_batches: "${{ steps.invoices.outputs.batches }}"
+  # dry_run only (see summary): a real day returns [] so the dispatcher's history stays small
+  batches: "${{ steps.summary.outputs.batches }}"
+  invoice_batches: "${{ steps.summary.outputs.invoice_batches }}"
   unallocated_leaves: "${{ steps.allocate.outputs.unallocated_leaves }}"
