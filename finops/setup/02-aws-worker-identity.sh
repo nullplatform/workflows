@@ -19,7 +19,7 @@
 # Usage:
 #   ./02-aws-worker-identity.sh --cluster runtime [--region us-east-1] \
 #       [--namespace np-workers] [--service-account np-finops-worker] \
-#       [--role np-finops-worker] [--image-glob 'public.ecr.aws/nullplatform/*']
+#       [--role np-finops-worker] [--image <registry/repository>] [--package cloud-query]
 #
 # Multi-account (the worker assumes a per-account role): run this ONCE on the
 # cluster account with --assume-only, then create `np-finops` in each account
@@ -32,7 +32,7 @@ IAM_DIR="$SCRIPT_DIR/../docs/iam"
 
 CLUSTER=""; REGION="${AWS_REGION:-us-east-1}"; NAMESPACE="np-workers"
 SA="np-finops-worker"; ROLE="np-finops-worker"
-IMAGE_GLOB="public.ecr.aws/nullplatform/*"; ASSUME_ONLY=false
+IMAGE="public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer"; PACKAGE="cloud-query"; ASSUME_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,7 +41,8 @@ while [[ $# -gt 0 ]]; do
     --namespace) NAMESPACE="$2"; shift 2 ;;
     --service-account) SA="$2"; shift 2 ;;
     --role) ROLE="$2"; shift 2 ;;
-    --image-glob) IMAGE_GLOB="$2"; shift 2 ;;
+    --image) IMAGE="$2"; shift 2 ;;
+    --package) PACKAGE="$2"; shift 2 ;;
     --assume-only) ASSUME_ONLY=true; shift ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -103,9 +104,10 @@ else
   echo "pod identity association created → $ROLE_ARN"
 fi
 
-# 4. Agent side: first matching rule wins; match on the image prefix so only the
-#    cloud-query image gets this identity.
-RULES=$(jq -cn --arg g "$IMAGE_GLOB" --arg sa "$SA" '[{match:{registry:$g},serviceAccount:$sa}]')
+# 4. Agent side: first matching rule wins. Match the EXACT image repository (the
+#    worker is always referenced by digest, so no tag is part of the string) and
+#    the package slug: no other image gets this identity.
+RULES=$(jq -cn --arg img "$IMAGE" --arg pkg "$PACKAGE" --arg sa "$SA" '[{match:{registry:$img,package:$pkg},serviceAccount:$sa}]')
 cat <<EOF
 
 Done. Now tell the controlplane-agent to spawn the cloud-query worker with SA $SA.
