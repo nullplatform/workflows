@@ -63,6 +63,7 @@ const RESULTS = {
     [['i-node2'], 3.7, 24],
     [['i-scope1'], 0.25, 24],
     [['i-loose'], 4.85, 24],
+    [['i-gone', 'c5a.xlarge'], 3.0, 12], // a Karpenter node that terminated before collection: type known from Cost Explorer
     [['NoResourceId'], 0, 0],
   ]),
   volumes: {
@@ -81,6 +82,8 @@ const RESULTS = {
     ],
   },
   lbs: { LoadBalancers: [{ LoadBalancerName: 'k8s-a' }, { LoadBalancerName: 'k8s-b' }, { LoadBalancerName: 'null-main' }, { LoadBalancerName: 'other' }] },
+  // RDS by owner tag × usage type: the tagged part goes to the cluster tagged payments, the untagged rest is spread in proportion
+  rds_by_tag: ceGroups([[['application$payments', 'InstanceUsage:db.r6g.large'], 0.8], [['application$', 'Aurora:StorageUsage'], 0.2]]),
   db_clusters: { DBClusters: [{ DBClusterIdentifier: 'transactions', DBClusterArn: 'arn:aws:rds:us-east-1:1:cluster:transactions', Engine: 'aurora-mysql', TagList: [], Endpoint: 'transactions.cluster-abc.us-east-1.rds.amazonaws.com',
     DBClusterMembers: [{ DBInstanceIdentifier: 'transactions-writer', IsClusterWriter: true }, { DBInstanceIdentifier: 'transactions-reader', IsClusterWriter: false }] }] },
   db_instances: { DBInstances: [
@@ -183,7 +186,9 @@ describe('finops/wf1-aws-billing-daily', () => {
     // two cloud-query rounds: the day's calls, then the instance types seen
     expect(queries.map((q) => q.__step)).toEqual(['query', 'query_types']);
     const calls = queries[0]?.calls as Array<{ id: string; params?: { TimePeriod?: { Start: string; End: string } } }>;
-    expect(calls.map((c) => c.id)).toEqual(['identity', 'by_service', 'by_usage_type', 'ec2_by_resource', 'instances', 'volumes', 'tagged', 'lbs', 'db_clusters', 'db_instances']);
+    expect(calls.map((c) => c.id)).toEqual(['identity', 'by_service', 'by_usage_type', 'ec2_by_resource', 'rds_by_tag', 'instances', 'volumes', 'tagged', 'lbs', 'db_clusters', 'db_instances']);
+    expect(calls[3]?.params?.GroupBy).toEqual([{ Type: 'DIMENSION', Key: 'RESOURCE_ID' }, { Type: 'DIMENSION', Key: 'INSTANCE_TYPE' }]);
+    expect(calls[4]?.params?.GroupBy).toEqual([{ Type: 'TAG', Key: 'application' }, { Type: 'DIMENSION', Key: 'USAGE_TYPE' }]);
     expect(calls[1]?.params?.TimePeriod).toEqual({ Start: '2026-09-09', End: '2026-09-10' });
     expect(queries[0]?.agent_tags).toEqual({ package: 'cloud-query', local: 'x' });
     expect(queries.map((q) => q.agent_nrn)).toEqual(['organization=1255165411:account=95118862', 'organization=1255165411:account=95118862']);
@@ -234,11 +239,14 @@ describe('finops/wf1-aws-billing-daily', () => {
     // cluster = nodes 7.4 + control plane 2.4 + LBs 2.0×(2/4)=1.0 + networking (VPC 3.0 + NAT 1.5)=4.5
     //         + storage EBS 2.0×(40/80)=1.0 + other CPUCredits 0.5×(2/4)=0.25 → 16.55
     const cluster = facts.find((f) => f.subject_type === 'cluster');
-    expect(cluster).toMatchObject({ id: 'raw-cluster-developent-2026-09-09', cluster: 'developent', allocation_method: 'unallocated', quantity: 2, units: 'nodes' });
-    expect(cluster?.cost_usd).toBeCloseTo(16.55, 6);
+    expect(cluster).toMatchObject({ id: 'raw-cluster-developent-2026-09-09', cluster: 'developent', allocation_method: 'unallocated', quantity: 3, units: 'nodes' });
+    // + the terminated node (3.0) attributed by its type → 19.55
+    expect(cluster?.cost_usd).toBeCloseTo(19.55, 6);
+    expect(cluster?.quantity).toBe(3);
+    expect(cluster?.instances_seen).toBe(2);
     const comps = Object.fromEntries(facts.filter((f) => f.subject_type === 'bucket' && f.component).map((b) => [b.component, b.cost_usd]));
     // networking is split by the cloud service it comes from (VPC 3.0 vs EC2-Other NAT 1.5) so the allocator can reconcile per service
-    expect(comps).toEqual({ nodes: 7.4, control_plane: 2.4, load_balancers: 1.0, networking: 3.0, networking_ec2: 1.5, storage: 1.0, other: 0.25 });
+    expect(comps).toEqual({ nodes: 7.4, nodes_terminated: 3.0, control_plane: 2.4, load_balancers: 1.0, networking: 3.0, networking_ec2: 1.5, storage: 1.0, other: 0.25 });
     for (const b of facts.filter((f) => f.subject_type === 'bucket' && f.component)) {
       expect(b.parent_id).toBe(cluster?.id);
       expect(typeof b.cloud_service).toBe('string');
@@ -253,13 +261,13 @@ describe('finops/wf1-aws-billing-daily', () => {
     expect(round2[1]).toMatchObject({ service: 'pi', params: { Identifier: 'db-WRITER', StartTime: '2026-09-09T00:00:00Z', EndTime: '2026-09-10T00:00:00Z', PeriodInSeconds: 86400 } });
     expect(facts.find((f) => f.subject_id === 'transactions')).toMatchObject({ metric: 'pi.db.load', metric_shares: { orders: 0.75, ledger: 0.25 } });
 
-    // blended rates over reserved capacity: 2 × c5a.xlarge × 24 h = 192 core-h, 384 GiB-h; cpu_share 0.5
-    expect(cluster?.cpu_capacity_core_h).toBe(192);
-    expect(cluster?.mem_capacity_gb_h).toBe(384);
+    // blended rates over capacity: 2 × c5a.xlarge × 24 h + the terminated one × 12 h = 240 core-h, 480 GiB-h; cpu_share 0.5
+    expect(cluster?.cpu_capacity_core_h).toBe(240);
+    expect(cluster?.mem_capacity_gb_h).toBe(480);
     expect(cluster?.cpu_share).toBe(0.5);
-    expect(cluster?.rate_cpu_usd_core_h).toBeCloseTo((16.55 * 0.5) / 192, 6);
-    expect(cluster?.rate_mem_usd_gb_h).toBeCloseTo((16.55 * 0.5) / 384, 6);
-    expect((summary.clusters as Array<Record<string, unknown>>)[0]).toMatchObject({ cluster: 'developent', cost_usd: 16.55, nodes: 2, lbs: 2, ebs_gb: 40 });
+    expect(cluster?.rate_cpu_usd_core_h).toBeCloseTo((19.55 * 0.5) / 240, 6);
+    expect(cluster?.rate_mem_usd_gb_h).toBeCloseTo((19.55 * 0.5) / 480, 6);
+    expect((summary.clusters as Array<Record<string, unknown>>)[0]).toMatchObject({ cluster: 'developent', cost_usd: 19.55, nodes: 2, lbs: 2, ebs_gb: 40 });
 
     // the Aurora cluster becomes a service fact carrying the RDS cost, mapped to the null service by host
     // (case-insensitive) → owner application from the service NRN, allocation_method service_owner

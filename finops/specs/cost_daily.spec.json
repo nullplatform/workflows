@@ -485,6 +485,13 @@
           "null"
         ],
         "description": "For by_metric allocations: the metric key this portion corresponds to"
+      },
+      "cost_method": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "How the subject's cost_usd was derived by the collector: direct_tag (Cost Explorer by owner tag), unallocated (even split / fallback)"
       }
     },
     "required": [

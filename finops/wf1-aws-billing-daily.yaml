@@ -107,6 +107,9 @@ variables:
     initialValue: "Amazon Elastic Load Balancing"
   rds_service_name:
     initialValue: "Amazon Relational Database Service"
+  # Cost allocation tag that names the owner of RDS resources (nullplatform: `application`).
+  rds_owner_tag:
+    initialValue: "application"
   # Share of the cluster cost attributed to CPU (the rest to memory) when
   # deriving the blended rates. 0.5 = Kubecost-style even split; tune per org.
   cpu_share:
@@ -188,6 +191,8 @@ steps:
       org_nrn_default: "${{ variables.org_nrn }}"
       region: "${{ variables.aws_region }}"
       ec2_service: "${{ variables.ec2_service_name }}"
+      rds_service: "${{ variables.rds_service_name }}"
+      rds_owner_tag: "${{ variables.rds_owner_tag }}"
       role_arn: "${{ workflow.inputs.assume_role_arn }}"
       role_arn_default: "${{ variables.assume_role_arn }}"
       role_ext: "${{ workflow.inputs.assume_role_external_id }}"
@@ -212,8 +217,13 @@ steps:
           { id: "by_usage_type", service: "ce", operation: "GetCostAndUsage",
             params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost", "UsageQuantity"], GroupBy: [{ Type: "DIMENSION", Key: "SERVICE" }, { Type: "DIMENSION", Key: "USAGE_TYPE" }] } },
           { id: "ec2_by_resource", service: "ce", operation: "GetCostAndUsageWithResources",
-            params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost", "UsageQuantity"], GroupBy: [{ Type: "DIMENSION", Key: "RESOURCE_ID" }],
+            params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost", "UnblendedCost", "UsageQuantity"], GroupBy: [{ Type: "DIMENSION", Key: "RESOURCE_ID" }, { Type: "DIMENSION", Key: "INSTANCE_TYPE" }],
                       Filter: { Dimensions: { Key: "SERVICE", Values: [String(inputs.ec2_service)] } } } },
+          // RDS by the owner tag (cost allocation tag `application`, active on the payer) × usage type: the real
+          // cost per cluster (tagged) and the untagged usage types (an untagged instance, backups) to place by class.
+          { id: "rds_by_tag", service: "ce", operation: "GetCostAndUsage",
+            params: { TimePeriod: period, Granularity: "DAILY", Metrics: ["AmortizedCost"], GroupBy: [{ Type: "TAG", Key: String(inputs.rds_owner_tag) }, { Type: "DIMENSION", Key: "USAGE_TYPE" }],
+                      Filter: { Dimensions: { Key: "SERVICE", Values: [String(inputs.rds_service)] } } } },
           { id: "instances", service: "ec2", operation: "DescribeInstances", params: {} },
           { id: "volumes", service: "ec2", operation: "DescribeVolumes", params: {} },
           // Tags for the resources we attribute beyond EC2: load balancers (cluster
@@ -269,6 +279,8 @@ steps:
         (((inputs.results || {}).instances || {}).Reservations || []).forEach(function (res) {
           (res.Instances || []).forEach(function (i) { if (i.InstanceType) types[i.InstanceType] = true; });
         });
+        // types of instances that already terminated (Cost Explorer resource rows carry INSTANCE_TYPE)
+        (((inputs.results || {}).ec2_by_resource || {}).ResultsByTime || []).forEach(function (rt) { (rt.Groups || []).forEach(function (g) { var t = g.Keys && g.Keys[1]; if (t && t !== "NoInstanceType" && /^[a-z0-9]+\.[a-z0-9]+$/.test(t)) types[t] = true; }); });
         var list = Object.keys(types).sort();
         var calls = [{ id: "instance_types", service: "ec2", operation: "DescribeInstanceTypes", params: { InstanceTypes: list.length ? list : ["t3.micro"] } }];
         // Performance Insights: DB load by DATABASE for each RDS subject (the writer of an Aurora
@@ -348,6 +360,7 @@ steps:
       vpc_service: "${{ variables.vpc_service_name }}"
       elb_service: "${{ variables.elb_service_name }}"
       rds_service: "${{ variables.rds_service_name }}"
+      rds_owner_tag: "${{ variables.rds_owner_tag }}"
       cpu_share: "${{ variables.cpu_share }}"
       collector: "${{ variables.collector }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
@@ -449,20 +462,32 @@ steps:
         //   (NAT gateways, …) keep a `resource` row. Keeps the day at tens of rows, not hundreds.
         var ec2ParentId = svcFactId[String(inputs.ec2_service)] || null;
         var cl = {}; // cluster -> {nodes, nodeIds[], coreH, gbH, volGb, instCount}
-        function clusterAcc(name) { return cl[name] || (cl[name] = { nodes: 0, nodeIds: [], coreH: 0, gbH: 0, volGb: 0, instCount: 0 }); }
+        function clusterAcc(name) { return cl[name] || (cl[name] = { nodes: 0, nodesTerminated: 0, terminatedCount: 0, nodeIds: [], coreH: 0, gbH: 0, volGb: 0, instCount: 0 }); }
         var totalInstances = Object.keys(inst).length;
         var unattr = { cost: 0, unbl: 0, hours: 0, ids: 0, seen: 0, byType: {} };
+        // Node instance types per cluster (from the instances still running): an instance that terminated
+        // before collection has no tags for us, but Cost Explorer still knows its type — if the type is a
+        // node type of a cluster, it was a node (Karpenter churn). Component `nodes_terminated`, kept apart.
+        var nodeTypeClusters = {}; Object.keys(inst).forEach(function (id) { var x = inst[id]; if (x.cluster && x.type) { nodeTypeClusters[x.type] = nodeTypeClusters[x.type] || {}; nodeTypeClusters[x.type][x.cluster] = (nodeTypeClusters[x.type][x.cluster] || 0) + 1; } });
+        function inferCluster(type) { var m = nodeTypeClusters[type]; if (!m) return null; return Object.keys(m).sort(function (a, b) { return m[b] - m[a]; })[0]; }
         ((r.ec2_by_resource || {}).ResultsByTime || []).forEach(function (rt) {
           (rt.Groups || []).forEach(function (g) {
             var rid = g.Keys[0]; var c = amort(g); var hours = qty(g);
             if (!rid || rid === "NoResourceId" || (c === 0 && hours === 0)) return;
             var isInstance = /^i-[0-9a-z]+$/i.test(rid);
-            var i = inst[rid] || { type: null, tags: {}, cluster: null };
+            var ceType = g.Keys[1] && g.Keys[1] !== "NoInstanceType" ? String(g.Keys[1]) : null;
+            var i = inst[rid] || { type: ceType, tags: {}, cluster: null, gone: true };
+            if (!i.type && ceType) i.type = ceType;
             var t = i.tags; var dims = npDims(t); var f;
             if (i.cluster) {
               var a = clusterAcc(i.cluster); var cap = typeCap[i.type] || { vcpu: 0, gib: 0 };
               a.nodes += c; a.nodeIds.push(rid); a.instCount += 1; a.coreH += cap.vcpu * hours; a.gbH += cap.gib * hours; a.volGb += (volGbByInstance[rid] || 0);
               return; // node cost lives in the cluster row (component `nodes`)
+            }
+            if (i.gone && isInstance && i.type && inferCluster(i.type)) {
+              var ac = clusterAcc(inferCluster(i.type)); var cp = typeCap[i.type] || { vcpu: 0, gib: 0 };
+              ac.nodesTerminated = num((ac.nodesTerminated || 0) + c); ac.terminatedCount = (ac.terminatedCount || 0) + 1; ac.coreH += cp.vcpu * hours; ac.gbH += cp.gib * hours;
+              return;
             }
             if (dims.scope_id) {
               f = base("raw", "scope", dims.scope_id); f.allocation_method = "direct_tag";
@@ -505,6 +530,7 @@ steps:
           // reconcile every cloud service: total = Σ resource rows + Σ cluster components + remainder.
           var compSvc = {
             nodes: [num(a.nodes), String(inputs.ec2_service)],
+            nodes_terminated: [num(a.nodesTerminated || 0), String(inputs.ec2_service)],
             control_plane: [num(eks / nClusters), String(inputs.eks_service)],
             load_balancers: [num(lbsAll ? elbTotal * ((lbsByCluster[name] || 0) / lbsAll) : 0), String(inputs.elb_service)],
             networking: [num(vpcTotal / nClusters), String(inputs.vpc_service)],
@@ -519,7 +545,7 @@ steps:
           f.cpu_capacity_core_h = num(a.coreH); f.mem_capacity_gb_h = num(a.gbH); f.cpu_share = cpuShare;
           f.rate_cpu_usd_core_h = a.coreH ? num(total * cpuShare / a.coreH) : null;
           f.rate_mem_usd_gb_h = a.gbH ? num(total * (1 - cpuShare) / a.gbH) : null;
-          f.quantity = a.instCount; f.units = "nodes";
+          f.quantity = a.instCount + (a.terminatedCount || 0); f.units = "nodes"; f.instances_seen = a.instCount;
           facts.push(f);
           Object.keys(comp).forEach(function (k) {
             var b = base("raw", "bucket", name + "|" + k);
@@ -540,13 +566,39 @@ steps:
         });
         function nrnParts(nrn) { var o = {}; String(nrn || "").split(":").forEach(function (kv) { var p = kv.split("="); if (p.length === 2) o[p[0]] = p[1]; }); return o; }
         var rdsTotal = num(svcTotal[String(inputs.rds_service)] || 0);
+        // Cost per RDS subject: Cost Explorer by owner tag (exact per tag value; clusters sharing a value split
+        // it evenly) + untagged usage types placed by instance class (an untagged instance of a tagged cluster)
+        // + whatever is left spread in proportion. Without tag data at all → even split (old behaviour).
+        var ownerTag = String(inputs.rds_owner_tag || "application"); var tagCost = {}; var untagged = []; var tagRows = 0;
+        ((r.rds_by_tag || {}).ResultsByTime || []).forEach(function (rt) { (rt.Groups || []).forEach(function (g) {
+          var tv = String(g.Keys[0] || ""); var ut = String(g.Keys[1] || ""); var c = amort(g); tagRows += 1;
+          var val = tv.indexOf("$") >= 0 ? tv.slice(tv.indexOf("$") + 1) : tv;
+          if (val) tagCost[val] = num((tagCost[val] || 0) + c); else untagged.push({ ut: ut, cost: c });
+        }); });
+        var byInstClass = {}; (((r.db_instances || {}).DBInstances) || []).forEach(function (i) { var cls = String(i.DBInstanceClass || "").replace(/^db\./, ""); var subj = i.DBClusterIdentifier || i.DBInstanceIdentifier; if (cls) (byInstClass[cls] = byInstClass[cls] || {})[subj] = true; });
+        dbs.forEach(function (db) { tagged.forEach(function (x) { if (x.arn === db.arn) Object.keys(x.tags).forEach(function (k) { db.tags[k] = x.tags[k]; }); }); });
+        var dbCost = {}; var dbMethod = {};
+        if (tagRows > 0) {
+          var byVal = {}; dbs.forEach(function (db) { var v = db.tags[ownerTag]; if (v) (byVal[v] = byVal[v] || []).push(db.id); });
+          dbs.forEach(function (db) { var v = db.tags[ownerTag]; dbCost[db.id] = v && tagCost[v] ? num(tagCost[v] / byVal[v].length) : 0; dbMethod[db.id] = v && tagCost[v] ? "direct_tag" : "unallocated"; });
+          var rest = 0;
+          untagged.forEach(function (u) {
+            var m = /InstanceUsage:db\.([a-z0-9]+\.[a-z0-9]+)/i.exec(u.ut); var cls = m ? m[1] : null;
+            var owners = cls ? Object.keys(byInstClass).filter(function (k) { return k === cls || k.indexOf(cls) === 0; }).map(function (k) { return Object.keys(byInstClass[k]); }).reduce(function (a, b) { return a.concat(b); }, []) : [];
+            owners = owners.filter(function (o, i, arr) { return arr.indexOf(o) === i && dbCost[o] !== undefined; });
+            if (owners.length) owners.forEach(function (o) { dbCost[o] = num(dbCost[o] + u.cost / owners.length); }); else rest += u.cost;
+          });
+          var placed = num(Object.keys(dbCost).reduce(function (a, k) { return a + dbCost[k]; }, 0));
+          if (rest > 0) { if (placed > 0) Object.keys(dbCost).forEach(function (k) { dbCost[k] = num(dbCost[k] + rest * (dbCost[k] / placed)); }); else dbs.forEach(function (db) { dbCost[db.id] = num(rest / dbs.length); }); }
+        } else { dbs.forEach(function (db) { dbCost[db.id] = num(dbs.length ? rdsTotal / dbs.length : 0); dbMethod[db.id] = "unallocated"; }); }
         dbs.forEach(function (db) {
-          var tg = db.tags; tagged.forEach(function (x) { if (x.arn === db.arn) Object.keys(x.tags).forEach(function (k) { tg[k] = x.tags[k]; }); });
+          var tg = db.tags;
           var dims = npDims(tg);
           var f = base("raw", "service", db.id); f.subject_name = db.id; f.resource_id = db.arn || db.id; f.resource_type = db.kind; f.usage_type = db.engine || null;
           f.host = (db.hosts || []).filter(Boolean)[0] || null;
           f.tags = Object.keys(tg).length ? tg : null;
-          f.cloud_service = String(inputs.rds_service); f.region = region; f.cost_usd = num(dbs.length ? rdsTotal / dbs.length : 0); f.parent_id = svcFactId[String(inputs.rds_service)] || null;
+          f.cloud_service = String(inputs.rds_service); f.region = region; f.cost_usd = num(dbCost[db.id] || 0); f.parent_id = svcFactId[String(inputs.rds_service)] || null;
+          f.cost_method = dbMethod[db.id] || "unallocated";
           Object.keys(dims).forEach(function (k) { f[k] = dims[k]; });
           f.allocation_method = dims.application_id ? "direct_tag" : "unallocated";
           // null service whose host is this database's endpoint → owner application (service_owner).
