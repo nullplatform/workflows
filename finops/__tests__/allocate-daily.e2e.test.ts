@@ -149,7 +149,7 @@ describe('finops/wf2-allocate-daily', () => {
     expect(byId[`alloc-app-300-${D}`]).toMatchObject({ cost_usd: 3 });
     expect(byId[`alloc-app-400-${D}`]).toMatchObject({ cost_usd: 2 });
     // application_cost_daily: one INVOICE per application — flat charge items with the null object each came through
-    const appRows = (result.outputs?.invoice_batches as Array<{ facts: Array<Record<string, unknown>> }>).flatMap((b) => b.facts);
+    const appRows = written.filter((w) => w._slug === 'application_cost_daily');
     type Item = Record<string, unknown>;
     const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; charge_items: Item[]; totals: { by_charge_type: Record<string, number>; by_category: Record<string, number>; by_cloud_service: Record<string, number> } };
     expect(app100).toMatchObject({ date: D, day: D, application_id: '100', namespace_id: '5', total_usd: 30, currency: 'USD', charge_items_count: 6, cloud_accounts: ['111122223333'] });
