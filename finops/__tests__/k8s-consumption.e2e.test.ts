@@ -104,7 +104,7 @@ describe('finops/wf3-k8s-consumption-daily', () => {
         'np-entity-paginated-fetch': { handler: () => ({ status: 'success' as const, outputs: { items: [{ id: 777, dimensions: { environment: 'production' } }, { id: 999, dimensions: {} }], totalFetched: 2, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
         'np-api-call': { handler: () => ({ status: 'success' as const, outputs: { status: 200, body: CLUSTER }, activePorts: ['default'] }), executeMode: 'all' as const },
         'np-agent-command': { handler: (ctx: { inputs: Record<string, unknown> }) => { cmds.push(String(ctx.inputs.cmdline)); return { status: 'success' as const, outputs: { status: 'success', stdout: '{}', stderr: '' }, activePorts: ['default'] }; }, executeMode: 'all' as const },
-        'http-request': { handler: (ctx: { inputs: Record<string, unknown> }) => { posts.push(ctx.inputs); return { status: 'success' as const, outputs: { status: 200, body: { data: { actor: { account: { usage: { results: rows } } } } } }, activePorts: ['default'] }; }, executeMode: 'all' as const },
+        'http-request': { handler: (ctx: { inputs: Record<string, unknown> }) => { posts.push(ctx.inputs); return { status: 'success' as const, outputs: { statusCode: 200, statusText: 'OK', headers: {}, body: { data: { actor: { account: { usage: { results: rows } } } } } }, activePorts: ['default'] }; }, executeMode: 'all' as const },
         'sub-workflow': { handler: () => ({ status: 'success' as const, outputs: { written: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
       },
     });

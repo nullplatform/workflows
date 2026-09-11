@@ -257,7 +257,7 @@ steps:
     name: "NR rows → per-scope collector shape"
     inputs:
       scopes: "${{ steps.prep_run.outputs.scopes }}"
-      status: "${{ steps.nr_query.outputs.status }}"
+      status: "${{ steps.nr_query.outputs.statusCode }}"
       body: "${{ steps.nr_query.outputs.body }}"
     config:
       language: javascript
