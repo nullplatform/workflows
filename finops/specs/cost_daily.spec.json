@@ -614,6 +614,16 @@
         "index": [
           "filter"
         ]
+      },
+      "bucket": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "owner bucket when the cost goes to a shared pool instead of an application (e.g. shared-platform)",
+        "index": [
+          "filter"
+        ]
       }
     },
     "required": [
