@@ -36,6 +36,7 @@ describe('finops/wf3-k8s-consumption-daily', () => {
       pluginStubs: {
         manual: passthroughTrigger,
         'np-lake-query': { handler: () => ({ status: 'success' as const, outputs: { rows: SCOPES, rowCount: 3 }, activePorts: ['default'] }), executeMode: 'all' as const },
+        'np-entity-paginated-fetch': { handler: () => ({ status: 'success' as const, outputs: { items: [{ id: 777, dimensions: { environment: 'production' } }, { id: 999, dimensions: {} }], totalFetched: 2, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
         'np-api-call': { handler: () => ({ status: 'success' as const, outputs: { status: 200, body: CLUSTER }, activePorts: ['default'] }), executeMode: 'all' as const },
         'np-agent-command': {
           handler: (ctx: { inputs: Record<string, unknown> }) => {
@@ -57,12 +58,12 @@ describe('finops/wf3-k8s-consumption-daily', () => {
     expect(facts.map((f) => f.id)).toEqual([`raw-k8s-scope-777-${D}`, `raw-k8s-scope-999-${D}`]); // 555 has no pods here
     // 777: chargeable 4 core-h × 0.05 + 5 GiB-h × 0.01 = 0.25; used 3 core-h + 4 GiB-h = 0.19; waste 0.06
     expect(facts[0]).toMatchObject({ subject_type: 'scope', source: 'k8s', cluster: 'runtime', application_id: '100', namespace_id: '5', scope_id: '777', application_slug: 'orders-api', subject_name: 'orders-api.prod',
-      core_h_chargeable: 4, gb_h_chargeable: 5, core_h_used: 3, gb_h_used: 4, core_h_requested: 3, gb_h_requested: 4, pods_avg: 2.5, cost_usd: 0.25, usage_usd: 0.19, waste_usd: 0.06, allocation_method: 'direct_resource', metric: 'k8s.chargeable' });
+      core_h_chargeable: 4, gb_h_chargeable: 5, core_h_used: 3, gb_h_used: 4, core_h_requested: 3, gb_h_requested: 4, pods_avg: 2.5, cost_usd: 0.25, usage_usd: 0.19, waste_usd: 0.06, allocation_method: 'direct_resource', metric: 'k8s.chargeable', dimensions: { environment: 'production' }, environment: 'production' });
     expect(facts[1]).toMatchObject({ scope_id: '999', application_id: '400', cost_usd: 0.03, usage_usd: 0.03, waste_usd: 0 });
     // cluster row patched with shares by scope (over the cluster cost) and the overhead
     const cluster = written.find((w) => (w.fact as { id: string }).id === `raw-cluster-runtime-${D}`)?.fact as Record<string, unknown>;
     expect(cluster).toMatchObject({ metric: 'k8s.chargeable', metric_shares: { 777: 0.0025, 999: 0.0003 }, k8s_overhead_usd: 99.72, cost_usd: 100 });
-    expect((cluster.metric_owners as Record<string, Record<string, unknown>>)[777]).toEqual({ application_id: '100', namespace_id: '5', scope_id: '777', account_id: '17', application_slug: 'orders-api', scope_name: 'prod', scope_type: 'web_pool_k8s' });
+    expect((cluster.metric_owners as Record<string, Record<string, unknown>>)[777]).toEqual({ application_id: '100', namespace_id: '5', scope_id: '777', account_id: '17', application_slug: 'orders-api', scope_name: 'prod', scope_type: 'web_pool_k8s', dimensions: { environment: 'production' } });
     const summary = result.outputs?.summary as Record<string, unknown>;
     expect(summary).toMatchObject({ scopes: 3, with_data: 2, scopes_cost_usd: 0.28, overhead_usd: 99.72, cluster_cost_usd: 100, written: 3, error_count: 0 });
     expect(written.map((w) => w.catalog_slug)).toEqual(['cost_daily', 'cost_daily', 'cost_daily']);
@@ -72,6 +73,7 @@ describe('finops/wf3-k8s-consumption-daily', () => {
     await expect(runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: {
       manual: passthroughTrigger,
       'np-lake-query': { handler: () => ({ status: 'success' as const, outputs: { rows: SCOPES }, activePorts: ['default'] }), executeMode: 'all' as const },
+      'np-entity-paginated-fetch': { handler: () => ({ status: 'success' as const, outputs: { items: [], totalFetched: 0, pages: 1 }, activePorts: ['default'] }), executeMode: 'all' as const },
       'np-api-call': { handler: () => ({ status: 'success' as const, outputs: { status: 404, body: { message: 'not found' } }, activePorts: ['default'] }), executeMode: 'all' as const },
       'np-agent-command': { handler: () => ({ status: 'success' as const, outputs: { stdout: '{}' }, activePorts: ['default'] }), executeMode: 'all' as const },
       'sub-workflow': { handler: () => ({ status: 'success' as const, outputs: {}, activePorts: ['default'] }), executeMode: 'all' as const },

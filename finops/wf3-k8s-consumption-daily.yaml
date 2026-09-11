@@ -49,6 +49,9 @@ inputs:
 variables:
   cluster:
     initialValue: "runtime"
+  # Organization NRN for the scopes listing (dimensions live in the API, not in the lake).
+  org_nrn:
+    initialValue: "organization=1255165411"
   # Agent that can reach the cluster's Prometheus (the same one the cost tracker uses).
   agent_tags:
     initialValue: { cluster: "runtime" }
@@ -85,6 +88,7 @@ steps:
       cluster_default: "${{ variables.cluster }}"
       agent_tags: "${{ variables.agent_tags }}"
       agent_nrn: "${{ variables.agent_nrn }}"
+      org_nrn: "${{ variables.org_nrn }}"
     config:
       language: javascript
       code: |
@@ -94,7 +98,7 @@ steps:
         if (!cluster) throw new Error("cluster is required");
         var sel = { tags: inputs.agent_tags || { cluster: cluster } };
         if (inputs.agent_nrn) sel.nrn = String(inputs.agent_nrn);
-        return { day: day, cluster: cluster, agent_selector: sel, cluster_row_path: "/catalog/instances/cost_daily/raw-cluster-" + cluster.toLowerCase().replace(/[^a-z0-9_]+/g, "-") + "-" + day };
+        return { day: day, cluster: cluster, agent_selector: sel, scope_filters: { nrn: String(inputs.org_nrn || ""), status: "active" }, cluster_row_path: "/catalog/instances/cost_daily/raw-cluster-" + cluster.toLowerCase().replace(/[^a-z0-9_]+/g, "-") + "-" + day };
 
   - id: lake_scopes
     type: module
@@ -112,6 +116,19 @@ steps:
           AND s.status = 'active'
           AND s.type IN ('web_pool_k8s', 'custom', 'web_pool')
         LIMIT 5000
+
+  - id: scope_dims
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "Scopes with dimensions (API)"
+    inputs:
+      filters: "${{ steps.prep.outputs.scope_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "scope"
+      filters: { status: "active" }
+      limit: 100
+      maxPages: 100
 
   - id: cluster_row
     type: module
@@ -133,6 +150,7 @@ steps:
     join_strategy: all
     inputs:
       rows: "${{ steps.lake_scopes.outputs.rows }}"
+      api_scopes: "${{ steps.scope_dims.outputs.items }}"
       day: "${{ steps.prep.outputs.day }}"
       nrn: "${{ workflow.inputs.nrn }}"
       base: "${{ variables.collector_cmd }}"
@@ -142,13 +160,15 @@ steps:
       language: javascript
       code: |
         var rows = inputs.rows || []; var nrn = String(inputs.nrn || "").trim();
+        var dimsById = {}; (inputs.api_scopes || []).forEach(function (sc) { if (sc && sc.id) dimsById[String(sc.id)] = sc.dimensions && Object.keys(sc.dimensions).length ? sc.dimensions : null; });
         function dims(n) { var o = {}; String(n || "").split(":").forEach(function (kv) { var p = kv.split("="); if (p.length === 2) o[p[0]] = p[1]; }); return o; }
         var scopes = [];
         rows.forEach(function (r) {
           var sn = String(r.scope_nrn || ""); if (nrn && sn !== nrn && sn.indexOf(nrn + ":") !== 0) return;
           var d = dims(sn);
           scopes.push({ scope_id: String(r.scope_id), scope_name: r.scope_name || null, scope_slug: r.scope_slug || null, scope_type: r.scope_type || null, app_name: r.app_name || null, app_slug: r.app_slug || null,
-                        application_id: d.application || null, namespace_id: d.namespace || null, account_id: d.account || null, nrn: sn || null });
+                        application_id: d.application || null, namespace_id: d.namespace || null, account_id: d.account || null, nrn: sn || null,
+                        dimensions: dimsById[String(r.scope_id)] || null });
         });
         if (Number(inputs.cluster_status) !== 200 || !inputs.cluster_body || !inputs.cluster_body.id) throw new Error("raw cluster row not found for the day (run finops_aws_billing_daily first): " + JSON.stringify(inputs.cluster_body).slice(0, 200));
         var c = inputs.cluster_body;
@@ -220,12 +240,12 @@ steps:
           var cost = num(chCore * C.rate_cpu + chGb * C.rate_mem); var usage = num(usedCore * C.rate_cpu + usedGb * C.rate_mem);
           var f = { id: "raw-k8s-scope-" + s.scope_id + "-" + d, date: d, day: d, stage: "raw", subject_type: "scope", subject_id: s.scope_id, subject_name: (s.app_slug ? s.app_slug + "." : "") + (s.scope_slug || s.scope_name || s.scope_id),
                     cloud: "aws", cloud_account: inputs.cluster_body.cloud_account || null, cloud_service: null, cluster: cname, region: inputs.cluster_body.region || null, source: "k8s", collected_at: now, collector: String(inputs.collector),
-                    scope_id: s.scope_id, scope_name: s.scope_name || null, scope_type: s.scope_type || null, application_id: s.application_id, application_slug: s.app_slug || null, namespace_id: s.namespace_id, account_id: s.account_id, nrn: s.nrn,
+                    scope_id: s.scope_id, scope_name: s.scope_name || null, scope_type: s.scope_type || null, dimensions: s.dimensions || null, environment: (s.dimensions || {}).environment || null, application_id: s.application_id, application_slug: s.app_slug || null, namespace_id: s.namespace_id, account_id: s.account_id, nrn: s.nrn,
                     cost_usd: cost, usage_usd: usage, waste_usd: num(Math.max(cost - usage, 0)), core_h_chargeable: num(chCore), gb_h_chargeable: num(chGb), core_h_used: num(usedCore), gb_h_used: num(usedGb),
                     core_h_requested: num(reqCore), gb_h_requested: num(reqGb), pods_avg: podsN ? num(pods / podsN) : null, quantity: samples, units: "samples",
                     rate_cpu_usd_core_h: C.rate_cpu, rate_mem_usd_gb_h: C.rate_mem, allocation_method: "direct_resource", metric: "k8s.chargeable" };
           facts.push(f); sum += cost;
-          if (cost > 0) { shares[s.scope_id] = cost; owners[s.scope_id] = { application_id: s.application_id, namespace_id: s.namespace_id, scope_id: s.scope_id, account_id: s.account_id, application_slug: s.app_slug || null, scope_name: s.scope_name || null, scope_type: s.scope_type || null }; }
+          if (cost > 0) { shares[s.scope_id] = cost; owners[s.scope_id] = { application_id: s.application_id, namespace_id: s.namespace_id, scope_id: s.scope_id, account_id: s.account_id, application_slug: s.app_slug || null, scope_name: s.scope_name || null, scope_type: s.scope_type || null, dimensions: s.dimensions || null }; }
         });
         var clusterCost = num(C.cost_usd); var denom = clusterCost > 0 ? Math.max(clusterCost, sum) : sum; // shares never exceed 1
         Object.keys(shares).forEach(function (k) { shares[k] = denom ? num(shares[k] / denom) : 0; });
@@ -270,8 +290,10 @@ steps:
 connections:
   - { from: start, to: prep }
   - { from: prep, to: lake_scopes }
+  - { from: prep, to: scope_dims }
   - { from: prep, to: cluster_row }
   - { from: lake_scopes, to: prep_run }
+  - { from: scope_dims, to: prep_run }
   - { from: cluster_row, to: prep_run }
   - { from: prep_run, to: collect }
   - { from: collect, to: build }

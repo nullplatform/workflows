@@ -55,6 +55,9 @@ variables:
       - { regex: "Simple Queue Service|Simple Notification Service|EventBridge|Kinesis|MSK|MQ", category: "messaging" }
       - { regex: "GuardDuty|Security Hub|Inspector|WAF|Config|Secrets Manager|Key Management|Cognito|Shield|Macie", category: "security" }
       - { regex: "CloudFront", category: "cdn" }
+  # Organization NRN: scopes (dimensions) and services listings.
+  org_nrn:
+    initialValue: "organization=1255165411"
   allocator:
     initialValue: "finops_allocate_daily@0.1.0"
 
@@ -77,6 +80,7 @@ steps:
     inputs:
       date: "${{ workflow.inputs.date }}"
       cloud_account: "${{ workflow.inputs.cloud_account }}"
+      org_nrn: "${{ variables.org_nrn }}"
     config:
       language: javascript
       code: |
@@ -85,7 +89,8 @@ steps:
         // Catalog list filters only work on fields indexed when the spec was CREATED (stage, subject_type,
         // cloud_service, cluster, …); `day` was added later and `date` is ignored → read all raw rows and
         // filter by day here. TODO: switch to the lake (customers_lake.catalog_entities) once volume grows.
-        return { day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, rule_filters: { status: "active" } };
+        var org = String(inputs.org_nrn || "");
+        return { day: day, cloud_account: inputs.cloud_account ? String(inputs.cloud_account) : null, raw_filters: { stage: "raw" }, rule_filters: { status: "active" }, scope_filters: { nrn: org, status: "active" }, service_query: { nrn: org, show_descendants: "true", limit: "500" } };
 
   - id: read_raw
     type: module
@@ -113,6 +118,32 @@ steps:
       limit: 100
       maxPages: 20
 
+  - id: scopes
+    type: module
+    plugin_type: np-entity-paginated-fetch
+    name: "Scopes (dimensions)"
+    inputs:
+      filters: "${{ steps.prep.outputs.scope_filters }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      entity: "scope"
+      filters: { status: "active" }
+      limit: 100
+      maxPages: 100
+
+  - id: services
+    type: module
+    plugin_type: np-api-call
+    name: "Services (dimensions)"
+    inputs:
+      query: "${{ steps.prep.outputs.service_query }}"
+    config:
+      apiKey: "${{ secrets.NP_API_KEY }}"
+      method: GET
+      path: "/service"
+      query: { show_descendants: "true", limit: "500" }
+      failOnHttpError: false
+
   - id: allocate
     type: module
     plugin_type: code-exec
@@ -123,6 +154,8 @@ steps:
       raw: "${{ steps.read_raw.outputs.items }}"
       rules: "${{ steps.read_rules.outputs.items }}"
       cloud_account: "${{ steps.prep.outputs.cloud_account }}"
+      scopes: "${{ steps.scopes.outputs.items }}"
+      services: "${{ steps.services.outputs.body }}"
       categories: "${{ variables.categories }}"
       allocator: "${{ variables.allocator }}"
       dry_run: "${{ workflow.inputs.dry_run }}"
@@ -138,6 +171,11 @@ steps:
         function num(x) { return Math.round((Number(x) || 0) * 1e6) / 1e6; }
         function slug(x) { return String(x).toLowerCase().replace(/[^a-z0-9_]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 100); }
         function get(obj, path) { if (path == null) return undefined; if (String(path).charAt(0) === "$") return undefined; return String(path).split(".").reduce(function (o, k) { return o == null ? undefined : o[k]; }, obj); }
+        // null dimensions by scope / service id (the API has them; the lake scope table does not)
+        var scopeInfo = {}; (inputs.scopes || []).forEach(function (sc) { if (sc && sc.id) scopeInfo[String(sc.id)] = { dimensions: sc.dimensions && Object.keys(sc.dimensions).length ? sc.dimensions : null, type: sc.type || null, name: sc.name || null }; });
+        var svcList = inputs.services; svcList = Array.isArray(svcList) ? svcList : ((svcList && (svcList.results || svcList.data)) || []);
+        var serviceInfo = {}; svcList.forEach(function (sv) { if (sv && sv.id) serviceInfo[String(sv.id)] = { dimensions: sv.dimensions && Object.keys(sv.dimensions).length ? sv.dimensions : null, name: sv.name || sv.slug || null }; });
+        function dimsFor(scopeId, serviceId, fact) { var d = scopeId && scopeInfo[scopeId] ? scopeInfo[scopeId].dimensions : (serviceId && serviceInfo[serviceId] ? serviceInfo[serviceId].dimensions : null); return d || fact.dimensions || null; }
         function categoryOf(svc) { var cats = inputs.categories || []; for (var i = 0; i < cats.length; i++) { if (new RegExp(cats[i].regex, "i").test(String(svc || ""))) return cats[i].category; } return "other"; }
 
         // ── 1) leaves per cloud service
@@ -273,18 +311,20 @@ steps:
             OWNER.forEach(function (k) { if (o[k] !== undefined) a[k] = o[k]; });
             allocated.push(a); sumAlloc += amt;
             if (o.cluster && !o.application_id) { perCluster[o.cluster] = num((perCluster[o.cluster] || 0) + amt); return; }
-            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, by_category: {}, by_cloud_service: {}, by_charge_type: {}, facts: 0, accounts: {}, charge_items: [] });
+            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, by_category: {}, by_cloud_service: {}, by_charge_type: {}, by_environment: {}, facts: 0, accounts: {}, charge_items: [] });
             app.cost_usd = num(app.cost_usd + amt); app.by_category[rcat] = num((app.by_category[rcat] || 0) + amt); app.by_cloud_service[L.service] = num((app.by_cloud_service[L.service] || 0) + amt); app.facts += 1;
             var acctOf = f.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null; if (acctOf) app.accounts[String(acctOf)] = true;
             // Invoice line: charged through a null SCOPE (any type), a null SERVICE, or the application itself.
             var scopeId = o.scope_id || f.scope_id || (p.key && hit.rule.method === "by_metric_parent" ? String(p.key) : null);
             var serviceId = !scopeId && (o.service_id || f.service_id) ? String(o.service_id || f.service_id) : null;
             var ctype = scopeId ? "scope" : serviceId ? "service" : "application";
-            var item = { charge_type: ctype, scope_id: scopeId ? String(scopeId) : null, scope_name: scopeId ? (o.scope_name || f.scope_name || null) : null, scope_type: scopeId ? (o.scope_type || f.scope_type || null) : null,
-                         service_id: serviceId, service_name: serviceId ? (f.service_name || f.subject_name || null) : null,
+            var dims = dimsFor(scopeId ? String(scopeId) : null, serviceId, f); var env = dims && dims.environment ? String(dims.environment) : null;
+            var item = { charge_type: ctype, scope_id: scopeId ? String(scopeId) : null, scope_name: scopeId ? (o.scope_name || f.scope_name || (scopeInfo[String(scopeId)] || {}).name || null) : null, scope_type: scopeId ? (o.scope_type || f.scope_type || (scopeInfo[String(scopeId)] || {}).type || null) : null,
+                         service_id: serviceId, service_name: serviceId ? (f.service_name || (serviceInfo[serviceId] || {}).name || f.subject_name || null) : null, dimensions: dims, environment: env,
                          category: rcat, cloud_service: L.service, subject_type: f.subject_type, subject_id: f.subject_id, subject_name: f.subject_name || f.subject_id, cluster: f.cluster || null, component: f.component || null,
                          cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), source_fact_id: f.id };
-            app.charge_items.push(item); app.by_charge_type[ctype] = num((app.by_charge_type[ctype] || 0) + amt);
+            app.charge_items.push(item); app.by_charge_type[ctype] = num((app.by_charge_type[ctype] || 0) + amt); var ek = env || "none"; app.by_environment[ek] = num((app.by_environment[ek] || 0) + amt);
+            a.dimensions = dims; if (env) a.environment = env;
           });
         });
         // ── 4) rollups: one per owner, one for unallocated
@@ -305,7 +345,7 @@ steps:
           items.forEach(function (it) { if (it.scope_id && (!it.scope_name || !it.scope_type)) { var kf = raw.filter(function (f) { return f.source === "k8s" && String(f.scope_id) === it.scope_id; })[0]; if (kf) { it.scope_name = it.scope_name || kf.scope_name || null; it.scope_type = it.scope_type || kf.scope_type || null; } } });
           appRows.push({ id: String(o.application_id) + "-" + d, date: d, day: d, application_id: String(o.application_id), application_slug: o.application_slug || null, namespace_id: o.namespace_id || null, account_id: o.account_id || null,
             total_usd: a.cost_usd, currency: "USD", charge_items: items, charge_items_count: items.length,
-            totals: { by_charge_type: a.by_charge_type, by_category: a.by_category, by_cloud_service: a.by_cloud_service },
+            totals: { by_charge_type: a.by_charge_type, by_environment: a.by_environment, by_category: a.by_category, by_cloud_service: a.by_cloud_service },
             cloud_accounts: Object.keys(a.accounts), allocator: String(inputs.allocator), computed_at: now });
         });
         var unTotal = num(Object.keys(unalloc).reduce(function (s, k) { return s + unalloc[k]; }, 0));
@@ -359,8 +399,12 @@ connections:
   - { from: start, to: prep }
   - { from: prep, to: read_raw }
   - { from: prep, to: read_rules }
+  - { from: prep, to: scopes }
+  - { from: prep, to: services }
   - { from: read_raw, to: allocate }
   - { from: read_rules, to: allocate }
+  - { from: scopes, to: allocate }
+  - { from: services, to: allocate }
   - { from: allocate, to: write_facts }
   - { from: write_facts, to: summary }
 

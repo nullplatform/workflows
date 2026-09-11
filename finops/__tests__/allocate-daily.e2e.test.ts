@@ -67,10 +67,16 @@ const RULES = [
   { id: 'proposed-rule', name: 'not active yet', enabled: true, status: 'proposed', priority: 1, target: { bucket: 'nope' } },
 ];
 
+const SCOPES_API = [
+  { id: 777, name: 'prod', type: 'web_pool_k8s', dimensions: { environment: 'production' } },
+  { id: 999, name: 'stage', type: 'web_pool_k8s', dimensions: { environment: 'stage' } },
+];
+const SERVICES_API = { results: [{ id: 'svc-1', name: 'Orders DB', dimensions: { environment: 'production' } }] };
+const servicesStub = { handler: () => ({ status: 'success' as const, outputs: { status: 200, body: SERVICES_API }, activePorts: ['default'] }), executeMode: 'all' as const };
 function fetchStub(raw = RAW, rules = RULES) {
   return {
     handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
-      const items = ctx.stepId === 'read_rules' ? rules : raw;
+      const items = ctx.stepId === 'read_rules' ? rules : ctx.stepId === 'scopes' ? SCOPES_API : raw;
       return { status: 'success' as const, outputs: { items, totalFetched: items.length, pages: 1 }, activePorts: ['default'] };
     },
     executeMode: 'all' as const,
@@ -86,6 +92,7 @@ describe('finops/wf2-allocate-daily', () => {
       pluginStubs: {
         manual: passthroughTrigger,
         'np-entity-paginated-fetch': fetchStub(),
+        'np-api-call': servicesStub,
         'sub-workflow': {
           handler: (ctx: { inputs: Record<string, unknown> }) => {
             written.push(ctx.inputs.fact as Record<string, unknown>);
@@ -141,12 +148,15 @@ describe('finops/wf2-allocate-daily', () => {
     type Item = Record<string, unknown>;
     const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; charge_items: Item[]; totals: { by_charge_type: Record<string, number>; by_category: Record<string, number>; by_cloud_service: Record<string, number> } };
     expect(app100).toMatchObject({ date: D, day: D, application_id: '100', namespace_id: '5', total_usd: 30, currency: 'USD', charge_items_count: 6, cloud_accounts: ['111122223333'] });
-    expect(app100.totals).toEqual({ by_charge_type: { scope: 6, service: 12, application: 12 }, by_category: { compute: 2, database: 24, kubernetes: 4 }, by_cloud_service: { [EC2]: 4.5, [RDS]: 24, [VPC]: 1.5 } });
+    expect(app100.totals).toEqual({ by_charge_type: { scope: 6, service: 12, application: 12 }, by_environment: { production: 18, none: 12 }, by_category: { compute: 2, database: 24, kubernetes: 4 }, by_cloud_service: { [EC2]: 4.5, [RDS]: 24, [VPC]: 1.5 } });
     expect(app100.charge_items.map((i) => [i.charge_type, i.subject_id, i.cost_usd])).toEqual([
       ['service', 'orders-db', 12], ['application', 'shared-db', 6], ['application', 'metrics-db', 6], ['scope', 'runtime|nodes', 2.5], ['scope', '777', 2], ['scope', 'runtime|networking', 1.5],
     ]);
-    expect(app100.charge_items[0]).toMatchObject({ charge_type: 'service', service_id: 'svc-1', service_name: 'Orders DB', scope_id: null, category: 'database', rule_id: 'default:null-service', share: 1 });
-    expect(app100.charge_items[3]).toMatchObject({ charge_type: 'scope', scope_id: '777', component: 'nodes', cluster: 'runtime', category: 'kubernetes', allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', share: 0.5 });
+    expect(app100.charge_items[0]).toMatchObject({ charge_type: 'service', service_id: 'svc-1', service_name: 'Orders DB', scope_id: null, category: 'database', rule_id: 'default:null-service', share: 1, dimensions: { environment: 'production' }, environment: 'production' });
+    expect(app100.charge_items[3]).toMatchObject({ charge_type: 'scope', scope_id: '777', scope_name: 'prod', scope_type: 'web_pool_k8s', environment: 'production', component: 'nodes', cluster: 'runtime', category: 'kubernetes', allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', share: 0.5 });
+    expect(app100.charge_items[1]).toMatchObject({ environment: null, dimensions: null });
+    // the allocated fact rows carry the dimensions too
+    expect(byId[`alloc-scope-777-${D}-app-100`]).toMatchObject({ dimensions: { environment: 'production' }, environment: 'production' });
     expect(app100.charge_items[4]).toMatchObject({ charge_type: 'scope', scope_id: '777', subject_type: 'scope', category: 'compute', rule_id: 'default:null-dims' });
     expect(app100.charge_items[1]).toMatchObject({ charge_type: 'application', scope_id: null, service_id: null, allocation_method: 'split', rule_id: 'shared-db-by-database' });
     const sum = Object.values(app100.totals.by_charge_type).reduce((a, b) => a + b, 0);
@@ -178,11 +188,11 @@ describe('finops/wf2-allocate-daily', () => {
   it('dry_run computes everything and writes nothing; no raw facts is an error', async () => {
     const written: unknown[] = [];
     const stub = { handler: (ctx: { inputs: Record<string, unknown> }) => { written.push(ctx.inputs.fact); return { status: 'success' as const, outputs: {}, activePorts: ['default'] }; }, executeMode: 'all' as const };
-    const r = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'sub-workflow': stub } });
+    const r = await runWorkflowE2E({ yamlPath: YAML, inputs: { date: D, dry_run: true }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub(), 'np-api-call': servicesStub, 'sub-workflow': stub } });
     expect(written).toHaveLength(0);
     expect((r.outputs?.summary as { written: number; dry_run: boolean })).toMatchObject({ written: 0, dry_run: true });
     await expect(
-      runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub([], []), 'sub-workflow': stub } }),
+      runWorkflowE2E({ yamlPath: YAML, inputs: { date: '2026-01-01' }, pluginStubs: { manual: passthroughTrigger, 'np-entity-paginated-fetch': fetchStub([], []), 'np-api-call': servicesStub, 'sub-workflow': stub } }),
     ).rejects.toThrow(/no raw facts for 2026-01-01/);
   });
 });

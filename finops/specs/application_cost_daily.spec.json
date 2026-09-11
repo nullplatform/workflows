@@ -94,7 +94,7 @@
       },
       "charge_items": {
         "type": "array",
-        "description": "Invoice lines: [{charge_type: scope|service|application, scope_id, scope_name, scope_type, service_id, service_name, category, cloud_service, subject_type, subject_id, subject_name, cluster, component, cost_usd, share, allocation_method, rule_id, source_fact_id}] \u2014 every key present (null when it does not apply) so lake queries can arrayJoin/JSONExtract uniformly",
+        "description": "Invoice lines: [{charge_type: scope|service|application, scope_id, scope_name, scope_type, service_id, service_name, dimensions, environment, category, cloud_service, subject_type, subject_id, subject_name, cluster, component, cost_usd, share, allocation_method, rule_id, source_fact_id}] \u2014 every key present (null when it does not apply)",
         "items": {
           "type": "object",
           "additionalProperties": true
@@ -102,7 +102,7 @@
       },
       "totals": {
         "type": "object",
-        "description": "{by_charge_type: {scope, service, application}, by_category: {\u2026}, by_cloud_service: {\u2026}}",
+        "description": "{by_charge_type: {scope, service, application}, by_environment: {production, stage, \u2026, none}, by_category: {\u2026}, by_cloud_service: {\u2026}}",
         "additionalProperties": true
       },
       "charge_items_count": {

@@ -607,7 +607,7 @@ steps:
             var np = nrnParts(sv.entity_nrn || sv.nrn);
             f.service_id = String(sv.id); f.service_name = sv.name || sv.slug || null; f.subject_name = sv.name || db.id; f.nrn = sv.entity_nrn || null;
             if (np.application) f.application_id = np.application; if (np.namespace) f.namespace_id = np.namespace; if (np.account) f.account_id = np.account;
-            var dm = sv.dimensions || {}; if (dm.environment) f.environment = dm.environment;
+            var dm = sv.dimensions || {}; if (dm.environment) f.environment = dm.environment; f.dimensions = Object.keys(dm).length ? dm : null;
             f.allocation_method = "service_owner";
           }
           // Performance Insights db.load by database → shares (evidence for by_metric rules; a shared cluster
