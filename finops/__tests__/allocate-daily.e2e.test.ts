@@ -147,7 +147,8 @@ describe('finops/wf2-allocate-daily', () => {
     expect(summary.written).toBe(facts.length);
     for (const f of facts) for (const k of ['id', 'date', 'day', 'stage', 'subject_type', 'subject_id', 'cloud', 'cost_usd', 'source', 'allocation_method', 'collected_at']) expect(f[k], `${f.id}.${k}`).toBeDefined();
     const unl = result.outputs?.unallocated_leaves as Array<Record<string, unknown>>;
-    expect(unl.map((u) => u.id)).toEqual([`raw-cloud_service-cloudwatch-${D}-remainder`, `raw-cloud_service-ec2-${D}-remainder`, `raw-bucket-ec2-instances-unattributed-${D}`]);
+    expect(unl.map((u) => u.id)).toEqual([`raw-cloud_service-cloudwatch-${D}-remainder`, `raw-cloud_service-ec2-${D}-remainder`, `raw-bucket-ec2-instances-unattributed-${D}`, `raw-service-metrics-db-${D}#scratch`]);
+    expect(unl[3]).toMatchObject({ kind: 'metric_key', metric_key: 'scratch', cost_usd: 1, rule_id: 'metrics-db-by-load', host: 'metrics-db.cluster-abc.us-east-1.rds.amazonaws.com' });
   });
 
   it('dry_run computes everything and writes nothing; no raw facts is an error', async () => {

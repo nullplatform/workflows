@@ -281,7 +281,13 @@ steps:
         var svcTotal = num(services.reduce(function (s, f) { return s + (Number(f.cost_usd) || 0); }, 0));
         if (Math.abs(sumAlloc - sumLeaves) > 0.01 || Math.abs(sumLeaves - svcTotal) > 0.01) throw new Error("allocation does not reconcile: services " + svcTotal + " leaves " + sumLeaves + " allocated " + sumAlloc);
         var apps = Object.keys(perApp).map(function (k) { var a = perApp[k]; return { owner: k, application_id: a.owner.application_id || null, cost_usd: a.cost_usd, by_category: a.by_category }; }).sort(function (x, y) { return y.cost_usd - x.cost_usd; });
-        var unLeaves = leaves.filter(function (L) { return !evaluate(L.fact); }).map(function (L) { return { id: L.fact.id, cloud_service: L.service, subject_type: L.fact.subject_type, subject_id: L.fact.subject_id, resource_type: L.fact.resource_type || null, host: L.fact.host || null, tags: L.fact.tags || null, cost_usd: num(L.fact.cost_usd), kind: L.kind }; }).sort(function (x, y) { return y.cost_usd - x.cost_usd; });
+        var unLeaves = leaves.filter(function (L) { return !evaluate(L.fact); }).map(function (L) { return { id: L.fact.id, cloud_service: L.service, subject_type: L.fact.subject_type, subject_id: L.fact.subject_id, resource_type: L.fact.resource_type || null, host: L.fact.host || null, tags: L.fact.tags || null, cost_usd: num(L.fact.cost_usd), kind: L.kind }; });
+        // by_metric keys nobody owns (a new database on a shared cluster, …) are candidates too: the
+        // suggestion pass proposes a map entry from the key name, the DB users and the DB_NAME parameters.
+        allocated.forEach(function (a) {
+          if (a.metric_key && a.allocation_method === "unallocated") unLeaves.push({ id: a.source_fact_id + "#" + a.metric_key, cloud_service: a.cloud_service, subject_type: a.subject_type, subject_id: a.subject_id, resource_type: a.resource_type || null, host: byId[a.source_fact_id] ? (byId[a.source_fact_id].host || null) : null, tags: null, cost_usd: a.cost_usd, kind: "metric_key", metric_key: a.metric_key, rule_id: a.rule_id });
+        });
+        unLeaves.sort(function (x, y) { return y.cost_usd - x.cost_usd; });
         return { day: d, facts: allocated, to_write: inputs.dry_run ? [] : allocated, count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0)),
                  cluster_pending_usd: perCluster, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
                  unallocated_leaves: unLeaves.slice(0, 200) };

@@ -20,6 +20,9 @@ const LEAVES = [
   { id: `raw-service-orders-db-${D}`, cloud_service: RDS, subject_type: 'service', subject_id: 'orders-db', subject_name: 'orders-db', resource_type: 'rds:cluster', host: ORDERS, cost_usd: 12 },
   { id: `raw-cloud_service-guardduty-${D}-remainder`, cloud_service: 'Amazon GuardDuty', subject_type: 'cloud_service', subject_id: 'guardduty', cost_usd: 1 },
   { id: `raw-bucket-tiny-${D}`, cloud_service: RDS, subject_type: 'service', subject_id: 'tiny-db', host: 'tiny.rds.amazonaws.com', cost_usd: 0.01 },
+  // by_metric keys nobody owns: one matches a DB_NAME parameter, one matches an application slug by name
+  { id: `raw-service-shared-db-${D}#orders`, cloud_service: RDS, subject_type: 'service', subject_id: 'shared-db', subject_name: 'shared-db', resource_type: 'rds:cluster', host: SHARED, cost_usd: 2, kind: 'metric_key', metric_key: 'orders', rule_id: 'shared-by-load' },
+  { id: `raw-service-shared-db-${D}#users_api_production`, cloud_service: RDS, subject_type: 'service', subject_id: 'shared-db', subject_name: 'shared-db', resource_type: 'rds:cluster', host: SHARED, cost_usd: 0.5, kind: 'metric_key', metric_key: 'users_api_production', rule_id: 'shared-by-load' },
 ];
 const SERVICES = { results: [{ id: 'svc-1', name: 'Orders DB', slug: 'orders-db', entity_nrn: 'organization=4:account=17:namespace=5:application=100', attributes: { host: ORDERS } }] };
 const APPS = [
@@ -59,7 +62,10 @@ describe('finops/wf-suggest-mappings', () => {
     });
     const sugg = result.outputs?.suggestions as Array<Record<string, unknown>>;
     const summary = result.outputs?.summary as Record<string, unknown>;
-    expect(sugg.map((s) => s.id)).toEqual([`sugg-orders-db-${D}`, `sugg-shared-db-${D}`]); // by recovered USD; tiny (< min_usd) and GuardDuty (no evidence) skipped
+    expect(sugg.map((s) => s.id)).toEqual([`sugg-orders-db-${D}`, `sugg-shared-db-${D}`, `sugg-shared-db-orders-${D}`, `sugg-shared-db-users_api_production-${D}`]); // by recovered USD; tiny (< min_usd) and GuardDuty (no evidence) skipped
+    // metric keys: DB_NAME parameter (0.7) and slug naming (0.5) → a map entry for the by_metric rule
+    expect(sugg[2]).toMatchObject({ confidence: 0.7, recovers_usd: 2, rule: { for_rule: 'shared-by-load', map_entry: { key: 'orders', target: { application_id: '100', application_slug: 'orders-api' } } } });
+    expect(sugg[3]).toMatchObject({ confidence: 0.5, rule: { map_entry: { key: 'users_api_production', target: { application_id: '200', application_slug: 'users-api' } } } });
 
     const orders = sugg[0] as { rule: Record<string, unknown>; evidence: Array<Record<string, unknown>>; confidence: number };
     expect(orders.confidence).toBe(0.95);
@@ -73,8 +79,8 @@ describe('finops/wf-suggest-mappings', () => {
     expect(shared.rule.target.split.map((p) => [p.weight, p.target.application_id, p.target.application_slug])).toEqual([[1, '100', 'orders-api'], [1, '200', 'users-api']]);
     expect(shared.evidence.map((e) => e.kind)).toEqual(['parameter', 'parameter']);
 
-    expect(summary).toMatchObject({ suggestions: 2, recovers_usd: 20, apps_scanned: 3, services: 1, written: 2 });
-    expect(written.map((w) => w.catalog_slug)).toEqual(['cost_mapping_suggestion', 'cost_mapping_suggestion']);
+    expect(summary).toMatchObject({ suggestions: 4, recovers_usd: 22.5, apps_scanned: 3, services: 1, written: 4 });
+    expect(new Set(written.map((w) => w.catalog_slug))).toEqual(new Set(['cost_mapping_suggestion']));
     expect((written[0]?.fact as { status: string }).status).toBe('proposed');
   });
 });

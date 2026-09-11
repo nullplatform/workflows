@@ -187,8 +187,31 @@ steps:
             hosts.forEach(function (h) { addConsumer(h, app, p.name); });
           }); });
         });
+        // DB_NAME-like parameter values → app (for by_metric keys = database names); app slugs normalized for name matching.
+        var dbNameOwners = {}; var slugIndex = {};
+        apps.forEach(function (a) { slugIndex[String(a.slug).toLowerCase().replace(/[^a-z0-9]+/g, "")] = a; });
+        paramsByApp.forEach(function (res, i) {
+          var app = apps[i]; if (!app) return;
+          var body = (res || {}).body || res || {}; (body.results || []).forEach(function (p) {
+            if (!/(DB_NAME|DATABASE|PG_?DB|DBNAME)/i.test(String(p.name))) return;
+            (p.values || []).forEach(function (v) { var val = String((v || {}).value || "").trim(); if (val && !/amazonaws|:/.test(val)) (dbNameOwners[val.toLowerCase()] = dbNameOwners[val.toLowerCase()] || []).push({ app: app, param: p.name }); });
+          });
+        });
+        function normKey(k) { return String(k).toLowerCase().replace(/_(production|prod|stage|staging|db|database)$/g, "").replace(/[^a-z0-9]+/g, ""); }
         var out = [];
         (inputs.candidates || []).forEach(function (L) {
+          if (L.kind === "metric_key" && L.metric_key) {
+            var key = String(L.metric_key); var ev = []; var owner = null;
+            (dbNameOwners[key.toLowerCase()] || []).forEach(function (c) { if (!owner) owner = { application_id: c.app.id, namespace_id: c.app.namespace_id, application_slug: c.app.slug }; ev.push({ kind: "parameter", detail: c.app.slug + " parameter " + c.param + " = " + key, application_id: c.app.id, application_slug: c.app.slug }); });
+            var nk = normKey(key); var bySlug = slugIndex[nk] || slugIndex[nk + "api"] || slugIndex[nk.replace(/api$/, "")];
+            if (bySlug) { if (!owner) owner = { application_id: bySlug.id, namespace_id: bySlug.namespace_id, application_slug: bySlug.slug }; ev.push({ kind: "naming", detail: "database " + key + " ~ application slug " + bySlug.slug, application_id: bySlug.id, application_slug: bySlug.slug }); }
+            if (!owner) return;
+            var conf = ev.some(function (e) { return e.kind === "parameter"; }) ? 0.7 : 0.5;
+            out.push({ id: "sugg-" + slug(L.subject_id) + "-" + slug(key) + "-" + d, name: "map " + key + " → " + owner.application_slug + " on " + (L.subject_name || L.subject_id),
+                       status: "proposed", day: d, cloud_service: L.cloud_service, resource_type: L.resource_type || null, subject_id: String(L.subject_id), recovers_usd: num(L.cost_usd), confidence: conf,
+                       rule: { for_rule: L.rule_id || null, map_entry: { key: key, target: owner } }, evidence: ev, created_at: now, updated_at: now, source: String(inputs.suggester) });
+            return;
+          }
           var host = String(L.host || "").toLowerCase(); var cost = num(L.cost_usd);
           var evidence = []; var owners = [];
           if (host && byHost[host]) {
