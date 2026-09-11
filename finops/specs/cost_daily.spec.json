@@ -599,6 +599,21 @@
           "null"
         ],
         "description": "scope_usage_daily row this k8s scope fact was priced from (usage-<scope_id>-<day>)"
+      },
+      "service_kind": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "null",
+          "cloud",
+          null
+        ],
+        "description": "service charges: null = a registered null service; cloud = a cloud resource acting as a service (database, cache) with no null service registered",
+        "index": [
+          "filter"
+        ]
       }
     },
     "required": [

@@ -267,7 +267,7 @@ steps:
         if (roleArn && !/^arn:aws:iam::\d{12}:role\/[\w+=,.@\/-]+$/.test(roleArn)) throw new Error("assume_role_arn is not an IAM role ARN: " + roleArn);
         var roleExt = String(inputs.role_ext || inputs.role_ext_default || "").trim();
         var ver = String(inputs.package_version || inputs.package_version_default || "").trim();
-        var acctNp = /account=(\d+)/.exec(String(agentNrn || "")); return { day: day, calls: calls, agent_tags: tags, agent_nrn: agentNrn || null, account_np_id: acctNp ? acctNp[1] : "", org_nrn: orgNrn, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null, package_version: ver || null };
+        var acctNp = /account=(\d+)/.exec(String(agentNrn || "")); return { day: day, calls: calls, agent_tags: tags, agent_nrn: agentNrn || null, account_np_id: acctNp ? acctNp[1] : "", services_nrn: acctNp ? String(agentNrn) : orgNrn, org_nrn: orgNrn, region: String(inputs.region), assume_role_arn: roleArn || null, assume_role_external_id: roleExt || null, package_version: ver || null };
 
   - id: query
     type: module
@@ -364,9 +364,10 @@ steps:
     name: "null services (descendants)"
     inputs:
       day: "${{ steps.prep.outputs.day }}"
-      # Inputs override config in np-api-call; the NRN is per run (org override).
+      # Inputs override config in np-api-call; the NRN is per run. The listing is capped at 500 rows,
+      # so it is scoped to the AGENT's subtree (the account) when there is one — an org can have thousands.
       query:
-        nrn: "${{ steps.prep.outputs.org_nrn }}"
+        nrn: "${{ steps.prep.outputs.services_nrn }}"
         show_descendants: "true"
         limit: "500"
     config:

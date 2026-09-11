@@ -327,9 +327,14 @@ steps:
             // The null OBJECT the cost came through (a scope of any type, a service, or the application) + its dimensions.
             var scopeId = o.scope_id || f.scope_id || (p.key && hit.rule.method === "by_metric_parent" ? String(p.key) : null);
             var serviceId = !scopeId && (o.service_id || f.service_id) ? String(o.service_id || f.service_id) : null;
-            a.charge_type = scopeId ? "scope" : serviceId ? "service" : "application";
+            // A cloud resource that acts as a service (a database, a cache) without a null service registered
+            // for it is still charged as a SERVICE — flagged service_kind "cloud" (vs "null") so the invoice
+            // and the dashboard can tell them apart.
+            var cloudSvc = !scopeId && !serviceId && f.subject_type === "service" && f.subject_id ? String(f.subject_id) : null;
+            a.charge_type = scopeId ? "scope" : (serviceId || cloudSvc) ? "service" : "application";
             if (scopeId) { a.scope_id = String(scopeId); a.scope_name = a.scope_name || (scopeInfo[String(scopeId)] || {}).name || null; a.scope_type = a.scope_type || (scopeInfo[String(scopeId)] || {}).type || null; }
-            if (serviceId) { a.service_id = serviceId; a.service_name = a.service_name || (serviceInfo[serviceId] || {}).name || f.subject_name || null; }
+            if (serviceId) { a.service_id = serviceId; a.service_name = a.service_name || (serviceInfo[serviceId] || {}).name || f.subject_name || null; a.service_kind = "null"; }
+            if (cloudSvc) { a.service_id = "cloud:" + slug(cloudSvc); a.service_name = f.subject_name || cloudSvc; a.service_kind = "cloud"; }
             var dims = dimsFor(scopeId ? String(scopeId) : null, serviceId, f); var env = dims && dims.environment ? String(dims.environment) : null;
             a.dimensions = dims; if (env) a.environment = env;
             a.cloud_account = a.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null;
