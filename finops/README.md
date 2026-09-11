@@ -70,3 +70,47 @@ the published engine); the E2E tests run against the stub and pass.
    `NP_PACKAGE_CALL_CALLS_FAILED` (`RESULT_TOO_LARGE`, 1.5 MB vs 300 KB cap)
    delivered through the callback, again with a single delivery — no re-delivery
    storm.
+
+## Deploying to an organization (done for nullplatform, org 4, 2026-09-11)
+
+Everything is per organization; nothing is registered on the platform as a package.
+
+1. **Worker identity** (once per cluster). The controlplane-agent spawns the collector as
+   a pod in its worker namespace; without an identity of its own the pod runs as the NODE
+   role. Give it a read-only role + ServiceAccount + an agent rule:
+   - IaC (nullplatform's own runtime): `iac-null-runtime` `iam/roles.tf` `k8s_np_finops_worker`
+     (IRSA) + `k8s/np_finops_worker.tf` (SA `np-workers/np-finops-worker`).
+   - Any other cluster: `setup/02-aws-worker-identity.sh --cluster <name>` (Pod Identity)
+     or `docs/iam/` by hand.
+   - Agent: `NP_ALLOWED_REGISTRIES` must include `public.ecr.aws/nullplatform/*` and
+     `NP_WORKER_RULES` must map the image to the SA:
+     `[{"match":{"registry":"public.ecr.aws/nullplatform/agent-plugins/workflows/aws-cost-explorer","package":"cloud-query"},"serviceAccount":"np-finops-worker"}]`
+     (restart the agent). Verify with a sync `sts GetCallerIdentity` through the tool.
+2. **Catalog spec**: `setup/01-catalog-spec.sh` (session bearer; grants must name a user of
+   THAT org — see `specs/cost_daily.spec.json`).
+3. **Secret**: `POST /workflows/config {"name":"NP_API_KEY","value":…,"secret":true,"path":"/finops"}`
+   with a session bearer (an org API key with catalog + agent_command grants).
+4. **Per-org values**: copy `setup/vars.nullplatform.json` — agent tags + `agent_nrn`
+   (REQUIRED when the agent is registered under an account: the control plane does not
+   find account-level agents from the organization root), `org_nrn`, dispatcher targets.
+5. **Publish** (from the engine repo, so the DSL parser resolves):
+   `NP_TOKEN=<bearer> pnpm tsx finops/setup/publish.ts finops --base https://api.nullplatform.com --vars finops/setup/vars.<org>.json`
+   and later `--update tool-cloud-query.yaml=<id>,…` for new revisions. The dispatcher
+   (`wf0`) owns the schedule (04:15 UTC); `wf1` has no cron of its own.
+6. **First run**: execute `wf0` with `{"date":"YYYY-MM-DD","dry_run":true}`, read the
+   child's `summary`, then run it for real. Rows: `GET /catalog/instances/cost_daily?stage=raw&subject_type=cluster`
+   (the `date` query filter is ignored by the catalog list API today — filter on other
+   fields or query the lake).
+
+### What nullplatform's first day looked like (2026-09-09, account 283477532906)
+
+275 rows: 38 `cloud_service`, 222 `bucket` (usage types + cluster components + one
+`ec2-instances-unattributed`), 9 `scope`, 7 `service` (RDS clusters, 2 mapped to null
+services by host), 1 `cluster`, 1 `resource`. Total 383.20 USD amortized.
+
+Known gap: Karpenter nodes that terminated before collection are not in `DescribeInstances`,
+so their cost (539 instance-days, 64.74 USD) lands in `ec2-instances-unattributed` instead
+of the cluster's `nodes` component, and the blended rates come out high. Fix: activate
+`aws:eks:cluster-name` as a cost allocation tag (Billing → Cost allocation tags; today only
+`application`, `namespace`, `scope` are active) and group the EC2 resource query by that
+tag — terminated instances keep their tags in Cost Explorer.
