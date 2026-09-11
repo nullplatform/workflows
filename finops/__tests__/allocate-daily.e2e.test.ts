@@ -32,7 +32,10 @@ const RAW = [
     cost_usd: 2, scope_id: '777', application_id: '100', namespace_id: '5', account_id: '1', tags: { scope_id: '777', application_id: '100' }, resource_id: 'i-1', resource_type: 'ec2:instance' },
   { id: `raw-bucket-runtime-nodes-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'runtime|nodes', subject_name: 'runtime / nodes', cloud: 'aws', cloud_service: EC2, cluster: 'runtime', component: 'nodes', parent_id: `raw-cluster-runtime-${D}`, cost_usd: 5 },
   { id: `raw-bucket-ec2-instances-unattributed-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'ec2-instances-unattributed', subject_name: 'EC2 instances not attributable', cloud: 'aws', cloud_service: EC2, parent_id: `raw-cloud_service-ec2-${D}`, cost_usd: 1, resource_type: 'ec2:instance' },
-  { id: `raw-cluster-runtime-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cluster', subject_id: 'runtime', cloud: 'aws', cluster: 'runtime', cost_usd: 8 },
+  { id: `raw-cluster-runtime-${D}`, date: D, day: D, stage: 'raw', subject_type: 'cluster', subject_id: 'runtime', cloud: 'aws', cluster: 'runtime', cost_usd: 8,
+    metric: 'k8s.chargeable', metric_shares: { 777: 0.5, 999: 0.25 }, metric_owners: { 777: { application_id: '100', namespace_id: '5', scope_id: '777' }, 999: { application_id: '400', scope_id: '999' } } },
+  // k8s consumption rows (wf3) — informational for the allocator, summarized into application_cost_daily.kubernetes
+  { id: `raw-k8s-scope-777-${D}`, date: D, day: D, stage: 'raw', subject_type: 'scope', subject_id: '777', cloud: 'aws', source: 'k8s', cluster: 'runtime', application_id: '100', scope_id: '777', cost_usd: 4, core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, usage_usd: 1, waste_usd: 3 },
   { id: `raw-bucket-runtime-networking-${D}`, date: D, day: D, stage: 'raw', subject_type: 'bucket', subject_id: 'runtime|networking', subject_name: 'runtime / networking', cloud: 'aws', cloud_service: VPC, cluster: 'runtime', component: 'networking', parent_id: `raw-cluster-runtime-${D}`, cost_usd: 3 },
   // RDS: one cluster mapped by wf1 (host = null service), one shared cluster with no owner
   { id: `raw-service-orders-db-${D}`, date: D, day: D, stage: 'raw', subject_type: 'service', subject_id: 'orders-db', subject_name: 'Orders DB', cloud: 'aws', cloud_service: RDS, parent_id: `raw-cloud_service-rds-${D}`,
@@ -114,9 +117,11 @@ describe('finops/wf2-allocate-daily', () => {
     expect(byId[`alloc-service-metrics-db-${D}-scratch-unallocated`]).toMatchObject({ cost_usd: 1, share: 0.1, allocation_method: 'unallocated', metric_key: 'scratch', rule_id: 'metrics-db-by-load' });
     // regex capture → application_slug
     expect(byId[`alloc-resource-loggroup-catalog-entities-api-${D}-app-entities-api`]).toMatchObject({ application_slug: 'entities-api', cost_usd: 1.5, rule_id: 'log-groups-by-name', category: 'observability' });
-    // cluster components wait for phase 3
-    expect(byId[`alloc-bucket-runtime-nodes-${D}-cluster-runtime`]).toMatchObject({ cluster: 'runtime', cost_usd: 5, allocation_method: 'cluster_pending_consumption', rule_id: 'default:cluster' });
-    expect(byId[`alloc-bucket-runtime-networking-${D}-cluster-runtime`]).toMatchObject({ cost_usd: 3, category: 'network' });
+    // cluster components split by the consumption metric on the cluster row; the uncovered share is k8s overhead
+    expect(byId[`alloc-bucket-runtime-nodes-${D}-app-100`]).toMatchObject({ application_id: '100', scope_id: '777', cost_usd: 2.5, share: 0.5, allocation_method: 'by_metric', rule_id: 'default:cluster-consumption', category: 'kubernetes' });
+    expect(byId[`alloc-bucket-runtime-nodes-${D}-app-400`]).toMatchObject({ application_id: '400', cost_usd: 1.25 });
+    expect(byId[`alloc-bucket-runtime-nodes-${D}-cluster-runtime`]).toMatchObject({ cluster: 'runtime', cost_usd: 1.25, share: 0.25, allocation_method: 'kubernetes_overhead' });
+    expect(byId[`alloc-bucket-runtime-networking-${D}-app-100`]).toMatchObject({ cost_usd: 1.5, category: 'kubernetes' });
     // security → shared bucket with the rule's category
     expect(byId[`alloc-cloud_service-guardduty-${D}-remainder-bucket-shared-platform`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1, category: 'security', rule_id: 'security-is-platform' });
     // what nobody claims
@@ -128,8 +133,19 @@ describe('finops/wf2-allocate-daily', () => {
     expect(facts.some((f) => f.source_fact_id === `raw-cluster-runtime-${D}`)).toBe(false);
 
     // rollups
-    expect(byId[`alloc-app-100-${D}`]).toMatchObject({ subject_type: 'application', application_id: '100', cost_usd: 26, by_category: { compute: 2, database: 24 }, quantity: 4 });
+    expect(byId[`alloc-app-100-${D}`]).toMatchObject({ subject_type: 'application', application_id: '100', cost_usd: 30, by_category: { compute: 2, database: 24, kubernetes: 4 }, quantity: 6 });
     expect(byId[`alloc-app-300-${D}`]).toMatchObject({ cost_usd: 3 });
+    expect(byId[`alloc-app-400-${D}`]).toMatchObject({ cost_usd: 2 });
+    // application_cost_daily: the per-app entity with the detail
+    const appRows = result.outputs?.app_rows as Array<Record<string, unknown>>;
+    const app100 = appRows.find((r) => r.id === `100-${D}`) as { total_usd: number; direct_usd: number; kubernetes_usd: number; items: Array<Record<string, unknown>>; kubernetes: Record<string, unknown>; by_category: Record<string, number> };
+    expect(app100).toMatchObject({ application_id: '100', namespace_id: '5', total_usd: 30, direct_usd: 26, kubernetes_usd: 4, by_category: { compute: 2, database: 24, kubernetes: 4 }, facts: 6, cloud_accounts: ['111122223333'] });
+    expect(app100.items).toHaveLength(6);
+    expect(app100.items[0]).toMatchObject({ subject_id: 'orders-db', cost_usd: 12, rule_id: 'default:null-service' });
+    expect(app100.items.find((i) => i.component === 'nodes')).toMatchObject({ scope_id: '777', cost_usd: 2.5, allocation_method: 'by_metric' });
+    expect(app100.kubernetes).toEqual({ core_h_chargeable: 48, gb_h_chargeable: 96, core_h_used: 10, gb_h_used: 40, usage_usd: 1, waste_usd: 3, scopes: 1 });
+    expect(appRows.map((r) => r.id).sort()).toEqual([`100-${D}`, `200-${D}`, `300-${D}`, `400-${D}`]);
+    expect(written.filter((w) => (w as { id: string }).id === `100-${D}`)).toHaveLength(1);
     expect(byId[`alloc-app-200-${D}`]).toMatchObject({ cost_usd: 2 });
     expect(byId[`alloc-bucket-shared-platform-${D}`]).toMatchObject({ bucket: 'shared-platform', cost_usd: 1 });
     expect(byId[`alloc-unallocated-${D}`]).toMatchObject({ subject_type: 'unallocated', cost_usd: 6.5, by_cloud_service: { [EC2]: 3, [CW]: 2.5, [RDS]: 1 } });
@@ -138,13 +154,13 @@ describe('finops/wf2-allocate-daily', () => {
     const leafRows = facts.filter((f) => f.allocation_method !== 'rollup' && f.subject_type !== 'unallocated');
     expect(leafRows.reduce((s, f) => s + Number(f.cost_usd), 0)).toBeCloseTo(48, 6);
     expect(summary.unallocated_usd).toBe(6.5);
-    expect(summary.cluster_pending_usd).toEqual({ runtime: 8 });
-    expect(summary.allocated_usd).toBeCloseTo(33.5, 6);
-    expect((summary.applications as Array<{ owner: string; cost_usd: number }>)[0]).toMatchObject({ owner: 'app-100', cost_usd: 26 });
+    expect(summary.cluster_pending_usd).toEqual({ runtime: 2 });
+    expect(summary.allocated_usd).toBeCloseTo(39.5, 6);
+    expect((summary.applications as Array<{ owner: string; cost_usd: number }>)[0]).toMatchObject({ owner: 'app-100', cost_usd: 30 });
 
-    // everything was written, every row carries the required keys
-    expect(written).toHaveLength(facts.length);
-    expect(summary.written).toBe(facts.length);
+    // everything was written (allocated facts + one application_cost_daily row per app), every fact carries the required keys
+    expect(written).toHaveLength(facts.length + 4);
+    expect(summary.written).toBe(facts.length + 4);
     for (const f of facts) for (const k of ['id', 'date', 'day', 'stage', 'subject_type', 'subject_id', 'cloud', 'cost_usd', 'source', 'allocation_method', 'collected_at']) expect(f[k], `${f.id}.${k}`).toBeDefined();
     const unl = result.outputs?.unallocated_leaves as Array<Record<string, unknown>>;
     expect(unl.map((u) => u.id)).toEqual([`raw-cloud_service-cloudwatch-${D}-remainder`, `raw-cloud_service-ec2-${D}-remainder`, `raw-bucket-ec2-instances-unattributed-${D}`, `raw-service-metrics-db-${D}#scratch`]);

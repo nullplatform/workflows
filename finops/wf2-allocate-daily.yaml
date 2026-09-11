@@ -201,6 +201,16 @@ steps:
             if (!e) return [];
             return [{ share: 1, owner: resolveTarget(e, fact, caps) }].filter(function (x) { return x.owner; });
           }
+          if (method === "by_metric_parent") {
+            // Cluster components: the consumption metric lives on the PARENT cluster row (wf3 attaches
+            // metric_shares {scope_id → share} + metric_owners {scope_id → dims}). Shares sum to < 1: the
+            // rest (system namespaces, idle headroom) stays with the cluster as k8s overhead.
+            var parent = byId[fact.parent_id]; if (!parent || !parent.metric_shares) return [];
+            var ps = parent.metric_shares; var po = parent.metric_owners || {}; var out = []; var covered = 0;
+            Object.keys(ps).forEach(function (k) { var sh = Number(ps[k]) || 0; if (sh <= 0) return; covered += sh; var o = po[k] ? resolveTarget(po[k], fact, caps) : null; out.push(o ? { share: sh, owner: o, key: k } : { share: sh, owner: null, key: k }); });
+            if (covered < 1) out.push({ share: num(1 - covered), owner: { cluster: String(fact.cluster) }, key: "kubernetes-overhead", overhead: true });
+            return out;
+          }
           if (method === "by_metric") {
             // The fact carries `metric_shares` {key → share} (e.g. Performance Insights db.load by db.name,
             // attached by the collector). `target.map.entries` maps each key to an owner; keys without an
@@ -219,6 +229,7 @@ steps:
         var defaults = [
           { id: "default:null-service", match: [{ field: "service_id", exists: true }, { field: "application_id", exists: true }], target: { capture: { application_id: "application_id", namespace_id: "namespace_id", service_id: "service_id", account_id: "account_id" } } },
           { id: "default:null-dims", match: [{ field: "application_id", exists: true }], target: { capture: { application_id: "application_id", namespace_id: "namespace_id", scope_id: "scope_id", account_id: "account_id" } } },
+          { id: "default:cluster-consumption", match: [{ field: "component", exists: true }, { field: "cluster", exists: true }], method: "by_metric_parent", target: {}, category: "kubernetes" },
           { id: "default:cluster", match: [{ field: "component", exists: true }, { field: "cluster", exists: true }], target: { capture: { cluster: "cluster" } }, cluster_pending: true }
         ];
         function evaluate(fact) {
@@ -257,13 +268,16 @@ steps:
               allocated.push(un); unalloc[L.service] = num((unalloc[L.service] || 0) + amt); sumAlloc += amt; return;
             }
             var o = p.owner; var key = ownerKey(o);
-            var method = hit.rule.cluster_pending ? "cluster_pending_consumption" : (hit.rule.method || (hit.rule.target && hit.rule.target.split ? "split" : hit.rule.target && hit.rule.target.map ? "map" : "direct"));
+            var method = hit.rule.cluster_pending ? "cluster_pending_consumption" : p.overhead ? "kubernetes_overhead" : (hit.rule.method === "by_metric_parent" ? "by_metric" : (hit.rule.method || (hit.rule.target && hit.rule.target.split ? "split" : hit.rule.target && hit.rule.target.map ? "map" : "direct")));
             var a = Object.assign({}, base, { id: "alloc-" + slug(f.id.replace(/^raw-/, "")) + "-" + slug(key), cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), category: rcat });
             OWNER.forEach(function (k) { if (o[k] !== undefined) a[k] = o[k]; });
             allocated.push(a); sumAlloc += amt;
             if (o.cluster && !o.application_id) { perCluster[o.cluster] = num((perCluster[o.cluster] || 0) + amt); return; }
-            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, by_category: {}, by_cloud_service: {}, facts: 0 });
+            var app = perApp[key] || (perApp[key] = { key: key, owner: o, cost_usd: 0, kubernetes_usd: 0, by_category: {}, by_cloud_service: {}, facts: 0, items: [], accounts: {} });
             app.cost_usd = num(app.cost_usd + amt); app.by_category[rcat] = num((app.by_category[rcat] || 0) + amt); app.by_cloud_service[L.service] = num((app.by_cloud_service[L.service] || 0) + amt); app.facts += 1;
+            if (method === "by_metric" && hit.rule.method === "by_metric_parent") app.kubernetes_usd = num(app.kubernetes_usd + amt);
+            var acctOf = f.cloud_account || ((byId[f.parent_id] || {}).cloud_account) || null; if (acctOf) app.accounts[String(acctOf)] = true;
+            app.items.push({ subject_type: f.subject_type, subject_id: f.subject_id, subject_name: f.subject_name || f.subject_id, cloud_service: L.service, category: rcat, cost_usd: amt, share: num(p.share), allocation_method: method, rule_id: String(hit.rule.id), cluster: f.cluster || null, component: f.component || null, scope_id: o.scope_id || (p.key && hit.rule.method === "by_metric_parent" ? String(p.key) : null), source_fact_id: f.id });
           });
         });
         // ── 4) rollups: one per owner, one for unallocated
@@ -274,6 +288,15 @@ steps:
                     by_category: a.by_category, by_cloud_service: a.by_cloud_service, quantity: a.facts, units: "facts" };
           OWNER.forEach(function (kk) { if (o[kk] !== undefined) r[kk] = o[kk]; });
           allocated.push(r);
+        });
+        // application_cost_daily: one row per null application (owners with an application_id) with the detail.
+        var k8sRows = {}; raw.forEach(function (f) { if (f.source === "k8s" && f.subject_type === "scope" && f.application_id) { var a = k8sRows[f.application_id] || (k8sRows[f.application_id] = { core_h_chargeable: 0, gb_h_chargeable: 0, core_h_used: 0, gb_h_used: 0, usage_usd: 0, waste_usd: 0, scopes: 0 }); ["core_h_chargeable", "gb_h_chargeable", "core_h_used", "gb_h_used", "usage_usd", "waste_usd"].forEach(function (k) { a[k] = num(a[k] + (Number(f[k]) || 0)); }); a.scopes += 1; } });
+        var appRows = [];
+        Object.keys(perApp).forEach(function (k) {
+          var a = perApp[k]; var o = a.owner; if (!o.application_id) return;
+          appRows.push({ id: String(o.application_id) + "-" + d, day: d, date: d, application_id: String(o.application_id), application_slug: o.application_slug || null, namespace_id: o.namespace_id || null, account_id: o.account_id || null,
+            total_usd: a.cost_usd, direct_usd: num(a.cost_usd - a.kubernetes_usd), kubernetes_usd: a.kubernetes_usd, by_category: a.by_category, by_cloud_service: a.by_cloud_service,
+            items: a.items.sort(function (x, y) { return y.cost_usd - x.cost_usd; }), kubernetes: k8sRows[String(o.application_id)] || null, facts: a.facts, cloud_accounts: Object.keys(a.accounts), currency: "USD", allocator: String(inputs.allocator), computed_at: now });
         });
         var unTotal = num(Object.keys(unalloc).reduce(function (s, k) { return s + unalloc[k]; }, 0));
         allocated.push({ id: "alloc-unallocated-" + d, date: d, day: d, stage: "allocated", subject_type: "unallocated", subject_id: "unallocated", subject_name: "Not attributable yet",
@@ -288,7 +311,8 @@ steps:
           if (a.metric_key && a.allocation_method === "unallocated") unLeaves.push({ id: a.source_fact_id + "#" + a.metric_key, cloud_service: a.cloud_service, subject_type: a.subject_type, subject_id: a.subject_id, resource_type: a.resource_type || null, host: byId[a.source_fact_id] ? (byId[a.source_fact_id].host || null) : null, tags: null, cost_usd: a.cost_usd, kind: "metric_key", metric_key: a.metric_key, rule_id: a.rule_id });
         });
         unLeaves.sort(function (x, y) { return y.cost_usd - x.cost_usd; });
-        return { day: d, facts: allocated, to_write: inputs.dry_run ? [] : allocated, count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0)),
+        var writes = allocated.map(function (f) { return { fact: f, catalog_slug: "cost_daily" }; }).concat(appRows.map(function (r) { return { fact: r, catalog_slug: "application_cost_daily" }; }));
+        return { day: d, facts: allocated, app_rows: appRows, to_write: inputs.dry_run ? [] : writes, count: allocated.length, summary: { day: d, total_usd: svcTotal, allocated_usd: num(sumAlloc - unTotal - Object.keys(perCluster).reduce(function (s, k) { return s + perCluster[k]; }, 0)),
                  cluster_pending_usd: perCluster, unallocated_usd: unTotal, unallocated_by_service: unalloc, applications: apps.slice(0, 50), rules_active: rules.length, leaves: leaves.length, dry_run: !!inputs.dry_run },
                  unallocated_leaves: unLeaves.slice(0, 200) };
 
@@ -298,11 +322,10 @@ steps:
     name: "Upsert allocated facts (fan-out)"
     forEach:
       expression: "${{ steps.allocate.outputs.to_write }}"
-      itemVariable: fact
+      itemVariable: row
+      spreadItem: true
       parallel: true
       maxConcurrency: 8
-    inputs:
-      fact: "${{ fact }}"
     config:
       # Definition id of finops/wf-cost-fact-upsert.yaml (patched at publish time).
       workflowId: FINOPS_COST_FACT_UPSERT_ID
@@ -334,4 +357,5 @@ connections:
 outputs:
   summary: "${{ steps.summary.outputs }}"
   facts: "${{ steps.allocate.outputs.facts }}"
+  app_rows: "${{ steps.allocate.outputs.app_rows }}"
   unallocated_leaves: "${{ steps.allocate.outputs.unallocated_leaves }}"

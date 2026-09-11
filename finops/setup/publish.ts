@@ -55,6 +55,7 @@ const ORDER: Array<{ file: string; placeholder?: string }> = [
   { file: 'wf-cost-fact-upsert.yaml', placeholder: 'FINOPS_COST_FACT_UPSERT_ID' },
   { file: 'wf1-aws-billing-daily.yaml', placeholder: 'FINOPS_AWS_BILLING_DAILY_ID' },
   { file: 'wf-suggest-mappings.yaml', placeholder: 'FINOPS_SUGGEST_MAPPINGS_ID' },
+  { file: 'wf3-k8s-consumption-daily.yaml', placeholder: 'FINOPS_K8S_CONSUMPTION_ID' },
   { file: 'wf2-allocate-daily.yaml', placeholder: 'FINOPS_ALLOCATE_DAILY_ID' },
   { file: 'wf0-aws-billing-dispatch.yaml' },
 ];

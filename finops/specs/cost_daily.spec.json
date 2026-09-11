@@ -492,6 +492,70 @@
           "null"
         ],
         "description": "How the subject's cost_usd was derived by the collector: direct_tag (Cost Explorer by owner tag), unallocated (even split / fallback)"
+      },
+      "metric_owners": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "metric key \u2192 owner dims {application_id, namespace_id, scope_id, account_id, application_slug} when the collector knows the owner (k8s scopes by label)",
+        "additionalProperties": true
+      },
+      "core_h_chargeable": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: \u03a3 hours max(usage, request) CPU cores"
+      },
+      "gb_h_chargeable": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: \u03a3 hours max(usage, request) memory GiB"
+      },
+      "core_h_used": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: CPU core-hours used"
+      },
+      "gb_h_used": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: memory GiB-hours used"
+      },
+      "core_h_requested": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: CPU core-hours requested"
+      },
+      "gb_h_requested": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: memory GiB-hours requested"
+      },
+      "pods_avg": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Kubernetes: average pods over the day"
+      },
+      "k8s_overhead_usd": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Cluster: cost not covered by any scope (system namespaces, idle headroom)"
       }
     },
     "required": [

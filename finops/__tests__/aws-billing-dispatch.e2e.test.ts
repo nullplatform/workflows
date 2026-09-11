@@ -32,15 +32,20 @@ describe('finops/wf0-aws-billing-dispatch', () => {
   it('fans out one collector run per target with its agent, role and version, and summarizes per account', async () => {
     const runs: Array<Record<string, unknown>> = [];
     const allocations: Array<Record<string, unknown>> = [];
+    const k8sRuns: Array<Record<string, unknown>> = [];
     const suggestions: Array<Record<string, unknown>> = [];
     const result = await runWorkflowE2E({
       yamlPath: YAML,
-      inputs: { date: '2026-09-09', targets: TARGETS, dry_run: true },
+      inputs: { date: '2026-09-09', targets: TARGETS, dry_run: true, k8s_clusters: [{ cluster: 'runtime' }] },
       pluginStubs: {
         manual: passthroughTrigger,
         cron: passthroughTrigger,
         'sub-workflow': {
           handler: (ctx: { stepId: string; inputs: Record<string, unknown> }) => {
+            if (ctx.stepId === 'k8s') {
+              k8sRuns.push(ctx.inputs);
+              return { status: 'success' as const, outputs: { summary: { cluster: 'runtime', scopes_cost_usd: 20, overhead_usd: 5, coverage_pct: 80 } }, activePorts: ['default'] };
+            }
             if (ctx.stepId === 'allocate') {
               allocations.push(ctx.inputs);
               return { status: 'success' as const, outputs: { summary: { day: '2026-09-09', total_usd: 42.816, allocated_usd: 30, unallocated_usd: 12.816 }, unallocated_leaves: [{ id: 'raw-x', cost_usd: 12.816 }] }, activePorts: ['default'] };
@@ -91,6 +96,10 @@ describe('finops/wf0-aws-billing-dispatch', () => {
     expect(suggestions).toHaveLength(1);
     expect(suggestions[0]).toMatchObject({ date: '2026-09-09', dry_run: true, unallocated_leaves: [{ id: 'raw-x', cost_usd: 12.816 }] });
     expect(out.allocation).toMatchObject({ allocated_usd: 30, unallocated_usd: 12.816 });
+    // one wf3 run per configured cluster, before the allocation
+    expect(k8sRuns).toHaveLength(1);
+    expect(k8sRuns[0]).toMatchObject({ date: '2026-09-09', cluster: 'runtime', dry_run: true });
+    expect((out as { kubernetes: Array<Record<string, unknown>> }).kubernetes).toEqual([{ cluster: 'runtime', scopes_cost_usd: 20, overhead_usd: 5, coverage_pct: 80 }]);
     expect(out.suggestions).toMatchObject({ suggestions: 1 });
   });
 

@@ -1,0 +1,196 @@
+{
+  "slug": "application_cost_daily",
+  "name": "Application Cost Daily",
+  "description": "One row per application per day: total USD, breakdown by category and cloud service, the resources behind it (with the rule that attributed each), and the Kubernetes consumption part. Written by the allocator (finops_allocate_daily).",
+  "schema": {
+    "type": "object",
+    "required": [
+      "id",
+      "day",
+      "application_id",
+      "total_usd",
+      "computed_at"
+    ],
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "<application_id>-<day>",
+        "alias": "id",
+        "primaryKey": true,
+        "autoGenerate": false
+      },
+      "day": {
+        "type": "string",
+        "description": "YYYY-MM-DD (UTC)",
+        "index": [
+          "filter"
+        ]
+      },
+      "date": {
+        "type": "string",
+        "description": "Same as day"
+      },
+      "application_id": {
+        "type": "string",
+        "description": "null application id",
+        "index": [
+          "filter"
+        ]
+      },
+      "application_slug": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null application slug"
+      },
+      "namespace_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null namespace id",
+        "index": [
+          "filter"
+        ]
+      },
+      "account_id": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "null account id",
+        "index": [
+          "filter"
+        ]
+      },
+      "total_usd": {
+        "type": "number",
+        "description": "Total attributed to the application on the day (amortized)"
+      },
+      "direct_usd": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Part attributed directly (tags, hosts, rules) \u2014 everything except the Kubernetes consumption part"
+      },
+      "kubernetes_usd": {
+        "type": [
+          "number",
+          "null"
+        ],
+        "description": "Part that comes from the cluster consumption split"
+      },
+      "by_category": {
+        "type": "object",
+        "description": "category \u2192 USD (compute, kubernetes, database, storage, network, observability, messaging, security, cdn, other)",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "by_cloud_service": {
+        "type": "object",
+        "description": "cloud service \u2192 USD",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "items": {
+        "type": "array",
+        "description": "The resources behind the total: [{subject_type, subject_id, subject_name, cloud_service, category, cost_usd, share, allocation_method, rule_id, cluster, scope_id}]",
+        "items": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "kubernetes": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "description": "{core_h_chargeable, gb_h_chargeable, core_h_used, gb_h_used, usage_usd, waste_usd, scopes} \u2014 \u03a3 over the application's k8s scopes",
+        "additionalProperties": true
+      },
+      "facts": {
+        "type": "integer",
+        "description": "How many allocated facts were rolled up"
+      },
+      "cloud_accounts": {
+        "type": "array",
+        "description": "Cloud accounts the cost came from",
+        "items": {
+          "type": "string"
+        }
+      },
+      "currency": {
+        "type": "string",
+        "description": "USD"
+      },
+      "allocator": {
+        "type": "string",
+        "description": "finops_allocate_daily@<version>"
+      },
+      "computed_at": {
+        "type": "string",
+        "description": "ISO timestamp"
+      }
+    }
+  },
+  "authorization": {
+    "entities": {
+      "grants": [
+        {
+          "actions": [
+            "read",
+            "list",
+            "create",
+            "write",
+            "delete"
+          ],
+          "principals": [
+            {
+              "type": "*"
+            }
+          ]
+        },
+        {
+          "actions": [
+            "*"
+          ],
+          "principals": [
+            {
+              "id": 732189543,
+              "type": "user"
+            }
+          ]
+        }
+      ]
+    },
+    "specification": {
+      "grants": [
+        {
+          "actions": [
+            "read"
+          ],
+          "principals": [
+            {
+              "type": "*"
+            }
+          ]
+        },
+        {
+          "actions": [
+            "*"
+          ],
+          "principals": [
+            {
+              "id": 732189543,
+              "type": "user"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

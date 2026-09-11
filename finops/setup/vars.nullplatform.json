@@ -18,10 +18,23 @@
         "region": "us-east-1",
         "expected_account": "283477532906"
       }
+    ],
+    "k8s_clusters": [
+      {
+        "cluster": "runtime"
+      }
     ]
   },
   "finops_suggest_mappings": {
     "org_nrn": "organization=4",
     "account_id": "17"
+  },
+  "finops_k8s_consumption_daily": {
+    "cluster": "runtime",
+    "agent_tags": {
+      "cluster": "runtime"
+    },
+    "agent_nrn": "organization=4:account=17",
+    "collector_cmd": "nullplatform/platform-scopes-override/cost/collect_metrics --prom http://prometheus-server.default.svc.cluster.local"
   }
 }

@@ -16,15 +16,17 @@ Read first:
 | `tool-cloud-query.yaml` | Reusable child: agent tags (+ `agent_nrn`) + calls → results by call id (async with engine callback by default, sync for small calls). Carries the image as an `oci_image` artifact: no package registration on the platform. |
 | `wf0-aws-billing-dispatch.yaml` | **The daily loop** (cron 04:15 UTC): one target per account (agent tags × NRN × AssumeRole × region) → `wf1` per target → `wf2` allocation of the day → `wf-suggest-mappings` for what stayed unallocated. `expected_account` guards the pairing. |
 | `wf1-aws-billing-daily.yaml` | Collector: one day of AWS billing → `raw` `cost_daily` facts (cloud services, usage-type buckets, EC2 scopes by null tags, one bucket for instances that terminated before collection, EKS clusters with components per cloud service + blended rates, databases with host/tags). Evidence fields (`tags`, `host`) travel with the facts. |
-| `wf2-allocate-daily.yaml` | **Allocator**: raw facts of a day + active `cost_mapping_rule`s → `allocated` facts per source fact × owner (categorized) + one rollup per application, per shared bucket and one `unallocated`. Σ allocated = Σ cloud services, always. |
+| `wf3-k8s-consumption-daily.yaml` | **Kubernetes consumption**: per null scope, `max(usage, request)` per hour from the cluster's Prometheus through the agent (the cost tracker's collector script), priced with the day's blended rates → `raw-k8s-scope-*` rows (cost, usage, waste, core-h/GiB-h) and the cluster row's consumption shares (`metric_shares`/`metric_owners`) that split the cluster among applications. Replaces the metadata `cost_tracking` writes of `cost/wf1b`. |
+| `wf2-allocate-daily.yaml` | **Allocator**: raw facts of a day + active `cost_mapping_rule`s → `allocated` facts per source fact × owner (categorized) + one rollup per application, per shared bucket and one `unallocated`, and one **`application_cost_daily`** row per application (total, by category, by cloud service, the resources behind it, the Kubernetes part). Σ allocated = Σ cloud services, always. |
 | `wf-suggest-mappings.yaml` | **Inference**: unallocated leaves × evidence (null services by host, application parameters) → `cost_mapping_suggestion` rows (`proposed`) with evidence, confidence and the USD they would recover. |
 | `wf-cost-fact-upsert.yaml` | Child: `PATCH /catalog/instances/<slug>/<id>?upsert=true` for one row (facts, rules, suggestions — `catalog_slug` input) |
 | `specs/cost_daily.spec.json` | Catalog spec (62 fields): subject, null dimensions, cloud dimensions, amortized `cost_usd` + `unblended_usd`, capacity/rates, evidence (`tags`, `host`), allocation provenance (`rule_id`, `share`, `source_fact_id`, `category`), rollups. Logical id `<stage>-<subject_type>-<slug>-<date>`; `day` = filterable copy of `date`. |
+| `specs/application_cost_daily.spec.json` | The per-application daily entity: `<application_id>-<day>` with `total_usd`, `direct_usd`, `kubernetes_usd`, `by_category`, `by_cloud_service`, `items[]` (resource by resource with the rule that attributed it), `kubernetes` (core-h/GiB-h chargeable and used, usage/waste USD, scopes). |
 | `specs/cost_mapping_rule.spec.json`, `specs/cost_mapping_suggestion.spec.json` | The rules as data (see [docs/mapping-rules-design.md](./docs/mapping-rules-design.md)) and what the inference proposes. |
 | `setup/01-catalog-spec.sh` | Creates/updates the three specs (session bearer; the admin grant is rewritten to the token's user) |
 | `setup/02-aws-worker-identity.sh` | Worker pod identity for clusters without IaC (Pod Identity role + SA + the agent rule) |
 | `setup/03-mapping-rules.sh` | Upserts a rules JSON (e.g. `setup/rules.nullplatform.json`) into `cost_mapping_rule` |
-| `setup/publish.ts`, `setup/vars.<org>.json` | Publishes the six workflows to an engine (platform or local) in dependency order with per-org variable values |
+| `setup/publish.ts`, `setup/vars.<org>.json` | Publishes the seven workflows to an engine (platform or local) in dependency order with per-org variable values |
 | `docs/iam/` | Read-only policy + trust documents for the worker role (IRSA, Pod Identity, cross-account) |
 | `__tests__/` | 16 E2E tests on the local executor, plugins stubbed at the plugin level |
 
@@ -154,12 +156,23 @@ What the allocator writes (`stage: allocated`, all in `cost_daily`):
 | leaf allocation | `alloc-<raw id>-<owner>` | one per source fact × owner: `cost_usd`, `share`, `rule_id`, `category`, `application_id`/`scope_id`/`service_id`/`cluster`/`bucket`, `source_fact_id` |
 | application rollup | `alloc-app-<application_id>-<day>` | `cost_usd`, `by_category`, `by_cloud_service`, `quantity` = facts |
 | shared bucket rollup | `alloc-bucket-<name>-<day>` | e.g. `shared-platform` |
-| cluster pending | `alloc-bucket-<cluster>-<component>-<day>-cluster-<cluster>` | waits for the k8s consumption split |
+| kubernetes | `alloc-bucket-<cluster>-<component>-<day>-app-<id>` | a cluster component split by the scope's consumption share (`default:cluster-consumption`, category `kubernetes`, `scope_id` on the row) |
+| kubernetes overhead | `alloc-bucket-<cluster>-<component>-<day>-cluster-<cluster>` | the share no scope covers (system namespaces, idle headroom) |
 | unallocated | `alloc-unallocated-<day>` | `by_cloud_service` = the gap to close with rules |
 
-Queries: `GET /catalog/instances/cost_daily?day=2026-09-09&stage=allocated&subject_type=application`
-(per-app daily), `…&stage=allocated&application_id=<id>` (resource by resource for one app),
-`…&stage=allocated&subject_type=unallocated` (the gap).
+**The per-application entity**: `GET /catalog/instances/application_cost_daily/<application_id>-<day>`
+(or list `?application_id=<id>` / `?day=<day>`): `total_usd`, `direct_usd` + `kubernetes_usd`, `by_category`,
+`by_cloud_service`, `items[]` (each resource, its category, USD, share and `rule_id`), `kubernetes`
+(core-h / GiB-h chargeable and used, usage vs waste USD, number of scopes).
+
+Other queries: `GET /catalog/instances/cost_daily?stage=allocated&application_id=<id>` (allocated
+facts of one app), `…&stage=allocated&subject_type=unallocated` (the gap),
+`…&stage=raw&subject_type=cluster` (cluster rows with rates, shares and overhead).
+
+**Kubernetes**: the cluster's cost (nodes, control plane, LBs, networking, storage) is split by each
+scope's consumption share = its chargeable cost (`max(usage, request)` per hour × blended rates)
+over the cluster cost. What no scope covers stays with the cluster as `kubernetes_overhead`. The
+scope rows (`raw-k8s-scope-*`, `source: k8s`) keep usage vs request, so waste per scope is visible.
 
 ## Deploying to an organization (done for nullplatform, org 4, 2026-09-11)
 
@@ -188,7 +201,8 @@ Everything is per organization; nothing is registered on the platform as a packa
 5. **Publish** (from the engine repo, so the DSL parser resolves):
    `NP_TOKEN=<bearer> pnpm tsx finops/setup/publish.ts finops --base https://api.nullplatform.com --vars finops/setup/vars.<org>.json`
    and later `--update tool-cloud-query.yaml=<id>,…` for new revisions. The dispatcher
-   (`wf0`) owns the schedule (04:15 UTC); `wf1` has no cron of its own.
+   (`wf0`) owns the schedule (04:15 UTC): collect → k8s consumption (`k8s_clusters` in the vars) →
+   allocate → suggest. `wf1`/`wf2`/`wf3` have no cron of their own.
 6. **Rules**: start from `setup/rules.<org>.json` (copy the nullplatform one) and load it with
    `setup/03-mapping-rules.sh`; everything else comes from the suggestions.
 7. **First run**: execute `wf0` with `{"date":"YYYY-MM-DD","dry_run":true}`, read the
