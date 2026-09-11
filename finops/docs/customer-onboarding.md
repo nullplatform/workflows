@@ -161,6 +161,10 @@ POST /workflows/definitions/<wf0>/execute   {"inputs": {"date": "YYYY-MM-DD", "a
 POST /workflows/definitions/<wf2>/execute   {"inputs": {"date": "YYYY-MM-DD"}}
 ```
 
+The daily schedule follows the same split: `wf0` at 04:15 UTC collects + Kubernetes (`allocate_in_chain:
+false` in the org's vars), `wf2`'s own cron allocates yesterday at 05:00 UTC. Suggestions are not
+produced by the daily runs while `allocate_in_chain` is false (run `wf-suggest-mappings` by hand).
+
 `setup/backfill.sh <wf0 id> <wf2 id> <day>…` does exactly that, one day at a time (never run days in
 parallel: the agent serialises package runs and the worker is shared), re-minting the API-key token
 per day (tokens live 60 minutes, backfills do not).
