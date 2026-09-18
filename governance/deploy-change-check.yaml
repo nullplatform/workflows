@@ -38,10 +38,14 @@ inputs:
     default: {}
 
 variables:
+  # Jev repeats the same diff within about ±0.02; the calibration point was
+  # 0.7 and a real file landed on 0.69 / 0.70 across two runs. 0.75 keeps a
+  # margin above that jitter so a gate never flaps on identical input; the grey
+  # band (0.3–0.75) is reported in the item details for reviewers.
   threshold_low:
     initialValue: 0.3
   threshold_high:
-    initialValue: 0.7
+    initialValue: 0.75
   max_patch_chars:
     initialValue: 8000
   max_total_chars:
