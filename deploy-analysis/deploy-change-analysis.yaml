@@ -79,7 +79,10 @@ steps:
 
       // Candidate (to) release + currently deployed (from) release + fastpath
       const to = await releaseInfo(release_id);
-      const deps = await np(`/deployment?scope_id=${scope_id}&limit=30`);
+      // Newest first: without `sort` the API returns an arbitrary (old) page and
+      // the 'previously deployed' release came out months stale (2026-09-18:
+      // 0.0.128 picked while 0.0.132 was live).
+      const deps = await np(`/deployment?scope_id=${scope_id}&limit=30&sort=created_at:desc`);
       const finalized = (deps.results || [])
         .filter(d => ["finalized", "active"].includes(d.status))
         .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
