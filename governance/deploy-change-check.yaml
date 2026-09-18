@@ -14,6 +14,10 @@
 # under a cent. The Claude-based `deploy-change-analysis` item stays as the
 # INFORMATIONAL functional summary; these items are the gates.
 #
+# NOTE: excluded from `npm run validate` until @nullplatform/workflow-kit ships the
+# `jev-system-one` plugin (kit ^0.1.0 predates it); the live engine validated this
+# definition on publish. Re-include it in package.json when the kit is bumped.
+#
 # Config entries (folder /checklist/deploy): secrets NP_API_KEY (folder),
 # GITHUB_TOKEN (root). Jev's own credential is platform-provided
 # (TYPESAFE_API_KEY on the worker), never configured here.
