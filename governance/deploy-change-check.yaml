@@ -1,15 +1,15 @@
 # Deploy Change Check — deploy-gate checks judged by Jev (TypeSafe System One).
 #
 # Pairs with checklist external items of `kind: deploy-change-check`. One item per
-# CHECK GROUP (`check_group`: api | frontend | common); each dispatch spawns one
-# execution:
+# CHECK (`check_id`, e.g. `logs_sensitive_data`) nested under the API / Frontend /
+# Common groups of the deploy-gate template; each dispatch spawns one execution:
 #   gather   diff previous-deployed → candidate WITH patches + repo facts, and the
 #            group's typed questions, in BATCHES of files (one Jev request judges
-#            several files: question `<check>__<i>` reads `files[i].diff`)
+#            up to 60 files: question `<check>__<i>` reads `files[i].diff`)
 #   → jev    jev-system-one, one request per batch, all batches in parallel
-#   → aggregate  per check: max probability over CODE files, evidence ≥ high,
-#            grey band; the item fails only on `gate` checks
-#   → resolve    passed / failed + per-check verdicts in message and details.
+#   → aggregate  max probability over CODE files, evidence ≥ high, grey band;
+#            a `gate` check fails the item, an `informational` one only reports
+#   → resolve    passed / failed + files and probabilities in message and details.
 #
 # Speed is the point: no heartbeats, no LLM. Jev itself answers in well under a
 # second per request; what remains is the engine's per-activity cost, so the
@@ -28,7 +28,7 @@ id: deploy_change_check
 key: deploy-change-check
 name: "Deploy Change Check (Jev)"
 path: /checklist/deploy
-semantic_version: 2.0.0
+semantic_version: 3.0.0
 description: >
   Resolves one deploy-gate check group (API / Frontend / Common) over the diff
   between the previously deployed release and the candidate. Jev judges every
@@ -77,7 +77,7 @@ steps:
       release_id:     "${{ steps.trigger.outputs.inputs.release_id }}"
       deployment_id:  "${{ steps.trigger.outputs.inputs.deployment_id }}"
       application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
-      check_group:    "${{ steps.trigger.outputs.inputs.check_group }}"
+      check_id:       "${{ steps.trigger.outputs.inputs.check_id }}"
       np_api_key:     "${{ secrets.NP_API_KEY }}"
       github_token:   "${{ secrets.GITHUB_TOKEN }}"
       max_patch_chars: "${{ variables.max_patch_chars }}"
@@ -88,7 +88,7 @@ steps:
         allowedHosts: ["api.nullplatform.com", "api.github.com"]
       code: |
         const { application_id, release_id, scope_id, np_api_key, github_token } = $item;
-        const group = String($item.check_group || "api");
+        const checkId = String($item.check_id || "");
         const MAX_PATCH = Number($item.max_patch_chars) || 6000;
         const MAX_TOTAL = Number($item.max_total_chars) || 600000;
         const MAX_Q = Number($item.max_questions_per_request) || 60;
@@ -205,12 +205,13 @@ steps:
             },
           },
         };
+        const group = Object.keys(CHECKS).find(gid => CHECKS[gid].checks[checkId]);
+        if (!group) throw new Error(`unknown check_id '${checkId}' — known: ${Object.values(CHECKS).flatMap(x => Object.keys(x.checks)).join(", ")}`);
         const g = CHECKS[group];
-        if (!g) throw new Error(`unknown check_group '${group}' — known: ${Object.keys(CHECKS).join(", ")}`);
-        const checkIds = Object.keys(g.checks);
+        const checkIds = [checkId];
 
         // ---------- batches: several files per Jev request, one question per (check, file) ----------
-        const batchSize = Math.max(1, Math.floor(MAX_Q / checkIds.length));
+        const batchSize = Math.max(1, MAX_Q); // one question per file → up to MAX_Q files per request
         const batches = [];
         for (let i = 0; i < codeFiles.length; i += batchSize) {
           const slice = codeFiles.slice(i, i + batchSize);
@@ -223,7 +224,8 @@ steps:
         const checks = Object.fromEntries(checkIds.map(cid => [cid, { title: g.checks[cid].title, behavior: g.checks[cid].behavior }]));
 
         return {
-          group, group_title: g.title, checks, batch_size: batchSize, batch_count: batches.length, batches, questions,
+          check_id: checkId, group, group_title: g.title, title: g.checks[checkId].title, behavior: g.checks[checkId].behavior,
+          checks, batch_size: batchSize, batch_count: batches.length, batches, questions,
           repo, criticality, stack, repo_facts,
           from_release: from ? { id: from.id, semver: from.semver, commit_sha: from.commit_sha } : null,
           to_release: { id: to.id, semver: to.semver, commit_sha: to.commit_sha },
@@ -257,7 +259,7 @@ steps:
   - id: aggregate
     type: module
     plugin_type: code-exec
-    name: "Aggregate: per-check verdicts"
+    name: "Aggregate: verdict + evidence"
     inputs:
       results: "${{ steps.jev.outputs.items }}"
       gathered: "${{ steps.gather.outputs }}"
@@ -267,44 +269,49 @@ steps:
       code: |
         const { results = [], gathered = {} } = $item;
         const low = Number($item.low), high = Number($item.high);
-        const checks = gathered.checks || {};
-        const per = Object.fromEntries(Object.keys(checks).map(c => [c, { ...checks[c], max: 0, evidence: [], grey: [] }]));
-        let tokens = 0, latency = 0, model = null, requests = 0;
-        let riskMax = 0, riskFile = null;
+        const cid = gathered.check_id;
+        const c = { title: gathered.title, behavior: gathered.behavior, max: 0, evidence: [], grey: [] };
+        let tokens = 0, latency = 0, model = null, requests = 0, riskMax = 0, riskFile = null;
         results.forEach((r, bi) => {
           const batch = (gathered.batches || [])[bi] || { files: [] };
-          const s = (r && r.summary) || {}; const u = (r && r.usage) || {};
+          const sm = (r && r.summary) || {}; const u = (r && r.usage) || {};
           tokens += Number(u.input_tokens || 0); latency += Number(r && r.latency_ms || 0); model = (r && r.model) || model; requests++;
-          for (const [qid, v] of Object.entries(s)) {
-            const m = qid.match(/^(.*)__(\d+)$/); if (!m) continue;
-            const cid = m[1], f = batch.files[Number(m[2])];
-            if (!f || f.kind === "padding" || !per[cid]) continue;
-            if (cid === "risk") { if (Number(v) > riskMax) { riskMax = Number(v); riskFile = f.path; } continue; }
+          for (const [qid, v] of Object.entries(sm)) {
+            const m = qid.match(/^(.*)__(\d+)$/); if (!m || m[1] !== cid) continue;
+            const f = batch.files[Number(m[2])]; if (!f || f.kind === "padding") continue;
             const p = Number(v); if (!Number.isFinite(p)) continue;
-            if (p > per[cid].max) per[cid].max = p;
-            if (p >= high) per[cid].evidence.push({ file: f.path, p: +p.toFixed(2) }); else if (p >= low) per[cid].grey.push({ file: f.path, p: +p.toFixed(2) });
+            if (cid === "risk") { if (p > riskMax) { riskMax = p; riskFile = f.path; } continue; }
+            if (p > c.max) c.max = p;
+            if (p >= high) c.evidence.push({ file: f.path, p: +p.toFixed(2) }); else if (p >= low) c.grey.push({ file: f.path, p: +p.toFixed(2) });
           }
         });
         const short = (f) => f.split("/").pop();
-        const lines = [];
-        let failedGates = 0;
-        for (const [cid, c] of Object.entries(per)) {
-          if (cid === "risk") { const LEVELS = ["Negligible", "Low", "Moderate", "High", "Critical"]; lines.push(`ℹ️ ${c.title}: ${LEVELS[Math.round(riskMax)] || "n/a"} (${riskMax.toFixed(2)}${riskFile ? `, ${short(riskFile)}` : ""})`); continue; }
-          const tag = c.behavior === "gate" ? (c.evidence.length ? "❌" : "✅") : (c.evidence.length ? "⚠️" : "ℹ️");
-          if (c.behavior === "gate" && c.evidence.length) failedGates++;
-          const ev = c.evidence.length ? ` — ${c.evidence.slice(0, 3).map(e => `${short(e.file)} ${e.p}`).join(", ")}${c.evidence.length > 3 ? ", …" : ""}` : c.grey.length ? ` — grey: ${c.grey.slice(0, 2).map(e => `${short(e.file)} ${e.p}`).join(", ")}` : "";
-          lines.push(`${tag} ${c.title}: max ${c.max.toFixed(2)}${ev}`);
-        }
         const from = gathered.from_release ? gathered.from_release.semver : "first deploy", to = gathered.to_release ? gathered.to_release.semver : "?";
         const cost = +(tokens / 1e6 * 0.042).toFixed(5);
-        const rb = gathered.rollback ? " ⏪ rollback: judging the changes being reverted" : "";
-        const head = gathered.code_files === 0
-          ? (!gathered.from_release || (gathered.from_release.commit_sha === gathered.to_release.commit_sha) ? `✅ ${gathered.group_title} — candidate is the commit already live on this scope (${from} → ${to}); nothing to judge.` : `✅ ${gathered.group_title} — no code files changed between ${from} and ${to} (${gathered.non_code_files || 0} docs/tests/config files not judged).`)
-          : `${failedGates ? "❌" : "✅"} ${gathered.group_title} — ${from} → ${to}${rb}: ${gathered.code_files} code file(s), ${requests} Jev request(s), ${(latency / 1000).toFixed(1)} s of Jev, $${cost}.`;
-        const status = failedGates ? "failed" : "passed";
-        // The run UI shows the message as plain text: one line per check, separated visibly.
-        return { status, message: gathered.code_files === 0 ? head : `${head}  ${lines.join("  ·  ")}`, details: {
-          group: gathered.group, checks: per, ...(per.risk ? { risk: { max: +riskMax.toFixed(2), file: riskFile } } : {}), thresholds: { low, high },
+        const rb = gathered.rollback ? " ⏪ rollback (judging the reverted changes)" : "";
+        const span = `${from} → ${to}${rb}: ${gathered.code_files} code file(s), ${requests} Jev request(s), ${(latency / 1000).toFixed(1)} s of Jev, $${cost}`;
+        const ev = (arr) => arr.slice(0, 4).map(e => `${short(e.file)} ${e.p}`).join(", ") + (arr.length > 4 ? ", …" : "");
+        let status = "passed", message;
+        if (gathered.code_files === 0) {
+          message = (!gathered.from_release || gathered.from_release.commit_sha === gathered.to_release.commit_sha)
+            ? `✅ ${c.title} — candidate is the commit already live on this scope (${from} → ${to}); nothing to judge.`
+            : `✅ ${c.title} — no code files changed between ${from} and ${to} (${gathered.non_code_files || 0} docs/tests/config files not judged).`;
+        } else if (cid === "risk") {
+          const LEVELS = ["Negligible", "Low", "Moderate", "High", "Critical"];
+          message = `ℹ️ Jev risk: ${LEVELS[Math.round(riskMax)] || "n/a"} (${riskMax.toFixed(2)}${riskFile ? `, driven by ${short(riskFile)}` : ""}). ${span}.`;
+        } else if (c.evidence.length && c.behavior === "gate") {
+          status = "failed"; message = `❌ ${c.title} — ${c.evidence.length} file(s) ≥ ${high}: ${ev(c.evidence)}. ${span}.`;
+        } else if (c.evidence.length) {
+          message = `⚠️ ${c.title} (informational) — found in ${ev(c.evidence)}. ${span}.`;
+        } else if (c.grey.length) {
+          message = `✅ ${c.title} — no file ≥ ${high}; grey band: ${ev(c.grey)}. ${span}.`;
+        } else {
+          message = `✅ ${c.title} — clear across all code files (max ${c.max.toFixed(2)}). ${span}.`;
+        }
+        return { status, message, details: {
+          check_id: cid, group: gathered.group, title: c.title, behavior: c.behavior, thresholds: { low, high },
+          max: +c.max.toFixed(3), evidence: c.evidence, grey: c.grey,
+          ...(cid === "risk" ? { risk: { max: +riskMax.toFixed(2), file: riskFile } } : {}),
           from_release: gathered.from_release, to_release: gathered.to_release, previously_deployed: gathered.previously_deployed, rollback: gathered.rollback,
           code_files: gathered.code_files, files_count: gathered.files_count, total_files: gathered.total_files, skipped_count: gathered.skipped_count, batch_size: gathered.batch_size, requests,
           repo_facts: gathered.repo_facts, jev_model: model, input_tokens: tokens, est_cost_usd: cost, jev_latency_ms: latency,
@@ -332,9 +339,9 @@ steps:
       callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
       callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
       status:        failed
-      message:       "⚠️ Check group `${{ steps.trigger.outputs.inputs.check_group }}` could not run: ${{ steps.gather.error.message }}${{ steps.jev.error.message }}"
+      message:       "⚠️ Check `${{ steps.trigger.outputs.inputs.check_id }}` could not run: ${{ steps.gather.error.message }}${{ steps.jev.error.message }}"
       details:
-        check_group:    "${{ steps.trigger.outputs.inputs.check_group }}"
+        check_id:       "${{ steps.trigger.outputs.inputs.check_id }}"
         release_id:     "${{ steps.trigger.outputs.inputs.release_id }}"
         application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
         gather_error:   "${{ steps.gather.error.message }}"
@@ -350,7 +357,7 @@ connections:
   - { id: f2, from: jev,       to: resolve_failure, condition: "false" }
 
 outputs:
-  check_group:      "${{ steps.trigger.outputs.inputs.check_group }}"
+  check_id:         "${{ steps.trigger.outputs.inputs.check_id }}"
   resolved_status:  "${{ steps.aggregate.outputs.status }}"
   resolved_message: "${{ steps.aggregate.outputs.message }}"
   callback_ok:      "${{ steps.resolve.outputs.ok }}"
