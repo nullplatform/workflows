@@ -289,7 +289,7 @@ steps:
         const lines = [];
         let failedGates = 0;
         for (const [cid, c] of Object.entries(per)) {
-          if (cid === "risk") { const LEVELS = ["Negligible", "Low", "Moderate", "High", "Critical"]; lines.push(`ℹ️ ${c.title}: **${LEVELS[Math.round(riskMax)] || "n/a"}** (${riskMax.toFixed(2)}${riskFile ? `, ${short(riskFile)}` : ""})`); continue; }
+          if (cid === "risk") { const LEVELS = ["Negligible", "Low", "Moderate", "High", "Critical"]; lines.push(`ℹ️ ${c.title}: ${LEVELS[Math.round(riskMax)] || "n/a"} (${riskMax.toFixed(2)}${riskFile ? `, ${short(riskFile)}` : ""})`); continue; }
           const tag = c.behavior === "gate" ? (c.evidence.length ? "❌" : "✅") : (c.evidence.length ? "⚠️" : "ℹ️");
           if (c.behavior === "gate" && c.evidence.length) failedGates++;
           const ev = c.evidence.length ? ` — ${c.evidence.slice(0, 3).map(e => `${short(e.file)} ${e.p}`).join(", ")}${c.evidence.length > 3 ? ", …" : ""}` : c.grey.length ? ` — grey: ${c.grey.slice(0, 2).map(e => `${short(e.file)} ${e.p}`).join(", ")}` : "";
@@ -299,11 +299,12 @@ steps:
         const cost = +(tokens / 1e6 * 0.042).toFixed(5);
         const rb = gathered.rollback ? " ⏪ rollback: judging the changes being reverted" : "";
         const head = gathered.code_files === 0
-          ? (!gathered.from_release || (gathered.from_release.commit_sha === gathered.to_release.commit_sha) ? `✅ **${gathered.group_title}** — candidate is the commit already live on this scope (${from} → ${to}); nothing to judge.` : `✅ **${gathered.group_title}** — no code files changed between ${from} and ${to} (${gathered.non_code_files || 0} docs/tests/config files not judged).`)
-          : `${failedGates ? "❌" : "✅"} **${gathered.group_title}** — ${from} → ${to}${rb}, ${gathered.code_files} code file(s) in ${requests} Jev request(s), ${(latency / 1000).toFixed(1)} s of Jev, $${cost}.`;
+          ? (!gathered.from_release || (gathered.from_release.commit_sha === gathered.to_release.commit_sha) ? `✅ ${gathered.group_title} — candidate is the commit already live on this scope (${from} → ${to}); nothing to judge.` : `✅ ${gathered.group_title} — no code files changed between ${from} and ${to} (${gathered.non_code_files || 0} docs/tests/config files not judged).`)
+          : `${failedGates ? "❌" : "✅"} ${gathered.group_title} — ${from} → ${to}${rb}: ${gathered.code_files} code file(s), ${requests} Jev request(s), ${(latency / 1000).toFixed(1)} s of Jev, $${cost}.`;
         const status = failedGates ? "failed" : "passed";
-        return { status, message: gathered.code_files === 0 ? head : `${head}\n\n${lines.join("\n")}`, details: {
-          group: gathered.group, checks: per, risk: { max: +riskMax.toFixed(2), file: riskFile }, thresholds: { low, high },
+        // The run UI shows the message as plain text: one line per check, separated visibly.
+        return { status, message: gathered.code_files === 0 ? head : `${head}  ${lines.join("  ·  ")}`, details: {
+          group: gathered.group, checks: per, ...(per.risk ? { risk: { max: +riskMax.toFixed(2), file: riskFile } } : {}), thresholds: { low, high },
           from_release: gathered.from_release, to_release: gathered.to_release, previously_deployed: gathered.previously_deployed, rollback: gathered.rollback,
           code_files: gathered.code_files, files_count: gathered.files_count, total_files: gathered.total_files, skipped_count: gathered.skipped_count, batch_size: gathered.batch_size, requests,
           repo_facts: gathered.repo_facts, jev_model: model, input_tokens: tokens, est_cost_usd: cost, jev_latency_ms: latency,
