@@ -1,0 +1,432 @@
+# Deploy Change Check — one checklist item per check, judged by Jev (TypeSafe System One).
+#
+# Pairs with checklist external items of `kind: deploy-change-check`. Each item
+# carries ONE `check_id` (e.g. `logs_sensitive_data`) and spawns its own execution:
+#   gather (diff previous-deployed → candidate, WITH patches, + repo facts)
+#   → select_check (the check's typed questions, from the catalogue below)
+#   → jev (jev-system-one, ONE request per changed code file, all questions)
+#   → aggregate (max probability per check, evidence ≥ high, grey band)
+#   → resolve (passed / failed + details the run UI shows).
+#
+# Jev answers with calibrated probabilities, not prose: a check trips when any
+# code file scores ≥ variables.threshold_high; docs/tests/config never gate
+# (they are reported under `informational`). Typical item: 3–10 s and well
+# under a cent. The Claude-based `deploy-change-analysis` item stays as the
+# INFORMATIONAL functional summary; these items are the gates.
+#
+# Config entries (folder /checklist/deploy): secrets NP_API_KEY (folder),
+# GITHUB_TOKEN (root). Jev's own credential is platform-provided
+# (TYPESAFE_API_KEY on the worker), never configured here.
+id: deploy_change_check
+key: deploy-change-check
+name: "Deploy Change Check (Jev)"
+path: /checklist/deploy
+semantic_version: 1.0.0
+description: >
+  Resolves one deploy-gate check (API contract, DB schema, sensitive logging,
+  design system, i18n, …) over the diff between the previously deployed release
+  and the candidate, one Jev request per changed file. Fails the item with the
+  files and probabilities that tripped it; passes with the max probability seen.
+
+inputs:
+  triggerPayload:
+    type: object
+    default: {}
+
+variables:
+  threshold_low:
+    initialValue: 0.3
+  threshold_high:
+    initialValue: 0.7
+  max_patch_chars:
+    initialValue: 8000
+  max_total_chars:
+    initialValue: 700000
+
+steps:
+  - id: trigger
+    type: trigger
+    plugin_type: np-checklist-trigger
+    name: "On checklist dispatch (deploy-change-check)"
+    config:
+      pathPrefix: /checklist/deploy/change-check
+      mode: start
+      kind: deploy-change-check
+      nrn: "organization=4"
+      npApiKey: "${{ secrets.NP_API_KEY }}"
+
+  - id: progress
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: computing diff"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Computing diff between the deployed release and the candidate for check `${{ steps.trigger.outputs.inputs.check_id }}`…"
+
+  - id: gather
+    type: module
+    plugin_type: code-exec
+    name: "Gather diff (with patches) + repo facts"
+    inputs:
+      scope_id:       "${{ steps.trigger.outputs.inputs.scope_id }}"
+      release_id:     "${{ steps.trigger.outputs.inputs.release_id }}"
+      deployment_id:  "${{ steps.trigger.outputs.inputs.deployment_id }}"
+      application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
+      check_id:       "${{ steps.trigger.outputs.inputs.check_id }}"
+      np_api_key:     "${{ secrets.NP_API_KEY }}"
+      github_token:   "${{ secrets.GITHUB_TOKEN }}"
+      max_patch_chars: "${{ variables.max_patch_chars }}"
+      max_total_chars: "${{ variables.max_total_chars }}"
+    config:
+      network:
+        allowedHosts: ["api.nullplatform.com", "api.github.com"]
+      code: |
+        const { application_id, release_id, scope_id, np_api_key, github_token, check_id } = $item;
+        const MAX_PATCH = Number($item.max_patch_chars) || 8000;
+        const MAX_TOTAL = Number($item.max_total_chars) || 700000;
+
+        // --- NP client (api-key → token) ---
+        const tokRes = await fetch("https://api.nullplatform.com/token", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ api_key: np_api_key }),
+        });
+        if (!tokRes.ok) throw new Error(`NP token exchange failed: ${tokRes.status}`);
+        const npToken = (await tokRes.json()).access_token;
+        const np = async (path) => {
+          const r = await fetch(`https://api.nullplatform.com${path}`, { headers: { authorization: `Bearer ${npToken}` } });
+          if (!r.ok) throw new Error(`NP GET ${path} → ${r.status}`);
+          return r.json();
+        };
+        const gh = async (path, accept) => {
+          const r = await fetch(`https://api.github.com${path}`, {
+            headers: { authorization: `Bearer ${github_token}`, accept: accept || "application/vnd.github+json", "user-agent": "nullplatform-workflows/deploy-change-check" },
+          });
+          if (r.status === 404 && accept) return null;
+          if (!r.ok) throw new Error(`GitHub ${path} → ${r.status}`);
+          return accept ? r.text() : r.json();
+        };
+        const releaseInfo = async (id) => {
+          const rel = await np(`/release/${id}`);
+          const build = await np(`/build/${rel.build_id}`);
+          return { id: rel.id, semver: rel.semver, created_at: rel.created_at, commit_sha: build.commit && build.commit.id, branch: build.branch };
+        };
+
+        // Candidate (to) and previously deployed (from): newest finalized deployment
+        // of this scope whose release differs. `sort=created_at:desc` is essential —
+        // without it the API returns an arbitrary old page (2026-09-18 lesson).
+        const to = await releaseInfo(release_id);
+        const deps = await np(`/deployment?scope_id=${scope_id}&limit=30&sort=created_at:desc`);
+        const finalized = (deps.results || []).filter(d => ["finalized", "active"].includes(d.status))
+          .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+        const previously_deployed = finalized.slice(0, 10).some(d => String(d.release_id) === String(release_id));
+        const current = finalized.find(d => String(d.release_id) !== String(release_id));
+        const from = current ? await releaseInfo(current.release_id) : null;
+
+        // Application: repo + criticality + stack hints
+        const app = await np(`/application/${application_id}`);
+        const repo = (app.repository_url || "").replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "");
+        if (!repo) throw new Error(`application ${application_id} has no repository_url`);
+        let criticality = "critical";
+        try { const m = await np(`/metadata/application/${application_id}`); if (m.governance && m.governance.criticality) criticality = String(m.governance.criticality); } catch (e) {}
+
+        // Repo facts from package.json at the candidate commit (deterministic; Jev
+        // cannot infer repo conventions from one hunk). Only facts that CHANGE an
+        // answer are used by the questions — never as hints for unrelated files.
+        let pkg = {};
+        try { const raw = await gh(`/repos/${repo}/contents/package.json?ref=${to.commit_sha}`, "application/vnd.github.raw+json"); if (raw) pkg = JSON.parse(raw); } catch (e) { pkg = {}; }
+        const deps_ = Object.keys({ ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) });
+        const dep = (re) => deps_.find(d => re.test(d)) || null;
+        const repo_facts = {
+          package_name: pkg.name || null,
+          design_system_package: dep(/design-system|ui-kit|@nullplatform\/ui|@mui\/material|^antd$|@chakra-ui\/react|@mantine\/core|@radix-ui\//),
+          uses_i18n: !!dep(/i18n|react-intl|@lingui|formatjs/),
+          logging_library: dep(/^(pino|winston|bunyan|log4js|loglevel)$/),
+          http_client_library: dep(/^(axios|undici|got|node-fetch|ky)$/),
+          test_framework: dep(/^(vitest|jest|mocha|playwright|@playwright\/test)$/),
+          frontend_framework: dep(/^(react|vue|@angular\/core|svelte|next)$/),
+          backend_framework: dep(/^(fastify|express|koa|@nestjs\/core|hapi)$/),
+        };
+        const stack = repo_facts.backend_framework && repo_facts.frontend_framework ? "fullstack" : repo_facts.backend_framework ? "node-api" : repo_facts.frontend_framework ? "frontend" : "unknown";
+
+        // Diff with patches, one item per changed file, bounded
+        const SKIP = /(^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|go\.sum|Cargo\.lock|poetry\.lock)$|\.(min\.js|min\.css|map|snap|svg|png|jpg|jpeg|gif|ico|woff2?|pdf)$|(^|\/)(dist|build|node_modules|vendor)\//i;
+        const LANG = { ts: "typescript", tsx: "typescript-react", js: "javascript", jsx: "javascript-react", mjs: "javascript", py: "python", go: "go", java: "java", kt: "kotlin", rb: "ruby", rs: "rust", cs: "csharp", php: "php", sql: "sql", yaml: "yaml", yml: "yaml", json: "json", md: "markdown" };
+        const kindOf = (f) => /\.(md|mdx|rst|txt)$/i.test(f) ? "docs"
+          : /(^|\/)(__tests__|tests?|spec|e2e)\/|\.(test|spec)\.[a-z]+$/i.test(f) ? "test"
+          : /\.(ya?ml|json|toml|ini|env(\..*)?)$|(^|\/)Dockerfile$/i.test(f) ? "config" : "code";
+        const imports = (patch, sign) => {
+          const out = new Set();
+          for (const line of (patch || "").split("\n")) {
+            if (line[0] !== sign) continue;
+            const m = line.match(/^[+-]\s*(?:import\s.*?from\s+['"]([^'"]+)['"]|(?:const|let|var)\s.*?=\s*require\(['"]([^'"]+)['"]\)|import\s+['"]([^'"]+)['"])/);
+            if (m) out.add(m[1] || m[2] || m[3]);
+          }
+          return [...out].slice(0, 20);
+        };
+        let files = [], skipped = [], commits = [], total_files = 0, truncated_budget = false;
+        if (!previously_deployed && from && from.commit_sha && to.commit_sha && from.commit_sha !== to.commit_sha) {
+          const cmp = await gh(`/repos/${repo}/compare/${from.commit_sha}...${to.commit_sha}`);
+          commits = (cmp.commits || []).map(c => c.commit.message.split("\n")[0]).slice(0, 40);
+          const all = cmp.files || [];
+          total_files = all.length;
+          const base = (f) => (f.split("/").pop() || "").replace(/\.(test|spec)/, "").replace(/\.[a-z]+$/, "");
+          const testBases = new Set(all.filter(f => kindOf(f.filename) === "test").map(f => base(f.filename)));
+          const migrationChanged = all.some(f => /(^|\/)(migrations?|db\/migrate|liquibase|flyway)\//i.test(f.filename));
+          let budget = 0;
+          for (const f of all) {
+            if (SKIP.test(f.filename) || !f.patch) { skipped.push(f.filename); continue; }
+            if (budget > MAX_TOTAL) { skipped.push(f.filename); truncated_budget = true; continue; }
+            const patch = f.patch.length > MAX_PATCH ? f.patch.slice(0, MAX_PATCH) + `\n… [truncated ${f.patch.length - MAX_PATCH} chars]` : f.patch;
+            budget += patch.length;
+            const ext = (f.filename.match(/\.([a-z0-9]+)$/i) || [])[1];
+            const kind = kindOf(f.filename);
+            files.push({
+              path: f.filename, kind, status: f.status, language: LANG[(ext || "").toLowerCase()] || ext || null,
+              additions: f.additions, deletions: f.deletions,
+              imports_added: imports(f.patch, "+"), imports_removed: imports(f.patch, "-"),
+              paired_test_changed: kind === "code" && testBases.has(base(f.filename)),
+              migration_file_changed_in_pr: migrationChanged,
+              is_route_or_handler_file: /(^|\/)(routes?|controllers?|handlers?|api|endpoints?)\//i.test(f.filename),
+              patch,
+            });
+          }
+        }
+        return {
+          check_id, repo, criticality, stack, repo_facts,
+          from_release: from ? { id: from.id, semver: from.semver, commit_sha: from.commit_sha } : null,
+          to_release: { id: to.id, semver: to.semver, commit_sha: to.commit_sha },
+          previously_deployed, commits, files, skipped, total_files, truncated_budget,
+          files_count: files.length,
+        };
+    error_handling:
+      fallback_step: resolve_failure
+
+  - id: select_check
+    type: module
+    plugin_type: code-exec
+    name: "Select the check's Jev questions"
+    inputs:
+      check_id: "${{ steps.trigger.outputs.inputs.check_id }}"
+    config:
+      code: |
+        // The catalogue: one entry per checklist item. `gate` names the question
+        // whose max probability decides; other questions ride along as context.
+        // Write the EXACT condition (Jev reads literally) and say what to answer
+        // when a repo fact makes the check not applicable.
+        const N = (question, tru, fal, focus) => ({ type: "noul", instructions: focus ? { question, focus } : question, ...(tru || fal ? { criteria: { ...(tru ? { true: tru } : {}), ...(fal ? { false: fal } : {}) } } : {}) });
+        const CHECKS = {
+          breaks_api_contract: { group: "API checks", title: "Breaks the public API contract", gate: "breaks_api_contract", questions: {
+            breaks_api_contract: N("Does the change in `diff` break the public HTTP API contract for existing clients?",
+              "An existing API consumer that worked before would receive a different shape, a different path, or an error.",
+              "Only additive or internal changes; existing consumers keep working unchanged, or `diff` has no API surface.",
+              "Removed or renamed response fields, changed URL paths, changed status codes, removed or renamed request parameters, changed field types, or a newly REQUIRED header/parameter. Additive changes (new optional field, new route) do NOT count. `file.is_route_or_handler_file` says whether this file is API surface.") } },
+          changes_db_schema: { group: "API checks", title: "Changes the database schema", gate: "changes_db_schema", questions: {
+            changes_db_schema: N("Does the change in `diff` modify a DATABASE schema (SQL tables, columns, indexes, constraints, ORM models) or add a database migration? API schemas, JSON schemas, config schemas and catalog specifications are NOT database schema.",
+              "Adds, drops or alters database tables, columns, indexes or constraints, or adds/edits a database migration file.",
+              "No database schema or migration change; JSON/API/config schema edits, or reads and writes to existing columns, do not count.") } },
+          irreversible_migration: { group: "API checks", title: "Irreversible or destructive migration", gate: "irreversible_migration", questions: {
+            irreversible_migration: N("Assuming `diff` contains a database migration, is it irreversible or destructive? If `diff` has no migration, answer no.",
+              "The migration drops or rewrites existing data, or cannot be rolled back.",
+              "The migration is additive with a rollback, or there is no migration.",
+              "DROP TABLE/COLUMN, data deletion, type narrowing, or a migration with no working down/rollback.") } },
+          logs_sensitive_data: { group: "API checks", title: "Logs sensitive data", gate: "logs_sensitive_data", questions: {
+            logs_sensitive_data: N("Does the change in `diff` write sensitive data to logs?",
+              "A new or changed logging call includes a secret, credential, card number, raw headers/body or personal data.",
+              "Logging only includes non-sensitive identifiers (ids, counts, statuses), or there is no new logging.",
+              "Passwords, tokens, API keys, session ids, card numbers, full request headers or bodies that can carry credentials, personal identifiers such as emails or document numbers. Logging goes through `repo_facts.logging_library` when set, or console/print otherwise.") } },
+          hardcoded_secret: { group: "API checks", title: "Hardcoded credential", gate: "hardcoded_secret", questions: {
+            hardcoded_secret: N("Does the change in `diff` add a hardcoded credential (API key, password, token, private key) as a literal in production code or config? Test fixtures with obviously fake values (`file.kind` = test) do not count.",
+              "A literal secret value appears in the added lines of production code or config.",
+              "Secrets come from env, config entries or a secret store, the values are test fixtures, or no secret is involved.") } },
+          touches_auth: { group: "API checks", title: "Touches authentication / authorization", gate: "touches_auth", questions: {
+            touches_auth: N("Does the change in `diff` modify authentication or authorization logic (login, token validation, permission checks, roles, session handling)?") } },
+          new_external_call_without_timeout: { group: "API checks", title: "New outbound call without timeout", gate: "new_external_call_without_timeout", questions: {
+            new_external_call_without_timeout: N("Does the change in `diff` add a new outbound HTTP or network call that has no timeout or abort handling?",
+              "A new fetch/axios/http/client call is added and no timeout, AbortSignal or deadline is set for it.",
+              "Any new outbound call sets a timeout or uses a shared client that owns timeouts, or no outbound call is added.",
+              "Look at `file.imports_added` and the added lines for fetch/axios/undici/http clients (`repo_facts.http_client_library`).") } },
+          removes_error_handling: { group: "API checks", title: "Removes or weakens error handling", gate: "removes_error_handling", questions: {
+            removes_error_handling: N("Does the change in `diff` remove or weaken error handling (deleted try/catch, swallowed errors, removed validation, removed status checks)?") } },
+          bypasses_component_library: { group: "Frontend checks", title: "Bypasses the component library", gate: "bypasses_component_library", questions: {
+            bypasses_component_library: N("Does the change in `diff` render UI with raw HTML elements or inline styles instead of the repo's component library `repo_facts.design_system_package`?",
+              "The repo has a component library and this UI is built from raw elements or inline styles instead.",
+              "UI uses the component library, the repo has no component library (`repo_facts.design_system_package` is null), or `diff` has no UI markup.",
+              "Only applies when `repo_facts.design_system_package` is not null. If it is null the repo has no component library and the answer is no.") } },
+          hardcoded_user_text: { group: "Frontend checks", title: "User-visible text without i18n", gate: "hardcoded_user_text", questions: {
+            hardcoded_user_text: N("Does the change in `diff` add user-visible text (labels, placeholders, button text, messages) as a literal string instead of a translation lookup?",
+              "The repo uses i18n and a user-visible string literal is added without t()/i18n, or a translation call is replaced by a literal.",
+              "Strings go through the translation function, the repo has no i18n (`repo_facts.uses_i18n` is false), or there is no UI text.",
+              "Only applies when `repo_facts.uses_i18n` is true. If it is false the repo does not translate and the answer is no.") } },
+          accessibility_regression: { group: "Frontend checks", title: "Accessibility regression", gate: "accessibility_regression", questions: {
+            accessibility_regression: N("Does the change in `diff` add UI that is missing basic accessibility: images without alt text, form inputs without labels, clickable non-button elements without keyboard/role handling?") } },
+          leftover_debug_output: { group: "Frontend checks", title: "Leftover debug output", gate: "leftover_debug_output", questions: {
+            leftover_debug_output: N("Does the change in `diff` leave debugging output in production code paths (console.log/print/debugger statements, commented-out blocks of code)? Deliberate structured logging through `repo_facts.logging_library` does not count.") } },
+          disables_tests_or_ci: { group: "Common checks", title: "Disables tests or CI", gate: "disables_tests_or_ci", questions: {
+            disables_tests_or_ci: N("Does the change in `diff` disable, skip or delete tests, or weaken CI checks (skip/xit/only markers, removed test files, lowered coverage thresholds, removed lint steps)?") } },
+          major_dependency_bump: { group: "Common checks", title: "Major dependency bump / new runtime dependency", gate: "major_dependency_bump", questions: {
+            major_dependency_bump: N("Does the change in `diff` bump a dependency across a major version or add a new runtime dependency? (`file.imports_added` lists new imports.)") } },
+          risk_level: { group: "Common checks", title: "Risk level (Jev)", gate: null, questions: {
+            risk: { type: "score", instructions: { question: "How risky is deploying the change in `diff` to `deployment.environment` for an application of criticality `deployment.criticality`?", note: "Judge blast radius and reversibility, not code style." },
+              criteria: [ { summary: "Negligible", signals: ["Pure refactor, formatting, comments, docs or tests only"] }, { summary: "Low", signals: ["Additive change, easily reverted, no data or contract impact"] }, { summary: "Moderate", signals: ["Behaviour change in a code path users depend on", "New logging, config or dependency"] }, { summary: "High", signals: ["Breaking API change", "Schema migration", "Auth or payment logic"] }, { summary: "Critical", signals: ["Irreversible data change", "Security exposure such as leaked credentials"] } ] },
+            change_kind: { type: "choice", instructions: "Which category best describes the primary change in `diff`?",
+              criteria: { api: "HTTP routes, request/response schemas, controllers, API clients", data: "Migrations, schema, persistence, queries", auth_security: "Authentication, authorization, secrets, security controls", frontend: "UI components, styles, translations, client state", infra: "Build, CI, Docker, deployment manifests, infrastructure as code", tests: "Test code only", docs: "Documentation or comments only", refactor: "Behaviour-preserving restructuring", other: "None of the above" } } } },
+        };
+        const c = CHECKS[$item.check_id];
+        if (!c) throw new Error(`unknown check_id '${$item.check_id}' — known: ${Object.keys(CHECKS).join(", ")}`);
+        return { check_id: $item.check_id, group: c.group, title: c.title, gate: c.gate, questions: c.questions };
+
+  - id: progress_judging
+    type: module
+    plugin_type: np-checklist-item-progress
+    name: "Heartbeat: judging files"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      message:       "Diff ${{ steps.gather.outputs.from_release.semver }} → ${{ steps.gather.outputs.to_release.semver }}: ${{ steps.gather.outputs.files_count }} file(s). Asking Jev `${{ steps.select_check.outputs.title }}`…"
+
+  - id: jev
+    type: module
+    plugin_type: jev-system-one
+    name: "Jev: one request per changed file"
+    forEach:
+      expression: "${{ steps.gather.outputs.files }}"
+      itemVariable: file
+      parallel: true
+      maxConcurrency: 12
+    inputs:
+      file:
+        path: "${{ file.path }}"
+        kind: "${{ file.kind }}"
+        language: "${{ file.language }}"
+        status: "${{ file.status }}"
+        additions: "${{ file.additions }}"
+        deletions: "${{ file.deletions }}"
+        imports_added: "${{ file.imports_added }}"
+        imports_removed: "${{ file.imports_removed }}"
+        paired_test_changed: "${{ file.paired_test_changed }}"
+        migration_file_changed_in_pr: "${{ file.migration_file_changed_in_pr }}"
+        is_route_or_handler_file: "${{ file.is_route_or_handler_file }}"
+      diff: "${{ file.patch }}"
+      repo_facts: "${{ steps.gather.outputs.repo_facts }}"
+      deployment:
+        environment: production
+        criticality: "${{ steps.gather.outputs.criticality }}"
+        stack: "${{ steps.gather.outputs.stack }}"
+    config:
+      questions: "${{ steps.select_check.outputs.questions }}"
+      maxStateChars: 60000
+    error_handling:
+      fallback_step: resolve_failure
+
+  - id: aggregate
+    type: module
+    plugin_type: code-exec
+    name: "Aggregate: verdict + evidence"
+    inputs:
+      results: "${{ steps.jev.outputs.items }}"
+      gathered: "${{ steps.gather.outputs }}"
+      check: "${{ steps.select_check.outputs }}"
+      low: "${{ variables.threshold_low }}"
+      high: "${{ variables.threshold_high }}"
+    config:
+      code: |
+        const { results = [], gathered = {}, check = {} } = $item;
+        const low = Number($item.low), high = Number($item.high);
+        const files = gathered.files || [];
+        const gate = check.gate;
+        const evidence = [], grey = [], informational = [], perFile = [];
+        let max = 0, tokens = 0, latency = 0, ok = 0, model = null;
+        let riskMax = 0, riskFile = null; const kinds = {};
+        results.forEach((r, i) => {
+          const meta = files[i] || {}; const name = meta.path || `#${i}`;
+          const s = (r && r.summary) || {}; const u = (r && r.usage) || {};
+          tokens += Number(u.input_tokens || 0); latency += Number(r && r.latency_ms || 0); if (r && r.ok) ok++; model = (r && r.model) || model;
+          perFile.push({ file: name, kind: meta.kind, summary: s });
+          if (gate) {
+            const v = Number(s[gate]); if (!Number.isFinite(v)) return;
+            if (meta.kind !== "code") { if (v >= low) informational.push({ file: name, kind: meta.kind, p: +v.toFixed(2) }); return; }
+            if (v > max) max = v;
+            if (v >= high) evidence.push({ file: name, p: +v.toFixed(2) }); else if (v >= low) grey.push({ file: name, p: +v.toFixed(2) });
+          } else {
+            if (meta.kind === "code" && Number(s.risk) > riskMax) { riskMax = Number(s.risk); riskFile = name; }
+            if (s.change_kind) kinds[s.change_kind] = (kinds[s.change_kind] || 0) + 1;
+          }
+        });
+        const from = gathered.from_release ? gathered.from_release.semver : "first deploy";
+        const to = gathered.to_release ? gathered.to_release.semver : "?";
+        const span = `${from} → ${to}, ${files.length} file(s) judged${gathered.skipped && gathered.skipped.length ? `, ${gathered.skipped.length} skipped` : ""}`;
+        const cost = +(tokens / 1e6 * 0.042).toFixed(5);
+        const perf = `${(latency / 1000).toFixed(1)} s of Jev time, ${tokens} tokens ≈ $${cost}`;
+        let status, message;
+        if (files.length === 0) {
+          status = "passed"; message = gathered.previously_deployed ? `✅ Release already deployed on this scope before — no code change to judge (${from} → ${to}).` : `✅ No changed files between ${from} and ${to}.`;
+        } else if (!gate) {
+          const LEVELS = ["Negligible", "Low", "Moderate", "High", "Critical"]; const level = LEVELS[Math.round(riskMax)] || "n/a";
+          status = "passed"; message = `ℹ️ Jev risk: **${level}** (${riskMax.toFixed(2)}${riskFile ? `, driven by ${riskFile.split("/").pop()}` : ""}). Change kinds: ${Object.entries(kinds).map(([k, n]) => `${k}×${n}`).join(", ") || "n/a"}. ${span}; ${perf}.`;
+        } else if (evidence.length > 0) {
+          status = "failed"; message = `❌ **${check.title}** — ${evidence.length} file(s) ≥ ${high}: ${evidence.slice(0, 5).map(e => `${e.file.split("/").pop()} (${e.p})`).join(", ")}${evidence.length > 5 ? ", …" : ""}. ${span}; ${perf}.`;
+        } else if (grey.length > 0) {
+          status = "passed"; message = `✅ **${check.title}** — no file ≥ ${high}; ${grey.length} in the grey band (${low}–${high}): ${grey.slice(0, 3).map(e => `${e.file.split("/").pop()} (${e.p})`).join(", ")}. Worth a look, not a block. ${span}; ${perf}.`;
+        } else {
+          status = "passed"; message = `✅ **${check.title}** — clear across all code files (max ${max.toFixed(2)}). ${span}; ${perf}.`;
+        }
+        return { status, message, details: {
+          check_id: check.check_id, group: check.group, title: check.title, gate, thresholds: { low, high },
+          max: +max.toFixed(3), evidence, grey, informational,
+          risk: gate ? undefined : { max: +riskMax.toFixed(2), file: riskFile, change_kinds: kinds },
+          from_release: gathered.from_release, to_release: gathered.to_release, previously_deployed: gathered.previously_deployed,
+          files_judged: files.length, files_ok: ok, files_skipped: gathered.skipped || [], total_files: gathered.total_files, truncated_budget: gathered.truncated_budget,
+          repo_facts: gathered.repo_facts, jev_model: model, input_tokens: tokens, est_cost_usd: cost, jev_latency_ms: latency,
+          per_file: perFile.slice(0, 60),
+        } };
+
+  - id: resolve
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item"
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        "${{ steps.aggregate.outputs.status }}"
+      message:       "${{ steps.aggregate.outputs.message }}"
+      details:       "${{ steps.aggregate.outputs.details }}"
+
+  # Reached only via `error_handling.fallback_step` of gather / jev (dormant
+  # edges below keep it out of the entry-point set). A check that could not
+  # run must resolve FAILED loudly — never as a silent pass.
+  - id: resolve_failure
+    type: module
+    plugin_type: np-checklist-item-resolve
+    name: "Resolve checklist item (check could not run)"
+    join_strategy: any
+    inputs:
+      callbackUrl:   "${{ steps.trigger.outputs.callbackUrl }}"
+      callbackToken: "${{ steps.trigger.outputs.callbackToken }}"
+      status:        failed
+      message:       "⚠️ Check `${{ steps.trigger.outputs.inputs.check_id }}` could not run: ${{ steps.gather.error.message }}${{ steps.jev.error.message }}"
+      details:
+        check_id:       "${{ steps.trigger.outputs.inputs.check_id }}"
+        release_id:     "${{ steps.trigger.outputs.inputs.release_id }}"
+        application_id: "${{ steps.trigger.outputs.inputs.application_id }}"
+        gather_error:   "${{ steps.gather.error.message }}"
+        jev_error:      "${{ steps.jev.error.message }}"
+        jev_error_code: "${{ steps.jev.error.code }}"
+
+connections:
+  - { id: c1, from: trigger,          to: progress }
+  - { id: c2, from: progress,         to: gather }
+  - { id: c3, from: gather,           to: select_check }
+  - { id: c4, from: select_check,     to: progress_judging }
+  - { id: c5, from: progress_judging, to: jev }
+  - { id: c6, from: jev,              to: aggregate }
+  - { id: c7, from: aggregate,        to: resolve }
+  # Dormant edges: declared so the engine knows the fallback targets exist.
+  - { id: f1, from: gather,           to: resolve_failure, condition: "false" }
+  - { id: f2, from: jev,              to: resolve_failure, condition: "false" }
+
+outputs:
+  check_id:         "${{ steps.trigger.outputs.inputs.check_id }}"
+  resolved_status:  "${{ steps.aggregate.outputs.status }}"
+  resolved_message: "${{ steps.aggregate.outputs.message }}"
+  callback_ok:      "${{ steps.resolve.outputs.ok }}"

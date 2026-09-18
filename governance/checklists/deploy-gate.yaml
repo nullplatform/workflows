@@ -1,65 +1,448 @@
-# Checklist template: deploy-gate
+# Checklist specification: deploy-gate (v10, Jev)
 #
-# Snapshot of the LIVE template (tmpl_9biefuuos8lbszqc, v2, 2026-05-23),
-# associated in production with the `deployment:create` approval action on
-# `dimensions.environment=production`. This is the template the governance
-# workflows in this folder resolve items for.
+# Snapshot of the LIVE specification (spec_q16ov89kwldmjfq3, "deploy-governance-v10-jev",
+# 2026-09-18), associated in production with the `deployment:create` approval action
+# 490799113 on `dimensions.environment=production`.
 #
-# External items on the NP dispatch path declare ONLY
-# `kind` + `inputs` + `timeout_seconds` + `trigger`. There is no
-# channel/url/method/headers here: routing is decided by the
-# notification_channel each workflow's `np-checklist-trigger` auto-registers
-# on alias activation (filtering on `source=checklist`,
-# `action=checklist:item:dispatched`, `context.kind=<kind>`). The
-# approval-api validator rejects the old url-bearing shape
-# (CHECKLIST_TEMPLATE.INVALID_EXTERNAL_SHAPE).
+# Structure:
+#   - source_branch (condition gate)
+#   - API checks / Frontend checks / Common checks (groups): one external item per
+#     check, `kind: deploy-change-check`, resolved by governance/deploy-change-check.yaml
+#     — Jev (TypeSafe System One) judges every changed code file in seconds; items with
+#     `behavior: gate` fail when any file scores >= 0.7, `informational` ones only report.
+#   - change_analysis (external, INFORMATIONAL since v10): the Claude functional summary
+#     and risk matrix, resolved by the deploy-change-analysis workflow.
+#   - human_approvals (override group): pair / admin approval unblocks a failed gate.
 #
-# `external.inputs` values are mustache placeholders resolved against the
-# run context at dispatch time — these KEEP the `context.` root (dispatch
-# payload, not the condition query language).
-#
-# Create + associate with the np-checklist skill (or the raw API):
-#   create_template.sh --nrn "organization=<org-id>" --name "deploy-gate" \
-#     --definition-file ./deploy-gate.yaml --created-by "<user>"
-#   set_action_template.sh --action-id <approval-action-id> --template-id <tmpl_…>
+# External items on the NP dispatch path declare ONLY `kind` + `inputs` +
+# `timeout_seconds` + `trigger`; routing is the notification_channel each workflow's
+# `np-checklist-trigger` registers on alias activation. `external.inputs` keep the
+# `context.` root (dispatch payload). Update with the np-checklist skill:
+#   update_specification.sh --id <spec_…> --definition-file ./deploy-gate.yaml
+#   set_action_specification.sh --action-id 490799113 --specification-id <new spec_…>
 items:
-  - id: epic_valid
+- id: source_branch
+  type: condition
+  query:
+    $or:
+    - build.branch: master
+    - build.branch: main
+  title: Source branch
+  behavior: gate
+  severity: major
+  description: >
+    Production deploys only from `main` or `master`. If the build comes from
+
+    another branch, this item fails and the deploy needs an approval from the
+
+    "Human approval" group.
+- id: api_checks
+  type: group
+  title: API checks (Jev)
+  behavior: gate
+  severity: major
+  aggregation: all
+  description: >
+    Backend / API safety checks over the diff between the deployed release and the candidate. Judged by
+    Jev (TypeSafe System One): one calibrated probability per changed code file, in seconds. Fails when
+    any file scores ≥ 0.7; docs/tests never gate. Evidence (files + probabilities) in the item details.
+  children:
+  - id: breaks_api_contract
     type: external
+    title: Breaks the public API contract
     behavior: gate
     severity: critical
-    title: "Jira Epic is valid"
-    description: >-
-      Validates that deployment.metadata.jira_epic refers to a Jira Epic
-      currently In Progress / In Development. The Jira API error is passed
-      verbatim back to the run.
+    description: >
+      Removed/renamed response fields or routes, changed types or status codes, newly required params.
+      Additive changes do not count.
     external:
-      kind: "validate-jira-epic"
+      kind: deploy-change-check
       inputs:
-        jira_epic: "{{ context.deployment.metadata.deployment.jira_epic }}"
+        check_id: breaks_api_contract
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
       trigger: auto
-      timeout_seconds: 60
-
-  - id: tests_confirmed
-    type: manual
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: changes_db_schema
+    type: external
+    title: Changes the database schema
+    behavior: gate
+    severity: major
+    description: >
+      Adds, drops or alters tables, columns, indexes or constraints, or adds a migration.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: changes_db_schema
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: irreversible_migration
+    type: external
+    title: Irreversible or destructive migration
+    behavior: gate
+    severity: critical
+    description: >
+      DROP/data rewrite or a migration with no rollback.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: irreversible_migration
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: logs_sensitive_data
+    type: external
+    title: Logs sensitive data
+    behavior: gate
+    severity: critical
+    description: >
+      Passwords, tokens, keys, card numbers, raw headers/bodies or personal data written to logs.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: logs_sensitive_data
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: hardcoded_secret
+    type: external
+    title: Hardcoded credential
+    behavior: gate
+    severity: critical
+    description: >
+      A literal secret in production code or config (test fixtures excluded).
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: hardcoded_secret
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: touches_auth
+    type: external
+    title: Touches authentication / authorization
+    behavior: informational
+    severity: major
+    description: >
+      Login, token validation, permission checks, roles, sessions. Informational: auth work is expected,
+      but reviewers should know.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: touches_auth
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: new_external_call_without_timeout
+    type: external
+    title: New outbound call without timeout
+    behavior: informational
+    severity: minor
+    description: >
+      A new fetch/http client call with no timeout, AbortSignal or deadline.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: new_external_call_without_timeout
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: removes_error_handling
+    type: external
+    title: Removes or weakens error handling
+    behavior: informational
+    severity: minor
+    description: >
+      Deleted try/catch, swallowed errors, removed validation or status checks.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: removes_error_handling
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+- id: frontend_checks
+  type: group
+  title: Frontend checks (Jev)
+  behavior: gate
+  severity: major
+  aggregation: all
+  description: >
+    UI conventions over the diff. Each check knows the repo's facts (component library, i18n) and answers
+    'no' when the convention does not apply to the repo. Judged by Jev (TypeSafe System One): one calibrated
+    probability per changed code file, in seconds. Fails when any file scores ≥ 0.7; docs/tests never
+    gate. Evidence (files + probabilities) in the item details.
+  children:
+  - id: bypasses_component_library
+    type: external
+    title: Bypasses the component library
+    behavior: gate
+    severity: major
+    description: >
+      Raw HTML elements or inline styles where the repo's design-system package exports an equivalent.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: bypasses_component_library
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: hardcoded_user_text
+    type: external
+    title: User-visible text without i18n
     behavior: gate
     severity: minor
-    title: "I ran tests for this change"
-    description: "Confirm after running the full test suite locally or in CI."
-    require_comment: false
-
-  - id: release_passed_stage
-    type: external
-    behavior: gate
-    severity: critical
-    title: "Release was deployed to a stage scope"
-    description: >-
-      Searches the last 30 finalized deployments across scopes with
-      dimensions.environment=stage for this application; fails if the
-      current release id is not found.
+    description: >
+      Literal user-visible strings in a repo that translates through i18n.
     external:
-      kind: "check-release-staged"
+      kind: deploy-change-check
       inputs:
-        release_id: "{{ context.release.id }}"
-        application_id: "{{ context.application.id }}"
+        check_id: hardcoded_user_text
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
       trigger: auto
-      timeout_seconds: 60
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: accessibility_regression
+    type: external
+    title: Accessibility regression
+    behavior: informational
+    severity: minor
+    description: >
+      Images without alt, inputs without labels, clickable non-buttons without keyboard/role handling.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: accessibility_regression
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: leftover_debug_output
+    type: external
+    title: Leftover debug output
+    behavior: informational
+    severity: info
+    description: >
+      console.log / print / debugger or commented-out code left in production paths.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: leftover_debug_output
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+- id: common_checks
+  type: group
+  title: Common checks (Jev)
+  behavior: gate
+  severity: major
+  aggregation: all
+  description: >
+    Hygiene checks for any stack, plus Jev's own risk level and change classification. Judged by Jev (TypeSafe
+    System One): one calibrated probability per changed code file, in seconds. Fails when any file scores
+    ≥ 0.7; docs/tests never gate. Evidence (files + probabilities) in the item details.
+  children:
+  - id: disables_tests_or_ci
+    type: external
+    title: Disables tests or CI
+    behavior: gate
+    severity: major
+    description: >
+      skip/only markers, deleted tests, lowered coverage thresholds, removed lint steps.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: disables_tests_or_ci
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: major_dependency_bump
+    type: external
+    title: Major dependency bump / new runtime dependency
+    behavior: informational
+    severity: minor
+    description: >
+      A dependency crosses a major version or a new runtime dependency appears.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: major_dependency_bump
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+  - id: risk_level
+    type: external
+    title: Risk level & change kind (Jev)
+    behavior: informational
+    severity: info
+    description: >
+      Jev's 0–4 risk score (worst code file) and the distribution of change kinds across files.
+    external:
+      kind: deploy-change-check
+      inputs:
+        check_id: risk_level
+        scope_id: '{{ context.scope.id }}'
+        release_id: '{{ context.release.id }}'
+        deployment_id: '{{ context.deployment.id }}'
+        application_id: '{{ context.application.id }}'
+      trigger: auto
+      timeout_seconds: 300
+    for_each: deployments
+    applies_when:
+      scope.dimensions.environment: production
+- id: change_analysis
+  type: external
+  title: Change summary & risk matrix (Claude, informational)
+  behavior: informational
+  external:
+    kind: deploy-change-analysis
+    inputs:
+      scope_id: '{{ context.scope.id }}'
+      release_id: '{{ context.release.id }}'
+      deployment_id: '{{ context.deployment.id }}'
+      application_id: '{{ context.application.id }}'
+    trigger: auto
+    timeout_seconds: 600
+  for_each: deployments
+  severity: major
+  description: >
+    Functional summary of the accumulated change (what ships, who did it, categories) and the risk × criticality
+    matrix, produced by Claude. Informational since 2026-09-18: the per-check Jev items below are the
+    gates.
+  applies_when:
+    scope.dimensions.environment: production
+- id: human_approvals
+  type: group
+  title: Human approval
+  behavior: override
+  children:
+  - id: pair_review
+    type: manual
+    title: Pair approval
+    behavior: gate
+    severity: major
+    description: >
+      Approval by a **peer other than the requester** when the matrix requires
+
+      it (medium risk on critical apps, high risk on important ones).
+
+      It is only enabled once the analysis has finished and the matrix asks
+
+      exactly for Pair — if it has not run yet, wait for it to finish.
+
+      The four-eyes validation rejects self-approval.
+    validations:
+    - id: four_eyes
+      rule:
+        actor.user_id:
+          $ne: $approval.requested_by
+      message: Someone other than the requester must approve this deploy
+    require_comment: true
+  - id: admin_review
+    type: manual
+    title: Admin approval (ops/secops)
+    behavior: gate
+    severity: major
+    description: >
+      Approval by **admin/ops/secops** — valid at any time (break-glass): for
+
+      the cases the matrix flags as group (high risk on mission-critical apps)
+
+      or when the analysis is not available.
+    validations:
+    - id: admin_role
+      rule:
+        actor.effective_roles:
+          $in:
+          - admin
+          - ops
+          - secops
+      message: Requires admin, ops or secops role on this scope
+    require_comment: true
+  severity: major
+  aggregation: any
+  description: >
+    When the matrix requires human review, ONE of these approvals unblocks the deploy. The "Change analysis
+    & risk matrix" item says which one applies for the detected risk.
