@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cost Explorer — falabella</title>
+<style>
+  :root {
+    --bg: #f7f8fa; --surface: #ffffff; --ink: #1a2233; --ink2: #5a6478; --muted: #8a93a6;
+    --line: #e3e7ee; --accent: #2563eb; --accent2: #0d9488; --waste: #cbd5e1;
+    --bad: #b91c1c; --warn: #b45309; --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1420; --surface: #171e2e; --ink: #e7ebf3; --ink2: #a8b1c4; --muted: #77809a;
+            --line: #27304a; --accent: #60a5fa; --accent2: #2dd4bf; --waste: #3a4460;
+            --bad: #f87171; --warn: #fbbf24; --ok: #4ade80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+           padding: 12px 20px; background: var(--surface); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0 14px 0 0; }
+  input, select, button { font: inherit; color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+  button { background: var(--accent); color: #fff; border: 0; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--ink2); font-size: 13px; }
+  main { max-width: 1240px; margin: 0 auto; padding: 18px 20px 60px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card .v { font-size: 22px; font-weight: 650; }
+  .card .l { color: var(--ink2); font-size: 12px; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 18px; overflow-x: auto; }
+  .panel h2 { font-size: 14px; margin: 0 0 10px; color: var(--ink2); font-weight: 600; }
+  .tabs { display: flex; gap: 6px; margin: 0 0 12px; flex-wrap: wrap; }
+  .tabs button { background: var(--surface); color: var(--ink2); border: 1px solid var(--line); }
+  .tabs button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--ink2); font-weight: 600; cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--surface); }
+  th:first-child, td:first-child { text-align: left; }
+  td.name { max-width: 340px; overflow: hidden; text-overflow: ellipsis; cursor: pointer; color: var(--accent); }
+  tr:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  .bar { display: inline-block; height: 8px; background: var(--accent); border-radius: 4px; vertical-align: middle; margin-right: 6px; min-width: 1px; }
+  .pct-bad { color: var(--bad); } .pct-warn { color: var(--warn); } .pct-ok { color: var(--ok); }
+  #trend { display: flex; align-items: stretch; gap: 4px; height: 140px; padding-top: 6px; }
+  #trend .day { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; align-items: stretch; position: relative; }
+  #trend .stack { display: flex; flex-direction: column; justify-content: flex-end; border-radius: 3px 3px 0 0; overflow: hidden; }
+  #trend .w { background: var(--waste); }
+  #trend .u { background: var(--accent2); }
+  #trend .lbl { font-size: 10px; color: var(--muted); text-align: center; margin-top: 4px; }
+  #trend .day:hover .tip { display: block; }
+  .tip { display: none; position: absolute; bottom: 100%; left: 50%; transform: translateX(-50%);
+         background: var(--ink); color: var(--bg); padding: 5px 8px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 5; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink2); margin-top: 8px; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
+  .hint { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cost Explorer</h1>
+  <input id="token" type="password" placeholder="token NP (Bearer)" size="34">
+  <button id="load">Cargar</button>
+  <label class="hint">día <select id="daySel"></select></label>
+  <input id="search" placeholder="filtrar…" size="22">
+  <span id="status">pegá tu token y dale Cargar</span>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div class="panel">
+    <h2>Costo por día (org, scopes k8s) — uso real vs reserva ociosa</h2>
+    <div id="trend"></div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--accent2)"></span>uso real</span>
+      <span><span class="sw" style="background:var(--waste)"></span>reservado sin usar (waste)</span>
+    </div>
+  </div>
+  <div class="tabs" id="tabs"></div>
+  <div class="panel"><div id="table"></div></div>
+</main>
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const fmt = (n, d = 0) => n == null || isNaN(n) ? "—" : n.toLocaleString("es-AR", { maximumFractionDigits: d, minimumFractionDigits: d });
+const usd = (n, d) => n == null || isNaN(n) ? "—" : "$" + fmt(n, d ?? (n < 10 ? 2 : 0));
+
+let ALL = [];          // instancias crudas
+let DAY = null;        // dia seleccionado
+let TAB = "app";
+let SORT = { k: "cost", asc: false };
+
+try { $("#token").value = localStorage.getItem("npCostToken") || ""; } catch (e) {}
+
+// DEPRECADO 2026-08-27: leia infrastructure_cost (spec borrado; ahora todo
+// vive en infrastructure_cost_daily). Usar el dashboard NP "Costos y
+// Eficiencia de Infraestructura". Adaptable a hechos si hiciera falta.
+if (location.protocol === "file:") {
+  $("#status").innerHTML = "<b>abriste el archivo directo</b> — corré <code>node serve.js</code> en esta carpeta y entrá a <a href='http://localhost:8917'>http://localhost:8917</a> (el server proxya la API de NP)";
+  $("#load").disabled = true;
+}
+
+const TABS = [
+  ["app", "Apps"], ["ns", "Namespaces"], ["acc", "Cuentas"], ["scope", "Scopes"],
+  ["cluster", "Clusters"], ["svc", "Servicios"], ["pool", "Pools servicios"],
+];
+
+async function fetchPage(offset, token) {
+  const r = await fetch(`/np/catalog/instances/infrastructure_cost?limit=100&offset=${offset}`,
+    { headers: { Authorization: "Bearer " + token } });
+  if (!r.ok) throw new Error(`HTTP ${r.status} — ${(await r.text()).slice(0, 120)}`);
+  return (await r.json()).results || [];
+}
+
+async function loadAll() {
+  const token = $("#token").value.trim();
+  if (!token) { $("#status").textContent = "falta el token"; return; }
+  try { localStorage.setItem("npCostToken", token); } catch (e) {}
+  $("#load").disabled = true;
+  ALL = [];
+  let offset = 0, done = false;
+  try {
+    while (!done) {
+      const pages = await Promise.all([0, 100, 200, 300].map((o) => fetchPage(offset + o, token)));
+      for (const p of pages) { ALL.push(...p); if (p.length < 100) done = true; }
+      offset += 400;
+      $("#status").textContent = `cargando… ${ALL.length} instancias`;
+    }
+    const days = [...new Set(ALL.flatMap((i) => (i.daily || []).map((p) => p.d)))].sort();
+    $("#daySel").innerHTML = days.map((d) => `<option ${d === days[days.length - 1] ? "selected" : ""}>${d}</option>`).join("");
+    DAY = days[days.length - 1] || null;
+    $("#status").textContent = `${ALL.length} instancias · último día: ${DAY || "—"}`;
+    render();
+  } catch (e) {
+    $("#status").textContent = "error: " + e.message;
+  } finally { $("#load").disabled = false; }
+}
+
+function dayEntry(inst, d) {
+  const dl = inst.daily || [];
+  const exact = dl.find((p) => p.d === d);
+  if (exact) return exact;
+  // services/pools (finout_direct) traen la serie con lag de billing:
+  // si el dia pedido no existe, usar la ultima entrada anterior disponible
+  if (/^(service-|svc-pool-)/.test(String(inst.id))) {
+    const prev = dl.filter((p) => p.d <= d).sort((a, b) => a.d < b.d ? -1 : 1);
+    return prev[prev.length - 1] || null;
+  }
+  return null;
+}
+
+// agrega una lista de instancias-scope para el dia DAY
+function aggregate(insts) {
+  const a = { cost: 0, use: 0, cpuRes: 0, cpuUsed: 0, cpuP95: 0, memRes: 0, memUsed: 0, pods: 0, n: 0, c7: 0, c30: 0 };
+  for (const i of insts) {
+    const e = dayEntry(i, DAY);
+    if (!e) continue;
+    a.n++;
+    a.cost += e.cost_usd || 0; a.use += e.usage_usd || 0;
+    // 7d/30d desde daily (el listado no siempre trae cost_7d/30d_usd)
+    const dl = (i.daily || []);
+    a.c7 += dl.slice(-7).reduce((x, p) => x + (p.cost_usd || 0), 0);
+    a.c30 += dl.slice(-30).reduce((x, p) => x + (p.cost_usd || 0), 0);
+    const r = e.resources || {};
+    if (r.cpu) { a.cpuRes += r.cpu.reserved || 0; a.cpuUsed += r.cpu.used || 0; a.cpuP95 += r.cpu.p95 || 0; }
+    if (r.mem) { a.memRes += r.mem.reserved || 0; a.memUsed += r.mem.used || 0; }
+    if (r.pods) a.pods += r.pods.avg || 0;
+  }
+  a.waste = a.cost - a.use;
+  a.ef = a.cost > 0 ? 100 * a.use / a.cost : null;
+  a.cpuUtil = a.cpuRes > 0 ? 100 * a.cpuUsed / a.cpuRes : null;
+  a.memUtil = a.memRes > 0 ? 100 * a.memUsed / a.memRes : null;
+  return a;
+}
+
+function groups() {
+  const scopes = ALL.filter((i) => i.entity_type === "scope");
+  const by = (keyFn) => {
+    const m = new Map();
+    for (const s of scopes) {
+      const k = keyFn(s) || "(sin dato)";
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(s);
+    }
+    return [...m.entries()].map(([name, list]) => ({ name, list }));
+  };
+  switch (TAB) {
+    case "app": return by((s) => s.application_name || ("app " + (s.application_id || "?")));
+    case "ns": return by((s) => s.namespace_name || ("ns " + (s.namespace_id || "?")));
+    case "acc": return by((s) => s.account_name || ("cuenta " + (s.account_id || "?")));
+    case "scope": return scopes.map((s) => ({
+      name: [s.account_name, s.application_name, s.entity_name].filter(Boolean).join(" / ") || s.id, list: [s] }));
+    case "cluster": return ALL.filter((i) => String(i.id).startsWith("cluster-")).map((i) => ({ name: i.entity_name || i.id, list: [i] }));
+    case "svc": return ALL.filter((i) => String(i.id).startsWith("service-")).map((i) => ({ name: i.entity_name || i.id, list: [i] }));
+    case "pool": return ALL.filter((i) => String(i.id).startsWith("svc-pool-")).map((i) => ({ name: i.entity_name || i.id, list: [i] }));
+  }
+  return [];
+}
+
+function pctClass(p) { return p == null ? "" : p < 15 ? "pct-bad" : p < 40 ? "pct-warn" : "pct-ok"; }
+
+function render() {
+  if (!ALL.length) return;
+  DAY = $("#daySel").value || DAY;
+  const scopes = ALL.filter((i) => i.entity_type === "scope");
+  const org = aggregate(scopes);
+  const nApps = new Set(scopes.map((s) => s.application_name || s.application_id)).size;
+  const nNs = new Set(scopes.map((s) => s.namespace_name || s.namespace_id)).size;
+  const services = ALL.filter((i) => String(i.id).startsWith("service-"));
+  const svcCost = services.reduce((a, i) => a + ((dayEntry(i, DAY) || {}).cost_usd || 0), 0);
+  $("#cards").innerHTML = [
+    [usd(org.cost), `costo k8s/día (${DAY})`],
+    [usd(org.use), "uso real/día"],
+    [usd(org.waste), "waste/día"],
+    [(org.ef == null ? "—" : fmt(org.ef, 1) + "%"), "eficiencia $"],
+    [fmt(org.cpuUtil, 0) + "%", `CPU util (${fmt(org.cpuRes / 24)} cores res.)`],
+    [fmt(org.memUtil, 0) + "%", `RAM util (${fmt(org.memRes / 24)} GB res.)`],
+    [usd(svcCost), `servicios directos/día (${services.length})`],
+    [fmt(org.n) + " / " + fmt(nApps) + " / " + fmt(nNs), "scopes / apps / namespaces"],
+  ].map(([v, l]) => `<div class="card"><div class="v">${v}</div><div class="l">${l}</div></div>`).join("");
+
+  // tendencia diaria org (scopes)
+  const byDay = new Map();
+  for (const s of scopes) for (const e of (s.daily || [])) {
+    const t = byDay.get(e.d) || { cost: 0, use: 0 };
+    t.cost += e.cost_usd || 0; t.use += e.usage_usd || 0;
+    byDay.set(e.d, t);
+  }
+  const days = [...byDay.keys()].sort().slice(-21);
+  const max = Math.max(...days.map((d) => byDay.get(d).cost), 1);
+  $("#trend").innerHTML = days.map((d) => {
+    const t = byDay.get(d);
+    const hU = 100 * t.use / max, hW = 100 * (t.cost - t.use) / max;
+    return `<div class="day"><div class="tip">${d} · total ${usd(t.cost)} · uso ${usd(t.use)} (${fmt(100 * t.use / t.cost, 1)}%)</div>
+      <div class="stack" style="height:${hU + hW}%"><div class="w" style="height:${(100 * hW) / (hU + hW || 1)}%"></div><div class="u" style="flex:1"></div></div>
+      <div class="lbl">${d.slice(5)}</div></div>`;
+  }).join("");
+
+  // tabla
+  const q = $("#search").value.trim().toLowerCase();
+  let rows = groups().map((g) => ({ name: g.name, n: g.list.length, ...aggregate(g.list) }))
+    .filter((r) => r.cost > 0 || r.use > 0)
+    .filter((r) => !q || r.name.toLowerCase().includes(q));
+  rows.sort((a, b) => {
+    const va = a[SORT.k] ?? -Infinity, vb = b[SORT.k] ?? -Infinity;
+    return SORT.asc ? (va > vb ? 1 : -1) : (va < vb ? 1 : -1);
+  });
+  const maxCost = Math.max(...rows.map((r) => r.cost), 0.001);
+  const isGroup = ["app", "ns", "acc"].includes(TAB);
+  const COLS = [
+    ["name", TABS.find(([k]) => k === TAB)[1]],
+    ...(isGroup ? [["n", "#scopes"]] : []),
+    ["cost", "costo/día"], ["use", "uso/día"], ["waste", "waste/día"], ["ef", "efic %"],
+    ["cpuUtil", "CPU %"], ["memUtil", "RAM %"], ["cpuP95", "p95 cores"], ["c7", "7d"], ["c30", "30d"],
+  ];
+  const sortIcon = (k) => SORT.k === k ? (SORT.asc ? " ↑" : " ↓") : "";
+  $("#table").innerHTML = `<table><thead><tr>` +
+    COLS.map(([k, l]) => `<th data-k="${k}">${l}${sortIcon(k)}</th>`).join("") +
+    `</tr></thead><tbody>` +
+    rows.slice(0, 400).map((r) => `<tr>
+      <td class="name" data-n="${r.name.replace(/"/g, "&quot;")}" title="${r.name}">${r.name}</td>` +
+      (isGroup ? `<td>${fmt(r.n)}</td>` : "") +
+      `<td><span class="bar" style="width:${Math.max(1, 60 * r.cost / maxCost)}px"></span>${usd(r.cost)}</td>
+      <td>${usd(r.use)}</td><td>${usd(r.waste)}</td>
+      <td class="${pctClass(r.ef)}">${r.ef == null ? "—" : fmt(r.ef, 1) + "%"}</td>
+      <td class="${pctClass(r.cpuUtil)}">${r.cpuUtil == null ? "—" : fmt(r.cpuUtil, 0) + "%"}</td>
+      <td class="${pctClass(r.memUtil)}">${r.memUtil == null ? "—" : fmt(r.memUtil, 0) + "%"}</td>
+      <td>${fmt(r.cpuP95, 1)}</td><td>${usd(r.c7)}</td><td>${usd(r.c30)}</td></tr>`).join("") +
+    `</tbody></table>` +
+    (rows.length > 400 ? `<p class="hint">mostrando 400 de ${rows.length} — usá el filtro</p>` : "");
+  document.querySelectorAll("th").forEach((th) => th.onclick = () => {
+    const k = th.dataset.k;
+    SORT = { k, asc: SORT.k === k ? !SORT.asc : false };
+    render();
+  });
+  document.querySelectorAll("td.name").forEach((td) => td.onclick = () => {
+    if (isGroup) { TAB = "scope"; $("#search").value = ""; renderTabs();
+      // drill-down: filtrar scopes del grupo clickeado
+      $("#search").value = td.dataset.n.split(" / ")[0] === td.dataset.n ? td.dataset.n : td.dataset.n;
+      render();
+    }
+  });
+}
+
+function renderTabs() {
+  $("#tabs").innerHTML = TABS.map(([k, l]) => `<button class="${k === TAB ? "on" : ""}" data-k="${k}">${l}</button>`).join("");
+  document.querySelectorAll("#tabs button").forEach((b) => b.onclick = () => { TAB = b.dataset.k; renderTabs(); render(); });
+}
+
+$("#load").onclick = loadAll;
+$("#daySel").onchange = render;
+$("#search").oninput = () => render();
+renderTabs();
+</script>
+</body>
+</html>

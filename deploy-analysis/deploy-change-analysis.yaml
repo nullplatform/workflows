@@ -7,8 +7,8 @@
 # fails, a heuristic fallback still writes signals-only metadata.
 #
 # Config entries (folder /deploy-analysis): secrets NP_API_KEY, GITHUB_TOKEN.
-# maxIterations: 10 on the agent — newer models spend a few no-op tool turns
-# before answering; a tighter budget dies with error_max_turns.
+# maxIterations: 12 + an explicit "do not call tools" instruction on the agent:
+# newer models otherwise burn the budget on no-op tool turns and die with error_max_turns.
 id: deploy_change_analysis
 key: deploy_change_analysis
 name: Deploy Change Analysis
@@ -338,7 +338,17 @@ steps:
       operators will notice), NOT which files were touched — file and line
       detail is already shown as structured data next to your summary.
       Name a code component only when it is essential to understand the risk.
-    maxIterations: 10
+
+      IMPORTANT — how to answer: everything you need is already in this
+      prompt. Do NOT call any tool (no Bash, no file reads, no searches, no
+      "no-op" commands): tool calls consume your turn budget and produce
+      nothing. Reply directly, in your FIRST turn, with the single JSON
+      object required by the output schema and nothing else.
+    # 12 turns is a safety margin only: with the no-tools instruction above
+    # the model answers in 1-2 turns. Without it, claude-sonnet-5 burned all
+    # of a tighter budget on `Bash true` no-ops and died with error_max_turns
+    # (prod, 2026-09-18), and the step read as completed with no answer.
+    maxIterations: 12
   error_handling:
     fallback_step: assemble_heuristic
 - id: assemble

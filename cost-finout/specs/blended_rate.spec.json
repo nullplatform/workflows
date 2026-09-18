@@ -1,0 +1,281 @@
+{
+  "name": "Blended Rate",
+  "slug": "blended_rate",
+  "description": "Precios blended por cluster k8s (USD/core-hora y USD/GB-hora): costo Finout del cluster + networking ÷ capacidad reservada (Datadog). Aca viven los PRECIOS; los hechos de costo en infrastructure_cost. Mantenido por cost-finout — no editar a mano.",
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "relations": {},
+    "authorization": {
+      "entities": {
+        "grants": [
+          {
+            "actions": [
+              "read",
+              "list",
+              "create",
+              "write"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 1061226164,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      },
+      "specification": {
+        "grants": [
+          {
+            "actions": [
+              "read"
+            ],
+            "principals": [
+              {
+                "type": "*"
+              }
+            ]
+          },
+          {
+            "actions": [
+              "*"
+            ],
+            "principals": [
+              {
+                "id": 1061226164,
+                "type": "user"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "properties": {
+      "id": {
+        "type": "string",
+        "description": "Nombre del cluster (nivel cluster) o dim-<cloud>-<country>-<environment> (nivel dimension, agregado ponderado de sus clusters)",
+        "alias": "id",
+        "primaryKey": true,
+        "autoGenerate": false
+      },
+      "level": {
+        "type": "string",
+        "enum": [
+          "cluster",
+          "dimension"
+        ],
+        "description": "Granularidad del rate. El nivel cluster es el primario; el nivel dimension es un agregado ponderado por costo para cortes rapidos.",
+        "index": [
+          "filter"
+        ]
+      },
+      "cluster": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Nombre del cluster k8s (null en level=dimension)",
+        "index": [
+          "filter"
+        ]
+      },
+      "provider_spec": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "gke-configuration | aks-configuration | oke",
+        "index": [
+          "filter"
+        ]
+      },
+      "dimensions": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Dimensiones null que este cluster/combo respalda (del mapeo providers API)",
+        "properties": {
+          "cloud": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "accounts": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Cuentas null cuyos scopes corren en este cluster (denormalizado del mapeo)"
+      },
+      "rates": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Precios vigentes (ultima ventana computada)",
+        "properties": {
+          "cpu_usd_core_hour": {
+            "type": "number"
+          },
+          "mem_usd_gb_hour": {
+            "type": "number"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "split_method": {
+            "type": "string",
+            "description": "Como se reparte el costo del cluster entre cpu y memoria (ej: weighted-50-50)"
+          }
+        }
+      },
+      "composition": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Texto humano que explica QUE compone este rate: fuente de costo (cuenta GCP / rgs Azure), desglose (compute/networking/observabilidad/fees), denominador (reservas DD) y metodo de split. Generado por wf2 en cada corrida."
+      },
+      "basis": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "De donde salen los rates — trazabilidad completa del calculo",
+        "properties": {
+          "window_days": {
+            "type": "number",
+            "description": "Ventana de promediado (ej. 7)"
+          },
+          "cluster_cost_usd_day": {
+            "type": "number",
+            "description": "Costo total diario promedio del cluster en la ventana"
+          },
+          "breakdown": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Descomposicion del costo diario del cluster",
+            "properties": {
+              "compute_usd_day": {
+                "type": "number",
+                "description": "Nodos/VMs del cluster"
+              },
+              "network_usd_day": {
+                "type": "number",
+                "description": "LB + NAT + bandwidth atribuible al cluster"
+              },
+              "other_usd_day": {
+                "type": "number",
+                "description": "Storage de nodos, fees de control plane, etc."
+              }
+            }
+          },
+          "cost_source": {
+            "type": "string",
+            "description": "finout_k8s_cluster (GKE) | finout_azure_rg (AKS via mc_<cluster>) | finout_oci (OKE)"
+          },
+          "cpu_alloc_core_h_day": {
+            "type": "number",
+            "description": "Core-horas reservadas por dia en el cluster (denominador cpu, fuente Datadog)"
+          },
+          "mem_alloc_gb_h_day": {
+            "type": "number",
+            "description": "GB-horas reservadas por dia en el cluster (denominador memoria, fuente Datadog)"
+          },
+          "capacity_source": {
+            "type": "string",
+            "description": "datadog_kubernetes_requests"
+          }
+        }
+      },
+      "daily": {
+        "type": "array",
+        "description": "Serie diaria FIFO (365 dias) de rates y sus insumos",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "d": {
+              "type": "string"
+            },
+            "cpu_usd_core_hour": {
+              "type": "number"
+            },
+            "mem_usd_gb_hour": {
+              "type": "number"
+            },
+            "cluster_cost_usd": {
+              "type": "number"
+            },
+            "network_usd": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "cpu_alloc_core_h": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "mem_alloc_gb_h": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          }
+        }
+      },
+      "sources": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "computed_at": {
+            "type": "string"
+          },
+          "workflow_execution_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "created_at": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "updated_at": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    }
+  }
+}
