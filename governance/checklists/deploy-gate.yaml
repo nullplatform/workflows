@@ -1,23 +1,25 @@
-# Checklist specification: deploy-gate (v10, Jev)
+# Checklist specification: deploy-gate (v11, Jev-only)
 #
-# Snapshot of the LIVE specification (spec_q16ov89kwldmjfq3, "deploy-governance-v10-jev",
+# Snapshot of the LIVE specification (spec_tlkh8gn2r89k4bck, "deploy-governance-v11-jev-only",
 # 2026-09-18), associated in production with the `deployment:create` approval action
 # 490799113 on `dimensions.environment=production`.
 #
 # Structure:
 #   - source_branch (condition gate)
-#   - API checks / Frontend checks / Common checks (groups): one external item per
-#     check, `kind: deploy-change-check`, resolved by governance/deploy-change-check.yaml
-#     — Jev (TypeSafe System One) judges every changed code file in seconds; items with
-#     `behavior: gate` fail when any file scores >= 0.7, `informational` ones only report.
-#   - change_analysis (external, INFORMATIONAL since v10): the Claude functional summary
-#     and risk matrix, resolved by the deploy-change-analysis workflow.
+#   - api_checks / frontend_checks / common_checks (external gates, `kind: deploy-change-check`):
+#     resolved by governance/deploy-change-check.yaml — Jev (TypeSafe System One) judges every
+#     changed code file, several files per request, all in parallel. Whole gate: ~10 s end to
+#     end, ~1 s of it is Jev, well under a cent. Each item fails only when a GATE check scores
+#     >= 0.75 on some file; informational checks are reported in the same message.
 #   - human_approvals (override group): pair / admin approval unblocks a failed gate.
 #
-# External items on the NP dispatch path declare ONLY `kind` + `inputs` +
-# `timeout_seconds` + `trigger`; routing is the notification_channel each workflow's
-# `np-checklist-trigger` registers on alias activation. `external.inputs` keep the
-# `context.` root (dispatch payload). Update with the np-checklist skill:
+# No LLM in the gate: the Claude functional summary and change categories run later against
+# the deploy history (deploy-analysis/*), not as approval items.
+#
+# External items on the NP dispatch path declare ONLY `kind` + `inputs` + `timeout_seconds` +
+# `trigger`; routing is the notification_channel the workflow's `np-checklist-trigger`
+# registers on alias activation. `external.inputs` keep the `context.` root. Update with the
+# np-checklist skill:
 #   update_specification.sh --id <spec_…> --definition-file ./deploy-gate.yaml
 #   set_action_specification.sh --action-id 490799113 --specification-id <new spec_…>
 items:
@@ -37,360 +39,77 @@ items:
 
     "Human approval" group.
 - id: api_checks
-  type: group
+  type: external
   title: API checks (Jev)
   behavior: gate
-  severity: major
-  aggregation: all
+  severity: critical
   description: >
-    Backend / API safety checks over the diff between the deployed release and the candidate. Judged by
-    Jev (TypeSafe System One): one calibrated probability per changed code file, in seconds. Fails when
-    any file scores ≥ 0.7; docs/tests never gate. Evidence (files + probabilities) in the item details.
-  children:
-  - id: breaks_api_contract
-    type: external
-    title: Breaks the public API contract
-    behavior: gate
-    severity: critical
-    description: >
-      Removed/renamed response fields or routes, changed types or status codes, newly required params.
-      Additive changes do not count.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: breaks_api_contract
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: changes_db_schema
-    type: external
-    title: Changes the database schema
-    behavior: gate
-    severity: major
-    description: >
-      Adds, drops or alters tables, columns, indexes or constraints, or adds a migration.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: changes_db_schema
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: irreversible_migration
-    type: external
-    title: Irreversible or destructive migration
-    behavior: gate
-    severity: critical
-    description: >
-      DROP/data rewrite or a migration with no rollback.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: irreversible_migration
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: logs_sensitive_data
-    type: external
-    title: Logs sensitive data
-    behavior: gate
-    severity: critical
-    description: >
-      Passwords, tokens, keys, card numbers, raw headers/bodies or personal data written to logs.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: logs_sensitive_data
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: hardcoded_secret
-    type: external
-    title: Hardcoded credential
-    behavior: gate
-    severity: critical
-    description: >
-      A literal secret in production code or config (test fixtures excluded).
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: hardcoded_secret
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: touches_auth
-    type: external
-    title: Touches authentication / authorization
-    behavior: informational
-    severity: major
-    description: >
-      Login, token validation, permission checks, roles, sessions. Informational: auth work is expected,
-      but reviewers should know.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: touches_auth
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: new_external_call_without_timeout
-    type: external
-    title: New outbound call without timeout
-    behavior: informational
-    severity: minor
-    description: >
-      A new fetch/http client call with no timeout, AbortSignal or deadline.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: new_external_call_without_timeout
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: removes_error_handling
-    type: external
-    title: Removes or weakens error handling
-    behavior: informational
-    severity: minor
-    description: >
-      Deleted try/catch, swallowed errors, removed validation or status checks.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: removes_error_handling
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-- id: frontend_checks
-  type: group
-  title: Frontend checks (Jev)
-  behavior: gate
-  severity: major
-  aggregation: all
-  description: >
-    UI conventions over the diff. Each check knows the repo's facts (component library, i18n) and answers
-    'no' when the convention does not apply to the repo. Judged by Jev (TypeSafe System One): one calibrated
-    probability per changed code file, in seconds. Fails when any file scores ≥ 0.7; docs/tests never
-    gate. Evidence (files + probabilities) in the item details.
-  children:
-  - id: bypasses_component_library
-    type: external
-    title: Bypasses the component library
-    behavior: gate
-    severity: major
-    description: >
-      Raw HTML elements or inline styles where the repo's design-system package exports an equivalent.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: bypasses_component_library
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: hardcoded_user_text
-    type: external
-    title: User-visible text without i18n
-    behavior: gate
-    severity: minor
-    description: >
-      Literal user-visible strings in a repo that translates through i18n.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: hardcoded_user_text
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: accessibility_regression
-    type: external
-    title: Accessibility regression
-    behavior: informational
-    severity: minor
-    description: >
-      Images without alt, inputs without labels, clickable non-buttons without keyboard/role handling.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: accessibility_regression
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: leftover_debug_output
-    type: external
-    title: Leftover debug output
-    behavior: informational
-    severity: info
-    description: >
-      console.log / print / debugger or commented-out code left in production paths.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: leftover_debug_output
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-- id: common_checks
-  type: group
-  title: Common checks (Jev)
-  behavior: gate
-  severity: major
-  aggregation: all
-  description: >
-    Hygiene checks for any stack, plus Jev's own risk level and change classification. Judged by Jev (TypeSafe
-    System One): one calibrated probability per changed code file, in seconds. Fails when any file scores
-    ≥ 0.7; docs/tests never gate. Evidence (files + probabilities) in the item details.
-  children:
-  - id: disables_tests_or_ci
-    type: external
-    title: Disables tests or CI
-    behavior: gate
-    severity: major
-    description: >
-      skip/only markers, deleted tests, lowered coverage thresholds, removed lint steps.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: disables_tests_or_ci
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: major_dependency_bump
-    type: external
-    title: Major dependency bump / new runtime dependency
-    behavior: informational
-    severity: minor
-    description: >
-      A dependency crosses a major version or a new runtime dependency appears.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: major_dependency_bump
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-  - id: risk_level
-    type: external
-    title: Risk level & change kind (Jev)
-    behavior: informational
-    severity: info
-    description: >
-      Jev's 0–4 risk score (worst code file) and the distribution of change kinds across files.
-    external:
-      kind: deploy-change-check
-      inputs:
-        check_id: risk_level
-        scope_id: '{{ context.scope.id }}'
-        release_id: '{{ context.release.id }}'
-        deployment_id: '{{ context.deployment.id }}'
-        application_id: '{{ context.application.id }}'
-      trigger: auto
-      timeout_seconds: 300
-    for_each: deployments
-    applies_when:
-      scope.dimensions.environment: production
-- id: change_analysis
-  type: external
-  title: Change summary & risk matrix (Claude, informational)
-  behavior: informational
+    Gates: breaks the public API contract, changes the DB schema, irreversible migration, logs sensitive
+    data, hardcoded credential. Informational: touches auth, new outbound call without timeout, removes
+    error handling. Judged by Jev (TypeSafe System One): one calibrated probability per changed code file,
+    several files per request, all in parallel — seconds, not minutes. Fails only when a GATE check scores
+    ≥ 0.75 on some file; docs/tests/config never gate. Per-check verdicts, files and probabilities in
+    the message and details.
   external:
-    kind: deploy-change-analysis
+    kind: deploy-change-check
     inputs:
+      check_group: api
       scope_id: '{{ context.scope.id }}'
       release_id: '{{ context.release.id }}'
       deployment_id: '{{ context.deployment.id }}'
       application_id: '{{ context.application.id }}'
     trigger: auto
-    timeout_seconds: 600
+    timeout_seconds: 180
   for_each: deployments
+  applies_when:
+    scope.dimensions.environment: production
+- id: frontend_checks
+  type: external
+  title: Frontend checks (Jev)
+  behavior: gate
   severity: major
   description: >
-    Functional summary of the accumulated change (what ships, who did it, categories) and the risk × criticality
-    matrix, produced by Claude. Informational since 2026-09-18: the per-check Jev items below are the
-    gates.
+    Gates: bypasses the component library, user-visible text without i18n (both answer 'no' when the repo
+    has no design system / no i18n). Informational: accessibility regression, leftover debug output. Judged
+    by Jev (TypeSafe System One): one calibrated probability per changed code file, several files per
+    request, all in parallel — seconds, not minutes. Fails only when a GATE check scores ≥ 0.75 on some
+    file; docs/tests/config never gate. Per-check verdicts, files and probabilities in the message and
+    details.
+  external:
+    kind: deploy-change-check
+    inputs:
+      check_group: frontend
+      scope_id: '{{ context.scope.id }}'
+      release_id: '{{ context.release.id }}'
+      deployment_id: '{{ context.deployment.id }}'
+      application_id: '{{ context.application.id }}'
+    trigger: auto
+    timeout_seconds: 180
+  for_each: deployments
+  applies_when:
+    scope.dimensions.environment: production
+- id: common_checks
+  type: external
+  title: Common checks (Jev)
+  behavior: gate
+  severity: major
+  description: >
+    Gate: disables tests or CI. Informational: major dependency bump / new runtime dependency, Jev risk
+    level (0–4) of the worst code file. Judged by Jev (TypeSafe System One): one calibrated probability
+    per changed code file, several files per request, all in parallel — seconds, not minutes. Fails only
+    when a GATE check scores ≥ 0.75 on some file; docs/tests/config never gate. Per-check verdicts, files
+    and probabilities in the message and details.
+  external:
+    kind: deploy-change-check
+    inputs:
+      check_group: common
+      scope_id: '{{ context.scope.id }}'
+      release_id: '{{ context.release.id }}'
+      deployment_id: '{{ context.deployment.id }}'
+      application_id: '{{ context.application.id }}'
+    trigger: auto
+    timeout_seconds: 180
+  for_each: deployments
   applies_when:
     scope.dimensions.environment: production
 - id: human_approvals
