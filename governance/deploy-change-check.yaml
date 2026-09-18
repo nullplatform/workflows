@@ -14,7 +14,7 @@
 # Speed is the point: no heartbeats, no LLM. Jev itself answers in well under a
 # second per request; what remains is the engine's per-activity cost, so the
 # graph is four activities plus ceil(files / batch) parallel Jev calls.
-# Docs/tests/config never gate. Informational work (functional summary, change
+# Docs never gate; tests only for the tests/CI check. Informational work (functional summary, change
 # categories) is NOT here — it runs later against the deploy history.
 #
 # Config entries (folder /checklist/deploy): secrets NP_API_KEY (folder),
@@ -30,10 +30,10 @@ name: "Deploy Change Check (Jev)"
 path: /checklist/deploy
 semantic_version: 3.0.0
 description: >
-  Resolves one deploy-gate check group (API / Frontend / Common) over the diff
-  between the previously deployed release and the candidate. Jev judges every
-  changed code file, several files per request, all requests in parallel; the
-  item fails with the files and probabilities that tripped a gate check.
+  Resolves one deploy-gate check (API / Frontend / Common groups) over the diff
+  between the live release and the candidate. Jev judges every changed code and
+  config file, up to 60 files per request; a gate check fails the item with the
+  files and probabilities that tripped it.
 
 inputs:
   triggerPayload:
@@ -142,7 +142,10 @@ steps:
 
         // ---------- phase 3: compare with patches, one entry per changed file ----------
         const SKIP = /(^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|go\.sum|Cargo\.lock|poetry\.lock)$|\.(min\.js|min\.css|map|snap|svg|png|jpg|jpeg|gif|ico|woff2?|pdf)$|(^|\/)(dist|build|node_modules|vendor)\//i;
-        const kindOf = (f) => /\.(md|mdx|rst|txt)$/i.test(f) ? "docs" : /(^|\/)(__tests__|tests?|spec|e2e)\/|\.(test|spec)\.[a-z]+$/i.test(f) ? "test" : /\.(ya?ml|json|toml|ini|env(\..*)?)$|(^|\/)Dockerfile$/i.test(f) ? "config" : "code";
+        // `test` = __tests__/, tests/, e2e/ folders or *.test.* / *.spec.* files. A bare `spec/`
+        // folder is NOT a test dir (BFF-style repos keep their endpoint definitions there —
+        // 2026-09-18 a real deploy had 0 judged files because of that).
+        const kindOf = (f) => /\.(md|mdx|rst|txt)$/i.test(f) ? "docs" : /(^|\/)(__tests__|tests?|e2e)\/|\.(test|spec)\.[a-z]+$/i.test(f) ? "test" : /\.(ya?ml|toml|ini|env(\..*)?)$|(^|\/)Dockerfile$|(^|\/)package(-lock)?\.json$/i.test(f) ? "config" : "code";
         // The change under judgment is ALWAYS live release → candidate, even when the
         // candidate was deployed here before (a re-deploy of an old release changes
         // production just the same). Only an identical commit has nothing to judge.
@@ -166,9 +169,11 @@ steps:
             files.push({ path: f.filename, kind: kindOf(f.filename), status: f.status, additions: f.additions, deletions: f.deletions, is_route_or_handler_file: /(^|\/)(routes?|controllers?|handlers?|api|endpoints?)\//i.test(f.filename), diff: patch });
           }
         }
-        // Only code files are judged (docs/tests/config never gate) — fewer Jev requests, no noise.
-        const codeFiles = files.filter(f => f.kind === "code");
-        const nonCode = files.length - codeFiles.length;
+        // Which file kinds a check judges: code + config by default (CI yaml, package
+        // manifests and endpoint JSON carry secrets, dependencies and contracts), tests
+        // too for the tests/CI check, docs never. Placeholder — resolved after the
+        // catalogue below is known.
+        let codeFiles = [], nonCode = 0;
 
         // ---------- the catalogue ----------
         const N = (question, tru, fal, focus) => ({ type: "noul", instructions: focus ? { question, focus } : question, ...(tru || fal ? { criteria: { ...(tru ? { true: tru } : {}), ...(fal ? { false: fal } : {}) } } : {}) });
@@ -209,6 +214,10 @@ steps:
         if (!group) throw new Error(`unknown check_id '${checkId}' — known: ${Object.values(CHECKS).flatMap(x => Object.keys(x.checks)).join(", ")}`);
         const g = CHECKS[group];
         const checkIds = [checkId];
+        const JUDGE_KINDS = { disables_tests_or_ci: ["code", "config", "test"] };
+        const judgeKinds = JUDGE_KINDS[checkId] || ["code", "config"];
+        codeFiles = files.filter(f => judgeKinds.includes(f.kind));
+        nonCode = files.length - codeFiles.length;
 
         // ---------- batches: several files per Jev request, one question per (check, file) ----------
         const batchSize = Math.max(1, MAX_Q); // one question per file → up to MAX_Q files per request
@@ -224,7 +233,7 @@ steps:
         const checks = Object.fromEntries(checkIds.map(cid => [cid, { title: g.checks[cid].title, behavior: g.checks[cid].behavior }]));
 
         return {
-          check_id: checkId, group, group_title: g.title, title: g.checks[checkId].title, behavior: g.checks[checkId].behavior,
+          check_id: checkId, group, group_title: g.title, title: g.checks[checkId].title, behavior: g.checks[checkId].behavior, judge_kinds: judgeKinds,
           checks, batch_size: batchSize, batch_count: batches.length, batches, questions,
           repo, criticality, stack, repo_facts,
           from_release: from ? { id: from.id, semver: from.semver, commit_sha: from.commit_sha } : null,
@@ -295,7 +304,7 @@ steps:
         if (gathered.code_files === 0) {
           message = (!gathered.from_release || gathered.from_release.commit_sha === gathered.to_release.commit_sha)
             ? `✅ ${c.title} — candidate is the commit already live on this scope (${from} → ${to}); nothing to judge.`
-            : `✅ ${c.title} — no code files changed between ${from} and ${to} (${gathered.non_code_files || 0} docs/tests/config files not judged).`;
+            : `✅ ${c.title} — nothing to judge between ${from} and ${to}: ${gathered.non_code_files || 0} changed file(s) are ${(gathered.judge_kinds || []).includes("test") ? "docs" : "docs/tests"} (not judged by this check).`;
         } else if (cid === "risk") {
           const LEVELS = ["Negligible", "Low", "Moderate", "High", "Critical"];
           message = `ℹ️ Jev risk: ${LEVELS[Math.round(riskMax)] || "n/a"} (${riskMax.toFixed(2)}${riskFile ? `, driven by ${short(riskFile)}` : ""}). ${span}.`;
