@@ -293,7 +293,7 @@ steps:
       expression: "${{ steps.gather.outputs.files }}"
       itemVariable: file
       parallel: true
-      maxConcurrency: 6
+      maxConcurrency: 12
     inputs:
       file:
         path: "${{ file.path }}"
