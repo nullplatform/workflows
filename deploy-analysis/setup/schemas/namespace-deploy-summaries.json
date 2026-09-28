@@ -62,14 +62,41 @@
        "additionalProperties": true,
        "visibleOn": [
         "read"
-       ]
+       ],
+       "properties": {
+        "low": {
+         "type": "integer",
+         "visibleOn": [
+          "read"
+         ]
+        },
+        "medium": {
+         "type": "integer",
+         "visibleOn": [
+          "read"
+         ]
+        },
+        "high": {
+         "type": "integer",
+         "visibleOn": [
+          "read"
+         ]
+        },
+        "unknown": {
+         "type": "integer",
+         "visibleOn": [
+          "read"
+         ]
+        }
+       }
       },
       "summary_md": {
        "type": "string",
        "visibleOn": [
         "read",
         "list"
-       ]
+       ],
+       "contentMediaType": "text/markdown"
       },
       "prs": {
        "type": "integer",
@@ -81,7 +108,21 @@
        "type": "array",
        "items": {
         "type": "object",
-        "additionalProperties": true
+        "additionalProperties": true,
+        "properties": {
+         "github": {
+          "type": "string"
+         },
+         "roles": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "prs": {
+          "type": "integer"
+         }
+        }
        },
        "visibleOn": [
         "read"
