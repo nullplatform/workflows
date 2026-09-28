@@ -42,6 +42,12 @@ export GITHUB_TOKEN=…         # PAT that can read the analyzed apps' repos
   "organization=<org>:account=<acc>:namespace=<ns1>" \
   "organization=<org>:account=<acc>:namespace=<ns2>"
 
+# 1b. Catalog panel: the namespace dashboard renders the org-level global spec only.
+#     Writes namespace/deploy_summaries at the org NRN (visible in EVERY namespace of
+#     the org) and its uiSchema category into the global spec. --dry-run prints the diffs.
+./setup/04-org-catalog-spec.sh --dry-run "organization=<org>"
+./setup/04-org-catalog-spec.sh "organization=<org>"
+
 # 2. Config entries (folder /deploy-analysis)
 ./setup/02-config-entries.sh --namespaces "<ns1>,<ns2>" --environments "prod,stage"
 

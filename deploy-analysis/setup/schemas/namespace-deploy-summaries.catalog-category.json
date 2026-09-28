@@ -1,0 +1,74 @@
+{
+ "type": "Category",
+ "label": "Deploy summaries",
+ "options": {
+  "description": "Weekly functional summaries of production deploys across the namespace, written by the deploy-weekly-summary workflow."
+ },
+ "elements": [
+  {
+   "type": "Group",
+   "label": "Latest week",
+   "elements": [
+    {
+     "type": "Control",
+     "scope": "#/properties/deploy_summaries/properties/latest_short",
+     "label": "Highlights"
+    },
+    {
+     "type": "Control",
+     "scope": "#/properties/deploy_summaries/properties/latest_summary",
+     "label": "Summary"
+    }
+   ]
+  },
+  {
+   "type": "Group",
+   "label": "Weekly history",
+   "elements": [
+    {
+     "type": "Control",
+     "scope": "#/properties/deploy_summaries/properties/weeks",
+     "label": "Weeks",
+     "options": {
+      "layout": "table",
+      "visibleColumns": [
+       "week_start",
+       "deploys"
+      ],
+      "detail": {
+       "type": "VerticalLayout",
+       "elements": [
+        {
+         "type": "Control",
+         "scope": "#/properties/summary_md",
+         "label": "Summary"
+        },
+        {
+         "type": "Control",
+         "scope": "#/properties/risk",
+         "label": "Risk"
+        },
+        {
+         "type": "Control",
+         "scope": "#/properties/prs",
+         "label": "PRs"
+        },
+        {
+         "type": "Control",
+         "scope": "#/properties/contributors",
+         "label": "Contributors",
+         "options": {
+          "visibleColumns": [
+           "github",
+           "prs"
+          ]
+         }
+        }
+       ]
+      }
+     }
+    }
+   ]
+  }
+ ]
+}
