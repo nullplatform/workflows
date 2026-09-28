@@ -365,7 +365,11 @@ steps:
       const nsSum = new Map((llm.namespace_summaries || []).map(s => [ek(s.namespace_id, s.environment), s.summary_md]));
       const appShort = new Map((llm.app_summaries || []).map(s => [ek(s.application_id, s.environment), s.short_summary]));
       const nsShort = new Map((llm.namespace_summaries || []).map(s => [ek(s.namespace_id, s.environment), s.short_summary]));
-      const derivedShort = (md) => [(String(md || "").split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 100)];
+      const derivedShort = (md) => {
+        const first = (String(md || "").split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 100);
+        return first ? [first] : [];
+      };
+      const presentShort = (short) => short.filter(s => String(s ?? "").trim());
 
       // Fallback narrative when the LLM output is missing for an entity.
       const fallback = (deploys) => deploys.map(d =>
@@ -390,7 +394,7 @@ steps:
         const latest = weeks[0];
         const body = JSON.stringify({
           latest_summary: `**Semana ${latest.week_start} → ${latest.week_end}** — ${latest.deploys} deploys (risk: ${latest.risk.low || 0} low / ${latest.risk.medium || 0} medium / ${latest.risk.high || 0} high)\n\n${latest.summary_md}`,
-          latest_short: latest.short_summary || derivedShort(latest.summary_md),
+          latest_short: Array.isArray(latest.short_summary) ? presentShort(latest.short_summary) : derivedShort(latest.summary_md),
           weeks,
         });
         let res = await fetch(url, { method: "POST", headers: H, body });
