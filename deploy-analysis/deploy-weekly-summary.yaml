@@ -369,7 +369,7 @@ steps:
         const first = (String(md || "").split(/[.\n]/)[0] || "").replace(/[*_#`]/g, "").trim().slice(0, 100);
         return first ? [first] : [];
       };
-      const presentShort = (short) => (Array.isArray(short) ? short : []).filter(s => String(s ?? "").trim());
+      const presentShort = (short) => short.filter(s => String(s ?? "").trim());
 
       // Fallback narrative when the LLM output is missing for an entity.
       const fallback = (deploys) => deploys.map(d =>

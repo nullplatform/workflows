@@ -42,11 +42,6 @@ export GITHUB_TOKEN=…         # PAT that can read the analyzed apps' repos
   "organization=<org>:account=<acc>:namespace=<ns1>" \
   "organization=<org>:account=<acc>:namespace=<ns2>"
 
-# 1b. The namespace dashboard's Catalog panel renders the org's namespace Global
-#     Specification only: merge the deploy_summaries slice into it (--dry-run shows the diff)
-./setup/04-global-namespace-spec.sh --dry-run "organization=<org>"
-./setup/04-global-namespace-spec.sh "organization=<org>"
-
 # 2. Config entries (folder /deploy-analysis)
 ./setup/02-config-entries.sh --namespaces "<ns1>,<ns2>" --environments "prod,stage"
 
