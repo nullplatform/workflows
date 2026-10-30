@@ -25,6 +25,11 @@ environment, so production and staging never mix.
 - All specs are **namespace-scoped** (never organization-wide): summaries are
   developer-visible, and entities outside the analyzed namespaces must not
   show empty metadata blocks.
+- `01-metadata-specs.sh` refuses to run when an analyzed namespace has no
+  global spec of its own for `deployment`, `application` or `namespace` but
+  the organization does: the first spec there would create an empty namespace
+  global that hides the organization's catalog layout for every entity in
+  that namespace, and metadata-api cannot delete it.
 - Participants: identity is commit-level (every commit author in the deployed
   range gets role `author`, even inside someone else's PR) plus PR-level
   roles (`author`/`reviewer`/`approver`). The weekly contributor `prs`

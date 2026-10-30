@@ -13,6 +13,11 @@
 #
 # Idempotent: existing (entity, metadata, nrn) specs get their schema PATCHed.
 #
+# Refuses to write anything when a namespace has no global spec of its own for
+# one of those entities but a parent NRN does: the first POST would create an
+# empty namespace global that hides the parent's catalog (see
+# assert_no_shadowing_global in specs.sh).
+#
 # Usage:
 #   ./01-metadata-specs.sh [--env-file <file>] \
 #     "organization=<org>:account=<acc>:namespace=<ns1>" \
@@ -37,6 +42,14 @@ done
 [[ ${#NRNS[@]} -gt 0 ]] || { echo "usage: $0 [--env-file f] <namespace-nrn> [...]" >&2; exit 1; }
 
 mint_token
+
+refused=""
+for nrn in "${NRNS[@]}"; do
+  for entity in deployment application namespace; do
+    assert_no_shadowing_global "$nrn" "$entity" || refused=1
+  done
+done
+[[ -z "$refused" ]] || { echo "nothing written." >&2; exit 1; }
 
 for nrn in "${NRNS[@]}"; do
   echo "namespace $nrn"
